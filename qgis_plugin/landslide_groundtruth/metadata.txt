@@ -1,0 +1,13 @@
+[general]
+name=Landslide Ground-Truthing
+qgisMinimumVersion=3.22
+description=Interactive landslide scar delineation from PlanetScope / Sentinel-2 / Landsat imagery.
+about=Pick an event location on the map, set its date and the pre/post imagery windows, choose an imagery source (PlanetScope ~3 m, Sentinel-2 ~10 m, or Landsat ~30 m), and run the ground-truthing pipeline. Results (pre/post RGB, dNDVI, brightness change, candidate scar polygon, crown/tip points) load straight into your project for review. Requires a configured Python environment with the pipeline installed (see plugin settings); the plugin runs that environment as a background process.
+version=0.1.0
+author=Ethan Hasenauer
+email=ethan.hasenauer@sjsu.edu
+tags=landslide,remote sensing,planet,sentinel,landsat,stac,hazard
+category=Plugins
+icon=icon.png
+experimental=True
+hasProcessingProvider=no

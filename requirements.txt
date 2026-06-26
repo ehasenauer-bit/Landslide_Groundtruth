@@ -1,0 +1,39 @@
+# Python 3.11+ (developed and tested on CPython 3.14). Install into a venv:
+#   python -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Environment variables / credentials:
+#   PL_API_KEY  -- PlanetScope API key (optional). Alternatively run
+#                  `planet auth login` once (token cached under ~/.planet/).
+#                  Without either, the pipeline prints a [planet] warning and
+#                  falls back to Sentinel-2/Landsat, so it still runs.
+#   (none)      -- Sentinel-2 / Landsat need NO credentials: Microsoft Planetary
+#                  Computer signs STAC requests anonymously.
+#
+# QGIS plugin only: the dock stores the venv-python path, project dir and output
+# dir in QgsSettings (set them once in the Environment box) — see qgis_plugin/.
+#
+# Pins are minimums; the exact known-good set last tested is noted per line.
+
+# --- imagery / STAC (Planetary Computer: Sentinel-2, Landsat) ---
+pystac-client>=0.7        # tested 0.9.0
+planetary-computer>=1.0   # tested 1.0.0  (signs PC asset URLs)
+stackstac>=0.5            # tested 0.5.1  (windowed COG -> xarray stack)
+
+# --- raster / array handling ---
+rioxarray>=0.15           # tested 0.22.0 (registers the .rio accessor)
+xarray>=2024.1            # tested 2026.4.0
+rasterio>=1.3             # tested 1.5.0
+numpy>=1.24               # tested 2.5.0
+
+# --- vector geometry + reprojection (review package, CRS transforms) ---
+geopandas>=0.14           # tested 1.1.3
+shapely>=2.0              # tested 2.1.2
+pyproj>=3.6               # tested 3.7.2
+
+# --- inventory spreadsheet + summary table ---
+pandas>=2.0               # tested 2.3.3
+openpyxl>=3.1             # tested 3.1.5  (reads LandslideInventory.xlsx)
+
+# --- PlanetScope: primary high-res source (optional auth, see above) ---
+planet>=3.0               # tested 3.6.0
