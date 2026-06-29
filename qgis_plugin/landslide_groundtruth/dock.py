@@ -92,6 +92,11 @@ _S2_TC_RESCALE = "0,16667"
 # muted text for table rows the run will NOT composite (ranked below the cutoff)
 MUTED_FG = QColor(120, 120, 120)
 
+# QGIS network-request timeout (ms) while previewing PC tiler layers: the on-
+# demand tiler can be slow to render the first tiles of a fresh scene, and the
+# 60 s default aborts them ("Network request … timed out"). 3 minutes.
+NETWORK_TIMEOUT_MS = 180000
+
 
 class LandslideDock(QgsDockWidget):
     def __init__(self, iface):
@@ -729,6 +734,7 @@ class LandslideDock(QgsDockWidget):
         self._append_log(
             f"Preview on map: streaming snow-safe true colour for {len(scenes)} "
             f"Sentinel-2 scene(s)…")
+        self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
         self._preview_added = []
         self._preview_failed = []
@@ -750,13 +756,36 @@ class LandslideDock(QgsDockWidget):
         else:
             self._finish_map_preview()
 
+    def _ensure_network_timeout(self, ms=NETWORK_TIMEOUT_MS):
+        """Raise QGIS's network-request timeout so slow PC tiler renders survive.
+
+        The XYZ/WMS provider reads the global 'qgis/networkAndProxy/networkTimeout'
+        setting; the on-demand tiler can exceed the 60 s default on the first tiles.
+        Bump it (only ever upward, so a user's higher value is kept) and update the
+        live network manager. Global QGIS setting — also helps other slow layers."""
+        try:
+            s = QgsSettings()
+            cur = s.value("qgis/networkAndProxy/networkTimeout", 60000, type=int)
+            if cur < ms:
+                s.setValue("qgis/networkAndProxy/networkTimeout", ms)
+                self._append_log(f"  raised network timeout {cur} → {ms} ms (3 min)")
+            try:
+                QgsNetworkAccessManager.instance().setTimeout(ms)
+            except (AttributeError, TypeError):
+                pass   # older QGIS: the setting above still applies
+        except Exception:
+            pass
+
     def _add_s2_tile_layer(self, label, item_id):
         """Add a snow-safe Sentinel-2 XYZ layer rendered by the PC data API.
 
         The tiler signs blob reads server-side, so no SAS token is needed (same
         public service as the rendered_preview thumbnails). Returns True if the
         layer opened, False so the caller can fall back to the COG path."""
-        tmpl = (f"{PC_DATA_URL}/item/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x"
+        # @1x = 256 px tiles: ~4x less per-tile render work than @2x, so the
+        # on-demand PC tiler returns them before the network timeout (slightly
+        # softer on hi-DPI screens, no difference to the data or colour).
+        tmpl = (f"{PC_DATA_URL}/item/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@1x"
                 f"?collection=sentinel-2-l2a&item={item_id}&{self._s2_render_query()}")
         # Percent-encode only the query separators (& =) and the rest; keep the
         # {z}/{x}/{y} placeholders, scheme and path literal so QGIS can substitute
