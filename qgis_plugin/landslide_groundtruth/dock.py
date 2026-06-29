@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import tempfile
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery
@@ -73,8 +74,8 @@ PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
 # Planetary Computer data API (public titiler; no SAS token needed — it signs
 # blob reads server-side, same service the rendered_preview thumbnails come from).
-# We use it to render BOTH the scene-preview PNG and the on-map XYZ tiles from the
-# raw 10 m bands (B04/B03/B02), so we control the stretch instead of inheriting
+# We use it to render BOTH the scene-preview PNG and the on-map AOI GeoTIFF from
+# the raw 10 m bands (B04/B03/B02), so we control the stretch instead of inheriting
 # the pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
 #
 # The render reproduces the project's "Highlight Optimized Natural Color" look
@@ -111,6 +112,9 @@ class LandslideDock(QgsDockWidget):
         self._search_result = None   # last Search/Preview result (for map preview)
         self._sign_replies = []      # in-flight COG-signing requests
         self._sign_pending = 0       # signs still outstanding this preview
+        self._tif_replies = []       # in-flight AOI-GeoTIFF downloads
+        self._tif_pending = 0        # AOI downloads still outstanding this preview
+        self._tif_fallbacks = []     # (label, cog_url) whose AOI render failed
         self._preview_added = []     # raster layers added by the current preview
         self._preview_failed = []    # labels that failed to sign/load
         self._gdal_tuned = False     # GDAL /vsicurl options set once
@@ -627,7 +631,11 @@ class LandslideDock(QgsDockWidget):
         self._fetch_preview(url, fallback=fb)
 
     def _s2_render_query(self):
-        """Snow-safe true-colour render params for the PC data API (preview + tiles)."""
+        """Snow-safe true-colour render params for the PC data API.
+
+        Used by both the scene-preview PNG and the on-map AOI GeoTIFF, each fetched
+        with a single GET, so the colour_formula is percent-encoded exactly once
+        here (encoding it again at the call site is the bug that blanked the map)."""
         return (f"{_S2_TC_BANDS}&color_formula={quote(_S2_TC_FORMULA)}"
                 f"&rescale={_S2_TC_RESCALE}&nodata=0")
 
@@ -696,7 +704,7 @@ class LandslideDock(QgsDockWidget):
         super().resizeEvent(event)
         self._render_preview()   # keep the preview fit to the pane as it resizes
 
-    # ---------- preview on map (streamed Sentinel-2 COGs) ----------
+    # ---------- preview on map (snow-safe AOI GeoTIFF) ----------
     def _best_s2(self, side):
         """The Sentinel-2 candidate a Run would lead with on `side` ('pre'/'post').
 
@@ -715,13 +723,17 @@ class LandslideDock(QgsDockWidget):
         return ranked[0] if ranked else None
 
     def _preview_on_map(self):
-        """Stream the run's pre & post Sentinel-2 scenes onto the canvas.
+        """Render the run's pre & post Sentinel-2 scenes over the AOI.
 
-        Renders each scene as a snow-safe true-colour XYZ layer from the Planetary
-        Computer data API (raw bands + our stretch — no SAS signing, and no blown-
-        out 'visual' TCI). If the tiler layer won't open, falls back to signing and
-        streaming the baked visual COG (the previous behaviour). Then zooms to the
-        AOI. Independent of the table row selection."""
+        Downloads a snow-safe true-colour GeoTIFF clipped to the search box from
+        the Planetary Computer data API (raw bands + our stretch — no 'visual' TCI
+        white-out, no SAS signing) and loads each as a georeferenced raster, then
+        zooms to the AOI. Covers the AOI box only. Falls back to the signed visual
+        COG if a download fails. Independent of the table row selection."""
+        bbox = self._aoi_bbox()
+        if bbox is None:
+            self._warn("Run Search / Preview first (need the AOI location).")
+            return
         scenes = []
         for side in ("pre", "post"):
             c = self._best_s2(side)
@@ -732,37 +744,24 @@ class LandslideDock(QgsDockWidget):
             self._warn("No Sentinel-2 scene to preview.")
             return
         self._append_log(
-            f"Preview on map: streaming snow-safe true colour for {len(scenes)} "
-            f"Sentinel-2 scene(s)…")
+            f"Preview on map: downloading snow-safe true colour over the AOI for "
+            f"{len(scenes)} Sentinel-2 scene(s)…")
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
         self._preview_added = []
         self._preview_failed = []
-        fallbacks = []   # (label, cog_url) for scenes whose tiler layer wouldn't open
+        self._tif_fallbacks = []
+        self._tif_pending = len(scenes)
         for label, item_id, cog_url in scenes:
-            if self._add_s2_tile_layer(label, item_id):
-                continue
-            if cog_url:
-                fallbacks.append((label, cog_url))
-            else:
-                self._preview_failed.append(label)
-                self._append_log(f"  could not preview {label}")
-        if fallbacks:
-            self._append_log(f"  tiler failed for {len(fallbacks)} scene(s); "
-                             f"falling back to signed COG stream")
-            self._sign_pending = len(fallbacks)
-            for label, cog_url in fallbacks:
-                self._sign_cog(label, cog_url)
-        else:
-            self._finish_map_preview()
+            self._download_aoi_tif(label, item_id, cog_url, bbox)
 
     def _ensure_network_timeout(self, ms=NETWORK_TIMEOUT_MS):
-        """Raise QGIS's network-request timeout so slow PC tiler renders survive.
+        """Raise QGIS's network-request timeout so a slow AOI render survives.
 
-        The XYZ/WMS provider reads the global 'qgis/networkAndProxy/networkTimeout'
-        setting; the on-demand tiler can exceed the 60 s default on the first tiles.
-        Bump it (only ever upward, so a user's higher value is kept) and update the
-        live network manager. Global QGIS setting — also helps other slow layers."""
+        The data API renders the clipped GeoTIFF on demand, which can exceed the
+        60 s default on a cold scene. Bump 'qgis/networkAndProxy/networkTimeout'
+        (only ever upward, so a user's higher value is kept) and update the live
+        network manager. Global QGIS setting — also helps other slow layers."""
         try:
             s = QgsSettings()
             cur = s.value("qgis/networkAndProxy/networkTimeout", 60000, type=int)
@@ -776,28 +775,79 @@ class LandslideDock(QgsDockWidget):
         except Exception:
             pass
 
-    def _add_s2_tile_layer(self, label, item_id):
-        """Add a snow-safe Sentinel-2 XYZ layer rendered by the PC data API.
+    def _aoi_bbox(self):
+        """(minx, miny, maxx, maxy, radius_km) for the search AOI in lon/lat, or None.
 
-        The tiler signs blob reads server-side, so no SAS token is needed (same
-        public service as the rendered_preview thumbnails). Returns True if the
-        layer opened, False so the caller can fall back to the COG path."""
-        # @1x = 256 px tiles: ~4x less per-tile render work than @2x, so the
-        # on-demand PC tiler returns them before the network timeout (slightly
-        # softer on hi-DPI screens, no difference to the data or colour).
-        tmpl = (f"{PC_DATA_URL}/item/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@1x"
-                f"?collection=sentinel-2-l2a&item={item_id}&{self._s2_render_query()}")
-        # Percent-encode only the query separators (& =) and the rest; keep the
-        # {z}/{x}/{y} placeholders, scheme and path literal so QGIS can substitute
-        # tile coords. QGIS URL-decodes the url= value before each request.
-        uri = "type=xyz&url=" + quote(tmpl, safe=":/?{}@") + "&zmin=0&zmax=18"
-        lyr = QgsRasterLayer(uri, label, "wms")
-        if not lyr.isValid():
-            return False
-        QgsProject.instance().addMapLayer(lyr)
-        self._preview_added.append(lyr)
-        self._append_log(f"  loaded {label} (PC tiler, snow-safe true colour)")
-        return True
+        Same box the run searches and `_zoom_to_aoi` frames; radius is returned so
+        the render can be sized near Sentinel-2's native 10 m."""
+        result = self._search_result or {}
+        try:
+            lat = float(result.get("lat"))
+            lon = float(result.get("lon"))
+            radius = float(result.get("params", {}).get("radius_km"))
+        except (TypeError, ValueError):
+            return None
+        dlat = radius / 111.32
+        dlon = radius / (111.32 * math.cos(math.radians(lat)))
+        return (lon - dlon, lat - dlat, lon + dlon, lat + dlat, radius)
+
+    def _download_aoi_tif(self, label, item_id, cog_url, bbox):
+        """Fetch a snow-safe true-colour GeoTIFF clipped to the AOI (async GET).
+
+        Single GET to the data API's bbox endpoint (same mechanism as the working
+        scene-preview pane), sized to ~10 m/px and capped so a wide AOI stays a
+        sane download. The reply lands in `_tif_loaded`."""
+        minx, miny, maxx, maxy, radius = bbox
+        px = int(min(2048, max(256, round(radius * 2 * 100))))   # ~10 m/px, capped
+        url = (f"{PC_DATA_URL}/item/bbox/{minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}.tif"
+               f"?collection=sentinel-2-l2a&item={item_id}&{self._s2_render_query()}"
+               f"&width={px}&height={px}")
+        reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
+        self._tif_replies.append(reply)
+        reply.finished.connect(
+            lambda r=reply, l=label, cu=cog_url: self._tif_loaded(r, l, cu))
+
+    def _tif_loaded(self, reply, label, cog_url):
+        if reply in self._tif_replies:
+            self._tif_replies.remove(reply)
+        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NoError and status == 200
+        data = bytes(reply.readAll())
+        reply.deleteLater()
+        added = False
+        if ok and data:
+            try:
+                fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_preview_")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                lyr = QgsRasterLayer(path, label)
+                if lyr.isValid():
+                    QgsProject.instance().addMapLayer(lyr)
+                    self._preview_added.append(lyr)
+                    self._append_log(
+                        f"  loaded {label} (AOI render, snow-safe true colour)")
+                    added = True
+            except OSError:
+                pass
+        if not added:
+            if cog_url:   # degrade to the previous signed-COG behaviour
+                self._tif_fallbacks.append((label, cog_url))
+            else:
+                self._preview_failed.append(label)
+                self._append_log(f"  could not render {label}")
+        self._tif_pending -= 1
+        if self._tif_pending <= 0:
+            self._after_tif_downloads()
+
+    def _after_tif_downloads(self):
+        if self._tif_fallbacks:
+            self._append_log(f"  AOI render failed for {len(self._tif_fallbacks)} "
+                             f"scene(s); falling back to signed COG stream")
+            self._sign_pending = len(self._tif_fallbacks)
+            for label, cog_url in self._tif_fallbacks:
+                self._sign_cog(label, cog_url)
+        else:
+            self._finish_map_preview()
 
     def _sign_cog(self, label, cog_url):
         url = QUrl(PC_SIGN_URL)
@@ -861,8 +911,8 @@ class LandslideDock(QgsDockWidget):
         if self._preview_added:
             self._zoom_to_aoi()
             n = len(self._preview_added)
-            msg = (f"Loaded {n} Sentinel-2 scene(s) on the map (streamed, no "
-                   f"download). Toggle the layers to compare before vs after.")
+            msg = (f"Loaded {n} Sentinel-2 scene(s) over the AOI (snow-safe true "
+                   f"colour). Toggle the layers to compare before vs after.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("Landslide", msg)
