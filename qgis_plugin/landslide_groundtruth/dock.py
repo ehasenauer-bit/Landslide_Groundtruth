@@ -722,24 +722,60 @@ class LandslideDock(QgsDockWidget):
                                      bool(params.get("auto_window")))
         return ranked[0] if ranked else None
 
-    def _preview_on_map(self):
-        """Render the run's pre & post Sentinel-2 scenes over the AOI.
+    def _selected_s2_by_side(self):
+        """side -> the Sentinel-2 candidate selected in the table (or None).
 
-        Downloads a snow-safe true-colour GeoTIFF clipped to the search box from
-        the Planetary Computer data API (raw bands + our stretch — no 'visual' TCI
-        white-out, no SAS signing) and loads each as a georeferenced raster, then
-        zooms to the AOI. Covers the AOI box only. Falls back to the signed visual
-        COG if a download fails. Independent of the table row selection."""
+        Lets 'Preview on map' honour a row you picked instead of always using the
+        run's ★ scene. The table is single-select, so at most one side is set."""
+        out = {"pre": None, "post": None}
+        if not self._search_result:
+            return out
+        by_id = {}
+        for side in ("pre", "post"):
+            for c in self._search_result.get(side, []):
+                if c.get("id"):
+                    by_id[c["id"]] = (side, c)
+        for idx in self.table.selectionModel().selectedRows():
+            cell = self.table.item(idx.row(), 0)
+            if cell and cell.data(Qt.UserRole + 1) == "Sentinel-2":
+                info = by_id.get(cell.data(Qt.UserRole + 2))
+                if info:
+                    out[info[0]] = info[1]
+        return out
+
+    def _clear_preview_layers(self):
+        """Remove the rasters a previous Preview-on-map added, so each preview
+        shows just the current selection/★ pair instead of piling up."""
+        for lyr in self._preview_added:
+            try:
+                QgsProject.instance().removeMapLayer(lyr.id())
+            except (RuntimeError, AttributeError):
+                pass
+        self._preview_added = []
+
+    def _preview_on_map(self):
+        """Render the selected (or run's ★) pre & post Sentinel-2 scenes over the AOI.
+
+        Per side, previews the Sentinel-2 row you selected in the table, or the
+        run's top-ranked scene if you didn't select one on that side. Downloads a
+        snow-safe true-colour GeoTIFF clipped to the search box from the Planetary
+        Computer data API (raw bands + our stretch — no 'visual' TCI white-out, no
+        SAS signing) and loads each as a georeferenced raster, then zooms to the
+        AOI. Covers the AOI box only; falls back to the signed visual COG if a
+        download fails."""
         bbox = self._aoi_bbox()
         if bbox is None:
             self._warn("Run Search / Preview first (need the AOI location).")
             return
+        chosen = self._selected_s2_by_side()
         scenes = []
         for side in ("pre", "post"):
-            c = self._best_s2(side)
+            c = chosen[side] or self._best_s2(side)
             if c and c.get("id"):
                 date = (c.get("date") or "")[:10]
-                scenes.append((f"S2 {side} {date}".strip(), c["id"], c.get("cog_url")))
+                pick = "selected" if chosen[side] else "★ best"
+                scenes.append((f"S2 {side} {date}".strip(), c["id"],
+                               c.get("cog_url"), pick))
         if not scenes:
             self._warn("No Sentinel-2 scene to preview.")
             return
@@ -748,11 +784,12 @@ class LandslideDock(QgsDockWidget):
             f"{len(scenes)} Sentinel-2 scene(s)…")
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
-        self._preview_added = []
+        self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
         self._tif_pending = len(scenes)
-        for label, item_id, cog_url in scenes:
+        for label, item_id, cog_url, pick in scenes:
+            self._append_log(f"  {label} ({pick})")
             self._download_aoi_tif(label, item_id, cog_url, bbox)
 
     def _ensure_network_timeout(self, ms=NETWORK_TIMEOUT_MS):
