@@ -96,10 +96,23 @@ often water/sandbar.
 
 ## Outputs (`out/`)
 
-- `qgis_packages/<event>_pre_rgb.tif`, `_post_rgb.tif` — true-colour before/after.
+Which of these "scenes" get written is selectable — `--scenes true_color,dndvi,…`
+on the CLI, or the **Scenes to download** checkboxes in the plugin (default: all).
+The predicted-point layer is always written.
+
+- `qgis_packages/<event>_pre_rgb.tif`, `_post_rgb.tif` — true-colour before/after
+  (`true_color`).
+- `qgis_packages/<event>_pre_highlight.tif`, `_post_highlight.tif` — "Highlight
+  Optimized Natural Color" before/after (`highlight_natural`): a cube-root tone
+  curve, `cbrt(0.6 × reflectance)`, on the true-colour bands — the same look the
+  Copernicus Browser offers. Lifts shadow detail and tames blown-out snow/cloud so
+  one stretch reads across the whole scene. (Sentinel Hub custom script by Marko
+  Repše, CC BY-SA 4.0; it's a rendering of the same bands, not an extra download.)
 - `qgis_packages/<event>_pre_falsecolor.tif`, `_post_falsecolor.tif` — NIR-red-green
-  before/after (vegetation = bright red; fresh bare scar reads dark).
-- `qgis_packages/<event>_dndvi.tif`, `_dbright.tif` — the two change rasters.
+  before/after (vegetation = bright red; fresh bare scar reads dark) (`false_color`).
+- `qgis_packages/<event>_pre_ndvi.tif`, `_post_ndvi.tif` — raw NDVI before/after (`ndvi`).
+- `qgis_packages/<event>_dndvi.tif`, `_dbright.tif` — the two change rasters
+  (`dndvi`, `dbright`).
 - `qgis_packages/<event>_point.gpkg` — the predicted (seismic) epicentre.
 - `qgis_packages/<event>_metadata.json` — sensor + scene ids/dates used, layer list.
 - `summary.csv` — sensor + pre/post scene counts for every processed event.
