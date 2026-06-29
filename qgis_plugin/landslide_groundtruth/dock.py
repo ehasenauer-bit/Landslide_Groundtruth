@@ -2,6 +2,7 @@
 import json
 import math
 import os
+from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery
 from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap
@@ -70,6 +71,27 @@ ROW_FG = QColor(20, 20, 20)
 # lived, so we sign on demand at preview time rather than caching signed URLs.
 PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
+# Planetary Computer data API (public titiler; no SAS token needed — it signs
+# blob reads server-side, same service the rendered_preview thumbnails come from).
+# We use it to render BOTH the scene-preview PNG and the on-map XYZ tiles from the
+# raw 10 m bands (B04/B03/B02), so we control the stretch instead of inheriting
+# the pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
+#
+# The render reproduces the project's "Highlight Optimized Natural Color" look
+# (see review_package): a cube-root tone curve cbrt(0.6 * reflectance). In data-
+# API terms that's gamma 3 (output = input**(1/3)) applied to reflectance scaled
+# by 0.6 — i.e. rescale 0..16667 of the 0..10000 reflectance DN range. It lifts
+# shadow detail and tames blown-out snow so one stretch reads across the scene.
+# Tune the formula/rescale constants here if a scene needs it.
+PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
+SOURCE_COLLECTION = {"Sentinel-2": "sentinel-2-l2a", "Landsat": "landsat-c2-l2"}
+_S2_TC_BANDS = "assets=B04&assets=B03&assets=B02"
+_S2_TC_FORMULA = "gamma RGB 3.0, saturation 1.2"
+_S2_TC_RESCALE = "0,16667"
+
+# muted text for table rows the run will NOT composite (ranked below the cutoff)
+MUTED_FG = QColor(120, 120, 120)
+
 
 class LandslideDock(QgsDockWidget):
     def __init__(self, iface):
@@ -80,6 +102,7 @@ class LandslideDock(QgsDockWidget):
         self.settings = QgsSettings()
         self._preview_reply = None   # in-flight thumbnail request (if any)
         self._preview_pix = None     # last loaded preview, kept for rescaling
+        self._preview_fallback = None  # baked thumb to retry if a render URL fails
         self._search_result = None   # last Search/Preview result (for map preview)
         self._sign_replies = []      # in-flight COG-signing requests
         self._sign_pending = 0       # signs still outstanding this preview
@@ -474,44 +497,108 @@ class LandslideDock(QgsDockWidget):
     def _fill_table(self, result):
         pre = result.get("pre", [])
         post = result.get("post", [])
+        # The dry-run lists are gap-sorted for display, but a Run does NOT pick the
+        # nearest scene — it ranks by the SAME cloud-weighted blend fetch_event uses
+        # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. So
+        # replicate that selection here: ★ = the run's top-ranked scene, ✓ = also in
+        # the composite, plain/greyed = ranked below the cutoff (not used).
+        sel = self._run_selection(pre, post, result.get("params", {}))
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
-        # the search lists are ranked best-first, so the first scene on each side
-        # is the one a real Run would actually composite — flag those rows.
-        chosen_rows = set()
-        if pre:
-            chosen_rows.add(0)
-        if post:
-            chosen_rows.add(len(pre))
         for r, (side, c) in enumerate(rows):
+            info = sel[side]
+            cid = c.get("id")
+            is_top = cid is not None and cid == info["top"]
+            in_comp = cid in info["used"]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
             cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
-            chosen = r in chosen_rows
-            label = ("★ " + side) if chosen else side
-            cells = [label, date, gap, cloud, c.get("source", ""), c.get("id", "")]
+            marker = "★ " if is_top else ("✓ " if in_comp else "  ")
+            cells = [marker + side, date, gap, cloud,
+                     c.get("source", ""), c.get("id", "")]
             base = PRE_BG if side == "pre" else POST_BG
-            bg = base.darker(112) if chosen else base   # chosen rows a touch darker
+            bg = base.darker(112) if is_top else base   # the run's pick a touch darker
+            fg = ROW_FG if in_comp else MUTED_FG        # grey the rows a Run won't use
             for col, val in enumerate(cells):
                 item = QTableWidgetItem(val)
                 item.setBackground(QBrush(bg))
-                item.setForeground(QBrush(ROW_FG))
-                if chosen:
+                item.setForeground(QBrush(fg))
+                if is_top:
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
-            # stash the free browse-image URL + source on the row for the preview
+            # stash the browse URL + source + scene id on the row for the preview
             side_item = self.table.item(r, 0)
             side_item.setData(Qt.UserRole, c.get("thumb_url"))
             side_item.setData(Qt.UserRole + 1, c.get("source", ""))
+            side_item.setData(Qt.UserRole + 2, c.get("id"))
             if c.get("thumb_url"):
                 self.table.item(r, 5).setToolTip(c["thumb_url"])
-            if chosen:
+            if is_top:
                 side_item.setToolTip(
-                    "Nearest clear scene on this side — the one a Run would composite.")
+                    "★ The run's top-ranked scene on this side (gap_days + cloud "
+                    "weighting). With --auto-window it's the single scene used; "
+                    "otherwise the run median-composites this plus the ✓ scenes.")
+            elif in_comp:
+                side_item.setToolTip(
+                    "✓ Also in the run's composite — a Run medians the top-ranked "
+                    "clear scenes on this side, not just one.")
+            else:
+                side_item.setToolTip(
+                    "Not used by the run: ranked below the composite cutoff "
+                    "(gap_days + cloud weighting).")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
+
+    # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
+    def _rank_like_run(self, cands, cloud_weight, auto_window):
+        """Order candidates exactly as imagery.search_scenes would for a Run.
+
+        auto_window: nearest day first, then clearest among same-day (cloud_weight
+        ignored). Otherwise the blend cost gap_days + cloud_weight*cloud_pct, so a
+        clearer scene a little further from the event can outrank a cloudy near one."""
+        def gap(c):
+            g = c.get("gap_days")
+            return 1e9 if g is None else g
+
+        def cloud(c):
+            v = c.get("cloud_pct")
+            return 100.0 if v is None else v
+
+        if auto_window:
+            return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
+        return sorted(cands, key=lambda c: gap(c) + cloud_weight * cloud(c))
+
+    def _run_selection(self, pre, post, params):
+        """Which scenes a Run would composite per side: {'pre'/'post': {top, used}}.
+
+        Mirrors fetch_event: pick the source it would use (explicit --prefer, else
+        the first of Planet→Sentinel-2→Landsat with scenes on both sides), then take
+        the top 1 (auto-window) or top 6 (default, median-composited) by the run's
+        ranking. `top` is the scene the preview should show; `used` is the full
+        composite set."""
+        cw = params.get("cloud_weight", 0.5)
+        cw = 0.5 if cw is None else cw
+        auto = bool(params.get("auto_window"))
+        prefer = params.get("prefer", "auto")
+        label_for = {"planet": "PlanetScope", "s2": "Sentinel-2", "landsat": "Landsat"}
+
+        def of(rows, src):
+            return [c for c in rows if c.get("source") == src]
+
+        if prefer in label_for:
+            source = label_for[prefer]
+        else:  # 'auto': fetch_event's source priority, first with both sides covered
+            source = next((s for s in ("PlanetScope", "Sentinel-2", "Landsat")
+                           if of(pre, s) and of(post, s)), None)
+        out = {}
+        for side, rows in (("pre", pre), ("post", post)):
+            ranked = self._rank_like_run(of(rows, source), cw, auto) if source else []
+            used = ranked[:1] if auto else ranked[:6]
+            out[side] = dict(top=ranked[0].get("id") if ranked else None,
+                             used={c.get("id") for c in used})
+        return out
 
     # ---------- scene preview ----------
     def _preview_selected(self):
@@ -519,12 +606,40 @@ class LandslideDock(QgsDockWidget):
         if not rows:
             return
         cell = self.table.item(rows[0].row(), 0)
-        url = cell.data(Qt.UserRole) if cell else None
+        if not cell:
+            return
+        primary = self._scene_preview_url(cell)
+        baked = cell.data(Qt.UserRole)
+        baked = self._auth_thumb_url(baked, cell.data(Qt.UserRole + 1)) if baked else None
+        url = primary or baked
         if not url:
             self._preview_pix = None
             self.preview.setText("No browse image available for this scene.")
             return
-        self._fetch_preview(self._auth_thumb_url(url, cell.data(Qt.UserRole + 1)))
+        # If we built a snow-safe render URL, keep the baked thumbnail as a fallback
+        # so a render hiccup degrades to the old preview rather than to nothing.
+        fb = baked if (primary and baked and primary != baked) else None
+        self._fetch_preview(url, fallback=fb)
+
+    def _s2_render_query(self):
+        """Snow-safe true-colour render params for the PC data API (preview + tiles)."""
+        return (f"{_S2_TC_BANDS}&color_formula={quote(_S2_TC_FORMULA)}"
+                f"&rescale={_S2_TC_RESCALE}&nodata=0")
+
+    def _scene_preview_url(self, cell):
+        """Browse-PNG URL for the selected row's scene.
+
+        Sentinel-2: a snow-safe data-API render from raw bands (so ice keeps its
+        texture instead of the 'visual' TCI's blown-out white). Other sources:
+        their baked rendered_preview/thumbnail (signed for Planet)."""
+        source = cell.data(Qt.UserRole + 1)
+        item_id = cell.data(Qt.UserRole + 2)
+        coll = SOURCE_COLLECTION.get(source)
+        if source == "Sentinel-2" and coll and item_id:
+            return (f"{PC_DATA_URL}/item/preview.png?collection={coll}"
+                    f"&item={item_id}&{self._s2_render_query()}&max_size=1024")
+        baked = cell.data(Qt.UserRole)
+        return self._auth_thumb_url(baked, source) if baked else None
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
@@ -535,8 +650,9 @@ class LandslideDock(QgsDockWidget):
                 url += ("&" if "?" in url else "?") + "api_key=" + key
         return url
 
-    def _fetch_preview(self, url):
+    def _fetch_preview(self, url, fallback=None):
         self._preview_pix = None
+        self._preview_fallback = fallback
         self.preview.setText("Loading preview…")
         reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
         self._preview_reply = reply
@@ -553,8 +669,14 @@ class LandslideDock(QgsDockWidget):
         reply.deleteLater()
         pix = QPixmap()
         if not ok or data.isEmpty() or not pix.loadFromData(data):
+            fb = self._preview_fallback
+            if fb:  # render URL failed — fall back to the baked thumbnail once
+                self._preview_fallback = None
+                self._fetch_preview(fb)
+                return
             self.preview.setText("Preview unavailable for this scene.")
             return
+        self._preview_fallback = None
         self._preview_pix = pix
         self._render_preview()
 
@@ -571,42 +693,82 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- preview on map (streamed Sentinel-2 COGs) ----------
     def _best_s2(self, side):
-        """Nearest streamable Sentinel-2 candidate on `side` ('pre'/'post').
+        """The Sentinel-2 candidate a Run would lead with on `side` ('pre'/'post').
 
-        The candidate lists are gap-sorted across all sources, so the first one
-        whose source is Sentinel-2 AND that carries a true-colour COG href is the
-        scene a Run would composite there — the one worth previewing on the map."""
+        Ranks the S2 candidates by the SAME blend the run uses (not gap-sorted
+        display order), so the on-map preview shows the scene the run actually
+        prioritises — the fix for the ★ previewing a near-but-cloudy scene the run
+        would down-rank. Rendered from the scene id via the data API, so a COG href
+        is no longer required."""
         if not self._search_result:
             return None
-        for c in self._search_result.get(side, []):
-            if c.get("source") == "Sentinel-2" and c.get("cog_url"):
-                return c
-        return None
+        params = self._search_result.get("params", {})
+        s2 = [c for c in self._search_result.get(side, [])
+              if c.get("source") == "Sentinel-2" and c.get("id")]
+        ranked = self._rank_like_run(s2, params.get("cloud_weight", 0.5) or 0.5,
+                                     bool(params.get("auto_window")))
+        return ranked[0] if ranked else None
 
     def _preview_on_map(self):
-        """Stream the chosen pre & post Sentinel-2 scenes onto the canvas.
+        """Stream the run's pre & post Sentinel-2 scenes onto the canvas.
 
-        Signs each scene's true-colour COG fresh (PC SAS tokens are short-lived),
-        adds it as a /vsicurl raster layer, then zooms to the search AOI so the
-        landslide area is in view. Independent of the table row selection."""
+        Renders each scene as a snow-safe true-colour XYZ layer from the Planetary
+        Computer data API (raw bands + our stretch — no SAS signing, and no blown-
+        out 'visual' TCI). If the tiler layer won't open, falls back to signing and
+        streaming the baked visual COG (the previous behaviour). Then zooms to the
+        AOI. Independent of the table row selection."""
         scenes = []
         for side in ("pre", "post"):
             c = self._best_s2(side)
-            if c:
+            if c and c.get("id"):
                 date = (c.get("date") or "")[:10]
-                scenes.append((f"S2 {side} {date}".strip(), c["cog_url"]))
+                scenes.append((f"S2 {side} {date}".strip(), c["id"], c.get("cog_url")))
         if not scenes:
-            self._warn("No Sentinel-2 scene with a streamable COG to preview.")
+            self._warn("No Sentinel-2 scene to preview.")
             return
         self._append_log(
-            f"Preview on map: signing + streaming {len(scenes)} Sentinel-2 "
-            f"scene(s)…")
+            f"Preview on map: streaming snow-safe true colour for {len(scenes)} "
+            f"Sentinel-2 scene(s)…")
         self.map_preview_btn.setEnabled(False)
         self._preview_added = []
         self._preview_failed = []
-        self._sign_pending = len(scenes)
-        for label, cog_url in scenes:
-            self._sign_cog(label, cog_url)
+        fallbacks = []   # (label, cog_url) for scenes whose tiler layer wouldn't open
+        for label, item_id, cog_url in scenes:
+            if self._add_s2_tile_layer(label, item_id):
+                continue
+            if cog_url:
+                fallbacks.append((label, cog_url))
+            else:
+                self._preview_failed.append(label)
+                self._append_log(f"  could not preview {label}")
+        if fallbacks:
+            self._append_log(f"  tiler failed for {len(fallbacks)} scene(s); "
+                             f"falling back to signed COG stream")
+            self._sign_pending = len(fallbacks)
+            for label, cog_url in fallbacks:
+                self._sign_cog(label, cog_url)
+        else:
+            self._finish_map_preview()
+
+    def _add_s2_tile_layer(self, label, item_id):
+        """Add a snow-safe Sentinel-2 XYZ layer rendered by the PC data API.
+
+        The tiler signs blob reads server-side, so no SAS token is needed (same
+        public service as the rendered_preview thumbnails). Returns True if the
+        layer opened, False so the caller can fall back to the COG path."""
+        tmpl = (f"{PC_DATA_URL}/item/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x"
+                f"?collection=sentinel-2-l2a&item={item_id}&{self._s2_render_query()}")
+        # Percent-encode only the query separators (& =) and the rest; keep the
+        # {z}/{x}/{y} placeholders, scheme and path literal so QGIS can substitute
+        # tile coords. QGIS URL-decodes the url= value before each request.
+        uri = "type=xyz&url=" + quote(tmpl, safe=":/?{}@") + "&zmin=0&zmax=18"
+        lyr = QgsRasterLayer(uri, label, "wms")
+        if not lyr.isValid():
+            return False
+        QgsProject.instance().addMapLayer(lyr)
+        self._preview_added.append(lyr)
+        self._append_log(f"  loaded {label} (PC tiler, snow-safe true colour)")
+        return True
 
     def _sign_cog(self, label, cog_url):
         url = QUrl(PC_SIGN_URL)
