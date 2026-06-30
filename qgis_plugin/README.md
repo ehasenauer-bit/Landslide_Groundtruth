@@ -81,6 +81,20 @@ pipeline falls back to Sentinel-2/Landsat.
 5. **Search / Preview** (free) → lists the candidate before/after scenes per
    source in the table, with date, day-gap, cloud %, and source. **No orders are
    placed and nothing downloads** — use it to dial the event in before paying.
+   Three things help you pick the right clear scene before a Run:
+   - **Quicklook gallery** — every pre and post candidate's browse thumbnail at
+     once, grouped Before / After, so you can scan for the scene that's cloud-free
+     over the AOI in one glance. Click a thumbnail to select that scene (it drives
+     the big preview and *Preview on map*).
+   - **Show scene footprints on map** (checkbox, off by default) — draws each
+     candidate's footprint outline (before = blue, after = green) plus the search
+     AOI box, so you can see whether a scene actually covers the AOI or leaves the
+     epicentre in a diagonal nodata gap.
+   - **Preview on map** — renders the selected (or best-ranked) before & after
+     scene over the AOI in *Highlight Optimized Natural Color* — the same look as
+     the Run's `*_highlight.tif`, streamed from the data API with no download or
+     order. Works for **Sentinel-2 and Landsat** (PlanetScope has no single
+     streamable scene, so it previews as a thumbnail in the gallery only).
 6. **Run** → composites the imagery and loads the layers. Watch the log/progress;
    **Cancel** stops the subprocess.
 7. When a Run finishes, the log shows a **SATELLITE USED** banner naming the source

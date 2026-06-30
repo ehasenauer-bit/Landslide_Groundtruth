@@ -140,18 +140,42 @@ def search_scenes(pl, aoi, start, end, event_time, max_cloud=0.6, limit=6,
     return items[:limit]
 
 
+def _geom_bbox(geom):
+    """[minx, miny, maxx, maxy] of a GeoJSON geometry, or None. Walks the nested
+    coordinate lists so it handles Polygon and MultiPolygon without shapely."""
+    if not geom:
+        return None
+    xs, ys = [], []
+
+    def walk(c):
+        if isinstance(c, (list, tuple)):
+            if c and isinstance(c[0], (int, float)):
+                xs.append(c[0])
+                ys.append(c[1])
+            else:
+                for sub in c:
+                    walk(sub)
+
+    walk(geom.get("coordinates"))
+    return [min(xs), min(ys), max(xs), max(ys)] if xs else None
+
+
 def _candidate(item, event_time):
     """One PSScene item -> a JSON-able candidate row for the dry-run preview.
 
     cloud_pct is normalized to 0-100 (Planet reports cloud_cover as 0-1, unlike
-    STAC's eo:cloud_cover). thumb_url is the free browse PNG link (no order)."""
+    STAC's eo:cloud_cover). thumb_url is the free browse PNG link (no order).
+    geometry/bbox are the scene footprint, so the plugin can draw it on the map
+    and you can see whether the strip actually covers the AOI."""
     d = _acquired(item)
     cloud = item["properties"].get("cloud_cover")
     thumb = (item.get("_links") or {}).get("thumbnail")
+    geom = item.get("geometry")
     return dict(id=item["id"], date=d.isoformat(),
                 cloud_pct=round(cloud * 100, 1) if cloud is not None else None,
                 gap_days=abs((d - event_time).days),
-                source="PlanetScope", thumb_url=thumb)
+                source="PlanetScope", thumb_url=thumb,
+                geometry=geom, bbox=_geom_bbox(geom))
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
@@ -185,19 +209,28 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                 post=[_candidate(i, event_time) for i in post_items])
 
 
-def _order_download(pl, item_ids, aoi, out_dir):
-    """Order scenes clipped to the AOI, wait, download, and pair SR/UDM2 files."""
+def _create_order(pl, item_ids, aoi):
+    """Create an AOI-clipped SR+UDM2 order for `item_ids` and return its id.
+
+    Deliberately does NOT wait: separating order creation from the blocking wait
+    lets the caller submit the pre AND post orders up front so Planet processes
+    them concurrently server-side, instead of waiting out the first order (~1-5
+    min) before the second is even queued."""
     from planet import order_request as orq
-    os.makedirs(out_dir, exist_ok=True)
     req = orq.build_request(
         name=f"landslide_{dt.datetime.now():%Y%m%d_%H%M%S}",
         products=[orq.product(item_ids, BUNDLE, ITEM_TYPE,
                               fallback_bundle=FALLBACK_BUNDLE)],
         tools=[orq.clip_tool(aoi)],
     )
-    order = pl.orders.create_order(req)
-    pl.orders.wait(order["id"])          # blocks until success/failure
-    pl.orders.download_order(order["id"], directory=out_dir, overwrite=True)
+    return pl.orders.create_order(req)["id"]
+
+
+def _wait_download(pl, order_id, out_dir):
+    """Block until `order_id` is ready, download it to out_dir, pair SR/UDM2 files."""
+    os.makedirs(out_dir, exist_ok=True)
+    pl.orders.wait(order_id)             # blocks until success/failure
+    pl.orders.download_order(order_id, directory=out_dir, overwrite=True)
     return _pair_downloads(out_dir)
 
 
@@ -339,10 +372,14 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
 
     workdir = workdir or tempfile.mkdtemp(prefix="planet_")
     epsg = im._utm_epsg(lat, lon)
-    pre_pairs = _order_download(pl, [i["id"] for i in pre_items], aoi,
-                                os.path.join(workdir, "pre"))
-    post_pairs = _order_download(pl, [i["id"] for i in post_items], aoi,
-                                 os.path.join(workdir, "post"))
+    # Submit BOTH orders before waiting on either, so Planet processes the pre and
+    # post clips concurrently. Total order latency then ~max(pre, post) instead of
+    # the old pre+post (each order's blocking wait runs ~1-5 min). Waiting pre
+    # first is fine — post is already cooking server-side meanwhile.
+    pre_order = _create_order(pl, [i["id"] for i in pre_items], aoi)
+    post_order = _create_order(pl, [i["id"] for i in post_items], aoi)
+    pre_pairs = _wait_download(pl, pre_order, os.path.join(workdir, "pre"))
+    post_pairs = _wait_download(pl, post_order, os.path.join(workdir, "post"))
 
     pre = _composite(pre_pairs, lat, lon, radius_km, epsg)
     post = _composite(post_pairs, lat, lon, radius_km, epsg)

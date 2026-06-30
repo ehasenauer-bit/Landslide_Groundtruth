@@ -21,6 +21,7 @@ Alaska caveats handled here:
 """
 from __future__ import annotations
 import datetime as dt
+import threading
 import time
 import warnings
 import numpy as np
@@ -50,10 +51,26 @@ _RETRY = Retry(
 _TIMEOUT = (15, 120)                         # (connect, read) seconds
 
 
+_local = threading.local()
+
+
 def _client():
-    stac_io = StacApiIO(timeout=_TIMEOUT, max_retries=_RETRY)
-    return pystac_client.Client.open(PC_URL, modifier=pc.sign_inplace,
-                                     stac_io=stac_io, timeout=_TIMEOUT)
+    """Open (once per thread) and reuse the Planetary Computer STAC client.
+
+    Opening a client fetches the catalog landing page + conformance over HTTP, so
+    a fresh client per search added a redundant round-trip on every call: 2 per
+    STAC run (pre+post), and up to 4 more when `_ids_collection` probes
+    collections for hand-picked scene IDs. The client is reused for the life of
+    the (short-lived) process. The cache is thread-local so the parallel dry-run
+    preview, which searches Sentinel-2 and Landsat on separate threads, never
+    shares one client's `requests` session across threads."""
+    c = getattr(_local, "client", None)
+    if c is None:
+        stac_io = StacApiIO(timeout=_TIMEOUT, max_retries=_RETRY)
+        c = pystac_client.Client.open(PC_URL, modifier=pc.sign_inplace,
+                                      stac_io=stac_io, timeout=_TIMEOUT)
+        _local.client = c
+    return c
 
 
 def _search_items(cat, *, attempts=3, **search_kwargs):
@@ -144,6 +161,39 @@ def search_scenes(lat, lon, radius_km, start, end, collection, event_time,
     return items[:limit]
 
 
+def fetch_items_by_ids(collection, ids):
+    """Materialize specific STAC items by ID from one collection (signed).
+
+    Used by the manual-selection path: when the caller hand-picks exact scene IDs
+    to composite, we fetch just those instead of running the windowed search.
+    Items come back in the requested order; IDs not present in the collection are
+    silently dropped, so probing a Sentinel-2 ID against the Landsat collection
+    simply returns nothing (which is how `_ids_collection` finds the right one)."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return []
+    cat = _client()
+    items = _search_items(cat, collections=[collection], ids=ids)
+    by_id = {i.id: i for i in items}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def _ids_collection(prefer, ids):
+    """The STAC collection that holds `ids`, probing only the streamable sources.
+
+    Tries prefer's collection first when it's Sentinel-2 / Landsat, otherwise
+    probes Sentinel-2 then Landsat. Returns the collection name, or None when no
+    requested ID is found in either (e.g. a stale or PlanetScope id)."""
+    streamable = {"s2": "sentinel-2-l2a", "landsat": "landsat-c2-l2"}
+    order = ([streamable[prefer]] if prefer in streamable
+             else ["sentinel-2-l2a", "landsat-c2-l2"])
+    # if prefer pinned one collection, still fall back to the other as a safety net
+    for coll in order + [c for c in streamable.values() if c not in order]:
+        if fetch_items_by_ids(coll, ids):
+            return coll
+    return None
+
+
 # label per collection, for the preview's "source" column
 _STAC_SOURCE = {"sentinel-2-l2a": "Sentinel-2", "landsat-c2-l2": "Landsat"}
 
@@ -157,7 +207,10 @@ def _stac_candidate(item, event_time, source):
     on-map preview, stored UNSIGNED (query string stripped): Planetary Computer
     SAS tokens expire in ~30-60 min, so the plugin re-signs this fresh at
     preview time via the public /api/sas/v1/sign endpoint. None when the source
-    has no single true-colour COG (e.g. Landsat, PlanetScope)."""
+    has no single true-colour COG (e.g. Landsat, PlanetScope).
+    geometry/bbox are the scene footprint (GeoJSON + lon/lat bounds); the plugin
+    draws them on the map so you can see whether the scene actually covers the
+    AOI (vs. leaving the epicentre in a diagonal nodata gap)."""
     d = item.datetime.replace(tzinfo=None) if item.datetime is not None else None
     cloud = item.properties.get("eo:cloud_cover")
     thumb = None
@@ -171,7 +224,8 @@ def _stac_candidate(item, event_time, source):
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=round(cloud, 1) if cloud is not None else None,
                 gap_days=abs((d - event_time).days) if d else None,
-                source=source, thumb_url=thumb, cog_url=cog)
+                source=source, thumb_url=thumb, cog_url=cog,
+                geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
@@ -256,10 +310,37 @@ def _has_coverage(comp):
     return bool(np.isfinite(comp.sel(band="red").values).any())
 
 
+def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
+                      fallback_note=None, auto_window=False):
+    """Composite the given pre/post items and derive the review products.
+
+    Shared by the ranked search path and the manual-selection path so both produce
+    the identical result dict. Returns None (caller falls back / reports
+    no_imagery) when either composite has no usable pixels over the AOI."""
+    pre = _composite(pre_items, lat, lon, radius_km, sensor)
+    post = _composite(post_items, lat, lon, radius_km, sensor)
+    if not _has_coverage(pre) or not _has_coverage(post):
+        hint = " — try without --auto-window to composite more scenes" if auto_window else ""
+        print(f"    [{sensor}] scenes found but no usable pixels over the AOI "
+              f"(scene nodata gap){hint}")
+        return None
+    ndvi_pre, ndvi_post = _ndvi(pre), _ndvi(post)
+    dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
+    bright_pre, bright_post = _brightness(pre), _brightness(post)
+    dbright = (bright_post - bright_pre).rename("dbright")
+    return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
+                dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
+                dbright=dbright, sensor=sensor,
+                pre_scenes=[i.id for i in pre_items],
+                post_scenes=[i.id for i in post_items],
+                fallback_note=fallback_note)
+
+
 def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
                 pre_days=60, post_days=60, seasonal=False, prefer="auto",
                 workdir=None, auto_window=False, cloud_weight=0.5,
-                max_cloud_pct=None, require_point=False, allow_test_quality=False):
+                max_cloud_pct=None, require_point=False, allow_test_quality=False,
+                pre_ids=None, post_ids=None):
     """Returns dict with pre/post composites, ndvi_pre/post, dndvi, sensor, scene lists.
 
     prefer: 'auto' | 'planet' | 's2' | 'landsat'. 'auto' tries PlanetScope (~3 m)
@@ -280,11 +361,34 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
     through to planet_imagery.fetch_event; ignored by the STAC sources.
     allow_test_quality: PlanetScope only — also order 'test'-quality scenes, not
     just 'standard'. Passed through; the STAC sources have no quality filter.
+    pre_ids/post_ids: hand-picked scene IDs to composite for each side, overriding
+    the automatic ranking. When both are given we composite exactly those scenes
+    (Sentinel-2 OR Landsat — the streamable STAC sources) and skip PlanetScope and
+    the windowed search entirely; `prefer` then only hints which collection to
+    probe first.
 
     Returns None (caller falls back / reports no_imagery) when no window has
     scenes OR when the chosen scenes composite to no usable pixels over the AOI
     (a scene-nodata gap) — never a blank composite.
     """
+    # --- manual override: composite exactly the hand-picked scenes -------------
+    if pre_ids and post_ids:
+        coll = _ids_collection(prefer, list(pre_ids) + list(post_ids))
+        if coll is None:
+            print("    [manual] none of the requested scene IDs were found on the "
+                  "Planetary Computer (Sentinel-2 / Landsat)")
+            return None
+        sensor = "s2" if coll == "sentinel-2-l2a" else "landsat"
+        pre_items = fetch_items_by_ids(coll, pre_ids)
+        post_items = fetch_items_by_ids(coll, post_ids)
+        if not pre_items or not post_items:
+            print(f"    [manual] requested scene IDs not all found in {coll} "
+                  f"({len(pre_items)} pre, {len(post_items)} post)")
+            return None
+        print(f"    [manual] compositing {len(pre_items)} pre + {len(post_items)} "
+              f"post hand-picked {sensor} scene(s)")
+        return _composite_result(pre_items, post_items, lat, lon, radius_km, sensor)
+
     planet_note = None      # why PlanetScope was not used, surfaced to the run banner
     if prefer in ("auto", "planet"):
         try:
@@ -333,23 +437,9 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
                                    max_cloud=cloud, limit=lim, cloud_weight=weight)
         if not pre_items or not post_items:
             continue
-
-        pre = _composite(pre_items, lat, lon, radius_km, sensor)
-        post = _composite(post_items, lat, lon, radius_km, sensor)
-        if not _has_coverage(pre) or not _has_coverage(post):
-            hint = " — try without --auto-window to composite more scenes" if auto_window else ""
-            print(f"    [{sensor}] scenes found but no usable pixels over the AOI "
-                  f"(scene nodata gap){hint}")
-            continue
-
-        ndvi_pre, ndvi_post = _ndvi(pre), _ndvi(post)
-        dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
-        bright_pre, bright_post = _brightness(pre), _brightness(post)
-        dbright = (bright_post - bright_pre).rename("dbright")
-        return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
-                    dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
-                    dbright=dbright, sensor=sensor,
-                    pre_scenes=[i.id for i in pre_items],
-                    post_scenes=[i.id for i in post_items],
-                    fallback_note=planet_note)
+        res = _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
+                                fallback_note=planet_note, auto_window=auto_window)
+        if res is not None:
+            return res
+        # scenes found but their nodata gap fell over the AOI — try the next sensor
     return None

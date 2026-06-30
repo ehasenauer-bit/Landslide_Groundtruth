@@ -1,7 +1,7 @@
 # Landslide imagery-gathering pipeline
 
-Reads a predicted location + time (from `LandslideInventory.xlsx` or the command
-line) and pulls **before/after satellite imagery** for each detected landslide —
+Takes a predicted location + time (a seismic detection — lat/lon + UTC time) and
+pulls **before/after satellite imagery** for the event —
 **PlanetScope (~3 m) first**, falling back to Sentinel-2 (~10 m) then Landsat
 (~30 m) — then exports a QGIS review package with everything needed to spot and
 digitize the scar by eye.
@@ -38,24 +38,27 @@ consume your account quota; downloads cache under `out/planet_cache/<event>/`.
 
 ## Run
 
+One event at a time, from its location + time. Use the **QGIS plugin** (click the
+point on the map — see *Interactive use / QGIS plugin* below) or `run_single.py`
+on the command line:
+
 ```bash
-# see what would be processed, no network:
-python run_groundtruth.py --inventory LandslideInventory.xlsx --out out --dry-run
+# free coverage preview only (no Planet orders, no downloads):
+python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
+    --radius-km 3 --prefer auto --out out/interactive --search-only
 
-# one event:
-python run_groundtruth.py --inventory LandslideInventory.xlsx --out out \
-    --event 230914_Denali --post-days 30
-
-# everything flagged for ground-truthing (not yet confirmed in ESEC):
-python run_groundtruth.py --inventory LandslideInventory.xlsx --out out --limit 0
+# fetch the imagery and write the review package:
+python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
+    --radius-km 3 --pre-days 60 --post-days 30 --prefer auto --out out/interactive
 ```
 
 Key flags: `--prefer {auto,planet,s2,landsat}` (source priority, default `auto`),
-`--pre-days`/`--post-days` (imagery windows), `--radius-scale` (widen the
-downloaded imagery footprint relative to the search radius, default 1.5),
+`--pre-days`/`--post-days` (imagery windows), `--radius-km` (imagery
+search/footprint radius around the point, default 3),
 `--seasonal` (winter event — use the prior-year summer as the pre window so snow
 doesn't swamp the signal), `--auto-window` (tightest before/after gap: use only
-the single clear scene nearest the event on each side).
+the single clear scene nearest the event on each side), `--search-only` (free
+dry-run: list candidate scenes to `<out>/search.json`, no orders/downloads).
 
 Two flags control which scenes the search will even consider (raise these if a
 manual search in **Planet Explorer** turns up closer/clearer scenes than the tool
@@ -115,7 +118,6 @@ The predicted-point layer is always written.
   (`dndvi`, `dbright`).
 - `qgis_packages/<event>_point.gpkg` — the predicted (seismic) epicentre.
 - `qgis_packages/<event>_metadata.json` — sensor + scene ids/dates used, layer list.
-- `summary.csv` — sensor + pre/post scene counts for every processed event.
 
 ## QGIS review step (the manual hinge)
 
@@ -137,29 +139,16 @@ Explorer** (stream PlanetScope, order clips), and **Profile Tool** (terrain).
 
 | file | role |
 |------|------|
-| `inventory.py` | parse the `landslides` sheet; fix Excel serial dates & fractional times; flag coordinate typos; pick best location (ground truth > grid center > grid search) and a search radius from the location errors |
 | `planet_imagery.py` | **primary source.** Planet Data API search + Orders API clip/download of PlanetScope (~3 m) surface reflectance; UDM2 cloud-masked median composite; same return contract as `imagery.py` |
 | `imagery.py` | tries Planet first (via `planet_imagery`), then STAC: cloud/snow-masked median composites, dNDVI, dBrightness (albedo change); falls back S2→Landsat; `--seasonal` for winter |
 | `review_package.py` | export the per-event QGIS review package (true/false-colour pre+post, dNDVI, dBrightness, predicted point) + `metadata.json` |
-| `run_groundtruth.py` | batch orchestrator + CLI (reads the inventory, loops events) |
-| `run_single.py` | single-event entry point: takes `--lat/--lon/--datetime` directly, reuses `run_groundtruth.process_one`, writes a `result.json`; used by the QGIS plugin |
+| `run_groundtruth.py` | library module: `process_one(ev, args)`, the per-event pipeline (fetch imagery → export review package). Imported by `run_single.py`; no CLI of its own |
+| `run_single.py` | single-event entry point/CLI: takes `--lat/--lon/--datetime` directly, calls `run_groundtruth.process_one`, writes a `result.json` (or `search.json` with `--search-only`); used by the QGIS plugin |
 | `qgis_plugin/` | QGIS dock-widget plugin (pick location on the map, set date + pre/post-day sliders, choose source) that runs `run_single.py` in the venv as a background process and loads the result layers — see `qgis_plugin/README.md` |
 
 ## Interactive use / QGIS plugin
 
-Beyond the batch CLI, you can pull imagery for a single ad-hoc location two ways:
-
-```bash
-# command line — same pipeline, manual location/time
-python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
-    --radius-km 3 --pre-days 60 --post-days 30 --prefer s2 --out out/interactive
-
-# free coverage preview only (no Planet orders, no downloads):
-python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
-    --radius-km 3 --prefer auto --out out/interactive --search-only
-```
-
-…or via the **QGIS plugin** in `qgis_plugin/`, which gives a dock panel: click the
+The **QGIS plugin** in `qgis_plugin/` gives a dock panel: click the
 event location on the map, set the date and the *days before/after* sliders, pick
 an imagery source, and the results load straight into your project. The plugin
 keeps the heavy dependencies in this venv (it shells out to `run_single.py`),
@@ -170,8 +159,9 @@ so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.
 - **Resolution vs. slide size.** With Planet authenticated, PlanetScope (~3 m)
   is used first and resolves most small slides. When Planet has no coverage and
   it falls back to Sentinel-2 (~10 m) / Landsat (~30 m), slides smaller than
-  roughly 50 m across can only be confirmed present/absent. The `sensor` column
-  in `summary.csv` (and each `metadata.json`) tells you which source was used.
+  roughly 50 m across can only be confirmed present/absent. The `sensor` field
+  in each `metadata.json` (and the plugin's **SATELLITE USED** banner) tells you
+  which source was used.
 - **Snow and clouds.** Alaska coastal/winter events are the hard case. Use
   `--seasonal`, widen `--post-days` to reach the next clear/snow-free window,
   and always do the QGIS visual check.
@@ -181,9 +171,9 @@ so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.
   acquisition's diagonal nodata gap. The pipeline detects an empty composite and
   falls back (S2→Landsat) or reports `no_imagery` rather than emitting a blank
   package — if that happens, drop `--auto-window` so it composites several scenes.
-- **Coordinate QC.** The parser flags suspect coordinates (e.g. a positive
-  longitude with a missing minus sign, or a value outside Alaska). Fix these in
-  the source sheet before trusting the imagery footprint.
+- **Coordinate sanity.** Double-check the input lat/lon (a dropped minus sign on
+  longitude is the classic error) before trusting the imagery footprint — the
+  plugin's *Pick location on map* avoids this by reading the click directly.
 
 ## Planet integration
 
@@ -200,6 +190,8 @@ as the STAC sources.
   `--prefer planet` skips the STAC fallback (returns no imagery if Planet has
   no coverage), useful when you only want ~3 m results.
 - Orders consume account quota and take ~1–5 min each (the SDK polls until the
-  order is ready); downloads cache under `out/planet_cache/<event>/`.
+  order is ready); the pre and post orders are submitted together and processed
+  concurrently, so the wait is ~one order's, not two. Downloads cache under
+  `out/planet_cache/<event>/`.
 - The `analytic_sr_udm2` bundle requires surface-reflectance access on your
   plan; the code sets a non-SR (`analytic_udm2`) fallback bundle automatically.

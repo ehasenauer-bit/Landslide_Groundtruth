@@ -5,19 +5,20 @@ import os
 import tempfile
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap
+from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
+from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QDateTimeEdit, QProgressBar,
     QPlainTextEdit, QFileDialog, QCheckBox, QTableWidget,
-    QTableWidgetItem, QSplitter,
+    QTableWidgetItem, QSplitter, QToolButton, QScrollArea, QGridLayout,
 )
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsSettings,
     QgsRectangle, QgsNetworkAccessManager,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsField, QgsFeature, QgsGeometry, QgsPointXY, QgsFillSymbol,
 )
 from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
@@ -75,20 +76,42 @@ PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 # Planetary Computer data API (public titiler; no SAS token needed — it signs
 # blob reads server-side, same service the rendered_preview thumbnails come from).
 # We use it to render BOTH the scene-preview PNG and the on-map AOI GeoTIFF from
-# the raw 10 m bands (B04/B03/B02), so we control the stretch instead of inheriting
-# the pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
+# the raw surface-reflectance bands, so we control the stretch instead of
+# inheriting a pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
 #
 # The render reproduces the project's "Highlight Optimized Natural Color" look
 # (see review_package): a cube-root tone curve cbrt(0.6 * reflectance). In data-
 # API terms that's gamma 3 (output = input**(1/3)) applied to reflectance scaled
-# by 0.6 — i.e. rescale 0..16667 of the 0..10000 reflectance DN range. It lifts
-# shadow detail and tames blown-out snow so one stretch reads across the scene.
-# Tune the formula/rescale constants here if a scene needs it.
+# by 0.6. Same tone curve for every source; only the band names and the rescale
+# (because each collection stores reflectance differently) change per source.
 PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
-SOURCE_COLLECTION = {"Sentinel-2": "sentinel-2-l2a", "Landsat": "landsat-c2-l2"}
-_S2_TC_BANDS = "assets=B04&assets=B03&assets=B02"
-_S2_TC_FORMULA = "gamma RGB 3.0, saturation 1.2"
-_S2_TC_RESCALE = "0,16667"
+_HIGHLIGHT_FORMULA = "gamma RGB 3.0, saturation 1.2"
+
+# Per-source highlight render config for the data API. `query` is the assets +
+# colour_formula + rescale (+ unscale for Landsat), percent-encoded ONCE here so
+# the call site appends it verbatim. PlanetScope is absent: it has no single
+# streamable COG, so it can't be rendered on the map / from the data API.
+#   Sentinel-2 L2A: SR is uint16 reflectance×10000 (no offset), so the rescale is
+#     in raw DN — 16667 = 10000 / 0.6 bakes in the 0.6 scale with white headroom.
+#   Landsat C2 L2: SR carries scale/offset (r = DN×2.75e-5 − 0.2); unscale=true so
+#     the rescale below is in reflectance units (0..1/0.6), mirroring S2. Tune the
+#     rescale here if Landsat scenes read too dark/bright.
+HIGHLIGHT_RENDER = {
+    "Sentinel-2": {
+        "collection": "sentinel-2-l2a",
+        "query": ("assets=B04&assets=B03&assets=B02"
+                  f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
+                  "&rescale=0,16667&nodata=0"),
+    },
+    "Landsat": {
+        "collection": "landsat-c2-l2",
+        "query": ("assets=red&assets=green&assets=blue&unscale=true"
+                  f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
+                  "&rescale=0,1.6667&nodata=0"),
+    },
+}
+# sources renderable on the map / in the gallery via the data API (preview order)
+STREAMABLE = ("Sentinel-2", "Landsat")
 
 # muted text for table rows the run will NOT composite (ranked below the cutoff)
 MUTED_FG = QColor(120, 120, 120)
@@ -118,6 +141,8 @@ class LandslideDock(QgsDockWidget):
         self._preview_added = []     # raster layers added by the current preview
         self._preview_failed = []    # labels that failed to sign/load
         self._gdal_tuned = False     # GDAL /vsicurl options set once
+        self._gallery_replies = []   # in-flight quicklook-thumbnail requests
+        self._footprint_layers = []  # scene-footprint vector layers on the map
         self.setWidget(self._build_ui())
 
     # ---------- UI ----------
@@ -276,11 +301,12 @@ class LandslideDock(QgsDockWidget):
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
-            "Stream the nearest Sentinel-2 before & after scenes (true colour) "
-            "straight onto the QGIS canvas as Cloud-Optimized GeoTIFF layers — "
-            "no download, no order. Run Search / Preview first to find the "
-            "scenes. Toggle the two layers' visibility to compare before vs "
-            "after. (PlanetScope / Landsat support comes later.)")
+            "Render the nearest before & after scenes in Highlight Optimized "
+            "Natural Color straight onto the QGIS canvas (clipped to the AOI) — "
+            "no download, no order. Works for Sentinel-2 and Landsat; run "
+            "Search / Preview first to find the scenes. Toggle the two layers' "
+            "visibility to compare before vs after. (PlanetScope has no single "
+            "streamable scene, so it's previewed as a thumbnail only.)")
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
         self.run_btn = QPushButton("Run")
@@ -293,6 +319,16 @@ class LandslideDock(QgsDockWidget):
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.cancel_btn)
         root.addLayout(btn_row)
+
+        # draw each candidate scene's footprint on the map (off by default)
+        self.footprint_check = QCheckBox("Show scene footprints on map")
+        self.footprint_check.setToolTip(
+            "Draw each candidate scene's footprint outline on the canvas (before = "
+            "blue, after = green) plus the search AOI box, so you can see whether a "
+            "scene actually covers the AOI or leaves the epicentre in a diagonal "
+            "nodata gap. Off by default; refreshes after each Search / Preview.")
+        self.footprint_check.toggled.connect(self._on_footprint_toggle)
+        root.addWidget(self.footprint_check)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)         # indeterminate
@@ -307,7 +343,16 @@ class LandslideDock(QgsDockWidget):
         scenes = QWidget()
         scenes_box = QVBoxLayout(scenes)
         scenes_box.setContentsMargins(0, 0, 0, 0)
-        scenes_box.addWidget(QLabel("Candidate scenes"))
+        scenes_lbl = QLabel(
+            "Candidate scenes — tick the pre &amp; post scenes to composite")
+        scenes_lbl.setToolTip(
+            "Each row has a checkbox. Only the ★ top-ranked scene on each side "
+            "starts ticked — by default the Run composites just that one clear pre "
+            "and one clear post. Tick more rows to median-composite several scenes, "
+            "or untick the ★ and tick another to swap in a different scene. "
+            "Hand-picking works for Sentinel-2 / Landsat; PlanetScope is left to "
+            "the automatic path.")
+        scenes_box.addWidget(scenes_lbl)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Source", "Scene ID"])
@@ -319,6 +364,23 @@ class LandslideDock(QgsDockWidget):
         self.table.itemSelectionChanged.connect(self._preview_selected)
         scenes_box.addWidget(self.table)
         out_split.addWidget(scenes)
+
+        # quicklook gallery: every candidate's browse thumbnail at once (before +
+        # after) so you can scan for the cloud-free scene over the AOI in one
+        # glance, instead of clicking the table row by row. Click a tile to select
+        # its scene (drives the big preview + Preview on map).
+        gallerybox = QWidget()
+        g_layout = QVBoxLayout(gallerybox)
+        g_layout.setContentsMargins(0, 0, 0, 0)
+        g_layout.addWidget(QLabel("Quicklook gallery (click a thumbnail to select its scene)"))
+        self.gallery_scroll = QScrollArea()
+        self.gallery_scroll.setWidgetResizable(True)
+        self.gallery_inner = QWidget()
+        self.gallery_layout = QVBoxLayout(self.gallery_inner)
+        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_scroll.setWidget(self.gallery_inner)
+        g_layout.addWidget(self.gallery_scroll, 1)
+        out_split.addWidget(gallerybox)
 
         # preview pane: free browse image of the selected scene (no order placed)
         previewbox = QWidget()
@@ -343,9 +405,11 @@ class LandslideDock(QgsDockWidget):
         out_split.addWidget(logbox)
 
         out_split.setStretchFactor(0, 3)   # table
-        out_split.setStretchFactor(1, 3)   # preview
-        out_split.setStretchFactor(2, 2)   # log
+        out_split.setStretchFactor(1, 3)   # gallery
+        out_split.setStretchFactor(2, 2)   # preview
+        out_split.setStretchFactor(3, 2)   # log
         scenes.setMinimumHeight(120)
+        gallerybox.setMinimumHeight(0)     # drag closed when you don't need it
         previewbox.setMinimumHeight(0)     # drag closed when you don't need it
         logbox.setMinimumHeight(80)
         root.addWidget(out_split, 1)
@@ -440,19 +504,65 @@ class LandslideDock(QgsDockWidget):
         self.run_btn.setEnabled(not on)
         self.search_btn.setEnabled(not on)
         self.cancel_btn.setEnabled(on)
-        # enabled only when idle AND a streamable Sentinel-2 scene is in hand
+        # enabled only when idle AND a streamable scene (S2 or Landsat) is in hand
         self.map_preview_btn.setEnabled(
-            (not on) and bool(self._best_s2("pre") or self._best_s2("post")))
+            (not on) and bool(self._best_streamable("pre") or self._best_streamable("post")))
+
+    def _checked_scene_selection(self):
+        """Hand-picked scenes to composite, from the table's ticked checkboxes.
+
+        Returns one of:
+          dict(source, pre=[ids], post=[ids]) — a valid single-source Sentinel-2 /
+            Landsat override to hand to the Run;
+          None — no streamable scene ticked, so the Run picks scenes automatically;
+          str  — an error message (mixed sources, or only one side ticked) to show
+            and abort, so a half-made selection isn't silently ignored.
+        Only Sentinel-2 / Landsat scenes are hand-pickable; PlanetScope is left to
+        the automatic path (and ignored here even if ticked)."""
+        picked = {"pre": [], "post": []}
+        sources = set()
+        for r in range(self.table.rowCount()):
+            cell = self.table.item(r, 0)
+            if cell is None or cell.checkState() != Qt.Checked:
+                continue
+            source = cell.data(Qt.UserRole + 1)
+            cid = cell.data(Qt.UserRole + 2)
+            side = cell.data(Qt.UserRole + 3)
+            if source not in STREAMABLE or not cid or side not in picked:
+                continue   # PlanetScope / id-less rows aren't hand-pickable
+            picked[side].append(cid)
+            sources.add(source)
+        if not picked["pre"] and not picked["post"]:
+            return None   # nothing streamable ticked -> automatic selection
+        if len(sources) > 1:
+            return ("Tick scenes from a single source — all Sentinel-2 OR all "
+                    "Landsat. They can't be composited together.")
+        if not picked["pre"] or not picked["post"]:
+            return ("Tick at least one pre and one post scene of the same source "
+                    "to composite, or untick them all to let the Run choose.")
+        return dict(source=next(iter(sources)), pre=picked["pre"], post=picked["post"])
 
     def _run(self):
         if not any(cb.isChecked() for cb in self.scene_checks.values()):
             self._warn("Select at least one scene to download.")
             return
+        sel = self._checked_scene_selection()
+        if isinstance(sel, str):
+            self._warn(sel)
+            return
         c = self._collect()
         if c is None:
             return
         python, script, project, out, args = c
+        if sel:
+            args = args + ["--pre-scene-ids", ",".join(sel["pre"]),
+                           "--post-scene-ids", ",".join(sel["post"])]
         self.log.clear()
+        if sel:
+            self._append_log(
+                f"Manual scene selection: compositing {len(sel['pre'])} pre + "
+                f"{len(sel['post'])} post {sel['source']} scene(s) you ticked "
+                f"(automatic ranking and PlanetScope skipped).")
         self._busy(True)
         self.task = PipelineTask(python, script, project, args, out)
         self.task.logLine.connect(self._append_log)   # queued: worker -> GUI thread
@@ -471,6 +581,8 @@ class LandslideDock(QgsDockWidget):
         self._preview_pix = None
         self._search_result = None    # invalidate map-preview until new results land
         self.preview.setText("Select a scene to preview its browse image.")
+        self._clear_gallery()
+        self._clear_footprints()      # stale footprints go until the new search lands
         self._busy(True)
         self.task = PipelineTask(python, script, project, args, out,
                                  result_name="search.json")
@@ -492,12 +604,15 @@ class LandslideDock(QgsDockWidget):
             return
         self._search_result = result
         self._fill_table(result)
+        self._load_gallery(result)
+        if self.footprint_check.isChecked():
+            self._draw_footprints()
         for note in result.get("notes", []):
             self._append_log("note: " + note)
-        # the map preview streams Sentinel-2 'visual' COGs; enable it only when
-        # there's a streamable S2 scene on at least one side.
-        has_s2 = bool(self._best_s2("pre") or self._best_s2("post"))
-        self.map_preview_btn.setEnabled(has_s2)
+        # the map preview renders via the data API (Sentinel-2 or Landsat); enable
+        # it only when there's a streamable scene on at least one side.
+        has_streamable = bool(self._best_streamable("pre") or self._best_streamable("post"))
+        self.map_preview_btn.setEnabled(has_streamable)
         npre, npost = len(result.get("pre", [])), len(result.get("post", []))
         self.iface.messageBar().pushInfo(
             "Landslide", f"Found {npre} pre / {npost} post candidate scenes "
@@ -537,11 +652,19 @@ class LandslideDock(QgsDockWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
-            # stash the browse URL + source + scene id on the row for the preview
+            # stash the browse URL + source + scene id + side on the row, for the
+            # preview and the manual run-selection checkbox.
             side_item = self.table.item(r, 0)
             side_item.setData(Qt.UserRole, c.get("thumb_url"))
             side_item.setData(Qt.UserRole + 1, c.get("source", ""))
             side_item.setData(Qt.UserRole + 2, c.get("id"))
+            side_item.setData(Qt.UserRole + 3, side)
+            # checkbox = include this scene in the Run's composite. Only the ★ top-
+            # ranked scene on each side starts ticked (the single nearest/clearest
+            # pick); tick more rows to median-composite several, or untick to swap in
+            # a different scene. Hand-pickable for Sentinel-2 / Landsat.
+            side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
+            side_item.setCheckState(Qt.Checked if is_top else Qt.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 5).setToolTip(c["thumb_url"])
             if is_top:
@@ -557,6 +680,10 @@ class LandslideDock(QgsDockWidget):
                 side_item.setToolTip(
                     "Not used by the run: ranked below the composite cutoff "
                     "(gap_days + cloud weighting).")
+            side_item.setToolTip(
+                side_item.toolTip() + "\n\nTick the checkbox to composite this "
+                "scene in the Run; untick to leave it out. Sentinel-2 / Landsat "
+                "only — PlanetScope can't be hand-picked.")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
 
@@ -630,29 +757,26 @@ class LandslideDock(QgsDockWidget):
         fb = baked if (primary and baked and primary != baked) else None
         self._fetch_preview(url, fallback=fb)
 
-    def _s2_render_query(self):
-        """Snow-safe true-colour render params for the PC data API.
+    def _preview_url_for(self, source, item_id, thumb_url, max_size=1024):
+        """Browse-image URL for a scene, shared by the table preview and the gallery.
 
-        Used by both the scene-preview PNG and the on-map AOI GeoTIFF, each fetched
-        with a single GET, so the colour_formula is percent-encoded exactly once
-        here (encoding it again at the call site is the bug that blanked the map)."""
-        return (f"{_S2_TC_BANDS}&color_formula={quote(_S2_TC_FORMULA)}"
-                f"&rescale={_S2_TC_RESCALE}&nodata=0")
+        Sentinel-2 / Landsat: a data-API Highlight Optimized Natural Color render
+        from the raw SR bands (so ice keeps its texture instead of a 'visual' TCI's
+        blown-out white, and no SAS signing is needed). PlanetScope (and anything
+        with no data-API render): its baked rendered_preview/thumbnail, signed for
+        Planet. The colour_formula is percent-encoded once in HIGHLIGHT_RENDER, so
+        the query is appended verbatim here."""
+        cfg = HIGHLIGHT_RENDER.get(source)
+        if cfg and item_id:
+            return (f"{PC_DATA_URL}/item/preview.png?collection={cfg['collection']}"
+                    f"&item={item_id}&{cfg['query']}&max_size={max_size}")
+        return self._auth_thumb_url(thumb_url, source) if thumb_url else None
 
     def _scene_preview_url(self, cell):
-        """Browse-PNG URL for the selected row's scene.
-
-        Sentinel-2: a snow-safe data-API render from raw bands (so ice keeps its
-        texture instead of the 'visual' TCI's blown-out white). Other sources:
-        their baked rendered_preview/thumbnail (signed for Planet)."""
-        source = cell.data(Qt.UserRole + 1)
-        item_id = cell.data(Qt.UserRole + 2)
-        coll = SOURCE_COLLECTION.get(source)
-        if source == "Sentinel-2" and coll and item_id:
-            return (f"{PC_DATA_URL}/item/preview.png?collection={coll}"
-                    f"&item={item_id}&{self._s2_render_query()}&max_size=1024")
-        baked = cell.data(Qt.UserRole)
-        return self._auth_thumb_url(baked, source) if baked else None
+        """Browse-image URL for the selected table row's scene (large preview)."""
+        return self._preview_url_for(cell.data(Qt.UserRole + 1),
+                                     cell.data(Qt.UserRole + 2),
+                                     cell.data(Qt.UserRole), max_size=1024)
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
@@ -704,26 +828,236 @@ class LandslideDock(QgsDockWidget):
         super().resizeEvent(event)
         self._render_preview()   # keep the preview fit to the pane as it resizes
 
-    # ---------- preview on map (snow-safe AOI GeoTIFF) ----------
-    def _best_s2(self, side):
-        """The Sentinel-2 candidate a Run would lead with on `side` ('pre'/'post').
+    # ---------- quicklook gallery (all candidates' thumbnails at once) ----------
+    def _clear_gallery(self):
+        """Abort any in-flight thumbnail fetches and tear down the tile grid, so a
+        fresh search rebuilds from scratch instead of stacking onto the old one."""
+        for reply in self._gallery_replies:
+            try:
+                reply.abort()
+            except RuntimeError:
+                pass
+        self._gallery_replies = []
+        while self.gallery_layout.count():
+            item = self.gallery_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
 
-        Ranks the S2 candidates by the SAME blend the run uses (not gap-sorted
-        display order), so the on-map preview shows the scene the run actually
-        prioritises — the fix for the ★ previewing a near-but-cloudy scene the run
-        would down-rank. Rendered from the scene id via the data API, so a COG href
-        is no longer required."""
+    def _load_gallery(self, result):
+        """Fill the gallery with every pre and post candidate's browse thumbnail.
+
+        Grouped Before/After; each tile is clickable and selects the matching table
+        row (which drives the big preview and Preview on map). Thumbnails load
+        asynchronously so the UI stays responsive."""
+        self._clear_gallery()
+        for side, title in (("pre", "Before"), ("post", "After")):
+            cands = result.get(side, [])
+            if not cands:
+                continue
+            self.gallery_layout.addWidget(QLabel(f"<b>{title}</b> ({len(cands)} scenes)"))
+            host = QWidget()
+            grid = QGridLayout(host)
+            grid.setContentsMargins(0, 0, 0, 0)
+            cols = 3
+            for i, c in enumerate(cands):
+                grid.addWidget(self._make_gallery_tile(c), i // cols, i % cols)
+            self.gallery_layout.addWidget(host)
+
+    def _make_gallery_tile(self, c):
+        date = (c.get("date") or "")[:10]
+        cloud = "—" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}%"
+        gap = "" if c.get("gap_days") is None else f"{c['gap_days']}d"
+        src = c.get("source", "")
+        cid = c.get("id")
+        tile = QToolButton()
+        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setIconSize(QSize(128, 128))
+        tile.setFixedWidth(150)
+        tile.setAutoRaise(True)
+        tile.setText(f"{date}\n{src}\ncloud {cloud} · {gap}")
+        tile.setToolTip(f"{src}\n{cid}\n{date}   cloud {cloud}   gap {gap}")
+        tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
+        url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)
+        if url:
+            baked = (self._auth_thumb_url(c.get("thumb_url"), src)
+                     if c.get("thumb_url") else None)
+            fb = baked if (baked and baked != url) else None
+            self._fetch_gallery_thumb(tile, url, fallback=fb)
+        else:
+            tile.setText(tile.text() + "\n(no preview)")
+        return tile
+
+    def _fetch_gallery_thumb(self, tile, url, fallback=None):
+        reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
+        self._gallery_replies.append(reply)
+        reply.finished.connect(
+            lambda r=reply, t=tile, fb=fallback: self._gallery_thumb_loaded(r, t, fb))
+
+    def _gallery_thumb_loaded(self, reply, tile, fallback):
+        if reply in self._gallery_replies:
+            self._gallery_replies.remove(reply)
+        ok = reply.error() == QNetworkReply.NoError
+        data = reply.readAll()
+        reply.deleteLater()
+        pix = QPixmap()
+        if ok and not data.isEmpty() and pix.loadFromData(data):
+            try:
+                tile.setIcon(QIcon(pix))
+            except RuntimeError:
+                pass   # tile was torn down by a newer search
+            return
+        if fallback:   # render URL failed — try the baked thumbnail once
+            self._fetch_gallery_thumb(tile, fallback)
+            return
+        try:
+            tile.setText(tile.text() + "\n(no preview)")
+        except RuntimeError:
+            pass
+
+    def _select_row_by_id(self, cid):
+        """Select the table row for scene `cid` (called when a gallery tile is
+        clicked), so the big preview and Preview on map follow the gallery pick."""
+        if not cid:
+            return
+        for r in range(self.table.rowCount()):
+            cell = self.table.item(r, 0)
+            if cell and cell.data(Qt.UserRole + 2) == cid:
+                self.table.selectRow(r)
+                self.table.scrollToItem(cell)
+                break
+
+    # ---------- scene footprints on the map ----------
+    def _on_footprint_toggle(self, checked):
+        if checked:
+            self._draw_footprints()
+        else:
+            self._clear_footprints()
+
+    def _clear_footprints(self):
+        for lyr in self._footprint_layers:
+            try:
+                QgsProject.instance().removeMapLayer(lyr.id())
+            except (RuntimeError, AttributeError):
+                pass
+        self._footprint_layers = []
+
+    def _qgs_geom(self, geom):
+        """A GeoJSON Polygon/MultiPolygon dict -> QgsGeometry (lon/lat), or None."""
+        if not geom:
+            return None
+        coords = geom.get("coordinates")
+        gtype = geom.get("type")
+
+        def ring(r):
+            return [QgsPointXY(p[0], p[1]) for p in r]
+
+        try:
+            if gtype == "Polygon":
+                return QgsGeometry.fromPolygonXY([ring(r) for r in coords])
+            if gtype == "MultiPolygon":
+                return QgsGeometry.fromMultiPolygonXY(
+                    [[ring(r) for r in poly] for poly in coords])
+        except (TypeError, IndexError):
+            return None
+        return None
+
+    def _draw_footprints(self):
+        """Draw each candidate scene's footprint (before = blue, after = green) plus
+        the search AOI box, so you can see whether a scene covers the AOI or leaves
+        the epicentre in a nodata gap. Memory layers, tracked for clean removal."""
+        self._clear_footprints()
+        result = self._search_result
+        if not result:
+            return
+        added = 0
+        for side, outline in (("pre", "0,90,200"), ("post", "0,150,60")):
+            cands = [c for c in result.get(side, []) if c.get("geometry")]
+            if not cands:
+                continue
+            lyr = QgsVectorLayer("Polygon?crs=EPSG:4326",
+                                 f"Scene footprints — {side}", "memory")
+            pr = lyr.dataProvider()
+            pr.addAttributes([
+                QgsField("source", QVariant.String),
+                QgsField("scene_id", QVariant.String),
+                QgsField("date", QVariant.String),
+                QgsField("gap_days", QVariant.Int),
+                QgsField("cloud_pct", QVariant.Double),
+            ])
+            lyr.updateFields()
+            feats = []
+            for c in cands:
+                g = self._qgs_geom(c.get("geometry"))
+                if g is None:
+                    continue
+                f = QgsFeature(lyr.fields())
+                f.setGeometry(g)
+                f.setAttributes([
+                    c.get("source"), c.get("id"), c.get("date"),
+                    c.get("gap_days"),
+                    c.get("cloud_pct") if c.get("cloud_pct") is not None else None,
+                ])
+                feats.append(f)
+            if not feats:
+                continue
+            pr.addFeatures(feats)
+            lyr.updateExtents()
+            sym = QgsFillSymbol.createSimple({
+                "style": "no",                 # no fill, outline only
+                "outline_color": outline,
+                "outline_width": "0.6",
+            })
+            lyr.renderer().setSymbol(sym)
+            QgsProject.instance().addMapLayer(lyr)
+            self._footprint_layers.append(lyr)
+            added += len(feats)
+
+        # the search AOI box, so coverage gaps read against the actual search area
+        bbox = self._aoi_bbox()
+        if bbox is not None:
+            minx, miny, maxx, maxy, _ = bbox
+            aoi = QgsVectorLayer("Polygon?crs=EPSG:4326", "Search AOI", "memory")
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromRect(
+                QgsRectangle(minx, miny, maxx, maxy)))
+            aoi.dataProvider().addFeatures([f])
+            aoi.updateExtents()
+            sym = QgsFillSymbol.createSimple({
+                "style": "no",
+                "outline_color": "220,30,30",
+                "outline_width": "0.8",
+                "outline_style": "dash",
+            })
+            aoi.renderer().setSymbol(sym)
+            QgsProject.instance().addMapLayer(aoi)
+            self._footprint_layers.append(aoi)
+        if added:
+            self._append_log(f"Drew {added} scene footprint(s) + AOI on the map.")
+
+    # ---------- preview on map (Highlight Optimized Natural Color AOI render) ----------
+    def _best_streamable(self, side):
+        """The scene Preview-on-map would lead with on `side` ('pre'/'post').
+
+        Prefers the best Sentinel-2 candidate, then Landsat (the two sources the
+        data API can render). Within a source, ranks by the SAME blend the run uses
+        (not gap-sorted display order), so the preview shows the scene the run
+        actually prioritises. PlanetScope is excluded (no single streamable COG)."""
         if not self._search_result:
             return None
         params = self._search_result.get("params", {})
-        s2 = [c for c in self._search_result.get(side, [])
-              if c.get("source") == "Sentinel-2" and c.get("id")]
-        ranked = self._rank_like_run(s2, params.get("cloud_weight", 0.5) or 0.5,
-                                     bool(params.get("auto_window")))
-        return ranked[0] if ranked else None
+        cw = params.get("cloud_weight", 0.5) or 0.5
+        auto = bool(params.get("auto_window"))
+        rows = self._search_result.get(side, [])
+        for src in STREAMABLE:
+            cands = [c for c in rows if c.get("source") == src and c.get("id")]
+            ranked = self._rank_like_run(cands, cw, auto)
+            if ranked:
+                return ranked[0]
+        return None
 
-    def _selected_s2_by_side(self):
-        """side -> the Sentinel-2 candidate selected in the table (or None).
+    def _selected_streamable_by_side(self):
+        """side -> the streamable (S2/Landsat) candidate selected in the table.
 
         Lets 'Preview on map' honour a row you picked instead of always using the
         run's ★ scene. The table is single-select, so at most one side is set."""
@@ -737,7 +1071,7 @@ class LandslideDock(QgsDockWidget):
                     by_id[c["id"]] = (side, c)
         for idx in self.table.selectionModel().selectedRows():
             cell = self.table.item(idx.row(), 0)
-            if cell and cell.data(Qt.UserRole + 1) == "Sentinel-2":
+            if cell and cell.data(Qt.UserRole + 1) in STREAMABLE:
                 info = by_id.get(cell.data(Qt.UserRole + 2))
                 if info:
                     out[info[0]] = info[1]
@@ -754,43 +1088,44 @@ class LandslideDock(QgsDockWidget):
         self._preview_added = []
 
     def _preview_on_map(self):
-        """Render the selected (or run's ★) pre & post Sentinel-2 scenes over the AOI.
+        """Render the selected (or run's ★) pre & post scenes over the AOI.
 
-        Per side, previews the Sentinel-2 row you selected in the table, or the
-        run's top-ranked scene if you didn't select one on that side. Downloads a
-        snow-safe true-colour GeoTIFF clipped to the search box from the Planetary
-        Computer data API (raw bands + our stretch — no 'visual' TCI white-out, no
-        SAS signing) and loads each as a georeferenced raster, then zooms to the
-        AOI. Covers the AOI box only; falls back to the signed visual COG if a
-        download fails."""
+        Per side, previews the streamable (Sentinel-2 / Landsat) row you selected in
+        the table, or the best-ranked scene if you didn't select one on that side.
+        Downloads a Highlight Optimized Natural Color GeoTIFF clipped to the search
+        box from the Planetary Computer data API (raw SR bands + our stretch — no
+        'visual' TCI white-out, no SAS signing) and loads each as a georeferenced
+        raster, then zooms to the AOI. Covers the AOI box only; Sentinel-2 falls
+        back to the signed visual COG if the render fails (Landsat has none)."""
         bbox = self._aoi_bbox()
         if bbox is None:
             self._warn("Run Search / Preview first (need the AOI location).")
             return
-        chosen = self._selected_s2_by_side()
+        chosen = self._selected_streamable_by_side()
         scenes = []
         for side in ("pre", "post"):
-            c = chosen[side] or self._best_s2(side)
+            c = chosen[side] or self._best_streamable(side)
             if c and c.get("id"):
                 date = (c.get("date") or "")[:10]
                 pick = "selected" if chosen[side] else "★ best"
-                scenes.append((f"S2 {side} {date}".strip(), c["id"],
-                               c.get("cog_url"), pick))
+                short = "S2" if c.get("source") == "Sentinel-2" else "Landsat"
+                scenes.append((f"{short} {side} {date}".strip(), c["id"],
+                               c.get("cog_url"), c.get("source"), pick))
         if not scenes:
-            self._warn("No Sentinel-2 scene to preview.")
+            self._warn("No streamable (Sentinel-2 / Landsat) scene to preview.")
             return
         self._append_log(
-            f"Preview on map: downloading snow-safe true colour over the AOI for "
-            f"{len(scenes)} Sentinel-2 scene(s)…")
+            f"Preview on map: rendering Highlight Optimized Natural Color over the "
+            f"AOI for {len(scenes)} scene(s)…")
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
         self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
         self._tif_pending = len(scenes)
-        for label, item_id, cog_url, pick in scenes:
+        for label, item_id, cog_url, source, pick in scenes:
             self._append_log(f"  {label} ({pick})")
-            self._download_aoi_tif(label, item_id, cog_url, bbox)
+            self._download_aoi_tif(label, item_id, cog_url, bbox, source)
 
     def _ensure_network_timeout(self, ms=NETWORK_TIMEOUT_MS):
         """Raise QGIS's network-request timeout so a slow AOI render survives.
@@ -828,16 +1163,24 @@ class LandslideDock(QgsDockWidget):
         dlon = radius / (111.32 * math.cos(math.radians(lat)))
         return (lon - dlon, lat - dlat, lon + dlon, lat + dlat, radius)
 
-    def _download_aoi_tif(self, label, item_id, cog_url, bbox):
-        """Fetch a snow-safe true-colour GeoTIFF clipped to the AOI (async GET).
+    def _download_aoi_tif(self, label, item_id, cog_url, bbox, source):
+        """Fetch a Highlight Optimized Natural Color GeoTIFF clipped to the AOI.
 
-        Single GET to the data API's bbox endpoint (same mechanism as the working
-        scene-preview pane), sized to ~10 m/px and capped so a wide AOI stays a
-        sane download. The reply lands in `_tif_loaded`."""
+        Single async GET to the data API's bbox endpoint (same mechanism as the
+        working scene-preview pane), using the per-source render config (collection
+        + bands + stretch), sized to ~10 m/px and capped so a wide AOI stays a sane
+        download. The reply lands in `_tif_loaded`."""
+        cfg = HIGHLIGHT_RENDER.get(source)
+        if cfg is None:
+            self._preview_failed.append(label)
+            self._tif_pending -= 1
+            if self._tif_pending <= 0:
+                self._after_tif_downloads()
+            return
         minx, miny, maxx, maxy, radius = bbox
         px = int(min(2048, max(256, round(radius * 2 * 100))))   # ~10 m/px, capped
         url = (f"{PC_DATA_URL}/item/bbox/{minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}.tif"
-               f"?collection=sentinel-2-l2a&item={item_id}&{self._s2_render_query()}"
+               f"?collection={cfg['collection']}&item={item_id}&{cfg['query']}"
                f"&width={px}&height={px}")
         reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
         self._tif_replies.append(reply)
@@ -862,7 +1205,7 @@ class LandslideDock(QgsDockWidget):
                     QgsProject.instance().addMapLayer(lyr)
                     self._preview_added.append(lyr)
                     self._append_log(
-                        f"  loaded {label} (AOI render, snow-safe true colour)")
+                        f"  loaded {label} (AOI render, Highlight Optimized Natural Color)")
                     added = True
             except OSError:
                 pass
@@ -948,13 +1291,13 @@ class LandslideDock(QgsDockWidget):
         if self._preview_added:
             self._zoom_to_aoi()
             n = len(self._preview_added)
-            msg = (f"Loaded {n} Sentinel-2 scene(s) over the AOI (snow-safe true "
-                   f"colour). Toggle the layers to compare before vs after.")
+            msg = (f"Loaded {n} scene(s) over the AOI (Highlight Optimized Natural "
+                   f"Color). Toggle the layers to compare before vs after.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("Landslide", msg)
         else:
-            self._warn("Preview on map: no Sentinel-2 scene could be loaded.")
+            self._warn("Preview on map: no scene could be loaded.")
 
     def _zoom_to_aoi(self):
         """Frame the canvas on the search AOI (lat/lon + radius box) so the
@@ -1061,5 +1404,11 @@ class LandslideDock(QgsDockWidget):
         for reply in self._sign_replies:
             reply.abort()
         self._sign_replies = []
+        for reply in self._gallery_replies:
+            try:
+                reply.abort()
+            except RuntimeError:
+                pass
+        self._gallery_replies = []
         if self.task is not None:
             self.task.cancel()

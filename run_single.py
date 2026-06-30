@@ -29,6 +29,39 @@ from argparse import Namespace
 from run_groundtruth import process_one
 
 
+def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
+    """Search ONE source ('planet'/'s2'/'landsat') for candidate pre/post scenes.
+
+    Returns (result_dict, note): result_dict is search_event's output (or None on
+    failure) and note is a per-source message (or None). Self-contained and
+    touches no shared state, so the preview can fan several of these out across
+    threads."""
+    try:
+        if s == "planet":
+            import planet_imagery as pi
+            r = pi.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
+                                post_days=args.post_days, seasonal=args.seasonal,
+                                auto_window=args.auto_window,
+                                cloud_weight=args.cloud_weight,
+                                max_cloud_pct=args.max_cloud,
+                                require_point=args.coverage == "point",
+                                allow_test_quality=args.quality == "any")
+        else:
+            import imagery as im
+            r = im.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
+                                post_days=args.post_days, seasonal=args.seasonal,
+                                auto_window=args.auto_window, sensor=s,
+                                cloud_weight=args.cloud_weight,
+                                max_cloud_pct=args.max_cloud)
+    except Exception as e:
+        return None, f"{s}: {type(e).__name__}: {e}"
+    note = None
+    if not r["pre"] or not r["post"]:
+        note = (f"{r['source']}: incomplete coverage "
+                f"({len(r['pre'])} pre, {len(r['post'])} post)")
+    return r, note
+
+
 def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
     """Free dry-run: search each source `prefer` could use and collect candidate
     pre/post scenes WITHOUT ordering or downloading anything.
@@ -38,7 +71,8 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
     specific --prefer previews just that source. Pre-2016 events drop Sentinel-2
     (no coverage) in favor of Landsat. Per-source failures (e.g. Planet not
     authenticated) become notes instead of aborting the whole preview."""
-    import imagery as im
+    from concurrent.futures import ThreadPoolExecutor
+
     sensors = {"auto": ["planet", "s2", "landsat"], "planet": ["planet"],
                "s2": ["s2"], "landsat": ["landsat"]}[args.prefer]
     if "s2" in sensors and when < dt.datetime(2016, 1, 1):
@@ -46,32 +80,23 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
         if "landsat" not in sensors:
             sensors.append("landsat")
 
+    # The per-source searches are independent network-bound calls, so fan them out
+    # across threads: the preview then returns in ~the slowest single source
+    # instead of their sum. ThreadPoolExecutor.map keeps input order, so results
+    # merge back in the fixed `sensors` order — candidate lists and notes stay
+    # deterministic regardless of which search finishes first.
+    with ThreadPoolExecutor(max_workers=len(sensors)) as ex:
+        results = list(ex.map(
+            lambda s: _search_one_source(s, lat, lon, radius_km, when, args),
+            sensors))
+
     pre, post, notes = [], [], []
-    for s in sensors:
-        try:
-            if s == "planet":
-                import planet_imagery as pi
-                r = pi.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                    post_days=args.post_days, seasonal=args.seasonal,
-                                    auto_window=args.auto_window,
-                                    cloud_weight=args.cloud_weight,
-                                    max_cloud_pct=args.max_cloud,
-                                    require_point=args.coverage == "point",
-                                    allow_test_quality=args.quality == "any")
-            else:
-                r = im.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                    post_days=args.post_days, seasonal=args.seasonal,
-                                    auto_window=args.auto_window, sensor=s,
-                                    cloud_weight=args.cloud_weight,
-                                    max_cloud_pct=args.max_cloud)
-        except Exception as e:
-            notes.append(f"{s}: {type(e).__name__}: {e}")
-            continue
-        pre += r["pre"]
-        post += r["post"]
-        if not r["pre"] or not r["post"]:
-            notes.append(f"{r['source']}: incomplete coverage "
-                         f"({len(r['pre'])} pre, {len(r['post'])} post)")
+    for r, note in results:
+        if r is not None:
+            pre += r["pre"]
+            post += r["post"]
+        if note is not None:
+            notes.append(note)
     pre.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
     post.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
     return dict(pre=pre, post=post, notes=notes)
@@ -146,6 +171,14 @@ def main():
                          "highlight_natural, false_color, ndvi, dndvi, dbright "
                          "(default: all). The predicted-point layer is always written. "
                          "Ignored with --search-only.")
+    ap.add_argument("--pre-scene-ids", default=None,
+                    help="comma-separated scene IDs to composite for the PRE side, "
+                         "overriding the automatic scene ranking (Sentinel-2 / Landsat "
+                         "only). Requires --post-scene-ids; PlanetScope and the windowed "
+                         "search are skipped. Ignored with --search-only.")
+    ap.add_argument("--post-scene-ids", default=None,
+                    help="comma-separated scene IDs for the POST side (see "
+                         "--pre-scene-ids).")
     ap.add_argument("--seasonal", action="store_true",
                     help="winter event: use prior-year pre window")
     ap.add_argument("--auto-window", action="store_true",
@@ -162,12 +195,19 @@ def main():
     # the event row process_one() expects (mirrors an inventory row)
     ev = dict(event_id=event_id, datetime_utc=a.when, lat=a.lat, lon=a.lon,
               loc_source="manual", search_radius_km=a.radius_km)
+    # hand-picked scene IDs (manual override) -> list[str] or None per side
+    def _id_list(s):
+        ids = [x.strip() for x in (s or "").split(",") if x.strip()]
+        return ids or None
+
     # args namespace process_one() reads; radius_scale=1.0 so radius-km is literal
     args = Namespace(out=a.out, prefer=a.prefer,
                      pre_days=a.pre_days, post_days=a.post_days, seasonal=a.seasonal,
                      radius_scale=1.0, auto_window=a.auto_window,
                      cloud_weight=a.cloud_weight, max_cloud=a.max_cloud,
-                     coverage=a.coverage, quality=a.quality, scenes=a.scenes)
+                     coverage=a.coverage, quality=a.quality, scenes=a.scenes,
+                     pre_scene_ids=_id_list(a.pre_scene_ids),
+                     post_scene_ids=_id_list(a.post_scene_ids))
 
     print(f">>> {event_id}  ({a.when}, {a.lat:.4f},{a.lon:.4f}, r={a.radius_km}km, "
           f"prefer={a.prefer})")
