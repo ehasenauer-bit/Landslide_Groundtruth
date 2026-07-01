@@ -32,13 +32,14 @@ from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QDoubleSpinBox, QDateTimeEdit, QCheckBox,
     QProgressBar, QPlainTextEdit, QTableWidget, QTableWidgetItem, QSplitter,
-    QScrollArea, QGridLayout, QToolButton,
+    QScrollArea, QGridLayout, QToolButton, QFrame, QSlider,
 )
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
     QgsNetworkAccessManager, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsField, QgsFeature, QgsFillSymbol,
 )
+from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import QVariant
 
 from .task import PipelineTask
@@ -49,6 +50,63 @@ from .task import PipelineTask
 TILE_HASH_URL = "https://tiles.planet.com/data/v1/layers"
 TILE_XYZ_URL = "https://tiles{shard}.planet.com/data/v1/layers/{hash}/{{z}}/{{x}}/{{y}}"
 ITEM_TYPE = "PSScene"
+
+# Planet account login (mirrors the official qgis-planet-plugin login tab): POST
+# {email, password} and get back a JWT whose base64url payload carries the user's
+# api_key. Same endpoint the `planet` SDK's ClientV1.login() calls. We do it in
+# QGIS's Python via Qt networking (no `planet` SDK import needed here), then feed
+# the recovered key into the same PL_API_KEY path the rest of the tab already uses.
+PLANET_LOGIN_URL = "https://api.planet.com/v0/auth/login"
+
+# status-line colours shared by the login panel (green ok / red fail / amber hint)
+STATUS_COLORS = {
+    "success": "#2e7d32", "error": "#c62828",
+    "warn": "#e65100", "info": "palette(mid)",
+}
+
+# Planet's brand palette, pulled from the official qgis-planet-plugin (its logo
+# SVGs + .ui stylesheets): teal accent, navy header, near-black ink. Used to give
+# this tab the Planet Explorer look instead of the plain QGIS widget theme.
+TEAL = "#009da5"        # primary accent / call-to-action buttons (rgb 0,157,165)
+TEAL_DARK = "#0b7c82"   # button hover / pressed
+NAVY = "#1e3967"        # header banner + table header background
+INK = "#27282a"         # near-black (rgb 39,40,42)
+
+# One stylesheet applied to the whole PlanetTab (and only it — the Sentinel-2 /
+# Landsat tab keeps the native QGIS look). Accent colours are explicit so they
+# read on both light and dark QGIS themes; structural colours use the palette().
+THEME_QSS = f"""
+QLabel#section {{ color: {TEAL}; font-weight: 600; padding-top: 2px; }}
+QPushButton#primary {{
+    background-color: {TEAL}; color: white; border: none;
+    border-radius: 4px; padding: 6px 14px; font-weight: 600;
+}}
+QPushButton#primary:hover {{ background-color: {TEAL_DARK}; }}
+QPushButton#primary:disabled {{ background-color: #9cc7ca; color: #eef4f4; }}
+QPushButton {{ border-radius: 4px; padding: 5px 10px; }}
+QLineEdit, QComboBox, QDoubleSpinBox, QDateTimeEdit {{
+    border: 1px solid palette(mid); border-radius: 4px; padding: 3px 6px;
+}}
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus {{
+    border: 1px solid {TEAL};
+}}
+QToolButton {{
+    border: 1px solid palette(mid); border-radius: 6px;
+    padding: 4px; background: palette(base);
+}}
+QToolButton:hover {{ border: 1px solid {TEAL}; }}
+QHeaderView::section {{
+    background: {NAVY}; color: white; padding: 4px 6px;
+    border: none; font-weight: 600;
+}}
+QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; }}
+QProgressBar::chunk {{ background-color: {TEAL}; border-radius: 3px; }}
+QSlider::groove:horizontal {{ height: 4px; background: palette(mid); border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {TEAL}; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    background: {TEAL}; width: 14px; margin: -6px 0; border-radius: 7px;
+}}
+"""
 
 # table row tints, matching the Sentinel tab (pre = blue, post = green)
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG  # noqa: E402
@@ -63,6 +121,7 @@ class PlanetTab(QWidget):
         self.settings = dock.settings
         self.task = None
         self._search_result = None       # last search.json (candidates + params)
+        self._login_reply = None         # in-flight Planet login POST
         self._preview_reply = None       # in-flight browse-thumbnail request
         self._preview_pix = None         # last loaded thumbnail, kept for rescaling
         self._tile_replies = []          # in-flight tile-hash POSTs
@@ -73,15 +132,22 @@ class PlanetTab(QWidget):
 
     # ---------- UI ----------
     def _build_ui(self):
+        self.setObjectName("planetTab")
+        self.setStyleSheet(THEME_QSS)
         root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        root.addWidget(self._build_header())
 
         intro = QLabel(
-            "Search PlanetScope (~3 m) and preview scenes at full resolution on the "
-            "map — no order placed, no quota used. Ordering into the review package "
-            "comes later; for now this is browse + preview.")
+            "Preview scenes at full resolution straight on the map — no order "
+            "placed, no quota used. (Ordering into the review package comes later.)")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         root.addWidget(intro)
+
+        # --- Planet account login (drop-down) ---
+        root.addWidget(self._build_login_box())
 
         # --- event inputs (own copy; convenience button pulls from the other tab) ---
         form = QFormLayout()
@@ -136,18 +202,24 @@ class PlanetTab(QWidget):
         form.addRow("Window", self._wrap(days))
 
         # --- Planet-specific filters (moved here from the old Advanced options) ---
-        self.cloud_spin = QDoubleSpinBox()
-        self.cloud_spin.setRange(0.0, 100.0)
-        self.cloud_spin.setDecimals(0)
-        self.cloud_spin.setSingleStep(5.0)
-        self.cloud_spin.setValue(80.0)
-        self.cloud_spin.setSuffix(" %")
-        self.cloud_spin.setToolTip(
+        # Cloud cover as a teal slider, echoing Planet Explorer's slider filters.
+        self.cloud_slider = QSlider(Qt.Horizontal)
+        self.cloud_slider.setRange(0, 100)
+        self.cloud_slider.setValue(80)
+        self.cloud_slider.setToolTip(
             "Maximum WHOLE-SCENE cloud cover to consider. Scene-wide metric, not "
             "your AOI — per-pixel UDM2 masking still applies, so a high value "
             "surfaces scenes clear over your point but cloudy elsewhere (what Planet "
             "Explorer shows).")
-        form.addRow("Max cloud %", self.cloud_spin)
+        self.cloud_lbl = QLabel("80%")
+        self.cloud_lbl.setFixedWidth(38)
+        self.cloud_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.cloud_slider.valueChanged.connect(
+            lambda v: self.cloud_lbl.setText(f"{v}%"))
+        crow = QHBoxLayout()
+        crow.addWidget(self.cloud_slider, 1)
+        crow.addWidget(self.cloud_lbl)
+        form.addRow("Max cloud", self._wrap(crow))
 
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
@@ -167,24 +239,18 @@ class PlanetTab(QWidget):
             "review; eyeball before trusting reflectance/NDVI.")
         form.addRow("Quality", self.quality_combo)
 
-        self.key_edit = QLineEdit(self._api_key())
-        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
-        self.key_edit.setPlaceholderText("Planet API key (or set PL_API_KEY)")
-        self.key_edit.setToolTip(
-            "Needed for the full-res map preview and browse thumbnails, and passed "
-            "to the search subprocess. Saved to QGIS settings; leave blank to use "
-            "the PL_API_KEY environment variable or a `planet auth login` session.")
-        form.addRow("Planet API key", self.key_edit)
         root.addLayout(form)
 
         # --- buttons ---
         btn_row = QHBoxLayout()
         self.search_btn = QPushButton("Search (free)")
+        self.search_btn.setObjectName("primary")
         self.search_btn.setToolTip(
             "Free Data API search for candidate before/after PlanetScope scenes. No "
             "orders placed, no quota used.")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map (full-res)")
+        self.map_preview_btn.setObjectName("primary")
         self.map_preview_btn.setToolTip(
             "Stream the selected scene (or the nearest before & after scenes) onto "
             "the canvas at full resolution via Planet's tile service — no order, no "
@@ -217,7 +283,7 @@ class PlanetTab(QWidget):
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(QLabel("Candidate scenes (★ = nearest on each side)"))
+        tl.addWidget(self._section("Candidate scenes  (★ = nearest on each side)"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Scene ID"])
@@ -233,7 +299,7 @@ class PlanetTab(QWidget):
         gallerybox = QWidget()
         gl = QVBoxLayout(gallerybox)
         gl.setContentsMargins(0, 0, 0, 0)
-        gl.addWidget(QLabel("Quicklook gallery (click a thumbnail to select its scene)"))
+        gl.addWidget(self._section("Quicklook gallery  (click a thumbnail to select its scene)"))
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
@@ -246,7 +312,7 @@ class PlanetTab(QWidget):
         previewbox = QWidget()
         pl = QVBoxLayout(previewbox)
         pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(QLabel("Scene preview (browse image)"))
+        pl.addWidget(self._section("Scene preview  (browse image)"))
         self.preview = QLabel("Search, then select a scene to preview its browse image.")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setWordWrap(True)
@@ -257,7 +323,7 @@ class PlanetTab(QWidget):
         logbox = QWidget()
         lo = QVBoxLayout(logbox)
         lo.setContentsMargins(0, 0, 0, 0)
-        lo.addWidget(QLabel("Log"))
+        lo.addWidget(self._section("Log"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1000)
@@ -274,6 +340,190 @@ class PlanetTab(QWidget):
         w = QWidget()
         w.setLayout(layout)
         return w
+
+    def _build_header(self):
+        """A Planet-branded banner: navy bar with the lowercase 'planet' wordmark
+        (teal dot) + a subtitle, mirroring the Planet Explorer header."""
+        bar = QFrame()
+        bar.setObjectName("planetHeader")
+        bar.setStyleSheet(
+            f"QFrame#planetHeader {{ background: {NAVY}; border-radius: 6px; }}"
+            "QFrame#planetHeader QLabel { background: transparent; color: white; }")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 10, 14, 10)
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        word = QLabel(
+            f'<span style="font-size:20px; font-weight:700; letter-spacing:1px;">'
+            f'planet<span style="color:{TEAL};">.</span></span>')
+        sub = QLabel("PlanetScope · browse & full-resolution preview")
+        sub.setStyleSheet("color:#b9c4da;")
+        col.addWidget(word)
+        col.addWidget(sub)
+        lay.addLayout(col)
+        lay.addStretch(1)
+        return bar
+
+    def _section(self, text):
+        """A section heading styled in Planet teal (see THEME_QSS QLabel#section)."""
+        lbl = QLabel(text)
+        lbl.setObjectName("section")
+        return lbl
+
+    # ---------- Planet account login (drop-down) ----------
+    def _build_login_box(self):
+        """A collapsible 'Planet account' panel modelled on the official
+        qgis-planet-plugin login tab: sign in with your Planet email + password
+        (which exchanges them for your API key), or paste an API key directly. The
+        recovered key flows into the SAME PL_API_KEY / QgsSettings path everything
+        else on this tab already uses, so login is just a friendlier front door to
+        the existing key field."""
+        box = QgsCollapsibleGroupBox("Planet account")
+        box.setSaveCollapsedState(False)
+        # start collapsed if a key is already in hand, else open to prompt sign-in
+        box.setCollapsed(bool(self._api_key()))
+        self.login_box = box
+        form = QFormLayout(box)
+
+        info = QLabel(
+            'Sign in with your Planet account to search PlanetScope and stream '
+            'full-res previews. No account? '
+            '<a href="https://www.planet.com/explorer/">planet.com</a>. You can also '
+            'paste an API key directly instead of signing in.')
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: palette(mid); }")
+        form.addRow(info)
+
+        self.user_edit = QLineEdit(
+            self.settings.value("landslide/planet_user", "", type=str))
+        self.user_edit.setPlaceholderText("email")
+        self.user_edit.returnPressed.connect(self._planet_login)
+        form.addRow("Email", self.user_edit)
+
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit.setPlaceholderText("password")
+        self.pass_edit.returnPressed.connect(self._planet_login)
+        form.addRow("Password", self.pass_edit)
+
+        btns = QHBoxLayout()
+        self.login_btn = QPushButton("Log in")
+        self.login_btn.setObjectName("primary")
+        self.login_btn.clicked.connect(self._planet_login)
+        self.logout_btn = QPushButton("Log out")
+        self.logout_btn.clicked.connect(self._planet_logout)
+        btns.addWidget(self.login_btn)
+        btns.addWidget(self.logout_btn)
+        form.addRow(self._wrap(btns))
+
+        # API key: the manual alternative to email/password, and where a successful
+        # login drops the recovered key. This is the field _api_key()/_collect() read.
+        self.key_edit = QLineEdit(self._api_key())
+        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.key_edit.setPlaceholderText("Planet API key (or set PL_API_KEY)")
+        self.key_edit.setToolTip(
+            "Needed for the full-res map preview and browse thumbnails, and passed "
+            "to the search subprocess. Filled in automatically when you log in; "
+            "saved to QGIS settings. Leave blank to use the PL_API_KEY environment "
+            "variable or a `planet auth login` session.")
+        form.addRow("API key", self.key_edit)
+
+        self.login_status = QLabel()
+        self.login_status.setWordWrap(True)
+        form.addRow("Status", self.login_status)
+        self._refresh_login_state()
+        return box
+
+    def _set_login_status(self, text, tone="info"):
+        self.login_status.setText(text)
+        self.login_status.setStyleSheet(
+            f"QLabel {{ color: {STATUS_COLORS.get(tone, 'palette(mid)')}; }}")
+
+    def _refresh_login_state(self):
+        """Reflect whether a key is in hand in the box title + Log out button."""
+        have = bool(self._api_key())
+        self.logout_btn.setEnabled(have)
+        user = self.settings.value("landslide/planet_user", "", type=str)
+        if have:
+            self.login_box.setTitle(
+                f"Planet account — signed in{f' ({user})' if user else ''}")
+        else:
+            self.login_box.setTitle("Planet account — sign in")
+
+    def _planet_login(self):
+        if self._login_reply is not None:
+            return                       # a login is already in flight
+        user = self.user_edit.text().strip()
+        pw = self.pass_edit.text()
+        if not user or not pw:
+            self._set_login_status(
+                "Enter your Planet email and password (or paste an API key).", "warn")
+            return
+        self._set_login_status("Signing in…", "info")
+        self.login_btn.setEnabled(False)
+        body = QByteArray(json.dumps({"email": user, "password": pw}).encode())
+        req = QNetworkRequest(QUrl(PLANET_LOGIN_URL))
+        req.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
+        reply = QgsNetworkAccessManager.instance().post(req, body)
+        self._login_reply = reply
+        reply.finished.connect(lambda r=reply, u=user: self._planet_login_done(r, u))
+
+    def _planet_login_done(self, reply, user):
+        if reply is not self._login_reply:
+            reply.deleteLater()
+            return
+        self._login_reply = None
+        self.login_btn.setEnabled(True)
+        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NoError and status == 200
+        data = bytes(reply.readAll())
+        reply.deleteLater()
+        if not ok:
+            if status in (401, 403):
+                self._set_login_status(
+                    "Sign-in failed — check your email and password.", "error")
+            else:
+                self._set_login_status(
+                    f"Sign-in failed (HTTP {status or '—'}).", "error")
+            return
+        api_key = self._api_key_from_jwt(data)
+        if not api_key:
+            self._set_login_status(
+                "Signed in, but no API key came back — try pasting a key.", "error")
+            return
+        self.key_edit.setText(api_key)
+        self.settings.setValue("landslide/planet_api_key", api_key)
+        self.settings.setValue("landslide/planet_user", user)
+        os.environ["PL_API_KEY"] = api_key
+        self.pass_edit.clear()
+        self._set_login_status(f"✓ Signed in as {user}.", "success")
+        self._refresh_login_state()
+        self.login_box.setCollapsed(True)
+
+    @staticmethod
+    def _api_key_from_jwt(data):
+        """Pull `api_key` out of the JWT Planet's /v0/auth/login returns.
+
+        The body is a bare JWT string (header.payload.signature); the middle part
+        is a base64url-encoded JSON payload carrying the account's api_key. Mirrors
+        the parsing in the `planet` SDK's ClientV1.login()."""
+        try:
+            jwt = data.decode("utf-8").strip().strip('"')
+            payload = jwt.split(".")[1]
+            payload += "=" * (-len(payload) % 4)   # restore base64 padding
+            obj = json.loads(base64.urlsafe_b64decode(payload.encode()))
+            return obj.get("api_key")
+        except (ValueError, IndexError, UnicodeDecodeError):
+            return None
+
+    def _planet_logout(self):
+        self.key_edit.clear()
+        self.pass_edit.clear()
+        self.settings.remove("landslide/planet_api_key")
+        os.environ.pop("PL_API_KEY", None)
+        self._set_login_status("Signed out.", "info")
+        self._refresh_login_state()
 
     # ---------- inputs ----------
     def _copy_from_main(self):
@@ -338,7 +588,7 @@ class PlanetTab(QWidget):
             "--pre-days", str(int(self.pre_spin.value())),
             "--post-days", str(int(self.post_spin.value())),
             "--prefer", "planet",
-            "--max-cloud", f"{self.cloud_spin.value():.0f}",
+            "--max-cloud", str(self.cloud_slider.value()),
             "--coverage", self.coverage_combo.currentData(),
             "--quality", self.quality_combo.currentData(),
             "--search-only", "--out", out,
@@ -793,12 +1043,14 @@ class PlanetTab(QWidget):
         self.iface.messageBar().pushWarning("PlanetScope", text)
 
     def teardown(self):
-        if self._preview_reply is not None:
-            try:
-                self._preview_reply.abort()
-            except RuntimeError:
-                pass
-            self._preview_reply = None
+        for attr in ("_preview_reply", "_login_reply"):
+            reply = getattr(self, attr, None)
+            if reply is not None:
+                try:
+                    reply.abort()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
         for reply in self._tile_replies + self._gallery_replies:
             try:
                 reply.abort()
