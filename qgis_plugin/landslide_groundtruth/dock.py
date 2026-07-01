@@ -13,6 +13,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QDateTimeEdit, QProgressBar,
     QPlainTextEdit, QFileDialog, QCheckBox, QTableWidget,
     QTableWidgetItem, QSplitter, QToolButton, QScrollArea, QGridLayout,
+    QTabWidget,
 )
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsSettings,
@@ -24,10 +25,11 @@ from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
 from .task import PipelineTask
 
-# label -> --prefer value
+# label -> --prefer value. PlanetScope lives in its own tab now (separate
+# Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
+# sources — Sentinel-2 and Landsat.
 SOURCES = [
-    ("Auto (Planet → Sentinel-2 → Landsat)", "auto"),
-    ("PlanetScope (~3 m)", "planet"),
+    ("Auto (Sentinel-2 → Landsat)", "auto"),
     ("Sentinel-2 (~10 m)", "s2"),
     ("Landsat (~30 m)", "landsat"),
 ]
@@ -143,15 +145,31 @@ class LandslideDock(QgsDockWidget):
         self._gdal_tuned = False     # GDAL /vsicurl options set once
         self._gallery_replies = []   # in-flight quicklook-thumbnail requests
         self._footprint_layers = []  # scene-footprint vector layers on the map
-        self.setWidget(self._build_ui())
+        self.setWidget(self._build_dock())
 
-    # ---------- UI ----------
-    def _build_ui(self):
-        w = QWidget()
-        root = QVBoxLayout(w)
+    # ---------- top-level layout: shared Environment + tabbed sources ----------
+    def _build_dock(self):
+        """Shared Environment header over a QTabWidget: a Sentinel-2/Landsat tab
+        (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
+        Data/Orders/Tiles system). Environment (venv/project/out) is shared because
+        both tabs launch the SAME venv subprocess."""
+        from .planet_tab import PlanetTab
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._build_env_box())
 
-        # --- environment settings (paths to the venv + project) ---
-        # Collapsible + collapsed by default: these are set once, then forgotten.
+        tabs = QTabWidget()
+        tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
+        self.planet_tab = PlanetTab(self)
+        tabs.addTab(self.planet_tab, "PlanetScope")
+        outer.addWidget(tabs, 1)
+        return container
+
+    def _build_env_box(self):
+        """Shared environment settings (paths to the venv + project + output).
+        Collapsible + collapsed by default: these are set once, then forgotten.
+        Read by BOTH tabs (see _collect and PlanetTab)."""
         env = QgsCollapsibleGroupBox("Environment")
         env.setSaveCollapsedState(False)
         env.setCollapsed(True)
@@ -174,7 +192,12 @@ class LandslideDock(QgsDockWidget):
             btn.clicked.connect(picker)
             row.addWidget(btn)
             ef.addRow(label, row)
-        root.addWidget(env)
+        return env
+
+    # ---------- Sentinel-2 / Landsat tab ----------
+    def _build_ui(self):
+        w = QWidget()
+        root = QVBoxLayout(w)
 
         # --- event inputs ---
         form = QFormLayout()
@@ -256,40 +279,7 @@ class LandslideDock(QgsDockWidget):
             sbox.addWidget(cb)
         root.addWidget(scenes_box)
 
-        # --- advanced PlanetScope coverage/quality toggles ---
-        # Collapsible + collapsed by default: most runs leave these at the defaults
-        # (both checked = match Planet Explorer). Tucked away to declutter the panel.
-        adv = QgsCollapsibleGroupBox("Advanced options")
-        adv.setSaveCollapsedState(False)
-        adv.setCollapsed(True)
-        adv_layout = QVBoxLayout(adv)
-
-        # PlanetScope coverage: any AOI overlap (Planet Explorer-like, default) vs.
-        # require the scene footprint to contain the exact epicentre.
-        self.aoi_overlap_check = QCheckBox("AOI overlap (match Planet Explorer)")
-        self.aoi_overlap_check.setChecked(True)
-        self.aoi_overlap_check.setToolTip(
-            "Checked: accept any PlanetScope scene overlapping the search box, like "
-            "Planet Explorer — recovers partial-coverage scenes close to the event "
-            "date. Unchecked: require the scene footprint to contain the exact "
-            "epicentre point (stricter; can miss the nearest scenes). Sentinel-2 / "
-            "Landsat ignore this.")
-        adv_layout.addWidget(self.aoi_overlap_check)
-
-        # include 'test'-quality PlanetScope (not just 'standard'). Near a fresh
-        # event the nearest/clearest scenes are frequently published as 'test'
-        # quality; they're fine for the visual review (looser calibration).
-        self.test_quality_check = QCheckBox("Include test-quality PlanetScope (match Planet Explorer)")
-        self.test_quality_check.setChecked(True)
-        self.test_quality_check.setToolTip(
-            "Checked: also consider PlanetScope scenes Planet publishes as 'test' "
-            "quality, not just 'standard'. Near a fresh event the nearest and "
-            "clearest scenes are often test-only (Planet Explorer shows them). Test "
-            "scenes have looser geo/radiometric calibration — fine for spotting and "
-            "digitizing a scar by eye, but eyeball them before trusting NDVI/"
-            "reflectance values. Sentinel-2 / Landsat ignore this.")
-        adv_layout.addWidget(self.test_quality_check)
-        root.addWidget(adv)
+        # (PlanetScope coverage/quality toggles moved to the PlanetScope tab.)
 
         # --- search (free dry-run) / run / cancel ---
         btn_row = QHBoxLayout()
@@ -486,8 +476,6 @@ class LandslideDock(QgsDockWidget):
             "--post-days", str(self.post_slider.value()),
             "--prefer", self.source_combo.currentData(),
             "--max-cloud", f"{self.cloud_spin.value():.0f}",
-            "--coverage", "aoi" if self.aoi_overlap_check.isChecked() else "point",
-            "--quality", "any" if self.test_quality_check.isChecked() else "standard",
             "--out", out,
         ]
         if self.auto_check.isChecked():
@@ -1412,3 +1400,5 @@ class LandslideDock(QgsDockWidget):
         self._gallery_replies = []
         if self.task is not None:
             self.task.cancel()
+        if getattr(self, "planet_tab", None) is not None:
+            self.planet_tab.teardown()

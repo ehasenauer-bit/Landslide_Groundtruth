@@ -343,9 +343,11 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
                 pre_ids=None, post_ids=None):
     """Returns dict with pre/post composites, ndvi_pre/post, dndvi, sensor, scene lists.
 
-    prefer: 'auto' | 'planet' | 's2' | 'landsat'. 'auto' tries PlanetScope (~3 m)
-    first and falls back to Sentinel-2 (~10 m) then Landsat (~30 m) when Planet
-    has no coverage or is not authenticated. workdir: where Planet clips download.
+    prefer: 'auto' | 's2' | 'landsat'. 'auto' uses Sentinel-2 (~10 m) when the
+    event is in the Sentinel-2 era (>= 2016) and falls back to Landsat (~30 m),
+    otherwise Landsat. (PlanetScope now lives in the plugin's own PlanetScope tab,
+    a separate Data/Orders/Tiles system, and is no longer part of this pipeline;
+    workdir/require_point/allow_test_quality are accepted but unused here.)
     auto_window: if True, use only the single clear scene nearest the event on
     each side (tightest possible window) instead of compositing the whole window;
     pre_days/post_days then act as the maximum search range each side.
@@ -389,28 +391,14 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
               f"post hand-picked {sensor} scene(s)")
         return _composite_result(pre_items, post_items, lat, lon, radius_km, sensor)
 
-    planet_note = None      # why PlanetScope was not used, surfaced to the run banner
-    if prefer in ("auto", "planet"):
-        try:
-            import planet_imagery as pi
-            res = pi.fetch_event(lat, lon, radius_km, event_time,
-                                 pre_days=pre_days, post_days=post_days,
-                                 seasonal=seasonal, workdir=workdir,
-                                 auto_window=auto_window, cloud_weight=cloud_weight,
-                                 max_cloud_pct=max_cloud_pct, require_point=require_point,
-                                 allow_test_quality=allow_test_quality)
-            if res is not None:
-                return res
-            planet_note = ("PlanetScope found scenes but produced no usable composite "
-                           "(a window had no orderable/clear scene, or the ordered scenes "
-                           "cloud-masked to nothing over the AOI) — see the [planet] log line")
-            print("    [planet] no usable coverage; falling back to Sentinel-2/Landsat")
-        except Exception as e:
-            planet_note = f"PlanetScope unavailable ({type(e).__name__}: {e})"
-            print(f"    [planet] unavailable ({type(e).__name__}: {e}); "
-                  f"falling back to Sentinel-2/Landsat")
-        if prefer == "planet":
-            return None
+    # PlanetScope has been split out of this pipeline into the plugin's dedicated
+    # PlanetScope tab (its own Data/Orders/Tiles system). This module now handles
+    # only the Planetary Computer STAC sources — Sentinel-2 and Landsat. A stray
+    # prefer='planet' (there should be none) degrades to the S2->Landsat default.
+    if prefer == "planet":
+        print("    [imagery] prefer='planet' is not handled here anymore "
+              "(PlanetScope lives in its own tab); using Sentinel-2 -> Landsat")
+        prefer = "auto"
 
     use_s2 = prefer in ("auto", "s2") and event_time >= dt.datetime(2016, 1, 1)
     # sensors to try in order: the chosen optical source, then Landsat as a
@@ -438,7 +426,7 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
         if not pre_items or not post_items:
             continue
         res = _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
-                                fallback_note=planet_note, auto_window=auto_window)
+                                fallback_note=None, auto_window=auto_window)
         if res is not None:
             return res
         # scenes found but their nodata gap fell over the AOI — try the next sensor

@@ -66,14 +66,16 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
     """Free dry-run: search each source `prefer` could use and collect candidate
     pre/post scenes WITHOUT ordering or downloading anything.
 
-    Mirrors fetch_event's source priority: 'auto' previews PlanetScope +
-    Sentinel-2 + Landsat so you can compare coverage and pick a source; a
-    specific --prefer previews just that source. Pre-2016 events drop Sentinel-2
-    (no coverage) in favor of Landsat. Per-source failures (e.g. Planet not
-    authenticated) become notes instead of aborting the whole preview."""
+    'auto' previews the Planetary Computer STAC sources — Sentinel-2 + Landsat —
+    so you can compare coverage and pick a source; a specific --prefer previews
+    just that source. PlanetScope is NOT part of 'auto' anymore: it has its own
+    plugin tab, and is searched only when explicitly requested with
+    '--prefer planet' (which the PlanetScope tab uses). Pre-2016 events drop
+    Sentinel-2 (no coverage) in favor of Landsat. Per-source failures (e.g. Planet
+    not authenticated) become notes instead of aborting the whole preview."""
     from concurrent.futures import ThreadPoolExecutor
 
-    sensors = {"auto": ["planet", "s2", "landsat"], "planet": ["planet"],
+    sensors = {"auto": ["s2", "landsat"], "planet": ["planet"],
                "s2": ["s2"], "landsat": ["landsat"]}[args.prefer]
     if "s2" in sensors and when < dt.datetime(2016, 1, 1):
         sensors = [s for s in sensors if s != "s2"]
@@ -143,7 +145,10 @@ def main():
                     help="label for the output files (default: derived from time)")
     ap.add_argument("--prefer", default="auto",
                     choices=["auto", "planet", "s2", "landsat"],
-                    help="imagery source priority; 'auto' = PlanetScope -> Sentinel-2 -> Landsat")
+                    help="imagery source; 'auto' = Sentinel-2 -> Landsat (STAC). "
+                         "'planet' searches PlanetScope only and is used by the "
+                         "plugin's PlanetScope tab (search/preview; runs need a "
+                         "PlanetScope order flow, added separately).")
     ap.add_argument("--pre-days", type=int, default=60)
     ap.add_argument("--post-days", type=int, default=90)
     ap.add_argument("--cloud-weight", type=float, default=0.5,
