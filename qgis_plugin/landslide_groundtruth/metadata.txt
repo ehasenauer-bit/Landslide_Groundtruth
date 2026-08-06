@@ -1,12 +1,12 @@
 [general]
 name=Landslide Ground-Truthing
 qgisMinimumVersion=3.22
-description=Interactive landslide scar delineation from PlanetScope / Sentinel-2 / Landsat imagery.
-about=Pick an event location on the map, set its date and the pre/post imagery windows, choose an imagery source (PlanetScope ~3 m, Sentinel-2 ~10 m, or Landsat ~30 m), and run the ground-truthing pipeline. Results (pre/post RGB, dNDVI, brightness change, candidate scar polygon, crown/tip points) load straight into your project for review. Requires a configured Python environment with the pipeline installed (see plugin settings); the plugin runs that environment as a background process.
+description=Interactive landslide scar delineation from PlanetScope / Sentinel-2 / Landsat imagery (true/false colour, SWIR debris-on-snow false colour, dNDVI/dNDSI/brightness change), with SAR (Sentinel-1) change detection, a native QGIS 3D terrain viewer (ArcticDEM or a loaded DEM) for reading scars against cirque/headwall relief, and scar-area-to-volume estimation.
+about=Pick an event location on the map, set its date and the pre/post imagery windows, choose an imagery source (PlanetScope ~3 m, Sentinel-2 ~10 m, or Landsat ~30 m), and run the ground-truthing pipeline. Results (pre/post RGB, dNDVI, brightness change, candidate scar polygon, crown/tip points) load straight into your project for review. Once you have digitized the scar, the Volume tab measures the selected polygon(s) and converts source area to volume via the Larsen et al. (2010) area-volume scaling, with a medial-axis centerline for slide length. Requires a configured Python environment with the pipeline installed (see plugin settings); the plugin runs that environment as a background process.
 version=0.1.0
 author=Ethan Hasenauer
 email=ethan.hasenauer@sjsu.edu
-tags=landslide,remote sensing,planet,sentinel,landsat,stac,hazard
+tags=landslide,remote sensing,planet,sentinel,landsat,stac,hazard,sar,swir,ndsi,dem,arcticdem,3d,terrain,volume,centerline
 category=Plugins
 icon=icon.png
 experimental=True

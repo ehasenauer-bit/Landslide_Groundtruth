@@ -17,6 +17,12 @@ Returns the SAME dict contract as `imagery.fetch_event` (pre/post composites,
 ndvi_pre/post, dndvi, dbright, sensor, pre_scenes/post_scenes) so the review-package
 export is identical regardless of which optical source was used.
 
+Quota: only step 2 costs anything, and it costs it at order CREATION. Every order
+placed here is therefore downloaded into the shared cache and written to the ledger
+in `planet_cache`, and every entry point checks that ledger before ordering — so a
+second look at an event recalls what was already paid for (`recall_preview`) instead
+of buying it twice. See `planet_cache` for the layout and match rules.
+
 Auth: run `planet auth login` once (OAuth) or set the PL_API_KEY env var. The
 password is never read by this code.
 """
@@ -24,13 +30,13 @@ from __future__ import annotations
 import datetime as dt
 import glob
 import os
-import tempfile
 import warnings
 import numpy as np
 import rioxarray  # noqa: F401  (registers .rio accessor)
 import xarray as xr
 
 import imagery as im  # reuse _bbox, _utm_epsg, _ndvi
+import planet_cache as pc  # shared order cache + ledger (never re-order what we own)
 
 ITEM_TYPE = "PSScene"
 BUNDLE = "analytic_sr_udm2"          # 4-band surface reflectance + usable-data mask
@@ -226,12 +232,53 @@ def _create_order(pl, item_ids, aoi):
     return pl.orders.create_order(req)["id"]
 
 
-def _wait_download(pl, order_id, out_dir):
-    """Block until `order_id` is ready, download it to out_dir, pair SR/UDM2 files."""
-    os.makedirs(out_dir, exist_ok=True)
-    pl.orders.wait(order_id)             # blocks until success/failure
-    pl.orders.download_order(order_id, directory=out_dir, overwrite=True)
-    return _pair_downloads(out_dir)
+def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=180):
+    """Block until `order_id` reaches a final state, download it into the shared
+    cache, record it in the ledger, and return its paired SR/UDM2 files.
+
+    Downloads land in `planet_cache.order_dir(order_id)` rather than a per-project
+    directory, and the ledger entry written afterwards is what lets any later run —
+    any project, any --out — recall this order instead of placing a new one. That
+    also makes `overwrite=False` the right choice: re-running against an order whose
+    files are already cached costs no quota AND no bytes.
+
+    `meta` is the {side, event_id, lat, lon, radius_km} the order was placed for, so
+    the ledger can be searched by event/AOI later. Scene ids come from the delivered
+    file names instead of `meta` so the record describes what actually arrived.
+
+    Logs order-state transitions (queued -> running -> success) via `log` so a
+    slow or queued order shows progress instead of blocking silently — the state
+    lines stream to the plugin log. The wait budget is ~max_attempts*delay seconds
+    (default ~30 min): Planet orders can sit queued for many minutes under load,
+    and the SDK default (200 x 5 s ~ 16 min) was timing out on busy days. If the
+    order still hasn't finished, the SDK raises ClientError; that and a non-success
+    final state propagate to the caller (per-side note), which keeps one slow order
+    from killing the other side."""
+    dest = pc.order_dir(order_id, create=True)
+    last = [None]
+
+    def _on_state(state):
+        if state != last[0]:
+            last[0] = state
+            log(f"    [planet] order {order_id[:12]} state: {state}")
+
+    final = pl.orders.wait(order_id, delay=delay, max_attempts=max_attempts,
+                           callback=_on_state)
+    if final != "success":
+        # failed/partial: the item(s) didn't deliver, so there's nothing to download
+        raise RuntimeError(f"order finished in state {final!r} (not 'success')")
+    pl.orders.download_order(order_id, directory=dest, overwrite=False)
+    pairs = _pair_downloads(dest)
+    # The delivered clip footprint beats the AOI we asked for: it's what actually
+    # arrived, so it's the honest answer to "does this order cover that box?" — and it
+    # keeps a re-download of someone else's order id from being filed at our AOI.
+    meta = dict(meta or {})
+    aoi = pc.aoi_from_disk(dest)
+    if aoi:
+        meta.update(lat=aoi["lat"], lon=aoi["lon"], bbox=aoi["bbox"])
+    pc.record(order_id, dest, bundle=BUNDLE,
+              scene_ids=pc.scene_ids_on_disk(dest), **meta)
+    return pairs
 
 
 def _pair_downloads(out_dir):
@@ -280,14 +327,20 @@ def _target_grid(lat, lon, radius_km, epsg, res=PS_RES):
     return from_origin(minx, maxy, res, res), (height, width)
 
 
-def _open_scene(sr_path, udm_path, epsg, transform, shape):
+def _open_scene(sr_path, udm_path, epsg, transform, shape, mask_clouds=True):
     """One clipped PSScene -> reflectance DataArray (bands blue/green/red/nir),
-    cloud-masked and reprojected onto the shared (transform, shape) target grid."""
+    reprojected onto the shared (transform, shape) target grid.
+
+    mask_clouds: UDM2-mask non-clear pixels to NaN (True, the default — what a
+    quantitative NDVI/composite run wants). The on-map SR detail preview passes
+    False so it shows EVERY real pixel: UDM2 can misflag bright snow/ice as cloud,
+    and punching those to NaN would blank out exactly the overexposed terrain the
+    preview exists to reveal. Clouds, if any, are then just visible in the render."""
     da = rioxarray.open_rasterio(sr_path, masked=True).astype("float32")
     if "_sr" in os.path.basename(sr_path).lower():
         da = da * PS_SR_SCALE            # SR DN -> reflectance; DN bundle left as-is
     da = da.assign_coords(band=["blue", "green", "red", "nir"])
-    if udm_path and os.path.exists(udm_path):
+    if mask_clouds and udm_path and os.path.exists(udm_path):
         udm = rioxarray.open_rasterio(udm_path)
         clear = udm.sel(band=1).rio.reproject_match(da)   # UDM2 band 1: 1 = clear
         da = da.where(clear == 1)
@@ -295,10 +348,12 @@ def _open_scene(sr_path, udm_path, epsg, transform, shape):
     return da.rio.reproject(epsg, transform=transform, shape=shape)
 
 
-def _composite(pairs, lat, lon, radius_km, epsg):
-    """Cloud-masked median composite over the scenes in one window, on the AOI grid."""
+def _composite(pairs, lat, lon, radius_km, epsg, mask_clouds=True):
+    """Median composite over the scenes in one window, on the AOI grid. UDM2
+    cloud-masking is applied unless mask_clouds=False (see _open_scene)."""
     transform, shape = _target_grid(lat, lon, radius_km, epsg)
-    scenes = [_open_scene(sr, udm, epsg, transform, shape) for sr, udm in pairs]
+    scenes = [_open_scene(sr, udm, epsg, transform, shape, mask_clouds=mask_clouds)
+              for sr, udm in pairs]
     if not scenes:
         return None
     with warnings.catch_warnings():
@@ -311,15 +366,76 @@ def _composite(pairs, lat, lon, radius_km, epsg):
     return comp.rio.write_crs(epsg)
 
 
+def _event_result(pre, post, pre_ids, post_ids):
+    """Build the fetch_event return contract from two finished composites.
+
+    Returns None when either side has no usable pixels over the AOI (all
+    cloud-masked, or the clips landed outside it), so the caller falls back to
+    Sentinel-2/Landsat rather than exporting a blank package. Shared by the ordering
+    path and the cache-recall path so both produce identical results."""
+    if pre is None or post is None or not im._has_coverage(pre) \
+            or not im._has_coverage(post):
+        bad = [s for s, c in (("pre", pre), ("post", post))
+               if c is None or not im._has_coverage(c)]
+        print(f"    [planet] scenes clipped to no clear pixels over the AOI on "
+              f"the {' and '.join(bad)} side (cloud-masked out or a scene nodata gap)")
+        return None
+    ndvi_pre, ndvi_post = im._ndvi(pre), im._ndvi(post)
+    dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
+    bright_pre, bright_post = im._brightness(pre), im._brightness(post)
+    dbright = (bright_post - bright_pre).rename("dbright")
+    return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
+                dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
+                dbright=dbright, sensor="planet",
+                pre_scenes=list(pre_ids), post_scenes=list(post_ids))
+
+
+def _cached_event(event_id, lat, lon, radius_km):
+    """fetch_event's result built entirely from orders already in the ledger, or None.
+
+    No search, no order, no Planet client, no network — the whole point is that a
+    re-run of a project whose PlanetScope scenes are already paid for spends nothing.
+    Requires a pre AND a post order for the event whose clips are still on disk and
+    whose AOI covers the requested radius (see planet_cache.find); anything less is a
+    miss and the caller goes on to search/order normally."""
+    recs = pc.find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km,
+                   require_radius_km=radius_km, require_files=True)
+    sides = pc.newest_by_side(recs)
+    if not (sides.get("pre") and sides.get("post")):
+        return None
+    epsg = im._utm_epsg(lat, lon)
+    comps, ids = {}, {}
+    for side, rec in sides.items():
+        pairs = _pair_downloads(pc.resolve_path(rec))
+        if not pairs:
+            return None
+        print(f"    [planet-cache] reusing {side} order {rec['order_id'][:12]} "
+              f"({len(pairs)} clip(s)) already ordered for this event — no quota")
+        comps[side] = _composite(pairs, lat, lon, radius_km, epsg)
+        ids[side] = rec.get("scene_ids") or []
+    return _event_result(comps["pre"], comps["post"], ids["pre"], ids["post"])
+
+
 def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
                 pre_days=60, post_days=60, seasonal=False, workdir=None,
                 auto_window=False, cloud_weight=0.5,
-                max_cloud_pct=None, require_point=False, allow_test_quality=False):
+                max_cloud_pct=None, require_point=False, allow_test_quality=False,
+                event_id=None, reuse=True):
     """PlanetScope pre/post composites + dNDVI, or None if no usable coverage.
 
     Returns None (so the caller falls back to Sentinel-2/Landsat) when either
     window has no orderable scenes. Auth/SDK errors propagate to the caller,
     which logs them and falls back.
+
+    reuse: check the order ledger FIRST and, when this event already has a pre and a
+    post order cached, composite those and place no order at all (see
+    _cached_event). This is why re-running a project doesn't spend quota twice. Pass
+    reuse=False to force a fresh search + order — e.g. after widening the window or
+    changing the cloud cap, where the cached scene choice is no longer what you want.
+    event_id: the event's id, used to key the ledger. Without it, cached orders are
+    matched by AOI proximity alone.
+    workdir: legacy, unused. Orders are downloaded into the shared cache
+    (planet_cache.cache_root()) so they are recallable from any project.
 
     cloud_weight: gap-days one will travel from the event date to avoid 1% cloud
     when ranking which scenes to order/composite (gap_days + cloud_weight *
@@ -341,6 +457,13 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
     nearest/clearest PlanetScope scenes are frequently test-only; they're fine for
     the visual review but carry looser geo/radiometric calibration.
     """
+    # Cache first, before the client is even constructed: a fully-cached event needs
+    # no auth and no network, so a re-run works offline and cannot touch quota.
+    if reuse:
+        hit = _cached_event(event_id, lat, lon, radius_km)
+        if hit is not None:
+            return hit
+
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
@@ -370,34 +493,352 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
               f"(within the date range, cloud cap, coverage, and quality filters)")
         return None
 
-    workdir = workdir or tempfile.mkdtemp(prefix="planet_")
     epsg = im._utm_epsg(lat, lon)
+    pre_ids = [i["id"] for i in pre_items]
+    post_ids = [i["id"] for i in post_items]
+    meta = dict(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
     # Submit BOTH orders before waiting on either, so Planet processes the pre and
     # post clips concurrently. Total order latency then ~max(pre, post) instead of
     # the old pre+post (each order's blocking wait runs ~1-5 min). Waiting pre
     # first is fine — post is already cooking server-side meanwhile.
-    pre_order = _create_order(pl, [i["id"] for i in pre_items], aoi)
-    post_order = _create_order(pl, [i["id"] for i in post_items], aoi)
-    pre_pairs = _wait_download(pl, pre_order, os.path.join(workdir, "pre"))
-    post_pairs = _wait_download(pl, post_order, os.path.join(workdir, "post"))
+    pre_order = _create_order(pl, pre_ids, aoi)
+    post_order = _create_order(pl, post_ids, aoi)
+    pre_pairs = _wait_download(pl, pre_order, dict(meta, side="pre"))
+    post_pairs = _wait_download(pl, post_order, dict(meta, side="post"))
 
-    pre = _composite(pre_pairs, lat, lon, radius_km, epsg)
-    post = _composite(post_pairs, lat, lon, radius_km, epsg)
-    # None = no scenes composited; no coverage = clips landed entirely outside the
-    # AOI / all cloud-masked. Either way fall back to Sentinel-2/Landsat.
-    if pre is None or post is None or not im._has_coverage(pre) or not im._has_coverage(post):
-        bad = [s for s, c in (("pre", pre), ("post", post))
-               if c is None or not im._has_coverage(c)]
-        print(f"    [planet] ordered scenes clipped to no clear pixels over the AOI on "
-              f"the {' and '.join(bad)} side (cloud-masked out or a scene nodata gap)")
-        return None
+    return _event_result(_composite(pre_pairs, lat, lon, radius_km, epsg),
+                         _composite(post_pairs, lat, lon, radius_km, epsg),
+                         pre_ids, post_ids)
 
-    ndvi_pre, ndvi_post = im._ndvi(pre), im._ndvi(post)
-    dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
-    bright_pre, bright_post = im._brightness(pre), im._brightness(post)
-    dbright = (bright_post - bright_pre).rename("dbright")
-    return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
-                dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
-                dbright=dbright, sensor="planet",
-                pre_scenes=[i["id"] for i in pre_items],
-                post_scenes=[i["id"] for i in post_items])
+
+def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
+    """Wait on each {side: order_id}, download it, and composite that side.
+
+    Shared by render_preview (orders it just created) and resume_preview (orders an
+    earlier render placed but didn't finish waiting on). Returns
+    (comps, notes, pending): comps is {'pre': comp|None, 'post': comp|None}; pending
+    is {side: order_id} for orders STILL processing after the wait budget. Those are
+    resumable — the order is already placed and paid for, it just hasn't finished
+    server-side — so the caller persists the id and can hand it back here later
+    WITHOUT re-ordering (no extra quota). A hard failure (bad state, download error)
+    is a per-side note and is NOT marked pending, because re-waiting won't help.
+
+    Every download that lands here is written to the order ledger keyed on
+    event_id + AOI, which is what makes it recallable for free later
+    (recall_preview) instead of ordered a second time."""
+    comps = {"pre": None, "post": None}
+    notes, pending = [], {}
+    meta = dict(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
+    for side, order_id in orders.items():
+        try:
+            pairs = _wait_download(pl, order_id, dict(meta, side=side))
+            # mask_clouds=False: a visual detail preview should show every real pixel
+            # (esp. bright snow UDM2 may misflag), not punch cloud-masked holes.
+            comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
+                                     mask_clouds=False)
+            if comps[side] is None:
+                notes.append(
+                    f"{side}: ordered scene(s) clipped to no pixels over the AOI")
+        except Exception as e:
+            if "Maximum number of attempts" in str(e):
+                pending[side] = order_id
+                notes.append(
+                    f"{side}: Planet is still processing order {order_id} after the "
+                    f"wait budget (~30 min). It's placed and saved in your Planet "
+                    f"account — resume it (don't re-order) to finish without spending "
+                    f"quota again.")
+            else:
+                notes.append(
+                    f"{side}: order/download failed: {type(e).__name__}: {e}")
+    return comps, notes, pending
+
+
+class _LazyClient:
+    """A Planet client built only if something actually needs the network.
+
+    Every cache path here is meant to be free AND offline when the clips are already
+    on disk; deferring _client() keeps it that way (no auth prompt, no requests) while
+    still allowing a free re-download when a cached order's files have gone missing."""
+
+    def __init__(self):
+        self._pl = None
+
+    def get(self):
+        if self._pl is None:
+            self._pl = _client()
+        return self._pl
+
+
+def _cached_side(side, ids, event_id, lat, lon, radius_km):
+    """Newest ledger order that already contains EVERY id in `ids` for this side, or None.
+
+    Prefers a record whose clips are still on disk (free and offline) over one that
+    would need a re-download (free, but needs auth). The second pass is an id-only
+    search restricted to records that know NEITHER where they were delivered nor what
+    AOI they were asked for: PSScene ids are globally unique, so an order containing
+    them holds the right pixels, and a location-blind record is the one case where
+    that's the only evidence available. If such a clip turns out not to reach this AOI,
+    _composite_record says so and the caller orders instead."""
+    recs = pc.find(event_id=event_id, lat=lat, lon=lon, side=side, scene_ids=ids,
+                   radius_km=radius_km, require_radius_km=radius_km)
+    if not recs:
+        recs = [r for r in pc.find(side=side, scene_ids=ids)
+                if not r.get("bbox") and r.get("radius_km") is None]
+    on_disk = [r for r in recs if pc.has_files(r)]
+    return (on_disk or recs or [None])[0]
+
+
+def _composite_record(rec, side, lat, lon, radius_km, epsg, client=None):
+    """(comp|None, note|None) for one cached order, composited on this AOI's grid.
+
+    When the order's files are missing locally, re-download it first: the order
+    already exists in the Planet account, so fetching it again costs NO quota — only
+    time. Needs `client` (a _LazyClient) to do that; without one, a missing-file
+    record becomes a note so a caller that must stay offline still degrades cleanly.
+    mask_clouds=False matches _finish_orders, so a recalled render is pixel-identical
+    to the original."""
+    oid = rec["order_id"]
+    path = pc.resolve_path(rec)
+    pairs = _pair_downloads(path)
+    if not pairs:
+        if client is None:
+            return None, (f"{side}: order {oid[:12]} is in the ledger but its files are "
+                          f"gone from {path} — Planet auth is needed to re-download it "
+                          f"(free, no new order)")
+        try:
+            print(f"    [planet-cache] {side}: local clips missing, re-downloading "
+                  f"order {oid[:12]} — already paid for, no new order")
+            pairs = _wait_download(client.get(), oid,
+                                   dict(side=side, event_id=rec.get("event_id"),
+                                        lat=lat, lon=lon, radius_km=radius_km))
+        except Exception as e:
+            return None, (f"{side}: re-downloading order {oid[:12]} failed: "
+                          f"{type(e).__name__}: {e}. Planet only keeps order results "
+                          f"available for a limited time, so these scenes may have to "
+                          f"be ordered again.")
+    if not pairs:
+        return None, f"{side}: cached order {oid[:12]} holds no usable SR clips"
+    comp = _composite(pairs, lat, lon, radius_km, epsg, mask_clouds=False)
+    if comp is None:
+        return None, (f"{side}: cached order {oid[:12]} covers no pixels over this AOI "
+                      f"— it was clipped to a different box")
+    print(f"    [planet-cache] {side}: reusing order {oid[:12]} ({len(pairs)} clip(s)) "
+          f"— no order, no quota")
+    return comp, None
+
+
+def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
+    """Put PlanetScope imagery ALREADY ORDERED for this event back on the canvas.
+    No search, no new order, NO QUOTA.
+
+    This is the "I paid for these pixels once" path. It takes the newest cached order
+    per side for the event — matched at EVENT level (any cached scenes for this
+    event/AOI), not against whatever is ticked in the table — composites it on the
+    current AOI grid, and hands back render_preview's shape so the caller renders and
+    loads it identically to a fresh render.
+
+    orders: {side: order_id} to pin exact orders instead of the newest, which is how
+    the plugin's order picker replays a specific one. An id that isn't in the ledger
+    is still attempted — Planet holds the order, so an id copied from Planet Explorer
+    can be pulled in and cached (free) as well.
+
+    Returns render_preview's keys plus:
+      reused    - {side: order_id} actually loaded (the free sides; here, all of them)
+      available - every cached order for this event, newest first, each with a
+                  human label and an on_disk flag, for a picker to offer.
+    'pending' is always {} — nothing was ordered, so there is nothing to wait on.
+    """
+    epsg = im._utm_epsg(lat, lon)
+    comps = {"pre": None, "post": None}
+    notes, reused = [], {}
+    client = _LazyClient()
+    recs = pc.find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
+    available = [dict(r, path=pc.resolve_path(r), on_disk=pc.has_files(r),
+                      label=pc.describe(r)) for r in recs]
+
+    # Start from the newest per side, then let explicit ids override. Pinning ONE side
+    # therefore still fills the other from the cache, so picking a specific order can
+    # never cost you the before/after pair.
+    picked = pc.newest_by_side(recs)
+    if orders:
+        by_id = {r["order_id"]: r for r in pc.load()}
+        for side, oid in orders.items():
+            if not oid or side not in ("pre", "post"):
+                continue
+            # an unknown id is not an error: Planet still has the order, so let the
+            # download path pull it in and record it on the way through
+            picked[side] = by_id.get(oid) or dict(order_id=oid, path=None, side=side,
+                                                  event_id=event_id)
+
+    for side in ("pre", "post"):
+        rec = picked.get(side)
+        if rec is None:
+            continue
+        comp, note = _composite_record(rec, side, lat, lon, radius_km, epsg,
+                                       client=client)
+        if note:
+            notes.append(note)
+        if comp is not None:
+            comps[side] = comp
+            reused[side] = rec["order_id"]
+            pc.stamp_footprint(rec["order_id"], event_id=event_id)
+
+    if not reused and not notes:
+        notes.append(
+            f"nothing cached for this event: no PlanetScope order recorded near "
+            f"{lat:.4f},{lon:.4f}" + (f" or for event {event_id}" if event_id else "")
+            + f". The ledger lives in {pc.cache_root()}; 'Render detail' places the "
+            f"first order, and every order after that is recallable for free.")
+    return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
+                pending={}, reused=reused, available=available)
+
+
+def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
+                   event_id=None, reuse=True):
+    """Composite EXACTLY the given PlanetScope scene IDs (AOI-clipped) and return
+    {'pre': comp|None, 'post': comp|None, 'epsg', 'notes', 'pending', 'reused'}.
+    'pending' is {side: order_id} for any order still processing when the wait ran
+    out — those are resumable via resume_preview without re-ordering (see
+    _finish_orders). 'reused' is {side: order_id} for sides served from a cached
+    order, i.e. the sides that cost nothing.
+
+    This backs the plugin's on-map "SR detail" preview. Planet's free tile service
+    streams pre-rendered 8-bit RGB that clips bright terrain (snow/ice) to flat
+    white with no recoverable detail; to get the raw surface-reflectance pixels and
+    apply our own tone curve we have to actually order the analytic_sr bundle. So,
+    unlike the free tile preview, this MAY place a Planet order and consume quota —
+    but only for a side whose scenes aren't in the cache already.
+
+    reuse: for each side, if an order in the ledger already contains ALL the
+    requested scene ids over an AOI at least this wide, composite it from disk and
+    place no order. Deliberately stricter than recall_preview's event-level match:
+    'Render detail' is asked for SPECIFIC ticked scenes, and quietly substituting a
+    different cached scene would put the wrong pixels on the canvas. To load whatever
+    was previously ordered for the event regardless of what's ticked, use
+    recall_preview. reuse=False forces a fresh order even when cached.
+
+    Differs from fetch_event: no windowed search or ranking — it composites the
+    exact ids handed in — and it renders whichever side(s) were requested (one side
+    alone is fine), so a single ticked scene can be previewed. Per-side failures
+    become notes rather than aborting the whole render, so one bad order still lets
+    the other side load."""
+    epsg = im._utm_epsg(lat, lon)
+    comps = {"pre": None, "post": None}
+    notes, reused, to_order = [], {}, {}
+    client = _LazyClient()
+    for side, ids in (("pre", pre_ids), ("post", post_ids)):
+        ids = [i for i in (ids or []) if i]
+        if not ids:
+            continue
+        rec = _cached_side(side, ids, event_id, lat, lon, radius_km) if reuse else None
+        if rec is None:
+            to_order[side] = ids
+            continue
+        comp, note = _composite_record(rec, side, lat, lon, radius_km, epsg,
+                                       client=client)
+        if note:
+            notes.append(note)
+        if comp is None:
+            # a cached order that won't composite is no use; buy the scenes instead
+            to_order[side] = ids
+            continue
+        comps[side] = comp
+        reused[side] = rec["order_id"]
+        pc.stamp_footprint(rec["order_id"], event_id=event_id)
+
+    pending = {}
+    if to_order:
+        pl = client.get()
+        aoi = _bbox_geojson(lat, lon, radius_km)
+        # Submit BOTH orders before waiting on either, so Planet clips the pre and
+        # post concurrently server-side (same trick as fetch_event); total latency
+        # ~max(pre, post) instead of pre+post.
+        orders = {}
+        for side, ids in to_order.items():
+            try:
+                orders[side] = _create_order(pl, ids, aoi)
+            except Exception as e:
+                notes.append(f"{side}: order create failed: {type(e).__name__}: {e}")
+        fresh, dl_notes, pending = _finish_orders(pl, orders, lat, lon, radius_km,
+                                                  epsg, event_id=event_id)
+        notes += dl_notes
+        for side in ("pre", "post"):
+            if fresh[side] is not None:
+                comps[side] = fresh[side]
+    return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
+                pending=pending, reused=reused)
+
+
+def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
+    """Recomposite PlanetScope clips ALREADY on disk. No Planet API call, no order,
+    NO QUOTA — and no network at all.
+
+    Backs the plugin's tone-mode switch: changing the tone curve is purely a local
+    re-render, so read the clips back, composite them on the same AOI grid, and hand
+    the composites to the caller to write with whichever curve is now selected.
+    Reading the same files with the same target grid and the same mask_clouds=False as
+    the original render makes the composites identical — the ONLY difference between
+    two tone modes is the curve applied on the way to 8-bit.
+
+    Looks for the clips in two places, in order: <workdir>/<side>/, where renders left
+    them before the shared cache existed, and then the order ledger for this
+    event/AOI, which is where they land now. That means a re-tone works for old
+    per-project downloads and new cached orders alike.
+
+    Same return shape as render_preview so run_single renders it identically. 'pending'
+    is always {}: there is no order to wait on. A side with nothing on disk comes back
+    None with a note rather than raising, so one downloaded side still re-tones."""
+    epsg = im._utm_epsg(lat, lon)
+    comps = {"pre": None, "post": None}
+    notes, reused = [], {}
+    cached = pc.newest_by_side(pc.find(event_id=event_id, lat=lat, lon=lon,
+                                       radius_km=radius_km, require_files=True))
+    for side in ("pre", "post"):
+        side_dir = os.path.join(workdir or "", side)
+        pairs = _pair_downloads(side_dir) if os.path.isdir(side_dir) else []
+        rec = cached.get(side)
+        if not pairs and rec is not None:
+            pairs = _pair_downloads(pc.resolve_path(rec))
+            if pairs:
+                reused[side] = rec["order_id"]
+        if not pairs:
+            continue
+        try:
+            # mask_clouds=False mirrors _finish_orders: same pixels in, so only the
+            # tone curve differs between modes (see docstring).
+            comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
+                                     mask_clouds=False)
+            if comps[side] is None:
+                notes.append(f"{side}: downloaded clip(s) cover no pixels over the AOI")
+            else:
+                print(f"    [planet-retone] {side}: recomposited {len(pairs)} clip(s) "
+                      f"from disk")
+        except Exception as e:
+            notes.append(f"{side}: re-render failed: {type(e).__name__}: {e}")
+    if comps["pre"] is None and comps["post"] is None and not notes:
+        notes.append(f"nothing to re-tone: no PlanetScope clips on disk for this event, "
+                     f"in {workdir} or in the order cache ({pc.cache_root()}). Run "
+                     f"'Render detail' once, or 'Recall order' if you've ordered it "
+                     f"before.")
+    return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
+                pending={}, reused=reused)
+
+
+def resume_preview(lat, lon, radius_km, orders, event_id=None):
+    """Finish EXISTING Planet orders (given by id) instead of creating new ones.
+
+    Backs the plugin's 'Resume pending order' button. When a render_preview order is
+    still processing when the wait budget runs out, its id is saved (see
+    render_preview's 'pending') rather than lost, and handed here to be waited on,
+    downloaded, clipped and composited. This places NO new order and spends NO extra
+    quota — it only finishes orders Planet is already processing. `orders` is
+    {side: order_id} (side in 'pre'/'post'). Same return shape as render_preview, so
+    the caller renders it identically (and a resume that times out AGAIN comes back
+    with its own 'pending', so it can be retried once more)."""
+    pl = _client()
+    epsg = im._utm_epsg(lat, lon)
+    orders = {s: o for s, o in (orders or {}).items() if o and s in ("pre", "post")}
+    comps, notes, pending = _finish_orders(pl, orders, lat, lon, radius_km, epsg,
+                                           event_id=event_id)
+    return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
+                pending=pending, reused={})

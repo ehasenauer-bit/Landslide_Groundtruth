@@ -1,7 +1,9 @@
 """The dock panel: location pick, date, pre/post sliders, source preference, run."""
+import base64
 import json
 import math
 import os
+import platform
 import tempfile
 from urllib.parse import quote
 
@@ -20,6 +22,7 @@ from qgis.core import (
     QgsRectangle, QgsNetworkAccessManager,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsField, QgsFeature, QgsGeometry, QgsPointXY, QgsFillSymbol,
+    QgsMarkerSymbol,
 )
 from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
@@ -49,10 +52,19 @@ SCENES = [
      "separate download, just a second rendering of the same scene."),
     ("false_color", "False colour (NIR-R-G)",
      "NIR-red-green: vegetation pops bright red, fresh bare scar reads dark."),
+    ("swir_falsecolor", "SWIR false colour (12-11-4)",
+     "SWIR2-SWIR1-Red (Sentinel-2 B12-B11-B4 / Landsat swir2-swir1-red): snow and "
+     "clean ice read dark blue, fresh rock/ice-avalanche debris reads bright "
+     "orange/brown — the highest-contrast combo for spotting debris on a glacier. "
+     "PlanetScope has no SWIR, so this is Sentinel-2/Landsat only."),
     ("ndvi", "NDVI (pre & post)",
      "Raw NDVI before and after — the inputs behind dNDVI, for thresholding by eye."),
     ("dndvi", "NDVI change (dNDVI)",
      "pre→post NDVI change; vegetation loss is a strong negative."),
+    ("dndsi", "NDSI change (dNDSI)",
+     "pre→post snow-index change; new dark debris on snow/ice reads a strong "
+     "negative — the debris-on-glacier signal where there's no vegetation to lose. "
+     "Sentinel-2/Landsat only (needs SWIR)."),
     ("dbright", "Brightness change (dBrightness)",
      "pre→post broadband brightness/albedo change; bare rock/soil reads positive."),
 ]
@@ -123,6 +135,29 @@ MUTED_FG = QColor(120, 120, 120)
 # 60 s default aborts them ("Network request … timed out"). 3 minutes.
 NETWORK_TIMEOUT_MS = 180000
 
+# NASA Earthdata (URS) login, modelled on the qgis-nasa-earthdata-plugin settings
+# tab. We validate a username/password with a Basic-auth GET to the URS token API
+# (200 = valid, 401/403 = bad) and, on success, persist them to ~/.netrc + the
+# EARTHDATA_* env vars — the exact form earthaccess / rasterio / the run subprocess
+# read automatically. URS host is the machine name used in the .netrc entry.
+EARTHDATA_TOKENS_URL = "https://urs.earthdata.nasa.gov/api/users/tokens"
+EARTHDATA_HOST = "urs.earthdata.nasa.gov"
+EARTHDATA_REGISTER_URL = "https://urs.earthdata.nasa.gov/"
+
+# status-line colours shared by the login panel (green ok / red fail / amber hint)
+STATUS_COLORS = {
+    "success": "#2e7d32", "error": "#c62828",
+    "warn": "#e65100", "info": "palette(mid)",
+}
+
+# Responsive text: the dock rescales its base font with its own size so the panel
+# stays readable whether it's a cramped side dock or a large floating window. The
+# scale is the geometric mean of the width/height ratios vs this baseline (so both
+# dimensions contribute — a change in the aspect ratio still moves it), clamped to
+# [MIN, MAX] so text never becomes unreadably small or cartoonishly large.
+FONT_BASE_W, FONT_BASE_H = 380, 720
+FONT_SCALE_MIN, FONT_SCALE_MAX = 0.8, 1.5
+
 
 class LandslideDock(QgsDockWidget):
     def __init__(self, iface):
@@ -131,6 +166,7 @@ class LandslideDock(QgsDockWidget):
         self.canvas = iface.mapCanvas()
         self.task = None
         self.settings = QgsSettings()
+        self._ed_reply = None        # in-flight Earthdata credential-check request
         self._preview_reply = None   # in-flight thumbnail request (if any)
         self._preview_pix = None     # last loaded preview, kept for rescaling
         self._preview_fallback = None  # baked thumb to retry if a render URL fails
@@ -145,7 +181,48 @@ class LandslideDock(QgsDockWidget):
         self._gdal_tuned = False     # GDAL /vsicurl options set once
         self._gallery_replies = []   # in-flight quicklook-thumbnail requests
         self._footprint_layers = []  # scene-footprint vector layers on the map
-        self.setWidget(self._build_dock())
+        # baseline font the responsive rescaling is measured from (point size if
+        # the theme uses one, else pixel size); _last_font_scale guards against
+        # re-applying an unchanged size on every resize tick.
+        base_font = self.font()
+        self._base_font_pt = base_font.pointSizeF()
+        self._base_font_px = base_font.pixelSize()
+        self._last_font_scale = None
+        self.setWidget(self._wrap_scrollable(self._build_dock()))
+        self._init_project_state()
+
+    # ---------- per-project persistence ----------
+    def _init_project_state(self):
+        """Bind the dock's inputs to the CURRENT QGIS project, so every project
+        keeps its own AOI/date/options (see project_state.py). Restores straight
+        away because the dock is usually opened after the project, then follows
+        the project signals: written into the .qgz as it saves, read back when
+        another project is opened, reset to defaults on File > New."""
+        from .project_state import ProjectState
+        self.project_state = ProjectState(self)
+        project = QgsProject.instance()
+        project.writeProject.connect(self.project_state.save)
+        project.readProject.connect(self.project_state.restore)
+        project.cleared.connect(self.project_state.restore)
+        self.project_state.restore()
+
+    def _wrap_scrollable(self, inner):
+        """Put the whole dock inside a scroll area so the panel can always be read
+        top-to-bottom and left-to-right, even when the docked area is smaller than
+        the content (narrow side dock, small screen, many stacked controls).
+
+        setWidgetResizable(True) lets the content fill the viewport when there's
+        room; a minimum width forces a HORIZONTAL scrollbar (rather than crushing
+        the form/table) once the dock is narrower than that, and the VERTICAL
+        scrollbar appears whenever the stacked controls are taller than the dock."""
+        inner.setMinimumWidth(360)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(inner)
+        return scroll
 
     # ---------- top-level layout: shared Environment + tabbed sources ----------
     def _build_dock(self):
@@ -154,6 +231,9 @@ class LandslideDock(QgsDockWidget):
         Data/Orders/Tiles system). Environment (venv/project/out) is shared because
         both tabs launch the SAME venv subprocess."""
         from .planet_tab import PlanetTab
+        from .sar_tab import SarTab
+        from .viewer3d_tab import Viewer3DTab
+        from .volume_tab import VolumeTab
         container = QWidget()
         outer = QVBoxLayout(container)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -163,6 +243,15 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
         self.planet_tab = PlanetTab(self)
         tabs.addTab(self.planet_tab, "PlanetScope")
+        self.sar_tab = SarTab(self)
+        tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
+        self.viewer3d_tab = Viewer3DTab(self)
+        tabs.addTab(self.viewer3d_tab, "3D viewer")
+        # The one tab that consumes the review step's output rather than
+        # producing imagery: it measures the polygon you digitized and converts
+        # scar area to volume. Runs entirely in-process — no venv subprocess.
+        self.volume_tab = VolumeTab(self)
+        tabs.addTab(self.volume_tab, "Volume from area")
         outer.addWidget(tabs, 1)
         return container
 
@@ -199,6 +288,9 @@ class LandslideDock(QgsDockWidget):
         w = QWidget()
         root = QVBoxLayout(w)
 
+        # --- NASA Earthdata login (drop-down) ---
+        root.addWidget(self._build_earthdata_box())
+
         # --- event inputs ---
         form = QFormLayout()
         self.lat_edit = QLineEdit()
@@ -214,7 +306,7 @@ class LandslideDock(QgsDockWidget):
         self.radius_spin = QDoubleSpinBox()
         self.radius_spin.setRange(0.2, 50.0)
         self.radius_spin.setSingleStep(0.5)
-        self.radius_spin.setValue(3.0)
+        self.radius_spin.setValue(5.0)
         self.radius_spin.setSuffix(" km")
         form.addRow("Search radius", self.radius_spin)
 
@@ -222,6 +314,26 @@ class LandslideDock(QgsDockWidget):
         self.dt_edit.setCalendarPopup(True)
         self.dt_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
         form.addRow("Event time (UTC)", self.dt_edit)
+
+        # --- add the entered location to the map (drop-down + button) ---
+        # "Add point" drops a marker at the lat/lon; "Add search area" draws a
+        # translucent red circle of the search radius. Both are memory layers, so
+        # nothing is written to disk. Placed right under the event time so the
+        # location can be sanity-checked on the canvas before searching.
+        self.point_area_combo = QComboBox()
+        self.point_area_combo.addItem("Add point", "point")
+        self.point_area_combo.addItem("Add search area", "area")
+        self.point_area_combo.setToolTip(
+            "Add a QGIS layer for the entered location: a marker at the "
+            "latitude/longitude, or a translucent red circle of the search "
+            "radius.")
+        add_pa_btn = QPushButton("Add")
+        add_pa_btn.setFixedWidth(56)
+        add_pa_btn.clicked.connect(self._add_point_or_area)
+        pa_row = QHBoxLayout()
+        pa_row.addWidget(self.point_area_combo, 1)
+        pa_row.addWidget(add_pa_btn)
+        form.addRow("Point and area", pa_row)
 
         self.auto_check = QCheckBox("Auto: tightest window (nearest clear scene each side)")
         self.auto_check.setToolTip(
@@ -244,22 +356,35 @@ class LandslideDock(QgsDockWidget):
             self.source_combo.addItem(label, value)
         form.addRow("Imagery source", self.source_combo)
 
-        # max whole-scene cloud cover to consider. Scene-wide metric: per-pixel
-        # cloud masking still applies, so a high value surfaces scenes that are
-        # clear over the AOI but cloudy elsewhere — i.e. what Planet Explorer shows.
+        # Cloud filtering is OFF by default: eo:cloud_cover is a whole-scene metric
+        # over a 110 km granule, so it says nothing about your few-km AOI, and
+        # filtering on it hides the cloudy-scene-wide acquisitions that are often
+        # perfectly clear over the point — plus every scene you'd need in order to
+        # judge that call yourself. Search lists them all; you look at the
+        # thumbnails and tick what's usable. Tick the box to cap it anyway.
+        self.cloud_filter_check = QCheckBox("Hide scenes cloudier than")
+        self.cloud_filter_check.setChecked(False)
+        self.cloud_filter_check.setToolTip(
+            "Off (default): NO cloud filtering — every scene in the window is "
+            "listed, clouds and all, so you can see the clouds and pick by eye.\n"
+            "On: drop scenes whose WHOLE-SCENE cloud cover exceeds the value on "
+            "the right. That is a scene-wide metric, not your AOI — a scene can be "
+            "90% cloudy overall and still clear over your point, so this filter "
+            "throws away usable scenes. Use it only to thin a very long list.")
         self.cloud_spin = QDoubleSpinBox()
         self.cloud_spin.setRange(0.0, 100.0)
         self.cloud_spin.setDecimals(0)
         self.cloud_spin.setSingleStep(5.0)
         self.cloud_spin.setValue(80.0)
         self.cloud_spin.setSuffix(" %")
-        self.cloud_spin.setToolTip(
-            "Maximum WHOLE-SCENE cloud cover to consider. This is a scene-wide "
-            "metric, not your AOI — per-pixel cloud masking still applies later, "
-            "so a high value surfaces scenes that are clear over your point but "
-            "cloudy elsewhere (matching Planet Explorer). Lower it to only consider "
-            "mostly-clear scenes.")
-        form.addRow("Max cloud %", self.cloud_spin)
+        self.cloud_spin.setEnabled(False)
+        self.cloud_spin.setToolTip(self.cloud_filter_check.toolTip())
+        self.cloud_filter_check.toggled.connect(self.cloud_spin.setEnabled)
+        cloud_row = QHBoxLayout()
+        cloud_row.addWidget(self.cloud_filter_check)
+        cloud_row.addWidget(self.cloud_spin)
+        cloud_row.addStretch(1)
+        form.addRow("Cloud filter", cloud_row)
         root.addLayout(form)
 
         # --- which review "scenes" to download ---
@@ -285,18 +410,21 @@ class LandslideDock(QgsDockWidget):
         btn_row = QHBoxLayout()
         self.search_btn = QPushButton("Search / Preview")
         self.search_btn.setToolTip(
-            "Free dry-run: search candidate before/after scenes per source and "
-            "show them below. No Planet orders are placed and nothing is "
-            "downloaded — use it to check coverage before a full Run.")
+            "Free dry-run: list the candidate before/after scenes per source, "
+            "nearest the event date first, and show them below with their browse "
+            "images. Nothing is downloaded and no order is placed — use it to check "
+            "coverage and pick the scenes before a full Run. Cloudy scenes are "
+            "listed too unless you turn the cloud filter on.")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
-            "Render the nearest before & after scenes in Highlight Optimized "
-            "Natural Color straight onto the QGIS canvas (clipped to the AOI) — "
-            "no download, no order. Works for Sentinel-2 and Landsat; run "
-            "Search / Preview first to find the scenes. Toggle the two layers' "
-            "visibility to compare before vs after. (PlanetScope has no single "
-            "streamable scene, so it's previewed as a thumbnail only.)")
+            "Render the TICKED scene(s) in Highlight Optimized Natural Color "
+            "straight onto the QGIS canvas (clipped to the AOI) — no download, no "
+            "order. Tick the scenes you want in the table, or double-click a row to "
+            "preview just that one; with nothing ticked the ★ best before & after "
+            "scenes are used. Works for Sentinel-2 and Landsat; run Search / "
+            "Preview first to find the scenes. Toggle the layers' visibility to "
+            "compare before vs after. (PlanetScope has its own tab.)")
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
         self.run_btn = QPushButton("Run")
@@ -313,10 +441,13 @@ class LandslideDock(QgsDockWidget):
         # draw each candidate scene's footprint on the map (off by default)
         self.footprint_check = QCheckBox("Show scene footprints on map")
         self.footprint_check.setToolTip(
-            "Draw each candidate scene's footprint outline on the canvas (before = "
-            "blue, after = green) plus the search AOI box, so you can see whether a "
-            "scene actually covers the AOI or leaves the epicentre in a diagonal "
-            "nodata gap. Off by default; refreshes after each Search / Preview.")
+            "Draw scene footprint outlines on the canvas (before = blue, after = "
+            "green) plus the search AOI box, so you can see whether a scene "
+            "actually covers the AOI or leaves the epicentre in a diagonal nodata "
+            "gap. With table rows selected, only THOSE scenes' footprints are "
+            "drawn — click a row to isolate its granule, Ctrl/Shift-click for "
+            "several, click in empty table space to show all candidates again. Off "
+            "by default; refreshes after each Search / Preview.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
         root.addWidget(self.footprint_check)
 
@@ -334,14 +465,19 @@ class LandslideDock(QgsDockWidget):
         scenes_box = QVBoxLayout(scenes)
         scenes_box.setContentsMargins(0, 0, 0, 0)
         scenes_lbl = QLabel(
-            "Candidate scenes — tick the pre &amp; post scenes to composite")
+            "Candidate scenes  (★ = the run's pick each side; tick the scenes to "
+            "preview on the map and composite)")
         scenes_lbl.setToolTip(
-            "Each row has a checkbox. Only the ★ top-ranked scene on each side "
-            "starts ticked — by default the Run composites just that one clear pre "
-            "and one clear post. Tick more rows to median-composite several scenes, "
-            "or untick the ★ and tick another to swap in a different scene. "
-            "Hand-picking works for Sentinel-2 / Landsat; PlanetScope is left to "
-            "the automatic path.")
+            "Ticks choose the scenes: 'Preview on map' renders the TICKED rows and "
+            "a Run composites them (one before + one after minimum). Only the ★ "
+            "top-ranked scene on each side starts ticked — tick more to "
+            "median-composite several, or untick the ★ and tick another to swap in "
+            "a different scene.\n\n"
+            "Selecting a row (click; Ctrl/Shift-click for several) is separate: it "
+            "drives the browse-image preview below and isolates that scene's "
+            "footprint on the map. Double-click a row to preview just that scene.\n\n"
+            "Hand-picking works for Sentinel-2 / Landsat; PlanetScope has its own "
+            "tab.")
         scenes_box.addWidget(scenes_lbl)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -349,9 +485,12 @@ class LandslideDock(QgsDockWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        # Extended, like the PlanetScope tab: select one scene to isolate its
+        # footprint and browse image, Ctrl/Shift-click to compare several.
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
+        self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         scenes_box.addWidget(self.table)
         out_split.addWidget(scenes)
 
@@ -404,6 +543,165 @@ class LandslideDock(QgsDockWidget):
         logbox.setMinimumHeight(80)
         root.addWidget(out_split, 1)
         return w
+
+    # ---------- NASA Earthdata login (drop-down) ----------
+    def _build_earthdata_box(self):
+        """A collapsible 'NASA Earthdata Login' panel modelled on the
+        qgis-nasa-earthdata-plugin settings tab. The Sentinel-2 / Landsat pipeline
+        here streams from Microsoft's Planetary Computer (no login needed), so these
+        credentials are for NASA Earthdata-hosted products: enter a username +
+        password, we validate them against NASA URS and, on success, persist them to
+        ~/.netrc and the EARTHDATA_* env vars so any Earthdata download (earthaccess,
+        rasterio, the run subprocess) can authenticate. Collapsed by default."""
+        box = QgsCollapsibleGroupBox("NASA Earthdata Login")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        self.earthdata_box = box
+        form = QFormLayout(box)
+
+        info = QLabel(
+            'Optional: store NASA Earthdata credentials for NASA-hosted imagery '
+            'downloads. The Sentinel-2 / Landsat search above uses the Planetary '
+            'Computer and needs no login. Register at '
+            f'<a href="{EARTHDATA_REGISTER_URL}">urs.earthdata.nasa.gov</a>.')
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: palette(mid); }")
+        form.addRow(info)
+
+        self.ed_user_edit = QLineEdit(
+            self.settings.value("landslide/earthdata_user", "", type=str))
+        self.ed_user_edit.setPlaceholderText("NASA Earthdata username")
+        form.addRow("Username", self.ed_user_edit)
+
+        self.ed_pass_edit = QLineEdit()
+        self.ed_pass_edit.setEchoMode(QLineEdit.Password)
+        self.ed_pass_edit.setPlaceholderText("NASA Earthdata password")
+        self.ed_pass_edit.returnPressed.connect(self._earthdata_login)
+        form.addRow("Password", self.ed_pass_edit)
+
+        row = QWidget()
+        btns = QHBoxLayout(row)
+        btns.setContentsMargins(0, 0, 0, 0)
+        self.ed_login_btn = QPushButton("Test && save credentials")
+        self.ed_login_btn.setToolTip(
+            "Check the username/password against NASA URS. If valid, save them to "
+            "~/.netrc and the EARTHDATA_* environment variables for downloads.")
+        self.ed_login_btn.clicked.connect(self._earthdata_login)
+        self.ed_check_btn = QPushButton("Check .netrc")
+        self.ed_check_btn.setToolTip(
+            "Report whether ~/.netrc already holds a NASA Earthdata entry.")
+        self.ed_check_btn.clicked.connect(self._earthdata_check_netrc)
+        btns.addWidget(self.ed_login_btn)
+        btns.addWidget(self.ed_check_btn)
+        form.addRow(row)
+
+        self.ed_status = QLabel()
+        self.ed_status.setWordWrap(True)
+        form.addRow("Status", self.ed_status)
+        return box
+
+    def _set_ed_status(self, text, tone="info"):
+        self.ed_status.setText(text)
+        self.ed_status.setStyleSheet(
+            f"QLabel {{ color: {STATUS_COLORS.get(tone, 'palette(mid)')}; }}")
+
+    def _earthdata_login(self):
+        if self._ed_reply is not None:
+            return                       # a check is already in flight
+        user = self.ed_user_edit.text().strip()
+        pw = self.ed_pass_edit.text()
+        if not user or not pw:
+            self._set_ed_status(
+                "Enter your NASA Earthdata username and password.", "warn")
+            return
+        self._set_ed_status("Testing credentials against NASA URS…", "info")
+        self.ed_login_btn.setEnabled(False)
+        req = QNetworkRequest(QUrl(EARTHDATA_TOKENS_URL))
+        token = base64.b64encode(f"{user}:{pw}".encode()).decode()
+        req.setRawHeader(b"Authorization", ("Basic " + token).encode())
+        reply = QgsNetworkAccessManager.instance().get(req)
+        self._ed_reply = reply
+        reply.finished.connect(
+            lambda r=reply, u=user, p=pw: self._earthdata_login_done(r, u, p))
+
+    def _earthdata_login_done(self, reply, user, password):
+        if reply is not self._ed_reply:
+            reply.deleteLater()
+            return
+        self._ed_reply = None
+        self.ed_login_btn.setEnabled(True)
+        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        err = reply.error()
+        reply.deleteLater()
+        if err == QNetworkReply.NoError and status == 200:
+            try:
+                self._earthdata_save_netrc(user, password)
+            except OSError as e:
+                self._set_ed_status(
+                    f"Credentials valid, but writing ~/.netrc failed: {e}", "error")
+                return
+            self.settings.setValue("landslide/earthdata_user", user)
+            os.environ["EARTHDATA_USERNAME"] = user
+            os.environ["EARTHDATA_PASSWORD"] = password
+            self.ed_pass_edit.clear()
+            self._set_ed_status(
+                f"✓ Credentials valid — saved for {user} (~/.netrc + env vars).",
+                "success")
+        elif status in (401, 403):
+            self._set_ed_status(
+                "✗ Invalid NASA Earthdata username or password.", "error")
+        else:
+            self._set_ed_status(
+                f"Could not verify (HTTP {status or '—'}); nothing saved. "
+                "Check your connection and try again.", "error")
+
+    def _earthdata_save_netrc(self, username, password):
+        """Write the URS entry to ~/.netrc, replacing any existing one and keeping
+        other machines' entries (mirrors the reference plugin). chmod 600 on POSIX
+        so the stored password isn't world-readable."""
+        from pathlib import Path
+        netrc_path = Path.home() / ".netrc"
+        existing = ""
+        if netrc_path.exists():
+            try:
+                existing = netrc_path.read_text()
+            except OSError:
+                existing = ""
+        # keep every line except the old urs.earthdata.nasa.gov machine block
+        kept = []
+        skip = False
+        for line in (existing.splitlines() if existing.strip() else []):
+            if line.strip().startswith("machine"):
+                skip = EARTHDATA_HOST in line
+            if not skip:
+                kept.append(line)
+        entry = (f"machine {EARTHDATA_HOST}\n"
+                 f"    login {username}\n    password {password}\n")
+        head = "\n".join(kept).strip()
+        netrc_path.write_text((head + "\n\n" if head else "") + entry)
+        if platform.system() != "Windows":
+            import stat
+            os.chmod(netrc_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    def _earthdata_check_netrc(self):
+        from pathlib import Path
+        netrc_path = Path.home() / ".netrc"
+        if not netrc_path.exists():
+            self._set_ed_status("No ~/.netrc file found yet.", "warn")
+            return
+        try:
+            import netrc as netrc_mod
+            auth = netrc_mod.netrc(str(netrc_path)).authenticators(EARTHDATA_HOST)
+        except Exception as e:  # netrc raises on malformed/permission issues
+            self._set_ed_status(f"Could not read ~/.netrc: {e}", "error")
+            return
+        if auth and auth[0]:
+            self._set_ed_status(
+                f"✓ ~/.netrc has a NASA Earthdata entry for {auth[0]}.", "success")
+        else:
+            self._set_ed_status(
+                "~/.netrc exists but has no NASA Earthdata entry.", "warn")
 
     def _day_slider(self, value):
         s = QSlider(Qt.Horizontal)
@@ -469,13 +767,18 @@ class LandslideDock(QgsDockWidget):
         os.makedirs(out, exist_ok=True)
 
         when = self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm")
+        # cloud filter off -> 100, which run_single/imagery read as "no cap" and
+        # drop the eo:cloud_cover predicate entirely (not the same as 'lt 100',
+        # which would still discard overcast and metadata-less scenes).
+        max_cloud = (self.cloud_spin.value() if self.cloud_filter_check.isChecked()
+                     else 100.0)
         args = [
             "--lat", f"{lat:.6f}", "--lon", f"{lon:.6f}",
             "--datetime", when, "--radius-km", f"{self.radius_spin.value():.2f}",
             "--pre-days", str(self.pre_slider.value()),
             "--post-days", str(self.post_slider.value()),
             "--prefer", self.source_combo.currentData(),
-            "--max-cloud", f"{self.cloud_spin.value():.0f}",
+            "--max-cloud", f"{max_cloud:.0f}",
             "--out", out,
         ]
         if self.auto_check.isChecked():
@@ -565,9 +868,12 @@ class LandslideDock(QgsDockWidget):
         python, script, project, out, args = c
         args = args + ["--search-only"]
         self.log.clear()
+        # drop the old result BEFORE emptying the table: clearing rows fires a
+        # selection change, and the footprint refresh that hangs off it would
+        # otherwise redraw every stale candidate on its way out.
+        self._search_result = None    # invalidate map-preview until new results land
         self.table.setRowCount(0)
         self._preview_pix = None
-        self._search_result = None    # invalidate map-preview until new results land
         self.preview.setText("Select a scene to preview its browse image.")
         self._clear_gallery()
         self._clear_footprints()      # stale footprints go until the new search lands
@@ -594,7 +900,7 @@ class LandslideDock(QgsDockWidget):
         self._fill_table(result)
         self._load_gallery(result)
         if self.footprint_check.isChecked():
-            self._draw_footprints()
+            self._draw_footprints(log=True)
         for note in result.get("notes", []):
             self._append_log("note: " + note)
         # the map preview renders via the data API (Sentinel-2 or Landsat); enable
@@ -609,11 +915,14 @@ class LandslideDock(QgsDockWidget):
     def _fill_table(self, result):
         pre = result.get("pre", [])
         post = result.get("post", [])
-        # The dry-run lists are gap-sorted for display, but a Run does NOT pick the
-        # nearest scene — it ranks by the SAME cloud-weighted blend fetch_event uses
+        # The dry-run lists every acquisition near the event, nearest-first (clouds
+        # included — see imagery.search_event), but an AUTOMATIC Run does not pick
+        # the nearest scene: it ranks by the cloud-weighted blend fetch_event uses
         # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. So
-        # replicate that selection here: ★ = the run's top-ranked scene, ✓ = also in
-        # the composite, plain/greyed = ranked below the cutoff (not used).
+        # replicate that selection here: ★ = the scene that ranking leads with, ✓ =
+        # also in its composite, plain/greyed = below its cutoff. Those marks are a
+        # SUGGESTION — the ticks decide, and a greyed row is often the right pick
+        # once you've looked at where the cloud actually sits.
         sel = self._run_selection(pre, post, result.get("params", {}))
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
@@ -647,31 +956,36 @@ class LandslideDock(QgsDockWidget):
             side_item.setData(Qt.UserRole + 1, c.get("source", ""))
             side_item.setData(Qt.UserRole + 2, c.get("id"))
             side_item.setData(Qt.UserRole + 3, side)
-            # checkbox = include this scene in the Run's composite. Only the ★ top-
-            # ranked scene on each side starts ticked (the single nearest/clearest
-            # pick); tick more rows to median-composite several, or untick to swap in
-            # a different scene. Hand-pickable for Sentinel-2 / Landsat.
+            # checkbox = use this scene — 'Preview on map' renders the ticked rows
+            # and a Run composites them. Only the ★ top-ranked scene on each side
+            # starts ticked; tick more rows to median-composite several, or untick
+            # the ★ and tick another to swap in a different scene. Hand-pickable for
+            # Sentinel-2 / Landsat.
             side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
             side_item.setCheckState(Qt.Checked if is_top else Qt.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 5).setToolTip(c["thumb_url"])
             if is_top:
                 side_item.setToolTip(
-                    "★ The run's top-ranked scene on this side (gap_days + cloud "
-                    "weighting). With --auto-window it's the single scene used; "
-                    "otherwise the run median-composites this plus the ✓ scenes.")
+                    "★ The scene an automatic run would lead with on this side "
+                    "(gap_days + cloud weighting). With --auto-window it's the "
+                    "single scene used; otherwise a run would median-composite this "
+                    "plus the ✓ scenes.")
             elif in_comp:
                 side_item.setToolTip(
-                    "✓ Also in the run's composite — a Run medians the top-ranked "
-                    "clear scenes on this side, not just one.")
+                    "✓ An automatic run would also composite this — it medians the "
+                    "top-ranked clear scenes on this side, not just one.")
             else:
                 side_item.setToolTip(
-                    "Not used by the run: ranked below the composite cutoff "
-                    "(gap_days + cloud weighting).")
+                    "An automatic run would skip this one: ranked below the "
+                    "composite cutoff (gap_days + cloud weighting). That ranking "
+                    "knows nothing about WHERE the cloud sits, so check the "
+                    "thumbnail — a 'cloudy' scene is often clear over the AOI.")
             side_item.setToolTip(
-                side_item.toolTip() + "\n\nTick the checkbox to composite this "
-                "scene in the Run; untick to leave it out. Sentinel-2 / Landsat "
-                "only — PlanetScope can't be hand-picked.")
+                side_item.toolTip() + "\n\nTick the checkbox to use this scene: "
+                "'Preview on map' renders the ticked rows and a Run composites "
+                "them. Untick to leave it out. Sentinel-2 / Landsat only — "
+                "PlanetScope has its own tab.")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
 
@@ -726,6 +1040,10 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- scene preview ----------
     def _preview_selected(self):
+        # keep the footprint overlay in sync with the selection (selected rows
+        # only; all candidates when nothing is selected)
+        if self.footprint_check.isChecked():
+            self._draw_footprints()
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return
@@ -768,9 +1086,11 @@ class LandslideDock(QgsDockWidget):
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
+        # Prefer the stored (account/pasted) key over the ambient PL_API_KEY env var,
+        # matching the PlanetScope tab so a signed-in account outranks a stray env key.
         if source == "PlanetScope" and "api_key=" not in url:
-            key = (os.environ.get("PL_API_KEY")
-                   or self.settings.value("landslide/planet_api_key", "", type=str))
+            key = (self.settings.value("landslide/planet_api_key", "", type=str)
+                   or os.environ.get("PL_API_KEY"))
             if key:
                 url += ("&" if "?" in url else "?") + "api_key=" + key
         return url
@@ -814,7 +1134,33 @@ class LandslideDock(QgsDockWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._rescale_fonts()    # grow/shrink text with the dock size
         self._render_preview()   # keep the preview fit to the pane as it resizes
+
+    def _rescale_fonts(self):
+        """Scale the base font by how far the dock's size departs from the baseline.
+
+        Driven off the dock's OWN width/height (a stable size set by the user
+        dragging the dock), not the scrolled content — so changing the font can't
+        feed back into another resize and oscillate. The new font is set on the
+        dock, which Qt propagates to every child widget that hasn't overridden its
+        own font."""
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        scale = math.sqrt((w / FONT_BASE_W) * (h / FONT_BASE_H))
+        scale = max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, scale))
+        if self._last_font_scale is not None and abs(scale - self._last_font_scale) < 0.02:
+            return                       # negligible change -> skip the relayout
+        self._last_font_scale = scale
+        f = self.font()
+        if self._base_font_pt > 0:
+            f.setPointSizeF(round(self._base_font_pt * scale, 1))
+        elif self._base_font_px > 0:
+            f.setPixelSize(max(1, round(self._base_font_px * scale)))
+        else:                            # neither reported -> assume 9 pt default
+            f.setPointSizeF(round(9.0 * scale, 1))
+        self.setFont(f)
 
     # ---------- quicklook gallery (all candidates' thumbnails at once) ----------
     def _clear_gallery(self):
@@ -918,7 +1264,7 @@ class LandslideDock(QgsDockWidget):
     # ---------- scene footprints on the map ----------
     def _on_footprint_toggle(self, checked):
         if checked:
-            self._draw_footprints()
+            self._draw_footprints(log=True)
         else:
             self._clear_footprints()
 
@@ -950,17 +1296,31 @@ class LandslideDock(QgsDockWidget):
             return None
         return None
 
-    def _draw_footprints(self):
-        """Draw each candidate scene's footprint (before = blue, after = green) plus
-        the search AOI box, so you can see whether a scene covers the AOI or leaves
-        the epicentre in a nodata gap. Memory layers, tracked for clean removal."""
+    def _selected_ids(self):
+        """Scene ids of the currently selected table rows."""
+        ids = set()
+        for idx in self.table.selectionModel().selectedRows():
+            cell = self.table.item(idx.row(), 0)
+            if cell is not None and cell.data(Qt.UserRole + 2):
+                ids.add(cell.data(Qt.UserRole + 2))
+        return ids
+
+    def _draw_footprints(self, log=False):
+        """Draw footprints for the SELECTED table rows (before = blue, after =
+        green) — or for every candidate when nothing is selected — plus the search
+        AOI box, so you can see whether a scene covers the AOI or leaves the
+        epicentre in a nodata gap. Redrawn on each selection change, so clicking a
+        row isolates its granule instead of the full overlapping pile. Memory
+        layers, tracked for clean removal."""
         self._clear_footprints()
         result = self._search_result
         if not result:
             return
+        sel = self._selected_ids()
         added = 0
         for side, outline in (("pre", "0,90,200"), ("post", "0,150,60")):
-            cands = [c for c in result.get(side, []) if c.get("geometry")]
+            cands = [c for c in result.get(side, []) if c.get("geometry")
+                     and (not sel or c.get("id") in sel)]
             if not cands:
                 continue
             lyr = QgsVectorLayer("Polygon?crs=EPSG:4326",
@@ -1020,8 +1380,12 @@ class LandslideDock(QgsDockWidget):
             aoi.renderer().setSymbol(sym)
             QgsProject.instance().addMapLayer(aoi)
             self._footprint_layers.append(aoi)
-        if added:
-            self._append_log(f"Drew {added} scene footprint(s) + AOI on the map.")
+        # Only announce the first draw after a search: this now also runs on every
+        # selection change, and logging each one would bury the run output.
+        if added and log:
+            self._append_log(
+                f"Drew {added} scene footprint(s) + AOI on the map. Select rows in "
+                f"the table to show only those scenes' footprints.")
 
     # ---------- preview on map (Highlight Optimized Natural Color AOI render) ----------
     def _best_streamable(self, side):
@@ -1044,30 +1408,45 @@ class LandslideDock(QgsDockWidget):
                 return ranked[0]
         return None
 
-    def _selected_streamable_by_side(self):
-        """side -> the streamable (S2/Landsat) candidate selected in the table.
-
-        Lets 'Preview on map' honour a row you picked instead of always using the
-        run's ★ scene. The table is single-select, so at most one side is set."""
-        out = {"pre": None, "post": None}
-        if not self._search_result:
-            return out
-        by_id = {}
+    def _candidate_by_id(self, cid):
+        """(side, candidate) for scene `cid` in the last search result, or None."""
+        if not cid or not self._search_result:
+            return None
         for side in ("pre", "post"):
             for c in self._search_result.get(side, []):
-                if c.get("id"):
-                    by_id[c["id"]] = (side, c)
-        for idx in self.table.selectionModel().selectedRows():
-            cell = self.table.item(idx.row(), 0)
-            if cell and cell.data(Qt.UserRole + 1) in STREAMABLE:
-                info = by_id.get(cell.data(Qt.UserRole + 2))
-                if info:
-                    out[info[0]] = info[1]
-        return out
+                if c.get("id") == cid:
+                    return side, c
+        return None
+
+    def _preview_picks(self):
+        """[(side, candidate, why), …] for Preview on map, from the TICKED rows.
+
+        Same rule as the PlanetScope tab: ticks choose the scenes — tick one to
+        preview it, tick several to compare. With nothing streamable ticked, fall
+        back to the ★ best-ranked scene on each side so the button still gives a
+        sensible before/after pair. Row SELECTION only drives the browse-image
+        pane and the footprint overlay. PlanetScope rows are skipped: the data API
+        can't render them."""
+        picks = []
+        for r in range(self.table.rowCount()):
+            cell = self.table.item(r, 0)
+            if cell is None or cell.checkState() != Qt.Checked:
+                continue
+            if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+                continue
+            info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+            if info:
+                picks.append((info[0], info[1], "ticked"))
+        if not picks:                    # nothing ticked -> the run's pick per side
+            for side in ("pre", "post"):
+                c = self._best_streamable(side)
+                if c and c.get("id"):
+                    picks.append((side, c, "★ best"))
+        return picks
 
     def _clear_preview_layers(self):
         """Remove the rasters a previous Preview-on-map added, so each preview
-        shows just the current selection/★ pair instead of piling up."""
+        shows just the current pick instead of piling up."""
         for lyr in self._preview_added:
             try:
                 QgsProject.instance().removeMapLayer(lyr.id())
@@ -1075,11 +1454,25 @@ class LandslideDock(QgsDockWidget):
                 pass
         self._preview_added = []
 
-    def _preview_on_map(self):
-        """Render the selected (or run's ★) pre & post scenes over the AOI.
+    def _preview_row_on_map(self, item):
+        """Double-click a row -> preview exactly that one scene (ignores ticks)."""
+        cell = self.table.item(item.row(), 0)
+        if cell is None:
+            return
+        if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+            self._warn("Only Sentinel-2 / Landsat scenes can be rendered on the map.")
+            return
+        info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+        if info:
+            self._render_picks([(info[0], info[1], "double-clicked")])
 
-        Per side, previews the streamable (Sentinel-2 / Landsat) row you selected in
-        the table, or the best-ranked scene if you didn't select one on that side.
+    def _preview_on_map(self):
+        """Render the ticked (or ★ best) scenes over the AOI."""
+        self._render_picks(self._preview_picks())
+
+    def _render_picks(self, picks):
+        """Render [(side, candidate, why), …] onto the canvas, clipped to the AOI.
+
         Downloads a Highlight Optimized Natural Color GeoTIFF clipped to the search
         box from the Planetary Computer data API (raw SR bands + our stretch — no
         'visual' TCI white-out, no SAS signing) and loads each as a georeferenced
@@ -1089,19 +1482,16 @@ class LandslideDock(QgsDockWidget):
         if bbox is None:
             self._warn("Run Search / Preview first (need the AOI location).")
             return
-        chosen = self._selected_streamable_by_side()
-        scenes = []
-        for side in ("pre", "post"):
-            c = chosen[side] or self._best_streamable(side)
-            if c and c.get("id"):
-                date = (c.get("date") or "")[:10]
-                pick = "selected" if chosen[side] else "★ best"
-                short = "S2" if c.get("source") == "Sentinel-2" else "Landsat"
-                scenes.append((f"{short} {side} {date}".strip(), c["id"],
-                               c.get("cog_url"), c.get("source"), pick))
-        if not scenes:
-            self._warn("No streamable (Sentinel-2 / Landsat) scene to preview.")
+        if not picks:
+            self._warn("No streamable (Sentinel-2 / Landsat) scene to preview — "
+                       "tick the scene(s) you want in the table.")
             return
+        scenes = []
+        for side, c, why in picks:
+            date = (c.get("date") or "")[:10]
+            short = "S2" if c.get("source") == "Sentinel-2" else "Landsat"
+            scenes.append((f"{short} {side} {date}".strip(), c["id"],
+                           c.get("cog_url"), c.get("source"), why))
         self._append_log(
             f"Preview on map: rendering Highlight Optimized Natural Color over the "
             f"AOI for {len(scenes)} scene(s)…")
@@ -1111,8 +1501,8 @@ class LandslideDock(QgsDockWidget):
         self._preview_failed = []
         self._tif_fallbacks = []
         self._tif_pending = len(scenes)
-        for label, item_id, cog_url, source, pick in scenes:
-            self._append_log(f"  {label} ({pick})")
+        for label, item_id, cog_url, source, why in scenes:
+            self._append_log(f"  {label} ({why})")
             self._download_aoi_tif(label, item_id, cog_url, bbox, source)
 
     def _ensure_network_timeout(self, ms=NETWORK_TIMEOUT_MS):
@@ -1287,6 +1677,67 @@ class LandslideDock(QgsDockWidget):
         else:
             self._warn("Preview on map: no scene could be loaded.")
 
+    # ---------- add point / search-area to the map ----------
+    def _add_point_or_area(self):
+        """Drop-down action: add the entered location to the map as either a point
+        marker or a translucent search-radius circle. Memory layers only."""
+        try:
+            lat = float(self.lat_edit.text().strip())
+            lon = float(self.lon_edit.text().strip())
+        except ValueError:
+            self._warn("Enter valid numeric latitude and longitude first.")
+            return
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            self._warn("Latitude must be -90..90 and longitude -180..180.")
+            return
+        if self.point_area_combo.currentData() == "point":
+            self._add_point_layer(lat, lon)
+        else:
+            self._add_area_layer(lat, lon, self.radius_spin.value())
+
+    def _add_point_layer(self, lat, lon):
+        """A red marker at the entered lat/lon (memory point layer)."""
+        lyr = QgsVectorLayer("Point?crs=EPSG:4326", "Event point", "memory")
+        f = QgsFeature()
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+        lyr.dataProvider().addFeatures([f])
+        lyr.updateExtents()
+        sym = QgsMarkerSymbol.createSimple({
+            "name": "circle",
+            "color": "255,0,0",
+            "outline_color": "255,255,255",
+            "outline_width": "0.4",
+            "size": "3.5",
+        })
+        lyr.renderer().setSymbol(sym)
+        QgsProject.instance().addMapLayer(lyr)
+        self._append_log(f"Added event point at {lat:.6f}, {lon:.6f}.")
+
+    def _add_area_layer(self, lat, lon, radius_km):
+        """A search-radius circle: red outline, 25%-opacity red fill (memory
+        polygon layer). Built as an N-sided ring using the same degree scaling as
+        the AOI box, so it stays round on the map at any latitude."""
+        dlat = radius_km / 111.32
+        dlon = radius_km / (111.32 * math.cos(math.radians(lat)))
+        n = 72
+        ring = [QgsPointXY(lon + dlon * math.cos(2 * math.pi * i / n),
+                           lat + dlat * math.sin(2 * math.pi * i / n))
+                for i in range(n + 1)]
+        lyr = QgsVectorLayer("Polygon?crs=EPSG:4326",
+                             f"Search area — {radius_km:g} km", "memory")
+        f = QgsFeature()
+        f.setGeometry(QgsGeometry.fromPolygonXY([ring]))
+        lyr.dataProvider().addFeatures([f])
+        lyr.updateExtents()
+        sym = QgsFillSymbol.createSimple({
+            "color": "255,0,0,64",         # red fill @ ~25% opacity
+            "outline_color": "255,0,0",
+            "outline_width": "0.6",
+        })
+        lyr.renderer().setSymbol(sym)
+        QgsProject.instance().addMapLayer(lyr)
+        self._append_log(f"Added {radius_km:g} km search-area circle.")
+
     def _zoom_to_aoi(self):
         """Frame the canvas on the search AOI (lat/lon + radius box) so the
         landslide point is centred rather than lost in the full S2 granule."""
@@ -1386,19 +1837,40 @@ class LandslideDock(QgsDockWidget):
         self.settings.setValue("landslide/out", self.out_edit.text().strip())
 
     def teardown(self):
-        if self._preview_reply is not None:
-            self._preview_reply.abort()
-            self._preview_reply = None
-        for reply in self._sign_replies:
-            reply.abort()
-        self._sign_replies = []
-        for reply in self._gallery_replies:
+        # drop the project-signal connections first: they'd otherwise fire into
+        # deleted widgets when the plugin is unloaded/reloaded with QGIS open
+        state = getattr(self, "project_state", None)
+        if state is not None:
+            project = QgsProject.instance()
+            for signal, slot in ((project.writeProject, state.save),
+                                 (project.readProject, state.restore),
+                                 (project.cleared, state.restore)):
+                try:
+                    signal.disconnect(slot)
+                except TypeError:
+                    pass
+            self.project_state = None
+        for attr in ("_preview_reply", "_ed_reply"):
+            reply = getattr(self, attr, None)
+            if reply is not None:
+                try:
+                    reply.abort()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
+        for reply in self._sign_replies + self._tif_replies + self._gallery_replies:
             try:
                 reply.abort()
             except RuntimeError:
                 pass
+        self._sign_replies = []
+        self._tif_replies = []
         self._gallery_replies = []
         if self.task is not None:
             self.task.cancel()
         if getattr(self, "planet_tab", None) is not None:
             self.planet_tab.teardown()
+        if getattr(self, "sar_tab", None) is not None:
+            self.sar_tab.teardown()
+        if getattr(self, "viewer3d_tab", None) is not None:
+            self.viewer3d_tab.teardown()

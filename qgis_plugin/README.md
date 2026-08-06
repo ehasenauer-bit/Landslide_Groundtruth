@@ -64,11 +64,12 @@ pipeline falls back to Sentinel-2/Landsat.
 3. Choose an **Imagery source** (Auto recommended; pick PlanetScope for small
    slides once Planet is authenticated).
 4. Tune what the search considers:
-   - **Max cloud %** (default 80) — the maximum *whole-scene* cloud cover to
-     consider. It's a scene-wide number, not your AOI, and per-pixel cloud masking
-     still runs afterwards, so a high value surfaces scenes that are clear over
-     your point but cloudy elsewhere (what Planet Explorer shows). Lower it for
-     mostly-clear scenes only.
+   - **Cloud filter** (*off by default*) — with the box unticked there is **no**
+     cloud filtering: every scene in the window is listed, clouds and all, so you
+     can see the clouds and pick by eye. `eo:cloud_cover` is a scene-wide number
+     over a ~110 km granule, not your AOI, and per-pixel cloud masking still runs
+     afterwards — so a "90% cloudy" scene is regularly the clearest thing you have
+     over the epicentre. Tick the box (and set a %) only to thin a very long list.
    - **AOI overlap (match Planet Explorer)** (default on) — accept any PlanetScope
      scene overlapping the search box. Uncheck to require the scene to cover the
      exact epicentre (stricter; can miss the nearest scenes).
@@ -79,22 +80,33 @@ pipeline falls back to Sentinel-2/Landsat.
      geo/radiometric calibration — fine for spotting/digitizing a scar by eye, but
      eyeball them before trusting NDVI/reflectance values.
 5. **Search / Preview** (free) → lists the candidate before/after scenes per
-   source in the table, with date, day-gap, cloud %, and source. **No orders are
-   placed and nothing downloads** — use it to dial the event in before paying.
-   Three things help you pick the right clear scene before a Run:
+   source in the table, nearest the event date first, with date, day-gap, cloud %,
+   and source. **No orders are placed and nothing downloads** — use it to dial the
+   event in before paying.
+
+   Scene picking works the same way as the PlanetScope tab:
+   - **Ticks choose the scenes.** The ★ row on each side (what the automatic
+     ranking would lead with) starts ticked; *Preview on map* renders the ticked
+     rows and a **Run** composites them. Tick several on a side to
+     median-composite them, or untick the ★ and tick another to swap scenes. The
+     ★/✓ marks are a suggestion — greyed rows are ranked below the automatic
+     cutoff, not unusable, and with the cloud filter off that's often where the
+     near-date scene you actually want is sitting.
+   - **Selection is separate.** Click a row (Ctrl/Shift-click for several) to load
+     its browse image in the preview pane and isolate its footprint on the map;
+     double-click a row to preview just that one scene on the canvas.
    - **Quicklook gallery** — every pre and post candidate's browse thumbnail at
      once, grouped Before / After, so you can scan for the scene that's cloud-free
-     over the AOI in one glance. Click a thumbnail to select that scene (it drives
-     the big preview and *Preview on map*).
-   - **Show scene footprints on map** (checkbox, off by default) — draws each
-     candidate's footprint outline (before = blue, after = green) plus the search
-     AOI box, so you can see whether a scene actually covers the AOI or leaves the
-     epicentre in a diagonal nodata gap.
-   - **Preview on map** — renders the selected (or best-ranked) before & after
-     scene over the AOI in *Highlight Optimized Natural Color* — the same look as
-     the Run's `*_highlight.tif`, streamed from the data API with no download or
-     order. Works for **Sentinel-2 and Landsat** (PlanetScope has no single
-     streamable scene, so it previews as a thumbnail in the gallery only).
+     over the AOI in one glance. Click a thumbnail to select that scene.
+   - **Show scene footprints on map** (checkbox, off by default) — draws footprint
+     outlines (before = blue, after = green) plus the search AOI box, so you can
+     see whether a scene covers the AOI or leaves the epicentre in a diagonal
+     nodata gap. With rows selected only *those* scenes' footprints are drawn;
+     with nothing selected, all candidates are.
+   - **Preview on map** — renders the ticked (or ★ best) before & after scenes
+     over the AOI in *Highlight Optimized Natural Color* — the same look as the
+     Run's `*_highlight.tif`, streamed from the data API with no download or
+     order. Works for **Sentinel-2 and Landsat** (PlanetScope has its own tab).
 6. **Run** → composites the imagery and loads the layers. Watch the log/progress;
    **Cancel** stops the subprocess.
 7. When a Run finishes, the log shows a **SATELLITE USED** banner naming the source

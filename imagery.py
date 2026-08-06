@@ -89,11 +89,30 @@ def _search_items(cat, *, attempts=3, **search_kwargs):
                 time.sleep(wait)
     raise last_exc
 
-S2_BANDS = ["B04", "B08", "B03", "B02", "SCL"]          # red, nir, green, blue, scene class
-LS_BANDS = ["red", "nir08", "green", "blue", "qa_pixel"]
+S2_BANDS = ["B04", "B08", "B03", "B02", "B11", "B12", "SCL"]   # red, nir, green, blue, swir1, swir2, scene class
+LS_BANDS = ["red", "nir08", "green", "blue", "swir16", "swir22", "qa_pixel"]
 
 S2_BAD_SCL = [0, 1, 3, 8, 9, 10]   # nodata, saturated, cloud shadow, cloud med/high, cirrus
                                     # NOTE: 11 = snow/ice intentionally kept (see mask note below)
+
+# Dry-run (search_event) candidate cap per side, mirroring sar_imagery: the
+# preview's job is to show what was actually acquired near the event so the
+# scenes can be judged by eye, so it lists more than the 6 a Run composites, and
+# the cap grows with the window instead of silently truncating it. Each extra
+# candidate costs one more server-side quicklook render in the plugin's gallery,
+# hence the ceiling. Sentinel-2's revisit is ~5 days (longer where neighbouring
+# orbits don't overlap), so days/5 tracks the real supply.
+PREVIEW_LIMIT = 12
+PREVIEW_MAX_LIMIT = 24
+
+
+def _preview_limit_for(days):
+    return max(PREVIEW_LIMIT, min(PREVIEW_MAX_LIMIT, round(days / 5)))
+
+
+def _no_cloud_cap(max_cloud):
+    """True when 'max cloud %' means no filtering at all (None or >= 100)."""
+    return max_cloud is None or max_cloud >= 100
 
 
 def _utm_epsg(lat, lon):
@@ -134,9 +153,15 @@ def search_scenes(lat, lon, radius_km, start, end, collection, event_time,
         near the event date; a large weight recovers the old least-cloudy order.
       None  -> rank by temporal proximity to event_time alone (the tightest
         --auto-window mode: pick the single nearest acceptably-clear scene).
+
+    max_cloud None or >= 100 drops the cloud predicate ENTIRELY rather than
+    querying 'lt 100'. The two are not the same: a property query also discards
+    items that don't carry eo:cloud_cover at all, and an overcast scene reports
+    exactly 100. "No cap" has to mean every acquisition in the window is
+    listed — that's what lets a scene be judged by eye instead of by metadata.
     """
     cat = _client()
-    query = {"eo:cloud_cover": {"lt": max_cloud}}
+    query = None if _no_cloud_cap(max_cloud) else {"eo:cloud_cover": {"lt": max_cloud}}
     items = _search_items(
         cat,
         collections=[collection],
@@ -233,23 +258,37 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                  cloud_weight=0.5, max_cloud_pct=None):
     """Free dry-run: candidate Sentinel-2 OR Landsat scenes per side, no download.
 
-    Searches exactly one sensor ('s2' or 'landsat') using the SAME window and
-    ranking logic as fetch_event, so what you preview is what a real run would
-    composite. Returns dict(source, pre=[...], post=[...]). STAC search is free;
-    no scenes are streamed or composited here. The caller chooses which sensor(s)
-    to query (e.g. both, for prefer='auto').
-    max_cloud_pct: whole-tile cloud cap (0-100); None -> mode default (60, or 20
-    under auto_window). Tile-wide metric; per-pixel SCL/QA masking still applies."""
+    Searches exactly one sensor ('s2' or 'landsat') over the SAME window as
+    fetch_event. Returns dict(source, pre=[...], post=[...]). STAC search is
+    free; no scenes are streamed or composited here. The caller chooses which
+    sensor(s) to query (e.g. both, for prefer='auto').
+
+    Deliberately does NOT reuse the run's cloud-weighted ranking to choose WHICH
+    candidates to list. That blend (gap_days + cloud_weight*cloud_pct) is the
+    right way to auto-pick scenes to composite, but as a listing rule it hides
+    the cloudy near-date acquisitions — the very scenes you need to see to judge
+    whether a run's automatic pick was sensible, or to hand-pick a scene whose
+    cloud sits off the AOI. So the preview lists the nearest-in-time
+    _preview_limit_for(days) scenes per side; `cloud_weight` is accepted for
+    symmetry with fetch_event but not applied here — the plugin re-ranks the
+    returned rows with that same blend to mark the run's pick (★) among them.
+
+    max_cloud_pct: whole-tile cloud cap (0-100); None or >= 100 -> no cap, every
+    acquisition in the window is listed. Tile-wide metric anyway — per-pixel
+    SCL/QA masking still applies to whatever a Run composites."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
     pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
-    weight = None if auto_window else cloud_weight   # None = nearest-only (auto_window)
-    lim = 1 if auto_window else 6
-    cloud = max_cloud_pct if max_cloud_pct is not None else (20 if auto_window else 60)
+    # cloud_weight=None -> nearest day first, clearest as the tie-break: both what
+    # auto_window's single pick needs (it is fetch_event's own rule there) and what
+    # the browse listing wants.
+    pre_lim = 1 if auto_window else _preview_limit_for(pre_days)
+    post_lim = 1 if auto_window else _preview_limit_for(post_days)
+    cloud = 20 if (max_cloud_pct is None and auto_window) else max_cloud_pct
     pre_items = search_scenes(lat, lon, radius_km, pre0, pre1, coll, event_time,
-                              max_cloud=cloud, limit=lim, cloud_weight=weight)
+                              max_cloud=cloud, limit=pre_lim, cloud_weight=None)
     post_items = search_scenes(lat, lon, radius_km, post0, post1, coll, event_time,
-                               max_cloud=cloud, limit=lim, cloud_weight=weight)
+                               max_cloud=cloud, limit=post_lim, cloud_weight=None)
     return dict(source=src,
                 pre=[_stac_candidate(i, event_time, src) for i in pre_items],
                 post=[_stac_candidate(i, event_time, src) for i in post_items])
@@ -268,15 +307,19 @@ def _composite(items, lat, lon, radius_km, sensor):
     if sensor == "s2":
         scl = stack.sel(band="SCL")
         good = ~scl.isin(S2_BAD_SCL)
-        data = stack.sel(band=["B04", "B08", "B03", "B02"]).where(good) / 10000.0
-        data = data.assign_coords(band=["red", "nir", "green", "blue"])
+        # B11/B12 are natively 20 m; stackstac has resampled them to the 10 m grid
+        # above, so they align with red/nir/green/blue for the SWIR products.
+        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(good) / 10000.0
+        data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     else:
         qa = stack.sel(band="qa_pixel").astype("uint16")
         # QA_PIXEL bits: 1 dilated cloud, 3 cloud, 4 cloud shadow  (bit 5 snow kept)
         bad = ((qa & (1 << 1)) > 0) | ((qa & (1 << 3)) > 0) | ((qa & (1 << 4)) > 0)
-        data = stack.sel(band=["red", "nir08", "green", "blue"]).where(~bad)
+        # swir16/swir22 are Landsat's SWIR1/SWIR2; same C2 L2 scale/offset as the
+        # other surface-reflectance bands, so they rescale together below.
+        data = stack.sel(band=["red", "nir08", "green", "blue", "swir16", "swir22"]).where(~bad)
         data = data * 0.0000275 - 0.2  # Landsat C2 L2 scale/offset
-        data = data.assign_coords(band=["red", "nir", "green", "blue"])
+        data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         comp = data.median(dim="time", skipna=True).compute()
@@ -287,6 +330,28 @@ def _composite(items, lat, lon, radius_km, sensor):
 def _ndvi(comp):
     r, n = comp.sel(band="red"), comp.sel(band="nir")
     return ((n - r) / (n + r)).clip(-1, 1)
+
+
+def _has_swir(comp):
+    """True if the composite carries the SWIR bands (both S2 and Landsat do now).
+
+    A guard for the old manual-selection / cached paths and any future sensor that
+    might composite without SWIR, so the SWIR products degrade to 'skip' instead of
+    raising a KeyError deep in the export."""
+    return "swir1" in list(comp.coords["band"].values)
+
+
+def _ndsi(comp):
+    """Normalised-Difference Snow Index, (green - swir1) / (green + swir1).
+
+    Snow/ice is bright in green and near-zero in SWIR1, so clean snow sits high
+    (~0.4-1.0); bare rock, fresh landslide/rock-avalanche debris and debris-covered
+    ice sit low. On a glacier a pre->post NDSI DROP is therefore a direct 'new dark
+    debris on snow' signal — the complement to the brightness/NDVI change, and the
+    one that works where there is no vegetation to lose (Sentinel-2 uses B03/B11,
+    Landsat green/swir16)."""
+    g, s = comp.sel(band="green"), comp.sel(band="swir1")
+    return ((g - s) / (g + s)).clip(-1, 1)
 
 
 def _brightness(comp):
@@ -328,9 +393,17 @@ def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
     dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
     bright_pre, bright_post = _brightness(pre), _brightness(post)
     dbright = (bright_post - bright_pre).rename("dbright")
+    # NDSI change — snow->debris on the glacier reads as a strong negative dNDSI.
+    # Guarded so a SWIR-less composite still returns a valid (SWIR-free) result.
+    if _has_swir(pre) and _has_swir(post):
+        ndsi_pre, ndsi_post = _ndsi(pre), _ndsi(post)
+        dndsi = (ndsi_post - ndsi_pre).rename("dndsi")
+    else:
+        ndsi_pre = ndsi_post = dndsi = None
     return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
                 dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
-                dbright=dbright, sensor=sensor,
+                dbright=dbright, ndsi_pre=ndsi_pre, ndsi_post=ndsi_post,
+                dndsi=dndsi, sensor=sensor,
                 pre_scenes=[i.id for i in pre_items],
                 post_scenes=[i.id for i in post_items],
                 fallback_note=fallback_note)
