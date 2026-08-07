@@ -1570,17 +1570,26 @@ class PlanetTab(QWidget):
             return None
 
     def _refresh_recall_combo(self, entries=None):
-        """Fill 'Cached orders' with the orders already paid for near the current AOI.
+        """Fill 'Cached orders' with the orders already paid for, this AOI's first.
 
         Refreshed after a search — so you can see what this account already owns here
         BEFORE spending quota on Render detail — and after any render/recall, so a new
         order shows up straight away. `entries` comes from render.json's 'available'
-        block when a run just produced one; otherwise the ledger is read directly."""
+        block when a run just produced one; otherwise the ledger is read directly.
+
+        Orders near the AOI head the list, because those are the ones that answer
+        "do I need to spend quota on this event?". Everything else the account has
+        paid for follows under a separator instead of being dropped: before a search
+        there is often no AOI to filter on, so the picker listed the whole ledger and
+        then appeared to LOSE orders the moment you hit Search. They are all still
+        recallable — an order from another location simply composites to nothing over
+        this AOI and says so — so hiding them only made paid-for imagery unreachable."""
         combo = getattr(self, "recall_combo", None)
         if combo is None:
             return
-        if entries is None:
-            pc = self._ledger()
+        near, rest = entries, []
+        pc = self._ledger()
+        if near is None:
             if pc is None:
                 return
             aoi = self._recall_aoi()
@@ -1593,25 +1602,45 @@ class PlanetTab(QWidget):
                 # project — this runs on the GUI thread and walking venv/ would stall it.
                 pc.adopt([base_out, os.path.join(project, "out"),
                           os.path.join(project, "Output")], log=lambda *_: None)
-                entries = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2])
-                           if aoi else pc.entries())
+                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2])
+                        if aoi else pc.entries())
             except Exception as e:
                 self._append_log(f"could not list cached Planet orders: {e}")
                 return
+        if pc is not None:
+            try:
+                seen = {e.get("order_id") for e in near or []}
+                rest = [e for e in pc.entries() if e.get("order_id") not in seen]
+            except Exception:
+                rest = []          # the near list is the important half; don't lose it
         keep = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Newest cached order per side", None)
-        for e in entries or []:
+        n = 0
+
+        def _add(e, suffix=""):
             oid, side = e.get("order_id"), e.get("side")
             if not oid or side not in ("pre", "post"):
-                continue
-            combo.addItem(e.get("label") or oid, (side, oid))
+                return 0
+            combo.addItem((e.get("label") or oid) + suffix, (side, oid))
+            return 1
+
+        for e in near or []:
+            n += _add(e)
+        if rest:
+            added = 0
+            mark = combo.count()
+            for e in rest:
+                # the event id is what tells these apart once they're out of area
+                added += _add(e, f" · {e.get('event_id') or 'other AOI'}")
+            if added:
+                combo.insertSeparator(mark)
+                n += added
         if keep is not None:
             idx = combo.findData(keep)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
-        n = combo.count() - 1
         combo.setEnabled(n > 0)
         self.recall_btn.setEnabled(n > 0 and self.task is None)
         return n
