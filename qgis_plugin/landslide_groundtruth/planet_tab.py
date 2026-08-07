@@ -95,6 +95,15 @@ QPushButton {{ border-radius: 4px; padding: 5px 10px; }}
 QLineEdit, QComboBox, QDoubleSpinBox, QDateTimeEdit {{
     border: 1px solid palette(mid); border-radius: 4px; padding: 3px 6px;
 }}
+/* Styling a QComboBox makes Qt drop the native popup for one that grows to fit
+   EVERY item — with a ledger of orders that runs off the bottom of the screen and
+   can't be scrolled. combobox-popup: 0 restores the list-view popup, which honours
+   setMaxVisibleItems() and gives it a scrollbar. */
+QComboBox {{ combobox-popup: 0; }}
+QComboBox QAbstractItemView {{
+    border: 1px solid palette(mid); selection-background-color: {TEAL};
+    selection-color: white;
+}}
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus {{
     border: 1px solid {TEAL};
 }}
@@ -495,6 +504,11 @@ class PlanetTab(QWidget):
             "the most recent before & after. Empty means nothing has been ordered here "
             "yet — the first 'Render detail' is the only one that costs quota.")
         self.recall_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        # The ledger is cumulative — every order this account has ever paid for near
+        # the AOI shows up here — so cap the drop-down and let it scroll instead of
+        # growing past the bottom of the screen. Needs 'combobox-popup: 0' in the
+        # theme, or Qt ignores this and renders one unscrollable list.
+        self.recall_combo.setMaxVisibleItems(12)
         self.recall_combo.setEnabled(False)
         self.recall_btn.setEnabled(False)
         recall_row.addWidget(self.recall_combo, 1)
