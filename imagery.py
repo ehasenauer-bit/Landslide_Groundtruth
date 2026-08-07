@@ -9,8 +9,13 @@ Strategy per event:
   post window: [t + 1 day, t + post_days]
   Rank scenes in each window by a blend of temporal distance to the event and
   cloud cover (gap_days + cloud_weight * cloud_pct) so the composite stays close
-  to the event date, take the best N, cloud/snow-mask them, median-composite,
+  to the event date, take the best N, median-composite them AS ACQUIRED,
   compute NDVI, then dNDVI = post - pre.
+
+  No cloud removal: pixels are never dropped for cloud, shadow or cirrus (only
+  scene fill/nodata is), so a downloaded layer shows the scene the way it was
+  acquired — clouds included — instead of holes where a mask fired. See
+  `_composite`.
 
 Alaska caveats handled here:
   - Winter/shoulder-season events: snow makes dNDVI useless. If --seasonal is
@@ -92,8 +97,11 @@ def _search_items(cat, *, attempts=3, **search_kwargs):
 S2_BANDS = ["B04", "B08", "B03", "B02", "B11", "B12", "SCL"]   # red, nir, green, blue, swir1, swir2, scene class
 LS_BANDS = ["red", "nir08", "green", "blue", "swir16", "swir22", "qa_pixel"]
 
-S2_BAD_SCL = [0, 1, 3, 8, 9, 10]   # nodata, saturated, cloud shadow, cloud med/high, cirrus
-                                    # NOTE: 11 = snow/ice intentionally kept (see mask note below)
+# Scene-classification values that mean "there is no measurement here": 0 nodata,
+# 1 saturated/defective. Those are the ONLY classes dropped — the cloud classes
+# (3 shadow, 8/9 cloud medium/high, 10 cirrus) and 11 snow/ice are deliberately
+# kept, so a run downloads the scene as acquired rather than a cloud-masked one.
+S2_NODATA_SCL = [0, 1]
 
 # Dry-run (search_event) candidate cap per side, mirroring sar_imagery: the
 # preview's job is to show what was actually acquired near the event so the
@@ -274,8 +282,9 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     returned rows with that same blend to mark the run's pick (★) among them.
 
     max_cloud_pct: whole-tile cloud cap (0-100); None or >= 100 -> no cap, every
-    acquisition in the window is listed. Tile-wide metric anyway — per-pixel
-    SCL/QA masking still applies to whatever a Run composites."""
+    acquisition in the window is listed. Tile-wide metric, and the only cloud
+    handling there is: a Run composites the scenes as acquired, with no per-pixel
+    cloud masking (see _composite), so what you see listed is what you get."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
     pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
@@ -295,7 +304,18 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
 
 
 def _composite(items, lat, lon, radius_km, sensor):
-    """Cloud-masked median composite. Returns dataset with red/nir/green/blue (reflectance 0-1)."""
+    """Median composite of the scenes AS ACQUIRED — no cloud removal.
+
+    Returns a dataset with red/nir/green/blue/swir1/swir2 (reflectance 0-1).
+
+    Cloud, cloud-shadow and cirrus pixels are kept: the scenes are chosen by eye
+    in the plugin (or by the cloud-weighted ranking), and a mask that punches
+    them out leaves transparent holes exactly where you are trying to look, which
+    reads as terrain change rather than as weather. Only pixels that carry no
+    measurement at all — the scene fill/nodata classes — are dropped, so an
+    acquisition's diagonal nodata gap stays transparent instead of turning into a
+    black wedge of "reflectance 0". With one scene per side (--auto-window, or a
+    single ticked scene) the output is therefore that scene verbatim."""
     epsg = _utm_epsg(lat, lon)
     bands = S2_BANDS if sensor == "s2" else LS_BANDS
     res = 10 if sensor == "s2" else 30
@@ -306,18 +326,20 @@ def _composite(items, lat, lon, radius_km, sensor):
     )
     if sensor == "s2":
         scl = stack.sel(band="SCL")
-        good = ~scl.isin(S2_BAD_SCL)
+        measured = ~scl.isin(S2_NODATA_SCL)   # fill/defective only — never cloud
         # B11/B12 are natively 20 m; stackstac has resampled them to the 10 m grid
         # above, so they align with red/nir/green/blue for the SWIR products.
-        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(good) / 10000.0
+        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured) / 10000.0
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     else:
         qa = stack.sel(band="qa_pixel").astype("uint16")
-        # QA_PIXEL bits: 1 dilated cloud, 3 cloud, 4 cloud shadow  (bit 5 snow kept)
-        bad = ((qa & (1 << 1)) > 0) | ((qa & (1 << 3)) > 0) | ((qa & (1 << 4)) > 0)
+        # QA_PIXEL bit 0 = fill (outside the imaged swath) — the only bit applied.
+        # The cloud bits (1 dilated cloud, 3 cloud, 4 cloud shadow) are left alone
+        # on purpose, as is bit 5 snow; see the docstring.
+        fill = (qa & 1) > 0
         # swir16/swir22 are Landsat's SWIR1/SWIR2; same C2 L2 scale/offset as the
         # other surface-reflectance bands, so they rescale together below.
-        data = stack.sel(band=["red", "nir08", "green", "blue", "swir16", "swir22"]).where(~bad)
+        data = stack.sel(band=["red", "nir08", "green", "blue", "swir16", "swir22"]).where(~fill)
         data = data * 0.0000275 - 0.2  # Landsat C2 L2 scale/offset
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     with warnings.catch_warnings():
@@ -375,6 +397,15 @@ def _has_coverage(comp):
     return bool(np.isfinite(comp.sel(band="red").values).any())
 
 
+def _item_dates(items):
+    """Acquisition dates ('YYYY-MM-DD') of the given STAC items, in item order.
+
+    The review package puts these in the exported layer FILENAMES (and hence the
+    QGIS layer names), so a layer says which day it was imaged without opening the
+    metadata; items with no datetime are skipped rather than named 'None'."""
+    return [i.datetime.strftime("%Y-%m-%d") for i in items if i.datetime is not None]
+
+
 def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
                       fallback_note=None, auto_window=False):
     """Composite the given pre/post items and derive the review products.
@@ -406,6 +437,8 @@ def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
                 dndsi=dndsi, sensor=sensor,
                 pre_scenes=[i.id for i in pre_items],
                 post_scenes=[i.id for i in post_items],
+                pre_dates=_item_dates(pre_items),
+                post_dates=_item_dates(post_items),
                 fallback_note=fallback_note)
 
 
@@ -429,8 +462,9 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
     a small weight keeps the composite close to the event date. Ignored when
     auto_window is set (that mode ranks by proximity only).
     max_cloud_pct: whole-scene/tile cloud-cover cap (0-100); None -> the source
-    default. Scene-wide metric; per-pixel masking still applies, so a higher cap
-    recovers scenes clear over the AOI but cloudy elsewhere.
+    default. Scene-wide metric, so a higher cap recovers scenes clear over the AOI
+    but cloudy elsewhere; the scenes it admits are composited as acquired (no
+    per-pixel cloud masking — see _composite).
     require_point: PlanetScope only — require each scene to cover the exact
     epicentre (True) vs. merely overlap the AOI box (False, default). Passed
     through to planet_imagery.fetch_event; ignored by the STAC sources.

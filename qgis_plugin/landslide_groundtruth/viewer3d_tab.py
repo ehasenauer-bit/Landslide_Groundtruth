@@ -28,6 +28,7 @@ helpers it shared (dem_diff.warp / utm_bounds / write_gtiff) are reused above.
 """
 import os
 import math
+import re
 
 import numpy as np
 
@@ -78,6 +79,12 @@ TERRAIN_RES = [
 # AOI will do (this is context terrain, not a dated pre/post pair).
 SEARCH_PRE_DAYS = 3650
 SEARCH_POST_DAYS = 3650
+
+# An acquisition-date tag in a run's layer name: '_2023-08-09', or the
+# '_2023-08-05_to_2023-08-09' span of a multi-scene composite (see
+# review_package._date_tag). Stripped before pairing pre with post, since the two
+# sides carry DIFFERENT dates by definition and would otherwise never match.
+_DATE_TAG_RE = re.compile(r"_\d{4}-\d{2}-\d{2}(?:_to_\d{4}-\d{2}-\d{2})?(?=_|$)")
 
 
 class Viewer3DTab(QWidget):
@@ -809,33 +816,59 @@ class Viewer3DTab(QWidget):
         """Loaded (pre, post) raster pairs as (label, pre_id, post_id).
 
         Matched by name so it works on whatever's in the project: the run's
-        …_pre_<kind> / …_post_<kind> outputs (rgb, swir, highlight, ndvi, …) and
-        the PlanetScope before/after previews. Our own '(3D cache)' copies are
-        excluded so we never try to cache a cache."""
+        …_pre_<date>_<kind> / …_post_<date>_<kind> outputs (rgb, swir, highlight,
+        ndvi, …) and the PlanetScope before/after previews. The acquisition-date
+        tag is stripped before matching — it differs between the two sides, which
+        is the whole point of it — and put back in the label, so the picker says
+        which dates the flip compares. Our own '(3D cache)' copies are excluded so
+        we never try to cache a cache."""
         rasters = [l for l in self._project_rasters()
                    if not l.name().endswith("(3D cache)")]
-        by_name = {l.name(): l for l in rasters}
+        # Grouped by the undated name, so '…_pre_2023-07-28_rgb' finds
+        # '…_post_2023-08-09_rgb' under the shared key '…_post_rgb'. A list per key,
+        # not one layer: two runs of the same event (different dates, or an older
+        # undated run) can be loaded at once and both deserve a flip entry.
+        by_key = {}
+        for l in rasters:
+            by_key.setdefault(_DATE_TAG_RE.sub("", l.name()), []).append(l)
         raw = []   # (kind_label, base, pre_lyr, post_lyr)
-        for name, lyr in by_name.items():
-            idx = name.find("_pre_")
+        for key, pres in by_key.items():
+            idx = key.find("_pre_")
             if idx == -1:
                 continue
-            base, kind = name[:idx], name[idx + len("_pre_"):]
-            post = by_name.get(f"{base}_post_{kind}")
-            if post is not None:
-                raw.append((kind.replace("_", " "), base, lyr, post))
+            base, kind = key[:idx], key[idx + len("_pre_"):]
+            posts = by_key.get(f"{base}_post_{kind}") or []
+            # name order = date order, so each pre meets the post of its own run
+            for pre_l, post_l in zip(sorted(pres, key=lambda l: l.name()),
+                                     sorted(posts, key=lambda l: l.name())):
+                raw.append((kind.replace("_", " ") + self._date_span(pre_l, post_l),
+                            base, pre_l, post_l))
         multi = len({b for _, b, _, _ in raw}) > 1
         out = []
         for kind, base, pre, post in raw:
             out.append((f"{base} · {kind}" if multi else kind, pre.id(), post.id()))
-        # PlanetScope before/after previews (first of each, if both present)
-        ps_pre = next((l for n, l in by_name.items()
-                       if n.startswith("PlanetScope before")), None)
-        ps_post = next((l for n, l in by_name.items()
-                        if n.startswith("PlanetScope after")), None)
+        # PlanetScope before/after previews (first of each, if both present).
+        # Matched on the layer names as-is — that tab names its own layers.
+        ps_pre = next((l for l in rasters
+                       if l.name().startswith("PlanetScope before")), None)
+        ps_post = next((l for l in rasters
+                        if l.name().startswith("PlanetScope after")), None)
         if ps_pre is not None and ps_post is not None:
             out.append(("PlanetScope before/after", ps_pre.id(), ps_post.id()))
         return out
+
+    @staticmethod
+    def _date_span(pre_lyr, post_lyr):
+        """' (2023-07-28 → 2023-08-09)' from the two layer names, or '' if undated.
+
+        The dates are already in the names (review_package puts them there); this
+        just lifts them into the flip label so the picker reads as a comparison of
+        two dates rather than of two anonymous layers."""
+        def tag(lyr):
+            m = _DATE_TAG_RE.search(lyr.name())
+            return m.group(0).lstrip("_").replace("_to_", "–") if m else None
+        pre, post = tag(pre_lyr), tag(post_lyr)
+        return f"  ({pre} → {post})" if pre and post else ""
 
     def _find_point_layer(self):
         for l in QgsProject.instance().mapLayers().values():

@@ -57,6 +57,9 @@ def process_one(ev, args):
         status="ok", event_id=ev["event_id"], sensor=img["sensor"],
         n_pre_scenes=len(img["pre_scenes"]), n_post_scenes=len(img["post_scenes"]),
         pre_scenes=img["pre_scenes"], post_scenes=img["post_scenes"],
+        # acquisition dates of the composited scenes; the plugin logs them, and
+        # they are already baked into the layer filenames (see review_package)
+        pre_dates=img.get("pre_dates"), post_dates=img.get("post_dates"),
         layers=layers, metadata=meta_path,
         fallback_note=img.get("fallback_note"),   # why PlanetScope wasn't used, if it fell back
     )

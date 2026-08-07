@@ -3,21 +3,25 @@
 This is purely the visual-review hinge — there is NO automatic delineation. The
 package gives a human everything needed to spot a landslide scar by eye and
 digitize it in QGIS. Which of these "scenes" get written is selectable (see
-SCENE_KEYS / the `scenes` arg); by default all are produced:
+SCENE_KEYS / the `scenes` arg); by default all are produced.
 
-  <event>_pre_rgb.tif        true-colour BEFORE (context, false-positive check)
-  <event>_post_rgb.tif       true-colour AFTER
-  <event>_pre_highlight.tif  Highlight Optimized Natural Color BEFORE (see _highlight_natural)
-  <event>_post_highlight.tif Highlight Optimized Natural Color AFTER
-  <event>_pre_falsecolor.tif NIR-red-green BEFORE  (vegetation = bright red)
-  <event>_post_falsecolor.tif NIR-red-green AFTER  (fresh scar = dark/bare)
-  <event>_pre_swir.tif       SWIR false colour BEFORE (12-11-4: snow blue, rock/debris orange)
-  <event>_post_swir.tif      SWIR false colour AFTER  (fresh debris on snow = orange/brown)
-  <event>_dndsi.tif          pre->post NDSI change  (new debris on snow/ice = strong negative)
-  <event>_pre_ndvi.tif       NDVI BEFORE
-  <event>_post_ndvi.tif      NDVI AFTER
-  <event>_dndvi.tif          pre->post NDVI change  (vegetation loss = strong negative)
-  <event>_dbright.tif        pre->post brightness/albedo change (bare rock/soil = positive)
+Every imagery layer carries the ACQUISITION DATE of the scene(s) behind it in its
+filename — and therefore in its QGIS layer name (`<pre>` / `<post>` below, see
+`_date_tag`), so a loaded layer always says when it was imaged:
+
+  <event>_pre_<pre>_rgb.tif        true-colour BEFORE (context, false-positive check)
+  <event>_post_<post>_rgb.tif      true-colour AFTER
+  <event>_pre_<pre>_highlight.tif  Highlight Optimized Natural Color BEFORE (see _highlight_natural)
+  <event>_post_<post>_highlight.tif Highlight Optimized Natural Color AFTER
+  <event>_pre_<pre>_falsecolor.tif NIR-red-green BEFORE  (vegetation = bright red)
+  <event>_post_<post>_falsecolor.tif NIR-red-green AFTER  (fresh scar = dark/bare)
+  <event>_pre_<pre>_swir.tif       SWIR false colour BEFORE (12-11-4: snow blue, rock/debris orange)
+  <event>_post_<post>_swir.tif     SWIR false colour AFTER  (fresh debris on snow = orange/brown)
+  <event>_pre_<pre>_ndvi.tif       NDVI BEFORE
+  <event>_post_<post>_ndvi.tif     NDVI AFTER
+  <event>_dndvi_<pre>_vs_<post>.tif   pre->post NDVI change  (vegetation loss = strong negative)
+  <event>_dndsi_<pre>_vs_<post>.tif   pre->post NDSI change  (new debris on snow/ice = strong negative)
+  <event>_dbright_<pre>_vs_<post>.tif pre->post brightness/albedo change (bare rock/soil = positive)
   <event>_point.gpkg         the predicted (seismic) epicentre to search around (always written)
   <event>_metadata.json      sensor + scene ids/dates used, and the layer file list
 
@@ -376,6 +380,37 @@ def _highlight_natural(comp, path, src_crs, contrast=1.0):
     rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
 
 
+def _date_tag(dates):
+    """Filename tag for the acquisition date(s) behind one side's composite.
+
+    One scene (the usual case, and always with --auto-window) -> '2023-08-09'.
+    Several scenes composited together -> '2023-08-05_to_2023-08-09', the span
+    they cover, so the layer name can't imply a single acquisition it isn't.
+    Empty/absent dates -> '' and the caller falls back to an undated filename
+    (a composite from a source that doesn't report dates, e.g. an older cache).
+    """
+    uniq = sorted({d for d in (dates or []) if d})
+    if not uniq:
+        return ""
+    return uniq[0] if len(uniq) == 1 else f"{uniq[0]}_to_{uniq[-1]}"
+
+
+def _tagged(base, side, tag, kind):
+    """'<base>_<side>_<date>_<kind>.tif' — the date dropped when there isn't one."""
+    return f"{base}_{side}_{tag}_{kind}.tif" if tag else f"{base}_{side}_{kind}.tif"
+
+
+def _change_path(base, kind, pre_tag, post_tag):
+    """'<base>_<kind>_<pre>_vs_<post>.tif' for a pre->post change raster.
+
+    Both dates go in the name: a change layer is only meaningful as a pair, and
+    the pair is what you need to know when reading it (a 3-day dNDVI and a
+    3-month one are different measurements)."""
+    if pre_tag and post_tag:
+        return f"{base}_{kind}_{pre_tag}_vs_{post_tag}.tif"
+    return f"{base}_{kind}.tif"
+
+
 def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None):
     """Write the per-event review layers QGIS opens. Returns the list of layer paths.
 
@@ -383,6 +418,9 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
          (pre, post, ndvi_pre/post, dndvi, dbright composites on a shared grid;
          Sentinel-2/Landsat also carry swir1/swir2 bands and a dndsi composite —
          PlanetScope has no SWIR, so those keys are absent/None and skip cleanly).
+         `pre_dates`/`post_dates` (acquisition dates of the scenes composited per
+         side) go into the filenames; a source that omits them still exports, just
+         with undated names.
     near_pt: (x, y) predicted epicentre in src_crs, written as the search point.
     scenes: which products to write — a subset of SCENE_KEYS. None/empty -> all.
             The predicted-point layer is always written regardless.
@@ -390,56 +428,72 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.join(out_dir, event_id)
     want = set(scenes) if scenes else set(SCENE_KEYS)
+    # acquisition dates of the composited scenes -> into every layer's filename,
+    # which is what QGIS shows as the layer name (see dock._load_layers)
+    pre_tag = _date_tag(img.get("pre_dates"))
+    post_tag = _date_tag(img.get("post_dates"))
     layers = []
+
+    def pair(kind):
+        """(pre_path, post_path) for a two-sided product, dated per side."""
+        return _tagged(base, "pre", pre_tag, kind), _tagged(base, "post", post_tag, kind)
 
     # true-colour pre/post — context and false-positive checks (clearcut, burn, cloud)
     if "true_color" in want:
-        _rgb(img["pre"], ["red", "green", "blue"], f"{base}_pre_rgb.tif", src_crs)
-        _rgb(img["post"], ["red", "green", "blue"], f"{base}_post_rgb.tif", src_crs)
-        layers += [f"{base}_pre_rgb.tif", f"{base}_post_rgb.tif"]
+        pre_p, post_p = pair("rgb")
+        _rgb(img["pre"], ["red", "green", "blue"], pre_p, src_crs)
+        _rgb(img["post"], ["red", "green", "blue"], post_p, src_crs)
+        layers += [pre_p, post_p]
 
     # Highlight Optimized Natural Color pre/post — same bands, cube-root tone curve
     if "highlight_natural" in want:
-        _highlight_natural(img["pre"], f"{base}_pre_highlight.tif", src_crs)
-        _highlight_natural(img["post"], f"{base}_post_highlight.tif", src_crs)
-        layers += [f"{base}_pre_highlight.tif", f"{base}_post_highlight.tif"]
+        pre_p, post_p = pair("highlight")
+        _highlight_natural(img["pre"], pre_p, src_crs)
+        _highlight_natural(img["post"], post_p, src_crs)
+        layers += [pre_p, post_p]
 
     # false-colour (NIR-red-green) — vegetation pops bright red, fresh bare scar reads dark
     if "false_color" in want:
-        _rgb(img["pre"], ["nir", "red", "green"], f"{base}_pre_falsecolor.tif", src_crs)
-        _rgb(img["post"], ["nir", "red", "green"], f"{base}_post_falsecolor.tif", src_crs)
-        layers += [f"{base}_pre_falsecolor.tif", f"{base}_post_falsecolor.tif"]
+        pre_p, post_p = pair("falsecolor")
+        _rgb(img["pre"], ["nir", "red", "green"], pre_p, src_crs)
+        _rgb(img["post"], ["nir", "red", "green"], post_p, src_crs)
+        layers += [pre_p, post_p]
 
     # SWIR false colour (S2 12-11-4 / Landsat swir2-swir1-red) — fresh rock/ice-
     # avalanche debris on snow reads bright orange/brown against dark-blue snow, the
     # highest-contrast band combo for spotting debris on a glacier. Guarded on the
     # SWIR bands so a SWIR-less composite (older cache/manual path) just skips it.
     if "swir_falsecolor" in want and "swir1" in list(img["pre"].coords["band"].values):
-        _rgb(img["pre"], ["swir2", "swir1", "red"], f"{base}_pre_swir.tif", src_crs)
-        _rgb(img["post"], ["swir2", "swir1", "red"], f"{base}_post_swir.tif", src_crs)
-        layers += [f"{base}_pre_swir.tif", f"{base}_post_swir.tif"]
+        pre_p, post_p = pair("swir")
+        _rgb(img["pre"], ["swir2", "swir1", "red"], pre_p, src_crs)
+        _rgb(img["post"], ["swir2", "swir1", "red"], post_p, src_crs)
+        layers += [pre_p, post_p]
 
     # raw NDVI pre/post — the inputs behind dNDVI, handy for thresholding by eye
     if "ndvi" in want:
+        pre_p, post_p = pair("ndvi")
         img["ndvi_pre"].rename("ndvi").rio.write_crs(src_crs).rio.to_raster(
-            f"{base}_pre_ndvi.tif", driver="GTiff")
+            pre_p, driver="GTiff")
         img["ndvi_post"].rename("ndvi").rio.write_crs(src_crs).rio.to_raster(
-            f"{base}_post_ndvi.tif", driver="GTiff")
-        layers += [f"{base}_pre_ndvi.tif", f"{base}_post_ndvi.tif"]
+            post_p, driver="GTiff")
+        layers += [pre_p, post_p]
 
     # change rasters — where a scar lights up
     if "dndvi" in want:
-        img["dndvi"].rio.write_crs(src_crs).rio.to_raster(f"{base}_dndvi.tif", driver="GTiff")
-        layers.append(f"{base}_dndvi.tif")
+        path = _change_path(base, "dndvi", pre_tag, post_tag)
+        img["dndvi"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        layers.append(path)
     # NDSI change — new dark debris on snow/ice drives NDSI down, so a strong
     # NEGATIVE dNDSI is the debris-on-glacier signal (works where there is no
     # vegetation for dNDVI to catch). None when the composite carried no SWIR.
     if "dndsi" in want and img.get("dndsi") is not None:
-        img["dndsi"].rio.write_crs(src_crs).rio.to_raster(f"{base}_dndsi.tif", driver="GTiff")
-        layers.append(f"{base}_dndsi.tif")
+        path = _change_path(base, "dndsi", pre_tag, post_tag)
+        img["dndsi"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        layers.append(path)
     if "dbright" in want and img.get("dbright") is not None:
-        img["dbright"].rio.write_crs(src_crs).rio.to_raster(f"{base}_dbright.tif", driver="GTiff")
-        layers.append(f"{base}_dbright.tif")
+        path = _change_path(base, "dbright", pre_tag, post_tag)
+        img["dbright"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        layers.append(path)
 
     # the predicted epicentre to search around (digitize the scar against it)
     pt = gpd.GeoDataFrame([{"geometry": Point(near_pt), "kind": "predicted"}], crs=src_crs)
@@ -463,6 +517,10 @@ def write_metadata(out_dir, ev, img, layers):
         n_post_scenes=len(img["post_scenes"]),
         pre_scenes=img["pre_scenes"],
         post_scenes=img["post_scenes"],
+        # acquisition dates of those scenes — the same dates the layer filenames
+        # carry, listed per scene here rather than collapsed to a span
+        pre_dates=img.get("pre_dates"),
+        post_dates=img.get("post_dates"),
         layers=layers,
     )
     path = os.path.join(out_dir, f"{ev['event_id']}_metadata.json")

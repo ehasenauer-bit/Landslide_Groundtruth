@@ -73,10 +73,12 @@ finds):
   does when the flag is omitted; a *Run* without the flag still caps (PlanetScope 80,
   Sentinel-2/Landsat 60, either one 20 with `--auto-window`), since it picks scenes
   for you rather than showing them to you.
-  The metric is scene-wide over the full satellite strip/tile, **not** your AOI, and
-  per-pixel cloud masking (UDM2 for PlanetScope, SCL/QA for Sentinel-2/Landsat) still
-  runs afterwards — so a cap only ever throws away scenes that might have been clear
-  over your point, which is why the interactive default is not to cap.
+  The metric is scene-wide over the full satellite strip/tile, **not** your AOI — so a
+  cap only ever throws away scenes that might have been clear over your point, which is
+  why the interactive default is not to cap. It also only decides *which* scenes are
+  used: for Sentinel-2/Landsat the chosen scenes are composited **as acquired**, with no
+  per-pixel cloud masking, so the downloaded layers show the cloud that was there
+  instead of holes where a mask fired (PlanetScope still UDM2-masks in its own tab).
 - `--coverage {aoi,point}` — PlanetScope coverage requirement (default `aoi`). `aoi`
   accepts any scene overlapping the search box, like Planet Explorer, so a strip that
   covers only part of the AOI near the event date still counts; `point` requires the
@@ -110,31 +112,41 @@ Which of these "scenes" get written is selectable — `--scenes true_color,dndvi
 on the CLI, or the **Scenes to download** checkboxes in the plugin (default: all).
 The predicted-point layer is always written.
 
-- `qgis_packages/<event>_pre_rgb.tif`, `_post_rgb.tif` — true-colour before/after
-  (`true_color`).
-- `qgis_packages/<event>_pre_highlight.tif`, `_post_highlight.tif` — "Highlight
-  Optimized Natural Color" before/after (`highlight_natural`): a cube-root tone
-  curve, `cbrt(0.6 × reflectance)`, on the true-colour bands — the same look the
-  Copernicus Browser offers. Lifts shadow detail and tames blown-out snow/cloud so
-  one stretch reads across the whole scene. (Sentinel Hub custom script by Marko
-  Repše, CC BY-SA 4.0; it's a rendering of the same bands, not an extra download.)
-- `qgis_packages/<event>_pre_falsecolor.tif`, `_post_falsecolor.tif` — NIR-red-green
-  before/after (vegetation = bright red; fresh bare scar reads dark) (`false_color`).
-- `qgis_packages/<event>_pre_ndvi.tif`, `_post_ndvi.tif` — raw NDVI before/after (`ndvi`).
-- `qgis_packages/<event>_dndvi.tif`, `_dbright.tif` — the two change rasters
-  (`dndvi`, `dbright`).
+Every imagery layer's filename carries the **acquisition date** of the scene behind
+it (`<pre>` / `<post>` below — e.g. `_pre_2023-07-28_rgb.tif`; a span like
+`2023-07-18_to_2023-07-28` when several scenes were composited into that side).
+QGIS names a loaded layer after its file, so the legend always says when the
+imagery is from.
+
+- `qgis_packages/<event>_pre_<pre>_rgb.tif`, `_post_<post>_rgb.tif` — true-colour
+  before/after (`true_color`).
+- `qgis_packages/<event>_pre_<pre>_highlight.tif`, `_post_<post>_highlight.tif` —
+  "Highlight Optimized Natural Color" before/after (`highlight_natural`): a
+  cube-root tone curve, `cbrt(0.6 × reflectance)`, on the true-colour bands — the
+  same look the Copernicus Browser offers. Lifts shadow detail and tames blown-out
+  snow/cloud so one stretch reads across the whole scene. (Sentinel Hub custom
+  script by Marko Repše, CC BY-SA 4.0; it's a rendering of the same bands, not an
+  extra download.)
+- `qgis_packages/<event>_pre_<pre>_falsecolor.tif`, `_post_<post>_falsecolor.tif` —
+  NIR-red-green before/after (vegetation = bright red; fresh bare scar reads dark)
+  (`false_color`).
+- `qgis_packages/<event>_pre_<pre>_ndvi.tif`, `_post_<post>_ndvi.tif` — raw NDVI
+  before/after (`ndvi`).
+- `qgis_packages/<event>_dndvi_<pre>_vs_<post>.tif`,
+  `_dbright_<pre>_vs_<post>.tif` — the two change rasters (`dndvi`, `dbright`);
+  both dates are in the name, since a change raster is only meaningful as a pair.
 - `qgis_packages/<event>_point.gpkg` — the predicted (seismic) epicentre.
 - `qgis_packages/<event>_metadata.json` — sensor + scene ids/dates used, layer list.
 
 ## QGIS review step (the manual hinge)
 
-For each event, open in QGIS:
-1. Load `<event>_pre_rgb.tif` and `<event>_post_rgb.tif`; use the **Swipe** tool
+For each event, open in QGIS (filenames carry the acquisition date, as above):
+1. Load the `_pre_…_rgb.tif` / `_post_…_rgb.tif` pair; use the **Swipe** tool
    (or flicker) to confirm it's a landslide and not a clearcut, burn, flood scar,
    cloud shadow, or new snow — these are the common false positives.
-2. Add `<event>_pre_falsecolor.tif` / `<event>_post_falsecolor.tif` to read
+2. Add the `_pre_…_falsecolor.tif` / `_post_…_falsecolor.tif` pair to read
    vegetation change directly (healthy veg is bright red; a fresh scar goes dark).
-3. Load `<event>_dndvi.tif` (vegetation loss) and `<event>_dbright.tif`
+3. Load `_dndvi_….tif` (vegetation loss) and `_dbright_….tif`
    (brightness/albedo rise) — agreement between the two confirms a scar.
 4. Load `<event>_point.gpkg` (the predicted epicentre), then digitize the scar
    polygon over the post imagery. `$area` in the field calculator gives the area;
@@ -285,7 +297,7 @@ coefficients change.
 |------|------|
 | `planet_imagery.py` | **primary source.** Planet Data API search + Orders API clip/download of PlanetScope (~3 m) surface reflectance; UDM2 cloud-masked median composite; same return contract as `imagery.py`. Checks the order cache before ordering, and `recall_preview` loads earlier orders back for free |
 | `planet_cache.py` | shared cache + ledger of Planet orders already paid for, so a scene is ordered once. Pure stdlib (the QGIS plugin imports it directly) — see [Ordering a scene once](#ordering-a-scene-once-quota) |
-| `imagery.py` | tries Planet first (via `planet_imagery`), then STAC: cloud/snow-masked median composites, dNDVI, dBrightness (albedo change); falls back S2→Landsat; `--seasonal` for winter |
+| `imagery.py` | the STAC sources (Sentinel-2, Landsat): median composites of the chosen scenes **as acquired** — only fill/nodata is dropped, never cloud — plus dNDVI, dNDSI, dBrightness (albedo change); falls back S2→Landsat; `--seasonal` for winter |
 | `review_package.py` | export the per-event QGIS review package (true/false-colour pre+post, dNDVI, dBrightness, predicted point) + `metadata.json` |
 | `run_groundtruth.py` | library module: `process_one(ev, args)`, the per-event pipeline (fetch imagery → export review package). Imported by `run_single.py`; no CLI of its own |
 | `run_single.py` | single-event entry point/CLI: takes `--lat/--lon/--datetime` directly, calls `run_groundtruth.process_one`, writes a `result.json` (or `search.json` with `--search-only`); used by the QGIS plugin |

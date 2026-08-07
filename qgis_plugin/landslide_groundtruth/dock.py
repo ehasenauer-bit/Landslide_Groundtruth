@@ -370,7 +370,10 @@ class LandslideDock(QgsDockWidget):
             "On: drop scenes whose WHOLE-SCENE cloud cover exceeds the value on "
             "the right. That is a scene-wide metric, not your AOI — a scene can be "
             "90% cloudy overall and still clear over your point, so this filter "
-            "throws away usable scenes. Use it only to thin a very long list.")
+            "throws away usable scenes. Use it only to thin a very long list.\n"
+            "Either way this only chooses WHICH scenes are listed: a Run downloads "
+            "the scenes as acquired, with the cloud left in. No pixels are masked "
+            "out for cloud, so you never get holes in the imagery.")
         self.cloud_spin = QDoubleSpinBox()
         self.cloud_spin.setRange(0.0, 100.0)
         self.cloud_spin.setDecimals(0)
@@ -1807,6 +1810,13 @@ class LandslideDock(QgsDockWidget):
         self._append_log("=" * 52)
         self._append_log(f"  SATELLITE USED:  {label}")
         self._append_log(f"  scenes composited: {npre} pre / {npost} post")
+        # acquisition dates — also baked into each layer's name, so the log and the
+        # legend agree on when the imagery is from
+        for side in ("pre", "post"):
+            dates = result.get(f"{side}_dates") or []
+            if dates:
+                self._append_log(f"  {side} date(s): " + ", ".join(sorted(set(dates))))
+        self._append_log("  clouds kept as acquired (no cloud masking)")
         self._append_log("=" * 52)
         if sensor and sensor != "planet":
             warn = (f"Imagery source was {label} — NOT PlanetScope (~3 m). "
