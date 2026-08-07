@@ -38,11 +38,11 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar, QPlainTextEdit, QListWidget, QListWidgetItem, QSpinBox,
 )
 from qgis.core import (
-    QgsProject, QgsApplication, QgsRasterLayer, QgsTask, QgsVector3D,
-    QgsHillshadeRenderer, QgsGeometry, QgsPointXY, Qgis,
+    QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsTask,
+    QgsVector3D, QgsHillshadeRenderer, QgsGeometry, QgsPointXY, Qgis,
     QgsCoordinateTransform, QgsCoordinateReferenceSystem,
 )
-from qgis.gui import QgsCollapsibleGroupBox
+from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 
 from . import dem_diff
 from .task import PipelineTask
@@ -98,6 +98,8 @@ class Viewer3DTab(QWidget):
         self._hillshade_layer = None     # optional draped multidirectional hillshade
         self._canvas3d = None            # the native 3D canvas we created
         self._scene_extent = None        # last scene extent (scene CRS), for Reset
+        self._flip_cache = {}            # imagery layer id -> aligned cache layer id
+        self._extra_scene_layers = []    # non-drape layer ids kept in the scene (point)
 
         self._build_ui()
         self._on_source_changed()
@@ -234,6 +236,65 @@ class Viewer3DTab(QWidget):
         dlay.addWidget(refresh_btn)
         root.addWidget(drape_box)
 
+        # --- before / after flip (live 3D) --------------------------------
+        flip_box = QgsCollapsibleGroupBox("Before / after (3D flip)")
+        fbl = QVBoxLayout(flip_box)
+        fhint = QLabel(
+            "Pick the Before and After image(s), then flip between them in the "
+            "open 3D scene — no rebuild, no camera move. Open the 3D view first.")
+        fhint.setWordWrap(True)
+        fhint.setStyleSheet("QLabel { color: palette(mid); }")
+        fbl.addWidget(fhint)
+
+        sel = QFormLayout()
+        self.before_combo = QgsCheckableComboBox()
+        self.before_combo.setToolTip(
+            "Tick one or more layers to drape as the BEFORE image. Tick several "
+            "to stack them (first ticked draws on top — set layer opacity in the "
+            "Layers panel to blend).")
+        self.before_combo.checkedItemsChanged.connect(self._on_ba_changed)
+        self.after_combo = QgsCheckableComboBox()
+        self.after_combo.setToolTip(
+            "Tick one or more layers to drape as the AFTER image. Tick several "
+            "to stack them (first ticked draws on top — set layer opacity in the "
+            "Layers panel to blend).")
+        self.after_combo.checkedItemsChanged.connect(self._on_ba_changed)
+        sel.addRow("Before image(s)", self.before_combo)
+        sel.addRow("After image(s)", self.after_combo)
+        fbl.addLayout(sel)
+
+        brow = QHBoxLayout()
+        self.before_btn = QPushButton("◀ Before")
+        self.before_btn.setCheckable(True)
+        self.before_btn.setToolTip("Drape the PRE (before) image over the terrain.")
+        self.before_btn.clicked.connect(lambda: self._flip_to("pre"))
+        self.after_btn = QPushButton("After ▶")
+        self.after_btn.setCheckable(True)
+        self.after_btn.setToolTip("Drape the POST (after) image over the terrain.")
+        self.after_btn.clicked.connect(lambda: self._flip_to("post"))
+        brow.addWidget(self.before_btn)
+        brow.addWidget(self.after_btn)
+        fbl.addLayout(brow)
+
+        self.flip_cache_check = QCheckBox(
+            "Cache imagery aligned to the terrain for fast flipping")
+        self.flip_cache_check.setChecked(True)
+        self.flip_cache_check.setToolTip(
+            "First flip reprojects each image to the 3D scene's CRS (the terrain "
+            "UTM), clips streamed scenes to the AOI, builds overviews, and caches "
+            "it under <output dir>/viewer3d/flip_cache. Later flips just swap "
+            "those aligned copies, so the scene re-textures the DEM near-"
+            "instantly. Uncheck to flip the original layers directly.")
+        fbl.addWidget(self.flip_cache_check)
+
+        self.add_point_btn = QPushButton("Add epicentre point to 3D")
+        self.add_point_btn.setToolTip(
+            "Add the predicted-epicentre point (…_point) to the 3D scene as a "
+            "terrain-clamped marker.")
+        self.add_point_btn.clicked.connect(self._add_point_to_3d)
+        fbl.addWidget(self.add_point_btn)
+        root.addWidget(flip_box)
+
         # --- actions -------------------------------------------------------
         btn_row = QHBoxLayout()
         self.open_btn = QPushButton("Open / update 3D view")
@@ -260,7 +321,8 @@ class Viewer3DTab(QWidget):
         root.addWidget(self.log, 1)
 
         if not HAS_3D:
-            for w in (self.fetch_btn, self.open_btn, self.reset_btn, self.close_btn):
+            for w in (self.fetch_btn, self.open_btn, self.reset_btn, self.close_btn,
+                      self.before_btn, self.after_btn, self.add_point_btn):
                 w.setEnabled(False)
 
     @staticmethod
@@ -320,6 +382,8 @@ class Viewer3DTab(QWidget):
         self.drape_list.clear()
         root = QgsProject.instance().layerTreeRoot()
         for lyr in self._project_rasters():
+            if lyr.name().endswith("(3D cache)"):
+                continue          # our own aligned flip copies — not a drape choice
             node = root.findLayer(lyr.id())
             item = QListWidgetItem(lyr.name())
             item.setData(Qt.UserRole, lyr.id())
@@ -330,6 +394,7 @@ class Viewer3DTab(QWidget):
                 check = bool(node and node.isVisible())
             item.setCheckState(Qt.Checked if check else Qt.Unchecked)
             self.drape_list.addItem(item)
+        self._refresh_before_after()
 
     def _checked_drape_ids(self):
         ids = []
@@ -671,7 +736,18 @@ class Viewer3DTab(QWidget):
         except Exception:
             pass
         drape = self._drape_layers()
-        ms.setLayers(drape)
+        proj = QgsProject.instance()
+        # keep any explicitly-added extras (e.g. the epicentre point) in the scene.
+        extra = [proj.mapLayer(i) for i in self._extra_scene_layers]
+        extra = [l for l in extra if l is not None and l not in drape]
+        # open the scene showing the ticked BEFORE image(s), so before/after is
+        # ready to flip the moment the view appears.
+        lead = []
+        for lid in self._checked_ids(self.before_combo):
+            l = proj.mapLayer(lid)
+            if l is not None and l not in drape and l not in extra and l not in lead:
+                lead.append(l)
+        ms.setLayers(extra + lead + drape)
 
         terr = QgsDemTerrainSettings()
         terr.setLayer(dem)
@@ -692,6 +768,9 @@ class Viewer3DTab(QWidget):
             "3D viewer",
             "Opened the native QGIS 3D view. Drag its dock onto this panel's tab to "
             "sit them side by side; orbit with left-drag, tilt with Shift+drag.")
+        self._refresh_before_after()   # scene open — enable Before/After flipping
+        if self._checked_ids(self.before_combo):
+            self.before_btn.setChecked(True)   # scene opened on the before image(s)
 
     def _point_camera(self, canvas, center, zc, extent):
         cc = canvas.cameraController()
@@ -724,6 +803,367 @@ class Viewer3DTab(QWidget):
         except Exception:
             pass
         self._canvas3d = None
+
+    # ------------------------------------------ before/after flip + point ----
+    def _find_pairs(self):
+        """Loaded (pre, post) raster pairs as (label, pre_id, post_id).
+
+        Matched by name so it works on whatever's in the project: the run's
+        …_pre_<kind> / …_post_<kind> outputs (rgb, swir, highlight, ndvi, …) and
+        the PlanetScope before/after previews. Our own '(3D cache)' copies are
+        excluded so we never try to cache a cache."""
+        rasters = [l for l in self._project_rasters()
+                   if not l.name().endswith("(3D cache)")]
+        by_name = {l.name(): l for l in rasters}
+        raw = []   # (kind_label, base, pre_lyr, post_lyr)
+        for name, lyr in by_name.items():
+            idx = name.find("_pre_")
+            if idx == -1:
+                continue
+            base, kind = name[:idx], name[idx + len("_pre_"):]
+            post = by_name.get(f"{base}_post_{kind}")
+            if post is not None:
+                raw.append((kind.replace("_", " "), base, lyr, post))
+        multi = len({b for _, b, _, _ in raw}) > 1
+        out = []
+        for kind, base, pre, post in raw:
+            out.append((f"{base} · {kind}" if multi else kind, pre.id(), post.id()))
+        # PlanetScope before/after previews (first of each, if both present)
+        ps_pre = next((l for n, l in by_name.items()
+                       if n.startswith("PlanetScope before")), None)
+        ps_post = next((l for n, l in by_name.items()
+                        if n.startswith("PlanetScope after")), None)
+        if ps_pre is not None and ps_post is not None:
+            out.append(("PlanetScope before/after", ps_pre.id(), ps_post.id()))
+        return out
+
+    def _find_point_layer(self):
+        for l in QgsProject.instance().mapLayers().values():
+            if isinstance(l, QgsVectorLayer) and l.name().endswith("_point"):
+                return l
+        return None
+
+    def _candidate_rasters(self):
+        """Project rasters selectable as before/after images.
+
+        Excludes our own '(3D cache)' copies and the current terrain DEM /
+        hillshade, so the pickers list imagery, not the surface it drapes on."""
+        skip = set()
+        if self._dem_layer is not None:
+            skip.add(self._dem_layer.id())
+        if self._hillshade_layer is not None:
+            skip.add(self._hillshade_layer.id())
+        return [l for l in self._project_rasters()
+                if not l.name().endswith("(3D cache)") and l.id() not in skip]
+
+    def _refresh_before_after(self):
+        """(Re)populate the Before/After pickers, preserving the user's ticks.
+
+        On the first populate, default the ticks to an auto-detected pre/post
+        pair (…_pre_/…_post_ or PlanetScope before/after) so the common case
+        needs no picking; the user can tick any other layer(s), one or more."""
+        rasters = self._candidate_rasters()
+        first = self.before_combo.count() == 0 and self.after_combo.count() == 0
+        for combo in (self.before_combo, self.after_combo):
+            prev = set(self._checked_ids(combo))
+            combo.blockSignals(True)
+            combo.clear()
+            for l in rasters:
+                combo.addItem(l.name(), l.id())
+            self._set_checked(combo, prev)
+            combo.blockSignals(False)
+        if first:
+            pairs = self._find_pairs()
+            if pairs:
+                _, pre_id, post_id = pairs[0]
+                for combo, lid in ((self.before_combo, pre_id),
+                                   (self.after_combo, post_id)):
+                    combo.blockSignals(True)
+                    self._set_checked(combo, {lid})
+                    combo.blockSignals(False)
+        have = (HAS_3D and self.before_combo.count() > 0
+                and self.after_combo.count() > 0)
+        self.before_btn.setEnabled(have)
+        self.after_btn.setEnabled(have)
+        if not have:
+            self.before_btn.setChecked(False)
+            self.after_btn.setChecked(False)
+        self.add_point_btn.setEnabled(HAS_3D and self._find_point_layer() is not None)
+
+    def _checked_ids(self, combo):
+        """Layer ids ticked in a QgsCheckableComboBox, in list order."""
+        model = combo.model()
+        out = []
+        if hasattr(model, "item"):
+            for i in range(combo.count()):
+                it = model.item(i)
+                if it is not None and it.checkState() == Qt.Checked:
+                    d = combo.itemData(i)
+                    if d:
+                        out.append(d)
+            return out
+        try:                                   # fallback: match checked texts
+            texts = set(combo.checkedItems())
+        except Exception:
+            return out
+        for i in range(combo.count()):
+            if combo.itemText(i) in texts:
+                d = combo.itemData(i)
+                if d:
+                    out.append(d)
+        return out
+
+    def _set_checked(self, combo, ids):
+        """Tick exactly `ids` in a QgsCheckableComboBox (untick the rest)."""
+        want = set(ids)
+        model = combo.model()
+        if not hasattr(model, "item"):
+            return
+        for i in range(combo.count()):
+            it = model.item(i)
+            if it is not None:
+                it.setCheckState(
+                    Qt.Checked if combo.itemData(i) in want else Qt.Unchecked)
+
+    def _on_ba_changed(self, *_):
+        # the before/after choice changed; which side is showing is now unknown
+        self.before_btn.setChecked(False)
+        self.after_btn.setChecked(False)
+
+    def _scene_ids_with_caches(self, ids):
+        """`ids` plus any cache copies built for them (to exclude on a flip)."""
+        out = set(ids)
+        for oid in ids:
+            cid = self._flip_cache.get(oid)
+            if cid:
+                out.add(cid)
+        return out
+
+    def _flip_to(self, side):
+        """Drape the ticked Before/After image(s) in the open scene, no rebuild."""
+        if not HAS_3D:
+            return
+        canvas = self._valid_canvas()
+        if canvas is None:
+            self._warn("Open the 3D view first (Open / update 3D view), then flip.")
+            return
+        before_ids = self._checked_ids(self.before_combo)
+        after_ids = self._checked_ids(self.after_combo)
+        if not before_ids or not after_ids:
+            self._warn("Tick at least one Before image and one After image.")
+            return
+        show_ids = before_ids if side == "pre" else after_ids
+        # route through the aligned on-disk cache when enabled, so the flip only
+        # swaps already-projected layers instead of re-warping onto the DEM.
+        if self.flip_cache_check.isChecked() and self._ensure_flip_cache(show_ids):
+            show_ids = [self._flip_cache.get(i, i) for i in show_ids]
+        proj = QgsProject.instance()
+        shown = [l for l in (proj.mapLayer(i) for i in show_ids) if l is not None]
+        if not shown:
+            self._warn("The selected image layer(s) are no longer in the project.")
+            return
+        ms = canvas.mapSettings()
+        exclude = self._scene_ids_with_caches(before_ids + after_ids)
+        base = [l for l in ms.layers() if l.id() not in exclude]
+        ms.setLayers(shown + base)             # ticked imagery on top of the rest
+        self.before_btn.setChecked(side == "pre")
+        self.after_btn.setChecked(side == "post")
+        names = ", ".join(l.name() for l in shown)
+        self._log(f"3D flip: showing {'before' if side == 'pre' else 'after'} — "
+                  f"{names}.")
+
+    # ----- aligned on-disk cache (fast DEM drape) -----
+    def _scene_crs(self):
+        if self._dem_layer is None:
+            return None
+        try:
+            crs, _ = self._scene_crs_and_extent(self._dem_layer)
+        except Exception:
+            return None
+        return crs if crs.isValid() else None
+
+    def _flip_cache_dir(self):
+        base = self.dock.out_edit.text().strip() or os.path.join(
+            self.dock.project_edit.text().strip(), "out", "interactive")
+        d = os.path.join(base, "viewer3d", "flip_cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except OSError as e:
+            self._log(f"flip cache: cannot create cache dir ({e}).")
+            return None
+
+    def _ensure_flip_cache(self, ids):
+        """Ensure every id in `ids` has an aligned cache layer; True iff all do."""
+        scene_crs = self._scene_crs()
+        if scene_crs is None:
+            return False
+        dst = scene_crs.authid() or scene_crs.toWkt()
+        for lid in ids:
+            cid = self._flip_cache.get(lid)
+            if cid and QgsProject.instance().mapLayer(cid) is not None:
+                continue
+            src = QgsProject.instance().mapLayer(lid)
+            if src is None:
+                continue
+            made = self._make_flip_cache_layer(src, dst)
+            if made is not None:
+                self._flip_cache[lid] = made.id()
+        return all(
+            self._flip_cache.get(i)
+            and QgsProject.instance().mapLayer(self._flip_cache[i]) is not None
+            for i in ids)
+
+    def _make_flip_cache_layer(self, src, dst_srs):
+        """Reproject+clip `src` to a local overview-built GeoTIFF in the scene CRS.
+
+        The heavy work (remote read, warp to the terrain UTM, overview build) runs
+        once and is memoised on disk; later flips just toggle the returned layer.
+        Returns the cache QgsRasterLayer, or None on any failure (caller then
+        flips the original)."""
+        try:
+            from osgeo import gdal
+        except Exception as e:            # QGIS bundles GDAL, but never break a flip
+            self._log(f"flip cache: GDAL unavailable ({e}); using originals.")
+            return None
+        d = self._flip_cache_dir()
+        if d is None:
+            return None
+        src_uri = src.source()
+        safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in src.name())
+        crs = self._scene_crs()
+        dtag = ((crs.authid() if crs else "") or "utm").replace(":", "_")
+        out_path = os.path.join(d, f"{safe}__{dtag}.3dcache.tif")
+        if not os.path.exists(out_path):
+            self._log(f"flip cache: building {os.path.basename(out_path)} …")
+            opts = dict(
+                format="GTiff",
+                creationOptions=["TILED=YES", "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER"],
+                dstSRS=dst_srs, resampleAlg="bilinear",
+                multithread=True, warpMemoryLimit=256,
+            )
+            # clip streamed COGs to the scene footprint to keep the cache small;
+            # local run outputs are already AOI-sized, so leave their extent alone.
+            if "vsicurl" in src_uri and self._scene_extent is not None:
+                e = self._scene_extent
+                opts["outputBounds"] = (e.xMinimum(), e.yMinimum(),
+                                        e.xMaximum(), e.yMaximum())
+            try:
+                ds = gdal.Warp(out_path, src_uri, **opts)
+            except Exception as ex:
+                self._log(f"flip cache: warp failed for {src.name()} ({ex}).")
+                return None
+            if ds is None:
+                self._log(f"flip cache: warp produced nothing for {src.name()}.")
+                return None
+            try:
+                ds.BuildOverviews("AVERAGE", [2, 4, 8, 16])
+            except Exception:
+                pass
+            ds = None                     # flush to disk
+        lyr = QgsRasterLayer(out_path, f"{src.name()} (3D cache)")
+        if not lyr.isValid():
+            self._log(f"flip cache: cached layer invalid for {src.name()}.")
+            return None
+        QgsProject.instance().addMapLayer(lyr, False)   # keep the legend tidy
+        self._log(f"flip cache: ready — {lyr.name()}")
+        return lyr
+
+    # ----- terrain-clamped epicentre point -----
+    def _add_point_to_3d(self):
+        if not HAS_3D:
+            return
+        pt = self._find_point_layer()
+        if pt is None:
+            self._warn("No epicentre point layer (…_point) in the project.")
+            return
+        ok, err = self._apply_3d_point_symbol(pt)
+        if pt.id() not in self._extra_scene_layers:
+            self._extra_scene_layers.append(pt.id())   # so _open_view keeps it too
+        canvas = self._valid_canvas()
+        if canvas is not None:
+            ms = canvas.mapSettings()
+            cur = list(ms.layers())
+            if pt.id() not in [l.id() for l in cur]:
+                ms.setLayers([pt] + cur)
+            where = "Added the epicentre point to the 3D scene"
+        else:
+            where = "Styled the epicentre point for 3D — open the 3D view to see it"
+        if ok:
+            self._log(where + " (terrain-clamped marker).")
+        else:
+            self._log(where + f", but the raised 3D marker style couldn't be applied "
+                      f"({err}); the point still renders draped on the terrain.")
+
+    def _apply_3d_point_symbol(self, lyr):
+        """Give `lyr` a terrain-clamped sphere 3D symbol. Best-effort: the 3D
+        symbol classes moved modules across QGIS versions, so every step is
+        guarded and we return (ok, error) rather than raising."""
+        try:
+            try:
+                from qgis._3d import QgsPoint3DSymbol, QgsPhongMaterialSettings
+            except ImportError:
+                from qgis.core import QgsPoint3DSymbol, QgsPhongMaterialSettings
+            try:
+                from qgis._3d import QgsVectorLayer3DRenderer
+            except ImportError:
+                from qgis.core import QgsVectorLayer3DRenderer
+        except Exception as e:
+            return False, f"3D API unavailable: {e}"
+        try:
+            from qgis.PyQt.QtGui import QColor
+            sym = QgsPoint3DSymbol()
+            self._set_altitude_terrain(sym)
+            shape = getattr(QgsPoint3DSymbol, "Sphere", None)
+            if shape is None:
+                shape_enum = getattr(QgsPoint3DSymbol, "Shape", None)
+                shape = getattr(shape_enum, "Sphere", None) if shape_enum else None
+            if shape is not None:
+                self._call_first(sym, ("setShape",), shape)
+            props = dict(sym.shapeProperties()) if hasattr(sym, "shapeProperties") else {}
+            props["radius"] = 60.0
+            self._call_first(sym, ("setShapeProperties",), props)
+            mat = QgsPhongMaterialSettings()
+            try:
+                mat.setDiffuse(QColor(230, 40, 40))
+                mat.setAmbient(QColor(90, 10, 10))
+            except Exception:
+                pass
+            self._call_first(sym, ("setMaterialSettings", "setMaterial"), mat)
+            renderer = QgsVectorLayer3DRenderer(sym)
+            lyr.setRenderer3D(renderer)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def _set_altitude_terrain(sym):
+        """Clamp a 3D symbol to the terrain surface across QGIS versions."""
+        try:
+            sym.setAltitudeClamping(Qgis.AltitudeClamping.Terrain)
+            return
+        except Exception:
+            pass
+        for modname in ("qgis.core", "qgis._3d"):
+            try:
+                mod = __import__(modname, fromlist=["Qgs3DTypes"])
+                sym.setAltitudeClamping(mod.Qgs3DTypes.AltClampTerrain)
+                return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _call_first(obj, method_names, *a):
+        """Call the first existing method in `method_names`; True if one ran."""
+        for name in method_names:
+            fn = getattr(obj, name, None)
+            if fn is not None:
+                try:
+                    fn(*a)
+                    return True
+                except Exception:
+                    continue
+        return False
 
     # -------------------------------------------------------- teardown ----
     def teardown(self):
