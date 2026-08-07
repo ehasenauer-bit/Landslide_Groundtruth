@@ -29,7 +29,9 @@ password is never read by this code.
 from __future__ import annotations
 import datetime as dt
 import glob
+import json
 import os
+import time
 import warnings
 import numpy as np
 import rioxarray  # noqa: F401  (registers .rio accessor)
@@ -43,6 +45,7 @@ BUNDLE = "analytic_sr_udm2"          # 4-band surface reflectance + usable-data 
 FALLBACK_BUNDLE = "analytic_udm2"    # non-SR (DN) if SR not licensed on the account
 PS_SR_SCALE = 1e-4                   # PlanetScope SR DN -> reflectance
 PS_RES = 3.0                         # PlanetScope native ground sample distance (~3 m)
+DOWNLOAD_TRIES = 4                   # passes at an order's files before giving up
 
 DEFAULT_MAX_CLOUD_PCT = 80.0         # whole-scene cloud cap when not overridden
 AUTO_WINDOW_MAX_CLOUD_PCT = 20.0     # stricter cap under --auto-window (nearest CLEAR scene)
@@ -232,6 +235,125 @@ def _create_order(pl, item_ids, aoi):
     return pl.orders.create_order(req)["id"]
 
 
+class IncompleteDownload(RuntimeError):
+    """An order's files did not all arrive intact.
+
+    Distinct from a bad order: the order itself is placed and paid for, so the fix
+    is to pull the missing bytes again (free), not to order the scenes again."""
+
+
+def _is_transport_error(e):
+    """True if `e` is a network-transport failure rather than an API refusal.
+
+    httpx is planet's dependency, not ours, so it's imported here instead of at
+    module load. Every TransportError (connection reset, read timeout, protocol
+    error) means the bytes stopped arriving mid-flight — it says nothing bad about
+    the order, which is still sitting on Planet's side waiting to be downloaded."""
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(e, httpx.TransportError)
+
+
+def _newest_file(root):
+    """The most recently written file under `root`, or None.
+
+    Used to identify the file a dead stream was in the middle of: the SDK fetches
+    an order's assets sequentially, so the one open when the connection dropped is
+    the one last touched."""
+    files = [p for p in glob.glob(os.path.join(root, "**", "*"), recursive=True)
+             if os.path.isfile(p)]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _short_files(dest):
+    """[(path, want, got)] for delivered files whose size disagrees with the manifest.
+
+    Planet ships a manifest.json listing every file's exact byte count, and that is
+    the only cheap way to tell a complete clip from one whose stream was cut short:
+    a truncated GeoTIFF still OPENS (the header is at the front) and only fails when
+    something reads the missing rows — i.e. long after the download looked fine.
+    Files missing from disk report got=None so they're re-fetched on the same path.
+
+    An order whose manifest hasn't landed yet returns [] — there's nothing to check
+    against, and the interrupted file is already handled by the retry loop."""
+    out = []
+    for mf in glob.glob(os.path.join(dest, "**", "manifest.json"), recursive=True):
+        try:
+            with open(mf) as fh:
+                files = json.load(fh).get("files") or []
+        except (OSError, ValueError):
+            continue
+        base = os.path.dirname(mf)
+        for f in files:
+            want, rel = f.get("size"), f.get("path")
+            if rel is None or want is None:
+                continue
+            p = os.path.join(base, rel)
+            got = os.path.getsize(p) if os.path.exists(p) else None
+            if got != want:
+                out.append((p, want, got))
+    return out
+
+
+def _download_order(pl, order_id, dest, log=print, tries=DOWNLOAD_TRIES):
+    """Download every asset of a finished order into `dest` — completely, or raise.
+
+    Wraps the SDK's download_order with the two things it doesn't do:
+
+    - Retry a stream that dies mid-body. planet's session lists httpx transport
+      errors as retryable but only retries the request SEND; the response body is
+      consumed afterwards, in StreamingBody.write, so a connection reset partway
+      through a 450 MB SR clip raises straight out (as a bare `ReadError: ` with no
+      message) with no retry at all.
+    - Discard the partial file first. download_order runs with overwrite=False,
+      which opens each file 'xb' — so on a plain retry the truncated clip already
+      exists, is skipped with "not overwriting", and a corrupt raster is handed on
+      as if it had downloaded fine. Deleting a file that had in fact just completed
+      costs one re-download and nothing else.
+
+    After a clean pass, sizes are checked against the manifest and any short file is
+    deleted and re-fetched; that also repairs a truncated clip left behind on disk
+    by an EARLIER run, which would otherwise be skipped forever by overwrite=False.
+
+    overwrite=False stays right across attempts: assets that already landed intact
+    are skipped, so a retry only re-pulls what's actually missing — no quota, and
+    no re-transfer of the files that made it."""
+    for attempt in range(1, tries + 1):
+        last = attempt == tries
+        try:
+            pl.orders.download_order(order_id, directory=dest, overwrite=False)
+        except Exception as e:
+            if not _is_transport_error(e):
+                raise
+            partial = _newest_file(dest)
+            if partial:
+                os.remove(partial)
+            if last:
+                raise
+            log(f"    [planet] order {order_id[:12]} download interrupted "
+                f"({type(e).__name__}); discarded partial "
+                f"{os.path.basename(partial) if partial else '(none)'}, "
+                f"retry {attempt + 1}/{tries}")
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        short = _short_files(dest)
+        if not short:
+            return
+        names = ", ".join(os.path.basename(p) for p, _, _ in short)
+        if last:
+            raise IncompleteDownload(
+                f"order {order_id} is still short of its manifest after {tries} "
+                f"attempts ({names})")
+        for p, _, _ in short:
+            if os.path.exists(p):
+                os.remove(p)
+        log(f"    [planet] order {order_id[:12]} incomplete vs manifest ({names}); "
+            f"re-fetching, attempt {attempt + 1}/{tries}")
+        time.sleep(min(2 ** attempt, 30))
+
+
 def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=180):
     """Block until `order_id` reaches a final state, download it into the shared
     cache, record it in the ledger, and return its paired SR/UDM2 files.
@@ -239,8 +361,9 @@ def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=18
     Downloads land in `planet_cache.order_dir(order_id)` rather than a per-project
     directory, and the ledger entry written afterwards is what lets any later run —
     any project, any --out — recall this order instead of placing a new one. That
-    also makes `overwrite=False` the right choice: re-running against an order whose
-    files are already cached costs no quota AND no bytes.
+    also makes `_download_order`'s skip-what's-already-here behaviour the right one:
+    re-running against an order whose files are already cached costs no quota AND no
+    bytes, while a file that arrived truncated is still re-fetched.
 
     `meta` is the {side, event_id, lat, lon, radius_km} the order was placed for, so
     the ledger can be searched by event/AOI later. Scene ids come from the delivered
@@ -267,7 +390,7 @@ def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=18
     if final != "success":
         # failed/partial: the item(s) didn't deliver, so there's nothing to download
         raise RuntimeError(f"order finished in state {final!r} (not 'success')")
-    pl.orders.download_order(order_id, directory=dest, overwrite=False)
+    _download_order(pl, order_id, dest, log=log)
     pairs = _pair_downloads(dest)
     # The delivered clip footprint beats the AOI we asked for: it's what actually
     # arrived, so it's the honest answer to "does this order cover that box?" — and it
@@ -517,11 +640,17 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
     Shared by render_preview (orders it just created) and resume_preview (orders an
     earlier render placed but didn't finish waiting on). Returns
     (comps, notes, pending): comps is {'pre': comp|None, 'post': comp|None}; pending
-    is {side: order_id} for orders STILL processing after the wait budget. Those are
-    resumable — the order is already placed and paid for, it just hasn't finished
-    server-side — so the caller persists the id and can hand it back here later
-    WITHOUT re-ordering (no extra quota). A hard failure (bad state, download error)
-    is a per-side note and is NOT marked pending, because re-waiting won't help.
+    is {side: order_id} for orders that didn't finish but are worth coming back to —
+    still processing after the wait budget, or finished and downloading when the
+    network cut out. Either way the order is already placed and paid for, so the
+    caller persists the id and can hand it back here later WITHOUT re-ordering (no
+    extra quota). A failure the order itself can't recover from (a non-success final
+    state, a clip that won't composite) is a per-side note and is NOT marked pending,
+    because coming back to it won't help.
+
+    Getting that split right matters more than it looks: an id that never reaches
+    'pending' is lost entirely — the ledger is only written after a SUCCESSFUL
+    download — and the next run silently pays for the same scenes again.
 
     Every download that lands here is written to the order ledger keyed on
     event_id + AOI, which is what makes it recallable for free later
@@ -547,6 +676,14 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
                     f"wait budget (~30 min). It's placed and saved in your Planet "
                     f"account — resume it (don't re-order) to finish without spending "
                     f"quota again.")
+            elif _is_transport_error(e) or isinstance(e, IncompleteDownload):
+                pending[side] = order_id
+                notes.append(
+                    f"{side}: the download of order {order_id} was cut short by the "
+                    f"network ({type(e).__name__}) and didn't recover in "
+                    f"{DOWNLOAD_TRIES} attempts. The order is placed and paid for, and "
+                    f"the files that did arrive are kept — resume it (don't re-order) "
+                    f"to pull the rest without spending quota again.")
             else:
                 notes.append(
                     f"{side}: order/download failed: {type(e).__name__}: {e}")
