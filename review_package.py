@@ -421,6 +421,9 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
          `pre_dates`/`post_dates` (acquisition dates of the scenes composited per
          side) go into the filenames; a source that omits them still exports, just
          with undated names.
+         A ONE-SIDED run (only `pre` or only `post`, from hand-picking scenes on a
+         single side) exports that side's products and skips the other side plus
+         the three change rasters, which are differences.
     near_pt: (x, y) predicted epicentre in src_crs, written as the search point.
     scenes: which products to write — a subset of SCENE_KEYS. None/empty -> all.
             The predicted-point layer is always written regardless.
@@ -433,53 +436,55 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
     pre_tag = _date_tag(img.get("pre_dates"))
     post_tag = _date_tag(img.get("post_dates"))
     layers = []
+    tags = {"pre": pre_tag, "post": post_tag}
 
-    def pair(kind):
-        """(pre_path, post_path) for a two-sided product, dated per side."""
-        return _tagged(base, "pre", pre_tag, kind), _tagged(base, "post", post_tag, kind)
+    def write_sides(kind, render, source="", when=None):
+        """Write a two-sided product for whichever sides this run actually has.
+
+        `source` names the img key holding the array ('' = the side's composite,
+        e.g. 'ndvi_' for ndvi_pre/ndvi_post). A one-sided run (see
+        imagery.fetch_event) simply exports one file instead of two; `when` gates a
+        side further (the SWIR products need SWIR bands in that composite)."""
+        for side in ("pre", "post"):
+            arr = img.get(f"{source}{side}")
+            if arr is None or (when is not None and not when(arr)):
+                continue
+            path = _tagged(base, side, tags[side], kind)
+            render(arr, path)
+            layers.append(path)
+
+    def has_swir(comp):
+        return "swir1" in list(comp.coords["band"].values)
 
     # true-colour pre/post — context and false-positive checks (clearcut, burn, cloud)
     if "true_color" in want:
-        pre_p, post_p = pair("rgb")
-        _rgb(img["pre"], ["red", "green", "blue"], pre_p, src_crs)
-        _rgb(img["post"], ["red", "green", "blue"], post_p, src_crs)
-        layers += [pre_p, post_p]
+        write_sides("rgb", lambda c, p: _rgb(c, ["red", "green", "blue"], p, src_crs))
 
     # Highlight Optimized Natural Color pre/post — same bands, cube-root tone curve
     if "highlight_natural" in want:
-        pre_p, post_p = pair("highlight")
-        _highlight_natural(img["pre"], pre_p, src_crs)
-        _highlight_natural(img["post"], post_p, src_crs)
-        layers += [pre_p, post_p]
+        write_sides("highlight", lambda c, p: _highlight_natural(c, p, src_crs))
 
     # false-colour (NIR-red-green) — vegetation pops bright red, fresh bare scar reads dark
     if "false_color" in want:
-        pre_p, post_p = pair("falsecolor")
-        _rgb(img["pre"], ["nir", "red", "green"], pre_p, src_crs)
-        _rgb(img["post"], ["nir", "red", "green"], post_p, src_crs)
-        layers += [pre_p, post_p]
+        write_sides("falsecolor",
+                    lambda c, p: _rgb(c, ["nir", "red", "green"], p, src_crs))
 
     # SWIR false colour (S2 12-11-4 / Landsat swir2-swir1-red) — fresh rock/ice-
     # avalanche debris on snow reads bright orange/brown against dark-blue snow, the
     # highest-contrast band combo for spotting debris on a glacier. Guarded on the
     # SWIR bands so a SWIR-less composite (older cache/manual path) just skips it.
-    if "swir_falsecolor" in want and "swir1" in list(img["pre"].coords["band"].values):
-        pre_p, post_p = pair("swir")
-        _rgb(img["pre"], ["swir2", "swir1", "red"], pre_p, src_crs)
-        _rgb(img["post"], ["swir2", "swir1", "red"], post_p, src_crs)
-        layers += [pre_p, post_p]
+    if "swir_falsecolor" in want:
+        write_sides("swir", lambda c, p: _rgb(c, ["swir2", "swir1", "red"], p, src_crs),
+                    when=has_swir)
 
     # raw NDVI pre/post — the inputs behind dNDVI, handy for thresholding by eye
     if "ndvi" in want:
-        pre_p, post_p = pair("ndvi")
-        img["ndvi_pre"].rename("ndvi").rio.write_crs(src_crs).rio.to_raster(
-            pre_p, driver="GTiff")
-        img["ndvi_post"].rename("ndvi").rio.write_crs(src_crs).rio.to_raster(
-            post_p, driver="GTiff")
-        layers += [pre_p, post_p]
+        write_sides("ndvi", source="ndvi_", render=lambda a, p: a.rename("ndvi")
+                    .rio.write_crs(src_crs).rio.to_raster(p, driver="GTiff"))
 
-    # change rasters — where a scar lights up
-    if "dndvi" in want:
+    # change rasters — where a scar lights up. Each is a pre->post DIFFERENCE, so
+    # all three are None (and skipped) on a one-sided run.
+    if "dndvi" in want and img.get("dndvi") is not None:
         path = _change_path(base, "dndvi", pre_tag, post_tag)
         img["dndvi"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
         layers.append(path)

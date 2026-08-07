@@ -307,11 +307,14 @@ def main():
     ap.add_argument("--pre-scene-ids", default=None,
                     help="comma-separated scene IDs to composite for the PRE side, "
                          "overriding the automatic scene ranking (Sentinel-2 / Landsat "
-                         "only). Requires --post-scene-ids; PlanetScope and the windowed "
-                         "search are skipped. Ignored with --search-only.")
+                         "only). PlanetScope and the windowed search are skipped. "
+                         "Ignored with --search-only.")
     ap.add_argument("--post-scene-ids", default=None,
                     help="comma-separated scene IDs for the POST side (see "
-                         "--pre-scene-ids).")
+                         "--pre-scene-ids). Either side may be given ALONE: a one-sided "
+                         "run exports just that side's imagery and skips dNDVI / dNDSI / "
+                         "dBrightness, which are pre->post differences. Useful for a "
+                         "fresh event with no usable pre-scene yet.")
     ap.add_argument("--seasonal", action="store_true",
                     help="winter event: use prior-year pre window")
     ap.add_argument("--auto-window", action="store_true",

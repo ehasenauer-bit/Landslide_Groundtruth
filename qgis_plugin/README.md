@@ -85,13 +85,20 @@ pipeline falls back to Sentinel-2/Landsat.
    event in before paying.
 
    Scene picking works the same way as the PlanetScope tab:
-   - **Ticks choose the scenes.** The ★ row on each side (what the automatic
-     ranking would lead with) starts ticked; *Preview on map* renders the ticked
-     rows and a **Run** composites them. Tick several on a side to
-     median-composite them, or untick the ★ and tick another to swap scenes. The
-     ★/✓ marks are a suggestion — greyed rows are ranked below the automatic
-     cutoff, not unusable, and with the cloud filter off that's often where the
-     near-date scene you actually want is sitting.
+   - **Ticks choose the scenes, and nothing else does.** Nothing starts ticked; a
+     **Run** downloads *exactly* the rows you tick and adds nothing to them
+     (*Preview on map* renders the same rows). Tick one per side for a plain
+     before/after pair, or several on a side to median-composite them. The ★/✓
+     marks are only a suggestion — ★ is the scene the automatic ranking would lead
+     with, greyed rows are ranked below its cutoff but are not unusable, and with
+     the cloud filter off that's often where the near-date scene you actually want
+     is sitting. With rows listed and none ticked, Run stops and asks you to pick;
+     only an empty table (no Search yet) falls back to the automatic ranking.
+   - **One side alone is a valid run.** Tick post scenes and no pre scene (a fresh
+     event with nothing usable acquired before it, say) and the Run exports just
+     that side's imagery — true colour, highlight, false colour, SWIR, NDVI. The
+     three change rasters are skipped, since dNDVI/dNDSI/dBrightness subtract one
+     side from the other. Pre-only works the same way.
    - **Selection is separate.** Click a row (Ctrl/Shift-click for several) to load
      its browse image in the preview pane and isolate its footprint on the map;
      double-click a row to preview just that one scene on the canvas.

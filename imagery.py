@@ -412,25 +412,33 @@ def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
 
     Shared by the ranked search path and the manual-selection path so both produce
     the identical result dict. Returns None (caller falls back / reports
-    no_imagery) when either composite has no usable pixels over the AOI."""
-    pre = _composite(pre_items, lat, lon, radius_km, sensor)
-    post = _composite(post_items, lat, lon, radius_km, sensor)
-    if not _has_coverage(pre) or not _has_coverage(post):
-        hint = " — try without --auto-window to composite more scenes" if auto_window else ""
-        print(f"    [{sensor}] scenes found but no usable pixels over the AOI "
-              f"(scene nodata gap){hint}")
-        return None
-    ndvi_pre, ndvi_post = _ndvi(pre), _ndvi(post)
-    dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
-    bright_pre, bright_post = _brightness(pre), _brightness(post)
-    dbright = (bright_post - bright_pre).rename("dbright")
-    # NDSI change — snow->debris on the glacier reads as a strong negative dNDSI.
-    # Guarded so a SWIR-less composite still returns a valid (SWIR-free) result.
-    if _has_swir(pre) and _has_swir(post):
-        ndsi_pre, ndsi_post = _ndsi(pre), _ndsi(post)
-        dndsi = (ndsi_post - ndsi_pre).rename("dndsi")
-    else:
-        ndsi_pre = ndsi_post = dndsi = None
+    no_imagery) when a requested composite has no usable pixels over the AOI.
+
+    One side may be empty (a hand-picked one-sided run — see fetch_event). That
+    side's composite and NDVI/NDSI come back None, and so do the three change
+    rasters, which are differences and need both sides to exist."""
+    pre = _composite(pre_items, lat, lon, radius_km, sensor) if pre_items else None
+    post = _composite(post_items, lat, lon, radius_km, sensor) if post_items else None
+    for side, comp in (("pre", pre), ("post", post)):
+        if comp is not None and not _has_coverage(comp):
+            hint = " — try without --auto-window to composite more scenes" if auto_window else ""
+            print(f"    [{sensor}] {side} scenes found but no usable pixels over "
+                  f"the AOI (scene nodata gap){hint}")
+            return None
+    ndvi_pre = _ndvi(pre) if pre is not None else None
+    ndvi_post = _ndvi(post) if post is not None else None
+    bright_pre = _brightness(pre) if pre is not None else None
+    bright_post = _brightness(post) if post is not None else None
+    # NDSI is per-side; guarded on the SWIR bands so a SWIR-less composite still
+    # returns a valid (SWIR-free) result.
+    ndsi_pre = _ndsi(pre) if pre is not None and _has_swir(pre) else None
+    ndsi_post = _ndsi(post) if post is not None and _has_swir(post) else None
+    # change rasters — differences, so every one of them needs both sides
+    both = pre is not None and post is not None
+    dndvi = (ndvi_post - ndvi_pre).rename("dndvi") if both else None
+    dbright = (bright_post - bright_pre).rename("dbright") if both else None
+    dndsi = ((ndsi_post - ndsi_pre).rename("dndsi")
+             if both and ndsi_pre is not None and ndsi_post is not None else None)
     return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
                 dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
                 dbright=dbright, ndsi_pre=ndsi_pre, ndsi_post=ndsi_post,
@@ -471,31 +479,42 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
     allow_test_quality: PlanetScope only — also order 'test'-quality scenes, not
     just 'standard'. Passed through; the STAC sources have no quality filter.
     pre_ids/post_ids: hand-picked scene IDs to composite for each side, overriding
-    the automatic ranking. When both are given we composite exactly those scenes
+    the automatic ranking. Given EITHER or both, we composite exactly those scenes
     (Sentinel-2 OR Landsat — the streamable STAC sources) and skip PlanetScope and
     the windowed search entirely; `prefer` then only hints which collection to
-    probe first.
+    probe first. One side alone yields a one-sided result: that side's composite
+    and indices, with the pre->post change rasters None (see _composite_result).
 
     Returns None (caller falls back / reports no_imagery) when no window has
     scenes OR when the chosen scenes composite to no usable pixels over the AOI
     (a scene-nodata gap) — never a blank composite.
     """
     # --- manual override: composite exactly the hand-picked scenes -------------
-    if pre_ids and post_ids:
-        coll = _ids_collection(prefer, list(pre_ids) + list(post_ids))
+    # Either side alone is enough. A one-sided run is the honest answer when only
+    # one side of the event has usable imagery (commonly a fresh event with no
+    # pre-scene yet): it exports that side and skips the change rasters, instead of
+    # refusing to run or quietly substituting a scene nobody picked.
+    if pre_ids or post_ids:
+        coll = _ids_collection(prefer, list(pre_ids or []) + list(post_ids or []))
         if coll is None:
             print("    [manual] none of the requested scene IDs were found on the "
                   "Planetary Computer (Sentinel-2 / Landsat)")
             return None
         sensor = "s2" if coll == "sentinel-2-l2a" else "landsat"
-        pre_items = fetch_items_by_ids(coll, pre_ids)
-        post_items = fetch_items_by_ids(coll, post_ids)
-        if not pre_items or not post_items:
+        pre_items = fetch_items_by_ids(coll, pre_ids) if pre_ids else []
+        post_items = fetch_items_by_ids(coll, post_ids) if post_ids else []
+        # only the sides that were ASKED for have to resolve
+        if (pre_ids and not pre_items) or (post_ids and not post_items):
             print(f"    [manual] requested scene IDs not all found in {coll} "
                   f"({len(pre_items)} pre, {len(post_items)} post)")
             return None
-        print(f"    [manual] compositing {len(pre_items)} pre + {len(post_items)} "
-              f"post hand-picked {sensor} scene(s)")
+        sides = " + ".join(f"{len(i)} {s}" for s, i in
+                           (("pre", pre_items), ("post", post_items)) if i)
+        print(f"    [manual] compositing {sides} hand-picked {sensor} scene(s)")
+        if not pre_items or not post_items:
+            print(f"    [manual] one-sided run ({'post' if post_items else 'pre'} "
+                  f"only) — dNDVI / dNDSI / dBrightness need both sides and are "
+                  f"skipped")
         return _composite_result(pre_items, post_items, lat, lon, radius_km, sensor)
 
     # PlanetScope has been split out of this pipeline into the plugin's dedicated

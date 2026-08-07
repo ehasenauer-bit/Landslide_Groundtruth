@@ -431,6 +431,12 @@ class LandslideDock(QgsDockWidget):
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
         self.run_btn = QPushButton("Run")
+        self.run_btn.setToolTip(
+            "Download and export the TICKED scenes as the review layers checked "
+            "above. Exactly the scenes you ticked are used — the ★ suggestion is "
+            "not added, and ticking only one side (post alone, say) runs that side "
+            "on its own, minus the change rasters that need both. With the table "
+            "empty (no Search yet) the run falls back to picking scenes itself.")
         self.run_btn.clicked.connect(self._run)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -468,14 +474,15 @@ class LandslideDock(QgsDockWidget):
         scenes_box = QVBoxLayout(scenes)
         scenes_box.setContentsMargins(0, 0, 0, 0)
         scenes_lbl = QLabel(
-            "Candidate scenes  (★ = the run's pick each side; tick the scenes to "
-            "preview on the map and composite)")
+            "Candidate scenes  (tick the scenes to download; ★ = best-ranked, only "
+            "a suggestion)")
         scenes_lbl.setToolTip(
             "Ticks choose the scenes: 'Preview on map' renders the TICKED rows and "
-            "a Run composites them (one before + one after minimum). Only the ★ "
-            "top-ranked scene on each side starts ticked — tick more to "
-            "median-composite several, or untick the ★ and tick another to swap in "
-            "a different scene.\n\n"
+            "a Run downloads EXACTLY them — nothing starts ticked and nothing is "
+            "added for you. Tick one scene per side for a plain before/after pair, "
+            "several on a side to median-composite them, or only one side (e.g. "
+            "post alone, when nothing usable was acquired before the event) to get "
+            "just that side's imagery without the change rasters.\n\n"
             "Selecting a row (click; Ctrl/Shift-click for several) is separate: it "
             "drives the browse-image preview below and isolates that scene's "
             "footprint on the map. Double-click a row to preview just that scene.\n\n"
@@ -803,14 +810,17 @@ class LandslideDock(QgsDockWidget):
             (not on) and bool(self._best_streamable("pre") or self._best_streamable("post")))
 
     def _checked_scene_selection(self):
-        """Hand-picked scenes to composite, from the table's ticked checkboxes.
+        """Hand-picked scenes to download, from the table's ticked checkboxes.
 
         Returns one of:
-          dict(source, pre=[ids], post=[ids]) — a valid single-source Sentinel-2 /
-            Landsat override to hand to the Run;
-          None — no streamable scene ticked, so the Run picks scenes automatically;
-          str  — an error message (mixed sources, or only one side ticked) to show
-            and abort, so a half-made selection isn't silently ignored.
+          dict(source, pre=[ids], post=[ids]) — the Sentinel-2 / Landsat scenes to
+            run. EITHER side may be empty: a post-only (or pre-only) run is valid
+            and produces that side's imagery, just no change rasters, which need
+            both sides to subtract. That matters for a fresh event where nothing
+            usable was acquired before it yet.
+          None — nothing ticked at all, so the caller decides what to do;
+          str  — an error message (mixed sources) to show and abort, so a
+            half-made selection isn't silently ignored.
         Only Sentinel-2 / Landsat scenes are hand-pickable; PlanetScope is left to
         the automatic path (and ignored here even if ticked)."""
         picked = {"pre": [], "post": []}
@@ -827,13 +837,10 @@ class LandslideDock(QgsDockWidget):
             picked[side].append(cid)
             sources.add(source)
         if not picked["pre"] and not picked["post"]:
-            return None   # nothing streamable ticked -> automatic selection
+            return None   # nothing streamable ticked
         if len(sources) > 1:
             return ("Tick scenes from a single source — all Sentinel-2 OR all "
                     "Landsat. They can't be composited together.")
-        if not picked["pre"] or not picked["post"]:
-            return ("Tick at least one pre and one post scene of the same source "
-                    "to composite, or untick them all to let the Run choose.")
         return dict(source=next(iter(sources)), pre=picked["pre"], post=picked["post"])
 
     def _run(self):
@@ -844,19 +851,38 @@ class LandslideDock(QgsDockWidget):
         if isinstance(sel, str):
             self._warn(sel)
             return
+        # Rows on the table but none ticked: don't quietly fall back to the
+        # automatic ranking and download scenes that weren't chosen. Only an empty
+        # table (no Search yet) leaves the run nothing to go on, and there the
+        # automatic pick is the whole point.
+        if sel is None and self.table.rowCount() > 0:
+            self._warn("Tick the scene(s) you want to download in the table "
+                       "(either side alone is fine), or run Search / Preview "
+                       "again to let the Run pick automatically.")
+            return
         c = self._collect()
         if c is None:
             return
         python, script, project, out, args = c
         if sel:
-            args = args + ["--pre-scene-ids", ",".join(sel["pre"]),
-                           "--post-scene-ids", ",".join(sel["post"])]
+            # only pass the sides that were actually ticked — a missing side means
+            # "don't fetch that side", not "fall back to the automatic search"
+            for side in ("pre", "post"):
+                if sel[side]:
+                    args = args + [f"--{side}-scene-ids", ",".join(sel[side])]
         self.log.clear()
         if sel:
+            parts = [f"{len(sel[s])} {s}" for s in ("pre", "post") if sel[s]]
             self._append_log(
-                f"Manual scene selection: compositing {len(sel['pre'])} pre + "
-                f"{len(sel['post'])} post {sel['source']} scene(s) you ticked "
+                f"Manual scene selection: downloading {' + '.join(parts)} "
+                f"{sel['source']} scene(s) you ticked — nothing else "
                 f"(automatic ranking and PlanetScope skipped).")
+            if not sel["pre"] or not sel["post"]:
+                missing = "pre" if not sel["pre"] else "post"
+                self._append_log(
+                    f"  one-sided run: no {missing} scene ticked, so the {missing} "
+                    f"imagery and the change rasters (dNDVI / dNDSI / dBrightness, "
+                    f"which subtract one side from the other) are skipped.")
         self._busy(True)
         self.task = PipelineTask(python, script, project, args, out)
         self.task.logLine.connect(self._append_log)   # queued: worker -> GUI thread
@@ -960,34 +986,32 @@ class LandslideDock(QgsDockWidget):
             side_item.setData(Qt.UserRole + 2, c.get("id"))
             side_item.setData(Qt.UserRole + 3, side)
             # checkbox = use this scene — 'Preview on map' renders the ticked rows
-            # and a Run composites them. Only the ★ top-ranked scene on each side
-            # starts ticked; tick more rows to median-composite several, or untick
-            # the ★ and tick another to swap in a different scene. Hand-pickable for
-            # Sentinel-2 / Landsat.
+            # and a Run downloads exactly them. NOTHING starts ticked: pre-ticking
+            # the ★ meant a Run silently composited it alongside whatever you had
+            # picked, so the only way to run one chosen scene was to notice the ★
+            # and untick it. Hand-pickable for Sentinel-2 / Landsat.
             side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
-            side_item.setCheckState(Qt.Checked if is_top else Qt.Unchecked)
+            side_item.setCheckState(Qt.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 5).setToolTip(c["thumb_url"])
             if is_top:
                 side_item.setToolTip(
-                    "★ The scene an automatic run would lead with on this side "
-                    "(gap_days + cloud weighting). With --auto-window it's the "
-                    "single scene used; otherwise a run would median-composite this "
-                    "plus the ✓ scenes.")
+                    "★ Best-ranked scene on this side (gap_days + cloud weighting) "
+                    "— a suggestion, not a selection. It is NOT ticked for you.")
             elif in_comp:
                 side_item.setToolTip(
-                    "✓ An automatic run would also composite this — it medians the "
-                    "top-ranked clear scenes on this side, not just one.")
+                    "✓ Also inside that ranking's top few on this side, so it's "
+                    "another reasonable pick.")
             else:
                 side_item.setToolTip(
-                    "An automatic run would skip this one: ranked below the "
-                    "composite cutoff (gap_days + cloud weighting). That ranking "
-                    "knows nothing about WHERE the cloud sits, so check the "
-                    "thumbnail — a 'cloudy' scene is often clear over the AOI.")
+                    "Ranked below where that suggestion stops (gap_days + cloud "
+                    "weighting). The ranking knows nothing about WHERE the cloud "
+                    "sits, so check the thumbnail — a 'cloudy' scene is often clear "
+                    "over the AOI and the right pick.")
             side_item.setToolTip(
-                side_item.toolTip() + "\n\nTick the checkbox to use this scene: "
-                "'Preview on map' renders the ticked rows and a Run composites "
-                "them. Untick to leave it out. Sentinel-2 / Landsat only — "
+                side_item.toolTip() + "\n\nTick the checkbox to use this scene: a "
+                "Run downloads EXACTLY the ticked rows (and 'Preview on map' "
+                "renders them). Nothing else is added. Sentinel-2 / Landsat only — "
                 "PlanetScope has its own tab.")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
