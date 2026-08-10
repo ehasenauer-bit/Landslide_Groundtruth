@@ -3,26 +3,30 @@
 Where this sits in the workflow: the other tabs get you imagery and elevation
 change; this one turns the polygons you digitize over that imagery into numbers.
 
-WHICH OUTLINE THE VOLUME COMES FROM: the TOTAL landslide outline — the whole
-affected area, source through runout to deposit. A mapped slide usually carries
-several outlines: one total extent plus two or three interpretations of the
-source scar inside it. Only the total is converted. The source outlines are
-measured and reported beside it, never run through the relation, because the
-relation answers a question about whatever area it is handed and the source scar
-is a fraction of what failed — feeding it a source outline silently answers a
-different question and reads low.
+WHICH OUTLINE THE VOLUME COMES FROM: it follows the Fit, because the Larsen
+coefficients are calibrated per outline definition. The source-scar fit (Larsen
+Table S1, the default) converts the BEST SOURCE outline and widens the volume
+range with the low/high source outlines when they are assigned. The total-area
+fit converts the TOTAL outline instead, once its coefficients are filled in (see
+LARSEN_TOTAL in volume_calc). Whichever outline is NOT the fit's calibrated input
+is still measured and reported alongside, never run through the relation, because
+the relation answers a question about whatever area it is handed — feeding the
+scar fit a total outline reads high, and feeding a total fit a source outline
+reads low.
 
 How the pieces fit:
 
-  Roles     Four layer pickers: one TOTAL (drives the volume) and three optional
-            SOURCE roles (best/low/high, reported only). Assigning by layer
-            rather than by map selection means the input is explicit and
-            re-measurable, and layers named for their role — "Total Area",
-            "Source Area (low)" — are recognised automatically, so a project that
-            already holds the outlines comes up ready to measure. A role layer
-            holding several polygons contributes its largest; the rest are
-            reported, not combined, since they are alternative attempts at one
-            outline rather than parts of it.
+  Roles     Four layer pickers: one TOTAL and three SOURCE roles (best/low/high).
+            Under the source-scar fit the SOURCE best drives the volume and
+            source low/high set its range; the total is reported alongside. Under
+            the total-area fit the TOTAL drives it and the source roles are
+            reported. Assigning by layer rather than by map selection means the
+            input is explicit and re-measurable, and layers named for their role
+            — "Total Area", "Source Area (low)" — are recognised automatically,
+            so a project that already holds the outlines comes up ready to
+            measure. A role layer holding several polygons contributes its
+            largest; the rest are reported, not combined, since they are
+            alternative attempts at one outline rather than parts of it.
 
   Area      Ellipsoidal plan-view area (QgsDistanceArea + the project
             ellipsoid) — the same thing $area gives, and the same quantity
@@ -35,14 +39,16 @@ How the pieces fit:
             outline instruction on the tab follows this choice, so the polygon
             and the calibration can't silently disagree.
 
-  Length    A medial-axis centerline of the total outline (see centerline.py),
-            dropped into an editable scratch layer so you can trim the ends or
-            nudge it and re-measure. Reported for reference only — the volume
-            comes from area alone.
+  Length    A medial-axis centerline of the total landslide outline (see
+            centerline.py) — a whole-slide runout length, taken from the total
+            even under the scar fit; with no total assigned it spines the
+            converted outline instead. Dropped into an editable scratch layer so
+            you can trim the ends or nudge it and re-measure. Reported for
+            reference only — the volume comes from area alone.
 
   Results   One row per slide, accumulating across slides so a session's work
             exports as one CSV, plus a write-back that stamps the numbers onto
-            the total outline's own feature so they travel with the geometry.
+            the converted outline's own feature so they travel with the geometry.
 
 The volume arithmetic itself lives in volume_calc, which prefers the project's
 canonical larsen_BR_volume.py and names whichever implementation ran.
@@ -120,15 +126,18 @@ SOURCE_ROLES = (("best", "best"), ("low", "low"), ("high", "high"))
 
 # Attribute fields the write-back adds to the scar layer. (name, type, source
 # key in a results row.) Kept short and lower-case so they survive a Shapefile
-# round-trip (10-character field-name limit) as well as GeoPackage.
+# round-trip (10-character field-name limit) as well as GeoPackage. area_m2 is
+# the area that PRODUCED the volume (source best under the scar fit, total under
+# the total fit); area_lo/hi_m2 are the low/high areas that set the range;
+# total_m2 records the total outline for context when it wasn't the converted one.
 WRITEBACK_FIELDS = [
     ("slide", QVariant.String, "name"),
     ("fit", QVariant.String, "fit_label"),
     ("material", QVariant.String, "material_label"),
-    ("area_m2", QVariant.Double, "a_total"),
-    ("src_m2", QVariant.Double, "src_best"),
-    ("src_lo_m2", QVariant.Double, "src_low"),
-    ("src_hi_m2", QVariant.Double, "src_high"),
+    ("area_m2", QVariant.Double, "a_conv"),
+    ("area_lo_m2", QVariant.Double, "a_conv_low"),
+    ("area_hi_m2", QVariant.Double, "a_conv_high"),
+    ("total_m2", QVariant.Double, "a_total"),
     ("length_m", QVariant.Double, "length"),
     ("vol_m3", QVariant.Double, "v_best"),
     ("vol_lo_m3", QVariant.Double, "v_low"),
@@ -149,19 +158,26 @@ TABLE_COLS = ["Slide", "Fit", "Material", "Total area (m²)", "V best (m³)",
               "Src high (m²)", "Length (m)", "Layers"]
 
 # CSV header + the row keys behind it, so the export carries raw numbers rather
-# than the table's thousands-separated display strings. total_area_m2 is the one
-# the volume came from; the source areas are recorded but were not converted.
+# than the table's thousands-separated display strings. converted_area_m2 is the
+# one the volume came from (source best under the scar fit, total under the total
+# fit); converted_from names which role that was. The other areas are recorded
+# but were not converted.
 CSV_FIELDS = [
     ("slide", "name"), ("fit", "fit"), ("material", "material"),
-    ("total_area_m2", "a_total"),
+    ("converted_from", "conv_role"),
+    ("converted_area_m2", "a_conv"),
+    ("converted_area_low_m2", "a_conv_low"),
+    ("converted_area_high_m2", "a_conv_high"),
     ("volume_best_m3", "v_best"), ("volume_low_m3", "v_low"),
     ("volume_high_m3", "v_high"),
+    ("total_area_m2", "a_total"),
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
     ("centerline_m", "length"), ("centerline_method", "length_method"),
-    ("total_layer", "layer_name"), ("source_best_layer", "best_layer"),
+    ("converted_layer", "layer_name"), ("total_layer", "total_layer"),
+    ("source_best_layer", "best_layer"),
     ("source_low_layer", "low_layer"), ("source_high_layer", "high_layer"),
-    ("total_feature_id", "best_fid"), ("calculator", "calc"),
+    ("converted_feature_id", "conv_fid"), ("calculator", "calc"),
 ]
 
 
@@ -194,9 +210,11 @@ class VolumeTab(QWidget):
 
         intro = QLabel(
             "Volume from landslide area — Larsen et al. (2010) area–volume "
-            "scaling. The volume is computed from the TOTAL landslide outline; "
-            "the source-area outlines are measured and reported alongside it, "
-            "not converted. Assign the layers below and press Measure.")
+            "scaling. The area converted to a volume follows the Fit below: the "
+            "source-scar fit converts the BEST SOURCE outline (and widens the ± "
+            "range with the low/high source outlines); the total-area fit "
+            "converts the TOTAL outline. The outline not used is measured and "
+            "reported alongside. Assign the layers below and press Measure.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         root.addWidget(intro)
@@ -247,9 +265,10 @@ class VolumeTab(QWidget):
         btns = QHBoxLayout()
         self.measure_btn = QPushButton("Measure")
         self.measure_btn.setToolTip(
-            "Measure the assigned layers and convert the TOTAL area to a "
-            "volume. The source-area layers are optional; they are measured "
-            "and recorded but never converted.")
+            "Measure the assigned layers and convert the area the selected Fit "
+            "is calibrated on — the best SOURCE area for the scar fit (source "
+            "low/high widen the range), the TOTAL area for the total fit. The "
+            "outline not converted is measured and recorded alongside.")
         self.measure_btn.clicked.connect(self._measure)
         self.add_btn = QPushButton("Add to results ↓")
         self.add_btn.setToolTip(
@@ -285,7 +304,7 @@ class VolumeTab(QWidget):
         rbtns = QHBoxLayout()
         self.write_btn = QPushButton("Write to layer")
         self.write_btn.setToolTip(
-            "Stamp the numbers onto the BEST outline's own feature as "
+            "Stamp the numbers onto the CONVERTED outline's own feature as "
             "attributes (fields are added if missing), so they travel with the "
             "geometry. Applies to the selected rows, or all rows if none are "
             "selected. Needs a layer that accepts attribute edits.")
@@ -608,16 +627,26 @@ class VolumeTab(QWidget):
             extra = f" of {len(measured)}, largest" if len(measured) > 1 else ""
             parts.append(f"{label} {_fmt(measured[0][0])} m²{extra}")
         if not parts:
-            self.role_lbl.setText(
-                "Assign the total landslide outline to “Total area layer” — that "
-                "is what the volume is computed from. The source-area layers are "
-                "optional and are reported alongside it.")
+            if self._fit() == "total":
+                self.role_lbl.setText(
+                    "Assign the total landslide outline to “Total area layer” — "
+                    "the total-area fit computes the volume from it. The "
+                    "source-area layers are optional and reported alongside.")
+            else:
+                self.role_lbl.setText(
+                    "Assign the best source outline to “Source area (best)” — "
+                    "the source-scar fit computes the volume from it. Source "
+                    "low/high widen the range; the total is reported alongside.")
             self.role_lbl.setStyleSheet("QLabel { color: palette(mid); }")
             return
         problem = self._role_order_problem(areas)
-        if not problem and "total" not in areas:
-            problem = ("No total area layer assigned — the volume needs the "
-                       "total outline, not the source areas.")
+        if not problem:
+            if self._fit() == "total" and "total" not in areas:
+                problem = ("No total area layer assigned — the total-area fit "
+                           "converts the total outline.")
+            elif self._fit() != "total" and "best" not in areas:
+                problem = ("No source-best layer assigned — the source-scar fit "
+                           "converts the best source outline.")
         self.role_lbl.setText("  ·  ".join(parts) + (f"\n⚠ {problem}" if problem else ""))
         self.role_lbl.setStyleSheet(
             "QLabel { color: #c62828; }" if problem
@@ -725,13 +754,14 @@ class VolumeTab(QWidget):
     def _build_current_box(self):
         """Which layers are measured, and what came out.
 
-        The drop-downs are the input. "Total area layer" is the whole landslide
-        outline and is the ONLY one converted to a volume; the three source-area
-        roles are measured and reported beside it, because the relation answers
-        a question about the area you give it and the source scar is a fraction
-        of what failed. Everything below them is read-only computed output,
-        which is also why the per-project state save skips it (see
-        project_state._persistable)."""
+        The drop-downs are the input. Which one is converted to a volume follows
+        the Fit: the source-scar fit converts "Source area (best)" and widens the
+        range with the low/high source outlines; the total-area fit converts
+        "Total area layer". The outline the fit doesn't use is measured and
+        reported beside the result, never fed to the relation, because the
+        relation answers a question about the area you give it. Everything below
+        the drop-downs is read-only computed output, which is also why the
+        per-project state save skips it (see project_state._persistable)."""
         box = QgsCollapsibleGroupBox("Current measurement")
         box.setSaveCollapsedState(False)
         f = QFormLayout(box)
@@ -742,8 +772,9 @@ class VolumeTab(QWidget):
         self._total_combo = QComboBox()
         self._total_combo.setToolTip(
             "Layer holding the TOTAL landslide outline — the whole affected "
-            "area, source through runout to deposit. THIS is the area converted "
-            "to a volume.\n\n"
+            "area, source through runout to deposit. Converted to a volume only "
+            "under the total-area fit; under the source-scar fit it is measured "
+            "and reported alongside, not converted.\n\n"
             "Filled in automatically from a layer named “Total Area”, “Total "
             "Landslide Area” or “Landslide Area”. Capitalisation and punctuation "
             "don't matter.")
@@ -751,21 +782,22 @@ class VolumeTab(QWidget):
 
         self._best_combo = QComboBox()
         self._best_combo.setToolTip(
-            "Optional. Layer holding the BEST source-scar interpretation. "
-            "Measured and reported alongside the volume, but NOT converted — the "
-            "volume comes from the total area.\n\n"
+            "Layer holding the BEST source-scar interpretation. Under the "
+            "source-scar fit THIS is the area converted to a volume.\n\n"
             "Filled in automatically from “Source Area (best)”, or a plain "
             "“Source Area”.")
         f.addRow("Source area (best)", self._best_combo)
         self._low_combo = QComboBox()
         self._low_combo.setToolTip(
             "Optional. Layer holding the CONSERVATIVE (smaller) source-scar "
-            "interpretation, from “Source Area (low)”. Reported, not converted.")
+            "interpretation, from “Source Area (low)”. Under the source-scar fit "
+            "it lowers the volume range (paired with source high).")
         f.addRow("Source area (low)", self._low_combo)
         self._high_combo = QComboBox()
         self._high_combo.setToolTip(
             "Optional. Layer holding the GENEROUS (larger) source-scar "
-            "interpretation, from “Source Area (high)”. Reported, not converted.")
+            "interpretation, from “Source Area (high)”. Under the source-scar fit "
+            "it raises the volume range (paired with source low).")
         f.addRow("Source area (high)", self._high_combo)
         for role, combo in (("total", self._total_combo),
                             ("best", self._best_combo), ("low", self._low_combo),
@@ -780,12 +812,12 @@ class VolumeTab(QWidget):
         self.role_lbl.setStyleSheet("QLabel { color: palette(mid); }")
         f.addRow(self.role_lbl)
 
-        self.source_out = self._ro("assign the total area layer, then Measure")
+        self.source_out = self._ro("assign the layer the fit needs, then Measure")
         f.addRow("Measured", self.source_out)
         self.area_best_out = self._ro()
-        f.addRow("Total area → volume", self.area_best_out)
+        f.addRow("Area → volume", self.area_best_out)
         self.area_range_out = self._ro()
-        f.addRow("Source areas (reported)", self.area_range_out)
+        f.addRow("Other areas (reported)", self.area_range_out)
         self.length_out = self._ro()
         f.addRow("Centerline length", self.length_out)
         self.vol_best_out = self._ro()
@@ -806,7 +838,8 @@ class VolumeTab(QWidget):
         v = QVBoxLayout(box)
 
         note = QLabel(
-            "Derives the medial-axis spine of the best outline — it follows the "
+            "Derives the medial-axis spine of the total landslide outline (or "
+            "the converted outline if no total is assigned) — it follows the "
             f"slide's bends instead of cutting across them — into “{CENTERLINE_LAYER}”, "
             "left in edit mode so you can trim the ends with the Vertex Tool. "
             "Re-measure afterwards to pick up your edits. Reported for "
@@ -845,6 +878,9 @@ class VolumeTab(QWidget):
             text += ("  Not configured yet: add LARSEN_TOTAL to "
                      "larsen_BR_volume.py (or volume_calc.py) — see the log.")
         self.outline_lbl.setText("⚠ " + text if text else "")
+        # The role readout names which layer the fit needs, so keep it in step.
+        if hasattr(self, "role_lbl"):
+            self._update_role_label()
 
     def _fit(self):
         return dict(volume_calc.FITS).get(self.fit_combo.currentText(), "scar")
@@ -881,32 +917,27 @@ class VolumeTab(QWidget):
         return area, feature, layer
 
     def _measure(self):
-        """Volume from the TOTAL landslide outline.
+        """Volume from the outline the selected Fit is calibrated on.
 
-        The source-area outlines are measured and reported alongside it but are
-        never converted: the source scar is a fraction of what failed, so running
-        the relation on it answers a different question than the one being asked.
-        Source low/high therefore no longer widen the volume range either — with
-        one total outline the range is the published fit uncertainty, and it takes
-        a low/high pair of TOTAL outlines to add area uncertainty to it."""
+        The Larsen coefficients are per outline definition, so which outline is
+        converted follows the Fit: the source-scar fit converts the BEST SOURCE
+        outline and widens the range with the source low/high outlines when they
+        are assigned; the total-area fit converts the TOTAL outline. Whichever
+        outline is not the fit's input is measured and reported alongside but
+        never fed to the relation — running it on the wrong outline silently
+        answers a different question (a total outline through the scar fit reads
+        high; a source outline through a total fit reads low)."""
         if not self._polygon_layers():
             self._append_log(
                 "This project has no polygon layer. Press New scar layer to "
                 "make one and start drawing the outline.")
             return
 
+        fit = self._fit()
+        # Every role is measured up front; the Fit decides which one is converted
+        # to a volume and which are reported alongside.
         a_total, total_feat, total_layer = self._role_area("total", "Total area")
-        if a_total is None:
-            if total_layer is None:
-                self._append_log(
-                    "No layer is assigned to “Total area layer”. The volume is "
-                    "computed from the TOTAL landslide outline — the whole "
-                    "affected area — so pick that layer. The source-area "
-                    "drop-downs are reported alongside it, not converted.")
-            return
-
-        # measured for the record; deliberately not fed to the relation
-        a_best, _bf, best_layer = self._role_area("best", "Source best")
+        a_best, best_feat, best_layer = self._role_area("best", "Source best")
         a_low, _lf, low_layer = self._role_area("low", "Source low")
         a_high, _hf, high_layer = self._role_area("high", "Source high")
 
@@ -918,12 +949,39 @@ class VolumeTab(QWidget):
                 "rather than reporting a number from the wrong outline.")
             return
 
-        fit = self._fit()
+        if fit == "total":
+            conv_role, conv_area = "total", a_total
+            conv_feat, conv_layer = total_feat, total_layer
+            conv_low = conv_high = None
+        else:  # scar: the calibrated input is the source scar
+            conv_role, conv_area = "source", a_best
+            conv_feat, conv_layer = best_feat, best_layer
+            conv_low, conv_high = a_low, a_high
+
+        if conv_area is None:
+            # A layer that is assigned but empty/unmeasurable already produced a
+            # specific message in _role_area; only the truly-unassigned case
+            # needs the "pick a layer" guidance here.
+            if conv_layer is None and fit == "total":
+                self._append_log(
+                    "No layer is assigned to “Total area layer”. The total-area "
+                    "fit converts the TOTAL landslide outline, so assign that "
+                    "layer — or switch Fit to “Source scar” to convert the "
+                    "source outline instead.")
+            elif conv_layer is None:
+                self._append_log(
+                    "No layer is assigned to “Source area (best)”. The "
+                    "source-scar fit converts the BEST SOURCE outline, so assign "
+                    "that layer. The total and low/high layers are optional — "
+                    "low/high widen the range, the total is reported alongside.")
+            return
+
         material, material_label = self._material(), self.material_combo.currentText()
         fit_label = self.fit_combo.currentText()
         try:
             v_best, v_low, v_high, calc = volume_calc.volume_source(
-                a_total, material=material, fit=fit,
+                conv_area, A_low=conv_low, A_high=conv_high,
+                material=material, fit=fit,
                 project_dir=self.dock.project_edit.text().strip())
         except volume_calc.NotConfigured as e:
             self._append_log(str(e))
@@ -933,29 +991,44 @@ class VolumeTab(QWidget):
             self._append_log(f"Volume calculation failed: {e}")
             return
 
-        self._warn_if_total_excludes_source(total_feat, best_layer)
+        if conv_role == "source" and total_feat is not None:
+            self._warn_if_total_excludes_source(total_feat, best_layer)
 
-        used = [f"total “{total_layer.name()}”"]
-        for label, area, layer in (("src best", a_best, best_layer),
+        used = [f"{conv_role} “{conv_layer.name()}” → volume"]
+        for label, area, layer in (("total", a_total, total_layer),
+                                   ("src best", a_best, best_layer),
                                    ("src low", a_low, low_layer),
                                    ("src high", a_high, high_layer)):
-            if area is not None:
+            if area is not None and layer is not conv_layer:
                 used.append(f"{label} “{layer.name()}”")
+        # The centerline is a whole-slide runout length, so it is taken from the
+        # TOTAL outline whenever one is assigned — even under the scar fit, where
+        # the volume itself comes from the source scar. With no total outline
+        # there is nothing else to spine but the converted one.
+        if total_feat is not None:
+            len_layer_id, len_fid = total_layer.id(), total_feat.id()
+            len_from = "total"
+        else:
+            len_layer_id, len_fid = conv_layer.id(), conv_feat.id()
+            len_from = conv_role
         self._current = {
             "name": self.name_edit.text().strip() or "slide",
             "material": material, "material_label": material_label,
             "fit": fit, "fit_label": fit_label,
-            "a_best": a_total, "a_low": None, "a_high": None,
+            "conv_role": conv_role,
+            "a_conv": conv_area, "a_conv_low": conv_low, "a_conv_high": conv_high,
             "a_total": a_total,
             "src_best": a_best, "src_low": a_low, "src_high": a_high,
             "v_best": v_best, "v_low": v_low, "v_high": v_high,
             "length": None, "length_method": "",
-            "layer_id": total_layer.id(), "layer_name": total_layer.name(),
+            "layer_id": conv_layer.id(), "layer_name": conv_layer.name(),
+            "conv_fid": conv_feat.id(),
+            "len_layer_id": len_layer_id, "len_fid": len_fid, "len_from": len_from,
+            "total_layer": total_layer.name() if a_total is not None else "",
+            "best_layer": best_layer.name() if a_best is not None else "",
             "low_layer": low_layer.name() if a_low is not None else "",
             "high_layer": high_layer.name() if a_high is not None else "",
-            "best_layer": best_layer.name() if a_best is not None else "",
-            "best_fid": total_feat.id(),
-            "fids_text": str(total_feat.id()),
+            "fids_text": str(conv_feat.id()),
             "used_text": ", ".join(used),
             "calc": calc,
         }
@@ -965,20 +1038,38 @@ class VolumeTab(QWidget):
         self.centerline_btn.setEnabled(True)
         self.remeasure_btn.setEnabled(False)
 
+        conv_name = "Source best" if conv_role == "source" else "Total"
         self._append_log(
-            f"Total area = {_fmt(a_total)} m² from “{total_layer.name()}” — "
-            f"V = {_fmt(v_best)} m³ ({_fmt(v_low)} – {_fmt(v_high)}). "
-            f"{fit_label}, {material_label.lower()}; via {calc}.")
-        srcs = [f"{lbl} {_fmt(a)} m²" for lbl, a in
-                (("low", a_low), ("best", a_best), ("high", a_high))
-                if a is not None]
-        if srcs:
+            f"{conv_name} area = {_fmt(conv_area)} m² from "
+            f"“{conv_layer.name()}” — V = {_fmt(v_best)} m³ "
+            f"({_fmt(v_low)} – {_fmt(v_high)}). {fit_label}, "
+            f"{material_label.lower()}; via {calc}.")
+        # Report the areas that were measured but not converted.
+        if conv_role == "source":
+            others = [f"total {_fmt(a_total)} m²"] if a_total is not None else []
+        else:
+            others = [f"{lbl} {_fmt(a)} m²" for lbl, a in
+                      (("src low", a_low), ("src best", a_best),
+                       ("src high", a_high)) if a is not None]
+        if others:
             self._append_log(
-                "Source areas measured for the record (not converted): "
-                + ", ".join(srcs) + ".")
-        self._append_log(
-            "Range is the published fit uncertainty — one total outline carries "
-            "no area uncertainty of its own.")
+                "Also measured (not converted): " + ", ".join(others) + ".")
+        # Say where the ± range came from.
+        if conv_role == "source" and conv_low is not None and conv_high is not None:
+            self._append_log(
+                "Range combines the published fit uncertainty with the source "
+                "low/high area spread.")
+        elif conv_role == "source":
+            missing = ("both source low and high outlines"
+                       if conv_low is None and conv_high is None
+                       else "the other source outline")
+            self._append_log(
+                f"Range is the published fit uncertainty — assign {missing} to "
+                "add area uncertainty to it.")
+        else:
+            self._append_log(
+                "Range is the published fit uncertainty — one total outline "
+                "carries no area uncertainty of its own.")
 
     def _warn_if_total_excludes_source(self, total_feat, best_layer):
         """The total outline should contain the source scar. If it doesn't, the
@@ -1005,14 +1096,23 @@ class VolumeTab(QWidget):
         if c is None:
             return
         self.source_out.setText(
-            f"{c['used_text']}  (feature {c['best_fid']})")
-        self.area_best_out.setText(
-            f"{_fmt(c['a_total'])} m²   ({c['a_total'] / 1e6:,.4f} km²)")
-        srcs = [f"{lbl} {_fmt(a)}" for lbl, a in
-                (("low", c["src_low"]), ("best", c["src_best"]),
-                 ("high", c["src_high"])) if a is not None]
+            f"{c['used_text']}  (feature {c['conv_fid']})")
+        # The area that produced the volume, with its low/high range if any.
+        conv_txt = f"{_fmt(c['a_conv'])} m²   ({c['a_conv'] / 1e6:,.4f} km²)"
+        if c.get("a_conv_low") is not None and c.get("a_conv_high") is not None:
+            conv_txt += (f"   [range {_fmt(c['a_conv_low'])} – "
+                         f"{_fmt(c['a_conv_high'])} m²]")
+        self.area_best_out.setText(conv_txt)
+        # The areas measured but not converted, for context.
+        if c["conv_role"] == "source":
+            others = ([f"total {_fmt(c['a_total'])}"]
+                      if c["a_total"] is not None else [])
+        else:
+            others = [f"{lbl} {_fmt(a)}" for lbl, a in
+                      (("src low", c["src_low"]), ("src best", c["src_best"]),
+                       ("src high", c["src_high"])) if a is not None]
         self.area_range_out.setText(
-            ("  ·  ".join(srcs) + " m²") if srcs else "— (none assigned)")
+            ("  ·  ".join(others) + " m²") if others else "— (none assigned)")
         self.vol_best_out.setText(
             f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
         self.vol_range_out.setText(
@@ -1089,15 +1189,22 @@ class VolumeTab(QWidget):
         c = self._current
         if c is None:
             return
-        layer = QgsProject.instance().mapLayer(c["layer_id"])
+        # The length spines the TOTAL outline when one was assigned (see _measure),
+        # so a scar-fit volume still gets a whole-slide runout length.
+        layer = QgsProject.instance().mapLayer(c["len_layer_id"])
         if layer is None:
-            self._append_log("The measured layer is no longer in the project.")
+            self._append_log("The outline to spine is no longer in the project.")
             return
-        feat = layer.getFeature(c["best_fid"])
+        feat = layer.getFeature(c["len_fid"])
         geom = feat.geometry() if feat is not None else None
         if geom is None or geom.isEmpty():
-            self._append_log("Could not re-read the best outline's geometry.")
+            self._append_log("Could not re-read the outline's geometry.")
             return
+        if c.get("len_from") != "total":
+            self._append_log(
+                "No total outline assigned — spining the "
+                f"{c.get('len_from', 'converted')} outline instead. Assign the "
+                "total landslide outline for a whole-slide runout length.")
 
         # the skeleton is metric: work in the local UTM zone, then hand the
         # result back in the project's CRS so it edits naturally on the canvas
@@ -1284,7 +1391,7 @@ class VolumeTab(QWidget):
         self.add_btn.setEnabled(False)
         self.centerline_btn.setEnabled(False)
         self.remeasure_btn.setEnabled(False)
-        self.source_out.setText("assign A_best and press Measure")
+        self.source_out.setText("assign the layer the fit needs, then Measure")
         for e in (self.area_best_out, self.area_range_out, self.length_out,
                   self.vol_best_out, self.vol_range_out, self.calc_out):
             e.clear()
@@ -1293,9 +1400,10 @@ class VolumeTab(QWidget):
     def _refresh_table(self):
         self.table.setRowCount(len(self._rows))
         for r, row in enumerate(self._rows):
-            srcs = [n for n in (row["best_layer"], row["low_layer"],
-                                row["high_layer"]) if n]
-            layers = row["layer_name"] + (f"  +src: {', '.join(srcs)}" if srcs else "")
+            others = [n for n in (row.get("total_layer", ""), row["best_layer"],
+                                  row["low_layer"], row["high_layer"])
+                      if n and n != row["layer_name"]]
+            layers = row["layer_name"] + (f"  + {', '.join(others)}" if others else "")
             values = [
                 row["name"], row["fit_label"], row["material_label"],
                 _fmt(row["a_total"]),
@@ -1394,9 +1502,9 @@ class VolumeTab(QWidget):
                 "edits (read-only source).")
             return False
 
-        if not layer.getFeature(row["best_fid"]).isValid():
+        if not layer.getFeature(row["conv_fid"]).isValid():
             self._append_log(
-                f"“{row['name']}”: feature {row['best_fid']} is no longer in "
+                f"“{row['name']}”: feature {row['conv_fid']} is no longer in "
                 f"{layer.name()} — saving a layer renumbers features that were "
                 "still unsaved when they were measured. Measure it again, then "
                 "write.")
@@ -1441,7 +1549,7 @@ class VolumeTab(QWidget):
                 continue
             value = row.get(key)
             if not layer.changeAttributeValue(
-                    row["best_fid"], idx,
+                    row["conv_fid"], idx,
                     QVariant() if value is None else value):
                 ok = False
         if started and not layer.commitChanges():
@@ -1452,7 +1560,7 @@ class VolumeTab(QWidget):
         if not ok:
             self._append_log(
                 f"“{row['name']}”: some attributes could not be set on "
-                f"feature {row['best_fid']}.")
+                f"feature {row['conv_fid']}.")
         return ok
 
 
