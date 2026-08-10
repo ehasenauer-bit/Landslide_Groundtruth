@@ -281,9 +281,11 @@ def main():
                     help="max whole-scene cloud cover %% to consider. 100 (or omitted, for "
                          "--search-only) = NO CAP: every acquisition in the window is listed, "
                          "clouds and all, so scenes can be judged by eye rather than by "
-                         "metadata. Scene-wide metric — per-pixel cloud masking still applies "
-                         "to a Run, so a high cap surfaces scenes clear over the AOI but cloudy "
-                         "elsewhere (what Planet Explorer shows). A Run without --max-cloud "
+                         "metadata. Scene-wide metric, and it only picks WHICH scenes are used "
+                         "— a Run composites them as acquired, with no per-pixel cloud masking "
+                         "(Sentinel-2/Landsat; see imagery._composite), so a high cap surfaces "
+                         "scenes clear over the AOI but cloudy elsewhere (what Planet Explorer "
+                         "shows). A Run without --max-cloud "
                          "still caps (PlanetScope 80, Sentinel-2/Landsat 60, either one 20 "
                          "with --auto-window), since it picks scenes for you rather than "
                          "showing them to you.")
@@ -305,11 +307,14 @@ def main():
     ap.add_argument("--pre-scene-ids", default=None,
                     help="comma-separated scene IDs to composite for the PRE side, "
                          "overriding the automatic scene ranking (Sentinel-2 / Landsat "
-                         "only). Requires --post-scene-ids; PlanetScope and the windowed "
-                         "search are skipped. Ignored with --search-only.")
+                         "only). PlanetScope and the windowed search are skipped. "
+                         "Ignored with --search-only.")
     ap.add_argument("--post-scene-ids", default=None,
                     help="comma-separated scene IDs for the POST side (see "
-                         "--pre-scene-ids).")
+                         "--pre-scene-ids). Either side may be given ALONE: a one-sided "
+                         "run exports just that side's imagery and skips dNDVI / dNDSI / "
+                         "dBrightness, which are pre->post differences. Useful for a "
+                         "fresh event with no usable pre-scene yet.")
     ap.add_argument("--seasonal", action="store_true",
                     help="winter event: use prior-year pre window")
     ap.add_argument("--auto-window", action="store_true",

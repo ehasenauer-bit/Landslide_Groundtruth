@@ -38,7 +38,14 @@ def process_one(ev, args):
     if img is None:
         return dict(status="no_imagery", event_id=ev["event_id"])
 
-    src_crs = img["dndvi"].rio.crs
+    # Grid CRS to write every layer in. dNDVI is absent on a one-sided run (it is a
+    # difference), so fall back to whichever composite the run does have — they all
+    # share one grid.
+    ref = next((img[k] for k in ("dndvi", "pre", "post") if img.get(k) is not None),
+               None)
+    if ref is None:
+        return dict(status="no_imagery", event_id=ev["event_id"])
+    src_crs = ref.rio.crs
     tf = Transformer.from_crs(4326, src_crs, always_xy=True)
     near = tf.transform(ev["lon"], ev["lat"])
 
@@ -57,6 +64,9 @@ def process_one(ev, args):
         status="ok", event_id=ev["event_id"], sensor=img["sensor"],
         n_pre_scenes=len(img["pre_scenes"]), n_post_scenes=len(img["post_scenes"]),
         pre_scenes=img["pre_scenes"], post_scenes=img["post_scenes"],
+        # acquisition dates of the composited scenes; the plugin logs them, and
+        # they are already baked into the layer filenames (see review_package)
+        pre_dates=img.get("pre_dates"), post_dates=img.get("post_dates"),
         layers=layers, metadata=meta_path,
         fallback_note=img.get("fallback_note"),   # why PlanetScope wasn't used, if it fell back
     )
