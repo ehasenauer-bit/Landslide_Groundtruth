@@ -153,6 +153,18 @@ self-intersecting polygon in OSM that GDAL rejects when clipping (298 of 299
 areas survive). It is nowhere near the St. Elias, so it has been left alone
 rather than patched.
 
+**XYZ URL encoding is load-bearing and fails silently.** If you ever hand-edit
+`BASEMAPS` or `xyz_layer`, know that the layer URI is itself an `&`/`=`
+delimited parameter string. Any `&` or `=` *inside* the tile URL — Google's
+`lyrs=s&x={x}&y={y}&z={z}` is nothing but those — must be percent-encoded, or
+the URL gets truncated at the first `&`. But `:` and `/` must stay literal:
+encoding them as `%3A`/`%2F` produces a layer that reports `isValid() == True`,
+raises no provider error, logs nothing, and renders a completely blank basemap.
+`urllib.parse.quote(url, safe=':/')` is the combination that satisfies both.
+Because none of the obvious health checks catch this, `build_template.py` now
+fetches one real tile per basemap (`tiles_arrive`) and refuses to write a
+template containing a basemap that returned no pixels.
+
 **Only global Overpass mirrors, and empty tiles get double-checked.** Worth
 knowing if you ever edit `OVERPASS`: an early version of this script listed
 `overpass.osm.ch`, which serves a Switzerland-only extract. Asked about Alaska

@@ -72,7 +72,8 @@ import urllib.parse  # noqa: E402
 from qgis.core import (  # noqa: E402
     Qgis, QgsApplication, QgsCoordinateReferenceSystem, QgsFillSymbol,
     QgsLineSymbol, QgsMarkerSymbol, QgsPalLayerSettings, QgsProject,
-    QgsProperty, QgsRasterLayer, QgsSingleSymbolRenderer, QgsTextBufferSettings,
+    QgsProperty, QgsRasterLayer, QgsRectangle, QgsSingleSymbolRenderer,
+    QgsTextBufferSettings,
     QgsTextFormat, QgsVectorLayer, QgsVectorLayerSimpleLabeling,
 )
 from qgis.PyQt.QtGui import QColor, QFont  # noqa: E402
@@ -107,14 +108,52 @@ BASEMAPS = (
 # than in projected units — Mercator area error at 60 N is a factor of ~4.
 PROJECT_CRS = "EPSG:3857"
 
+# A small patch of the Logan massif in EPSG:3857, used only to ask each basemap
+# for real pixels at build time (see tiles_arrive). Any land extent would do —
+# every basemap here is global — so retargeting the template at another region
+# does not require changing it.
+PROBE_EXTENT_3857 = (-15679000.0, 8560000.0, -15580000.0, 8625000.0)
+
 
 def xyz_layer(name, url, zmax):
-    uri = (f"type=xyz&url={urllib.parse.quote(url, safe='')}"
-           f"&zmax={zmax}&zmin=0&http-header:referer=")
+    """Build an XYZ raster layer.
+
+    The encoding of `url` is load-bearing and fails silently if wrong. The URI
+    is itself an &-and-=-delimited parameter string, so any & or = *inside* the
+    tile URL — Google's "lyrs=s&x={x}&y={y}&z={z}" is all of them — has to be
+    percent-encoded or the parser truncates the URL at the first &. But ':' and
+    '/' must stay literal: encoding those as %3A/%2F yields a layer that reports
+    isValid() == True, raises no provider error, and renders nothing at all.
+    safe=':/' is the combination that satisfies both.
+    """
+    uri = (f"type=xyz&url={urllib.parse.quote(url, safe=':/')}"
+           f"&zmax={zmax}&zmin=0")
     layer = QgsRasterLayer(uri, name, "wms")
     if not layer.isValid():
         raise RuntimeError(f"XYZ layer failed to build: {name}")
+    if not tiles_arrive(layer):
+        raise RuntimeError(
+            f"{name}: layer is valid but served no tile data — check the URL "
+            f"encoding in xyz_layer(), or the endpoint may be unreachable.\n"
+            f"  {uri}")
     return layer
+
+
+def tiles_arrive(layer, probe=PROBE_EXTENT_3857):
+    """Fetch one real block and report whether any imagery came back.
+
+    isValid() only means the URI parsed, so it cannot catch a mangled tile URL —
+    that failure mode is completely silent. Nothing short of asking the provider
+    for pixels distinguishes a working basemap from a broken one, so the build
+    pays for one small request per basemap rather than shipping a blank
+    template. A uniform block is the signature of failure; real imagery has
+    thousands of distinct pixel values.
+    """
+    block = layer.dataProvider().block(1, QgsRectangle(*probe), 200, 120)
+    if block is None:
+        return False
+    raw = bytes(block.data())
+    return len(set(raw[i:i + 4] for i in range(0, len(raw), 4))) > 5
 
 
 def gpkg_layer(gpkg, table, name):
