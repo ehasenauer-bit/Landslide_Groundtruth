@@ -300,6 +300,17 @@ class Viewer3DTab(QWidget):
             "terrain-clamped marker.")
         self.add_point_btn.clicked.connect(self._add_point_to_3d)
         fbl.addWidget(self.add_point_btn)
+
+        self.web_btn = QPushButton("Export instant-flip 3D web viewer")
+        self.web_btn.setToolTip(
+            "Bake the DEM plus the ticked Before/After image(s) into a single "
+            "standalone HTML 3D viewer and open it in your browser. Both images "
+            "preload onto the GPU, so you orbit freely and flip before/after "
+            "instantly with zero loading — unlike QGIS's 3D view, which re-"
+            "textures the terrain on every flip. Fully offline / self-contained.")
+        self.web_btn.setEnabled(False)   # needs a terrain DEM first
+        self.web_btn.clicked.connect(self._export_web_viewer)
+        fbl.addWidget(self.web_btn)
         root.addWidget(flip_box)
 
         # --- actions -------------------------------------------------------
@@ -629,6 +640,7 @@ class Viewer3DTab(QWidget):
         self._dem_layer = lyr
         self.terrain_label.setText(f"Terrain: {lyr.name()}")
         self.open_btn.setEnabled(True)
+        self.web_btn.setEnabled(True)
         self._rebuild_hillshade()
         self._refresh_drape_list()
         self._log(f"Terrain ready: {lyr.name()}. Tick drape layers, then "
@@ -1197,6 +1209,140 @@ class Viewer3DTab(QWidget):
                 except Exception:
                     continue
         return False
+
+    # -------------------------------------- instant-flip web viewer ----
+    def _export_web_viewer(self):
+        """Bake DEM + before/after imagery into a standalone WebGL viewer.
+
+        Unlike QGIS's 3D view (which re-textures the terrain on every flip),
+        the exported page uploads BOTH images to the GPU up front, so flipping
+        before/after is a zero-load texture swap while you orbit freely."""
+        from . import web3d_export
+        if self._dem_layer is None:
+            self._warn("Build or select a terrain DEM first (Terrain section).")
+            return
+        proj = QgsProject.instance()
+        before = [proj.mapLayer(i) for i in self._checked_ids(self.before_combo)]
+        after = [proj.mapLayer(i) for i in self._checked_ids(self.after_combo)]
+        before = [l for l in before if l is not None]
+        after = [l for l in after if l is not None]
+        if not before or not after:
+            self._warn("Tick at least one Before image and one After image.")
+            return
+        scene_crs, extent = self._scene_crs_and_extent(self._dem_layer)
+        if not scene_crs.isValid() or extent.isEmpty():
+            self._warn("Could not derive a projected scene CRS/extent from the DEM.")
+            return
+        self._busy(True)
+        self._log("Exporting instant-flip 3D web viewer (rendering imagery, "
+                  "reading DEM)…")
+        try:
+            html = self._build_web_viewer(web3d_export, scene_crs, extent,
+                                          before, after)
+        except Exception as e:
+            self._busy(False)
+            self._log(f"Web viewer export failed: {e}")
+            self._warn(f"Web viewer export failed: {e}")
+            return
+        self._busy(False)
+        base_out = self.dock.out_edit.text().strip() or os.path.join(
+            self.dock.project_edit.text().strip(), "out", "interactive")
+        out_dir = os.path.join(base_out, "viewer3d", "web")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            self._warn(f"Cannot create output dir: {e}")
+            return
+        path = os.path.join(out_dir, "instant_flip_3d.html")
+        try:
+            with open(path, "w") as f:
+                f.write(html)
+        except OSError as e:
+            self._warn(f"Could not write the viewer: {e}")
+            return
+        self._log(f"Wrote {path} ({round(len(html)/1024)} KB). Opening in browser…")
+        from qgis.PyQt.QtGui import QDesktopServices
+        from qgis.PyQt.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.iface.messageBar().pushInfo(
+            "3D viewer", "Opened the instant-flip 3D viewer in your browser — "
+            "orbit freely; Space or the buttons flip before/after with no loading.")
+
+    def _build_web_viewer(self, w3d, scene_crs, extent, before, after):
+        """Render the two image sets + DEM to embedded assets; return the HTML."""
+        from qgis.PyQt.QtCore import QSize, QByteArray, QBuffer, QIODevice
+        from qgis.PyQt.QtGui import QColor
+        from qgis.core import QgsMapSettings, QgsMapRendererParallelJob
+
+        ew, eh = extent.width(), extent.height()
+        tex_max = 2048
+        if ew >= eh:
+            tw, th = tex_max, max(1, int(round(tex_max * eh / ew)))
+        else:
+            th, tw = tex_max, max(1, int(round(tex_max * ew / eh)))
+
+        def render(layers):
+            ms = QgsMapSettings()
+            ms.setDestinationCrs(scene_crs)
+            ms.setExtent(extent)
+            ms.setOutputSize(QSize(tw, th))
+            ms.setBackgroundColor(QColor(10, 12, 16))
+            ms.setLayers(layers)          # index 0 draws on top
+            job = QgsMapRendererParallelJob(ms)
+            job.start()
+            job.waitForFinished()
+            img = job.renderedImage()
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.WriteOnly)
+            img.save(buf, "PNG")
+            buf.close()
+            return "data:image/png;base64," + bytes(ba.toBase64()).decode("ascii")
+
+        before_uri = render(before)
+        after_uri = render(after)
+        # 255×255 mesh keeps vertex count under 65536 → 16-bit indices, no
+        # OES_element_index_uint dependency (the verified path).
+        rows = self._dem_grid(scene_crs, extent, 255, 255)
+        elev_b64, ncols, nrows, zmin, zmax = w3d.encode_heightfield(rows)
+        label = lambda ls: " + ".join(l.name() for l in ls)
+        cfg = {
+            "title": "Landslide 3D — before / after",
+            "before_label": label(before),
+            "after_label": label(after),
+            "ncols": ncols, "nrows": nrows,
+            "width_m": float(ew), "height_m": float(eh),
+            "zmin": zmin, "zmax": zmax,
+            "exaggeration": float(self.vscale_spin.value()),
+            "elev_b64": elev_b64,
+            "before_uri": before_uri,
+            "after_uri": after_uri,
+        }
+        return w3d.build_viewer_html(cfg)
+
+    def _dem_grid(self, scene_crs, extent, ncols, nrows):
+        """Warp the DEM to an ncols×nrows grid over `extent` (north-first rows).
+
+        Returns a list of rows with nodata cells as None."""
+        from osgeo import gdal
+        dst = scene_crs.authid() or scene_crs.toWkt()
+        ds = gdal.Warp(
+            "", self._dem_layer.source(), format="MEM", dstSRS=dst,
+            outputBounds=(extent.xMinimum(), extent.yMinimum(),
+                          extent.xMaximum(), extent.yMaximum()),
+            width=ncols, height=nrows, resampleAlg="bilinear")
+        if ds is None:
+            raise RuntimeError("DEM warp for the web viewer produced nothing.")
+        band = ds.GetRasterBand(1)
+        nod = band.GetNoDataValue()
+        arr = np.array(band.ReadAsArray(), dtype="float64")
+        ds = None
+        if nod is not None:
+            arr = np.where(arr == nod, np.nan, arr)
+        rows = []
+        for j in range(arr.shape[0]):
+            rows.append([None if v != v else float(v) for v in arr[j]])
+        return rows
 
     # -------------------------------------------------------- teardown ----
     def teardown(self):
