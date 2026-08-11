@@ -301,6 +301,7 @@ class PlanetTab(QWidget):
                                 "highlights", "knee")
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
+        self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
             "• Highlight rolloff (knee) — THE DEFAULT. A plain linear stretch below "
@@ -314,15 +315,41 @@ class PlanetTab(QWidget):
             "the whole range: snow lands near DN 215 with real texture. The cost is "
             "global contrast — it brightens everything below 0.127 reflectance and "
             "darkens everything above, which reads as milky midtones.\n"
+            "• None (linear) — turns OFF all of the above: a plain black/white stretch of "
+            "the reflectance itself, no rolloff, cube root, desaturation, or S-curve. "
+            "Bright ice clips to flat white, exactly as a naive stretch would — the point "
+            "is to see the un-toned pixels. Honours the Manual stretch below, but not "
+            "Auto-stretch or Contrast (neither applies).\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
-            "once. Both get a gentle S-curve contrast nudge that cannot clip either end.\n"
+            "once; pick None to check what the raw reflectance looks like unshaped. rolloff "
+            "and Natural Color get a gentle S-curve contrast nudge (see 'Contrast' below) "
+            "that cannot clip either end.\n"
             "Switching this after a render is FREE — see 'Re-tone'.")
         tone_mode = self.settings.value("landslide/planet_tone", "knee", type=str)
         idx = self.tone_combo.findData(tone_mode)
         self.tone_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.tone_combo.currentIndexChanged.connect(self._on_tone_changed)
         form.addRow("SR tone curve", self.tone_combo)
+
+        # The gentle S-curve nudge both shaped curves get (run_single --planet-contrast,
+        # review_package.CONTRAST = 1.15). ON by default keeps every existing render
+        # byte-identical; OFF passes contrast 1.0 (identity). Greyed out for the None
+        # curve, which never adds contrast.
+        self.contrast_check = QCheckBox("Add S-curve contrast")
+        self.contrast_check.setChecked(self.settings.value(
+            "landslide/planet_contrast_scurve", True, type=bool))
+        self.contrast_check.setToolTip(
+            "ON (default): apply a gentle S-curve contrast nudge (strength 1.15, roughly a "
+            "'+10' in photo-editor terms) to the Highlight rolloff and Natural Color "
+            "renders. It pivots at mid-grey and pins BOTH ends, so it can never clip "
+            "shadows to black or highlights to white.\n"
+            "Turn it OFF to render the tone curve with nothing added on top — contrast "
+            "1.0, an exact identity.\n"
+            "No effect on the None tone curve, which never adds contrast. Switching this "
+            "is FREE — see 'Re-tone'.")
+        self.contrast_check.toggled.connect(self._on_tone_changed)
+        form.addRow("Contrast", self.contrast_check)
 
         # The rolloff curve's fixed stretch assumes the frame contains terrain. On an AOI
         # that is ALL snow/ice there is nothing in its untouched linear zone, the whole
@@ -596,6 +623,10 @@ class PlanetTab(QWidget):
         # Wire the auto-resume combo now that the Resume button it toggles exists.
         self.autoresume_combo.currentIndexChanged.connect(self._on_autoresume_changed)
         self._refresh_resume_btn()
+        # Match the greying of Contrast/Auto-stretch to the restored tone curve (None
+        # disables both) — the combo's setCurrentIndex above ran before the handler was
+        # connected, so it didn't fire.
+        self._sync_tone_controls()
         # Show what this account already owns from the moment the panel opens, so a
         # previously-ordered event can be recalled without searching first.
         self._refresh_recall_combo()
@@ -1472,13 +1503,16 @@ class PlanetTab(QWidget):
         # a render.json written before tone modes existed — those were always cube-root,
         # so it is NOT the current default leaking in here.
         tone = result.get("tone") or "natural"
-        tone_word = "rolloff" if tone == "knee" else "natural"
+        tone_word = {"knee": "rolloff", "natural": "natural",
+                     "linear": "linear"}.get(tone, "natural")
         # Two rolloff renders of the same scene can now differ in their stretch as well
         # as their curve, so say which one this is in the layer name — otherwise a fitted
-        # and an unfitted layer sit on the canvas under identical labels.
+        # and an unfitted layer sit on the canvas under identical labels. A nonzero black
+        # is scene-fitted on knee but a manual choice on linear (which never auto-fits).
         stretch = result.get("stretch") or {}
         if stretch.get("black"):
-            tone_word += f", fitted {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
+            kind = "stretch" if tone == "linear" else "fitted"
+            tone_word += f", {kind} {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
         # replace whatever the previous preview (tiles or SR) put on the map
         self._clear_preview_layers()
         self._preview_extent = None
@@ -1503,8 +1537,10 @@ class PlanetTab(QWidget):
             # render exactly (no per-layer extent bookkeeping needed).
             self.zoom_btn.setEnabled(True)
             self._zoom_to_aoi()
-            shown = "Highlight rolloff" if tone == "knee" \
-                else "Highlight Optimized Natural Color"
+            shown = {"knee": "Highlight rolloff",
+                     "natural": "Highlight Optimized Natural Color",
+                     "linear": "None (plain linear stretch)"}.get(
+                         tone, "Highlight Optimized Natural Color")
             other = "Natural Color" if tone == "knee" else "Highlight rolloff"
             self.iface.messageBar().pushInfo(
                 "PlanetScope", f"Loaded {loaded} SR detail layer(s) — {shown}, "
@@ -1731,11 +1767,25 @@ class PlanetTab(QWidget):
         args = ["--planet-tone", self._tone_mode()]
         if not self.autostretch_check.isChecked():
             args.append("--planet-no-auto-stretch")
+        # Off -> render with contrast 1.0 (identity); on -> omit so run_single keeps the
+        # default 1.15 and the output stays byte-identical. Harmless for the None curve,
+        # which ignores contrast either way.
+        if not self.contrast_check.isChecked():
+            args += ["--planet-contrast", "1.0"]
         if self.white_spin.value() > 0:
             args += ["--planet-white", f"{self.white_spin.value():.4f}"]
         if self.black_spin.value() > 0:
             args += ["--planet-black", f"{self.black_spin.value():.4f}"]
         return args
+
+    def _sync_tone_controls(self):
+        """Grey out the controls that do nothing for the selected curve. The None (linear)
+        mode adds no contrast and never auto-fits, so its Contrast and Auto-stretch boxes
+        would be misleading if left live; Manual stretch stays enabled, since linear
+        honours it."""
+        shaped = self._tone_mode() != "linear"
+        self.contrast_check.setEnabled(shaped)
+        self.autostretch_check.setEnabled(shaped)
 
     def _on_tone_changed(self, *_):
         """Remember the choice, and nudge toward the free re-render rather than letting
@@ -1743,8 +1793,11 @@ class PlanetTab(QWidget):
         self.settings.setValue("landslide/planet_tone", self._tone_mode())
         self.settings.setValue("landslide/planet_autostretch",
                                self.autostretch_check.isChecked())
+        self.settings.setValue("landslide/planet_contrast_scurve",
+                               self.contrast_check.isChecked())
         self.settings.setValue("landslide/planet_white", self.white_spin.value())
         self.settings.setValue("landslide/planet_black", self.black_spin.value())
+        self._sync_tone_controls()
         if self._last_render and self.task is None:
             self._append_log(
                 f"Tone curve set to '{self._tone_label()}' — click Re-tone to re-render "

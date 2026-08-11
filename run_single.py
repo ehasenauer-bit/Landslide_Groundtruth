@@ -77,36 +77,46 @@ def _write_render_json(a, event_id, r):
                event_id=event_id, reused=r.get("reused") or {},
                available=r.get("available") or [])
     base = os.path.join(a.out, event_id)
-    tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
-                else rp.CONTRAST)
-    if a.planet_tone == "knee":
-        tone["knee"] = a.planet_knee if a.planet_knee is not None else rp.KNEE
-        tone["white"] = a.planet_white if a.planet_white is not None else rp.WHITE
-        tone["desat"] = a.planet_desat if a.planet_desat is not None else rp.DESAT
-        # Fit the stretch to the scene when the scene needs it — an all-ice AOI has
-        # nothing inside the knee curve's untouched linear zone and renders flat white
-        # otherwise (see review_package.auto_stretch). Computed ONCE from both sides so
-        # the before/after layers stay photometrically comparable under the swipe tool.
-        # An explicit --planet-white/--planet-black means the caller has already decided
-        # what stretch they want, so auto steps aside; auto is skipped entirely by
-        # --planet-no-auto-stretch.
-        manual = a.planet_white is not None or a.planet_black is not None
-        if a.planet_black is not None:
-            tone["black"] = a.planet_black
-        comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
-        if manual or a.planet_no_auto_stretch:
-            out["notes"].append(
-                "auto-stretch: off — " + ("explicit --planet-white/--planet-black"
-                                          if manual else "--planet-no-auto-stretch"))
-        elif comps:
-            black, white_used, onset, note = rp.auto_stretch(
-                comps, white=tone["white"], knee=tone["knee"])
-            tone.update(black=black, white=white_used, onset=onset)
-            out["notes"].append(note)
-        tone.setdefault("black", 0.0)
-        # what the pixels were actually rendered with, for the log and for reproducing it
-        out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
-    render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
+    if a.planet_tone == "linear":
+        # "None" tone mode: a plain black/white stretch with NO shaping — no rolloff,
+        # cube root, desaturation, or S-curve. It honours the manual stretch spin boxes
+        # but NOT the auto-stretch (a scene-fitted stretch is itself a processing choice
+        # this mode exists to switch off), and contrast doesn't apply. See rp._linear.
+        tone = dict(white=a.planet_white if a.planet_white is not None else rp.WHITE,
+                    black=a.planet_black if a.planet_black is not None else 0.0)
+        out["stretch"] = dict(tone)
+        render = rp._linear
+    else:
+        tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
+                    else rp.CONTRAST)
+        if a.planet_tone == "knee":
+            tone["knee"] = a.planet_knee if a.planet_knee is not None else rp.KNEE
+            tone["white"] = a.planet_white if a.planet_white is not None else rp.WHITE
+            tone["desat"] = a.planet_desat if a.planet_desat is not None else rp.DESAT
+            # Fit the stretch to the scene when the scene needs it — an all-ice AOI has
+            # nothing inside the knee curve's untouched linear zone and renders flat white
+            # otherwise (see review_package.auto_stretch). Computed ONCE from both sides so
+            # the before/after layers stay photometrically comparable under the swipe tool.
+            # An explicit --planet-white/--planet-black means the caller has already decided
+            # what stretch they want, so auto steps aside; auto is skipped entirely by
+            # --planet-no-auto-stretch.
+            manual = a.planet_white is not None or a.planet_black is not None
+            if a.planet_black is not None:
+                tone["black"] = a.planet_black
+            comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
+            if manual or a.planet_no_auto_stretch:
+                out["notes"].append(
+                    "auto-stretch: off — " + ("explicit --planet-white/--planet-black"
+                                              if manual else "--planet-no-auto-stretch"))
+            elif comps:
+                black, white_used, onset, note = rp.auto_stretch(
+                    comps, white=tone["white"], knee=tone["knee"])
+                tone.update(black=black, white=white_used, onset=onset)
+                out["notes"].append(note)
+            tone.setdefault("black", 0.0)
+            # what the pixels were actually rendered with, for the log and for reproducing it
+            out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
+        render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
     for side in ("pre", "post"):
         comp = r.get(side)
         if comp is None:
@@ -372,17 +382,22 @@ def main():
                          "same --lat/--lon/--radius-km/--datetime (or --event-id) the "
                          "original render used, so it finds the same workdir. Backs the "
                          "plugin's tone-mode switch.")
-    ap.add_argument("--planet-tone", default="knee", choices=["knee", "natural"],
+    ap.add_argument("--planet-tone", default="knee",
+                    choices=["knee", "natural", "linear"],
                     help="tone curve for the --planet-render / --planet-resume GeoTIFFs. "
                          "'knee' (DEFAULT) = highlight rolloff: a plain linear stretch "
                          "below the knee, so midtones/shadows are untouched and only "
                          "highlights get compressed. 'natural' = Highlight Optimized "
                          "Natural Color (cube root: even detail across the whole range, "
                          "including inside bright ice, at the cost of softer global "
-                         "contrast). Both get a gentle S-curve; see "
-                         "review_package.TONE_MODES. 'knee' additionally fits its "
-                         "black/white points to a frame that is all snow/ice — see "
-                         "--planet-no-auto-stretch.")
+                         "contrast). 'linear' = None: a plain black/white stretch with NO "
+                         "shaping at all (no rolloff, cube root, desaturation, or S-curve) "
+                         "— the un-toned reference; bright ice clips to flat white. knee "
+                         "and natural get a gentle S-curve (see --planet-contrast); linear "
+                         "never does. See review_package.TONE_MODES. 'knee' additionally "
+                         "fits its black/white points to a frame that is all snow/ice — see "
+                         "--planet-no-auto-stretch; 'linear' honours --planet-white/"
+                         "--planet-black but never auto-fits.")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "
@@ -419,8 +434,9 @@ def main():
                          "neutral to remove it; midtones and shadows below the knee are "
                          "untouched at any setting. 0 = off (pure ratio-preserving).")
     ap.add_argument("--planet-contrast", type=float, default=None,
-                    help="S-curve contrast strength for either tone mode (default 1.15; "
-                         "1.0 = off/identity).")
+                    help="S-curve contrast strength for the knee/natural tone modes "
+                         "(default 1.15; 1.0 = off/identity). No effect on --planet-tone "
+                         "linear, which never adds contrast.")
     ap.add_argument("--resume-pre-order", default=None,
                     help="Planet order id for the PRE side to resume (see --planet-resume).")
     ap.add_argument("--resume-post-order", default=None,

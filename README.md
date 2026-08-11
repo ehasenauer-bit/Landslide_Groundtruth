@@ -357,7 +357,7 @@ as the STAC sources.
 
 Planet's free tiles are pre-rendered 8-bit RGB that has already clipped bright
 terrain to flat white, so **Render detail** orders the raw surface-reflectance
-bundle and renders it here instead. Two curves, `--planet-tone`:
+bundle and renders it here instead. Three curves, `--planet-tone`:
 
 - **`knee`** (default) — highlight rolloff. A plain linear stretch up to
   `KNEE × WHITE` = 0.165 reflectance, so midtones and shadows are arithmetically
@@ -365,6 +365,16 @@ bundle and renders it here instead. Two curves, `--planet-tone`:
   asymptote that never clips. Right when the scar is on terrain and ice is context.
 - **`natural`** — `cbrt(0.6 × reflectance)`, the Copernicus Browser look. Even
   detail across the whole range, at the cost of global contrast.
+- **`linear`** (**None** in the plugin) — every shaping switched off: a plain
+  black/white stretch of the reflectance itself, no rolloff, cube root,
+  desaturation, or S-curve. Bright ice clips to flat white exactly as a naive
+  stretch would — the un-toned reference. Honours the manual `--planet-white`/
+  `--planet-black`, but never auto-fits.
+
+**S-curve contrast.** `knee` and `natural` get a gentle S-curve nudge
+(`--planet-contrast`, default `CONTRAST` = 1.15) that pins both ends and so cannot
+clip. The plugin's **Contrast** checkbox (on by default) turns it off by passing
+`--planet-contrast 1.0`; `linear` never adds contrast.
 
 **Auto-stretch.** The knee curve's fixed 0–0.165 linear zone assumes the frame
 contains terrain. On an AOI that is *entirely* snow/ice it contains nothing: a

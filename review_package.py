@@ -53,6 +53,7 @@ SCENE_KEYS = ["true_color", "highlight_natural", "false_color", "swir_falsecolor
 TONE_MODES = {
     "knee": "Highlight rolloff — untouched midtones, tamed highlights",
     "natural": "Highlight Optimized Natural Color — even detail, softer contrast",
+    "linear": "None — plain linear stretch, no tone shaping",
 }
 
 # Gentle S-curve strength applied to BOTH tone modes by the PlanetScope render path
@@ -376,6 +377,33 @@ def _highlight_natural(comp, path, src_crs, contrast=1.0):
     rgb = np.cbrt(0.6 * rgb).clip(0, 1)
     rgb = _contrast(rgb, contrast)
     rgb = (rgb * 255).fillna(0).astype("uint8")
+    rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
+    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+
+
+def _linear(comp, path, src_crs, white=WHITE, black=0.0):
+    """Write a plain linear black/white stretch of the true-colour bands — the "None"
+    tone mode, with every shaping the other two curves add switched OFF.
+
+    No highlight rolloff, no cube-root, no highlight desaturation, no S-curve contrast:
+    just (black..white) reflectance mapped to (0..255) per channel and hard-clipped, the
+    same maths as _rgb but with the endpoints exposed. Bright ice therefore CLIPS to flat
+    white exactly as a naive stretch would — that is the point. It is the un-toned
+    reference for reading what the surface reflectance itself looks like, without the
+    render making a highlight/contrast decision on your behalf.
+
+    `white`/`black` default to WHITE (0.30) and 0.0 — the same window _rgb uses — and are
+    the only knobs: the plugin's Manual-stretch spin boxes drive them. The auto-stretch is
+    deliberately NOT wired in here (a scene-fitted stretch is itself a processing choice
+    this mode exists to turn off), and `contrast` is not a parameter at all.
+    """
+    refl = comp.sel(band=["red", "green", "blue"]).clip(0, None)
+    rgb = ((refl - black) / max(white - black, 1e-6)).clip(0, 1) * 255
+    if black > 0:
+        # nodata is 0, so floor valid pixels at 1 lest a black-clipped scar punch a
+        # transparent hole in the layer (see _highlight_rolloff). NaN stays nodata.
+        rgb = rgb.clip(1.0, 255.0)
+    rgb = rgb.fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
     rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
 
