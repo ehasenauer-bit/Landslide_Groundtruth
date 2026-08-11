@@ -67,27 +67,32 @@ def utm_bounds(minx, miny, maxx, maxy, epsg, res):
 
 
 def warp(url, bounds, epsg, res, resample="bilinear", nodata=NODATA):
-    """Warp a remote COG onto the shared AOI grid; (array, geotransform, proj).
+    """Warp a remote COG (or a MOSAIC of them) onto the shared AOI grid;
+    returns (array, geotransform, proj).
 
-    `bounds` must come from utm_bounds so every call returns the same grid.
+    `url` may be a single COG href or a list of hrefs — a list is mosaicked by
+    GDAL onto the one AOI grid, which is how tiled sources (e.g. 3DEP seamless,
+    tiled 1x1 deg) cover an AOI that straddles tile boundaries. `bounds` must
+    come from utm_bounds so every call returns the same grid.
     bilinear for elevations; use 'near' AND nodata=None for the bitmask —
     interpolating flag bits invents values, and a float nodata clamped into
     the mask's Byte range would collide with real flag values (GDAL then
     shifts the good-ground 0s to 1, flagging everything). A mask warped
     without nodata reads 0 ('good') outside the strip footprint, which is
     harmless because those pixels are already nodata in the DEM itself.
-    Reads via /vsicurl — only the intersecting tiles of the strip are
+    Reads via /vsicurl — only the intersecting tiles of each source are
     fetched."""
-    src = url if url.startswith("/vsi") else "/vsicurl/" + url
+    urls = [url] if isinstance(url, str) else list(url)
+    srcs = [u if u.startswith("/vsi") else "/vsicurl/" + u for u in urls]
     opts = dict(format="MEM", dstSRS=f"EPSG:{epsg}",
                 outputBounds=bounds, xRes=res, yRes=res,
                 resampleAlg=resample,
                 multithread=False, errorThreshold=0.125)
     if nodata is not None:
         opts["dstNodata"] = nodata
-    ds = gdal.Warp("", src, **opts)
+    ds = gdal.Warp("", srcs, **opts)
     if ds is None:
-        raise IOError(f"gdal.Warp failed for {url}")
+        raise IOError(f"gdal.Warp failed for {urls}")
     arr = ds.GetRasterBand(1).ReadAsArray()
     gt, proj = ds.GetGeoTransform(), ds.GetProjection()
     ds = None

@@ -41,7 +41,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsTask,
     QgsVector3D, QgsHillshadeRenderer, QgsGeometry, QgsPointXY, Qgis,
-    QgsCoordinateTransform, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle,
 )
 from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 
@@ -62,6 +62,31 @@ except Exception as e:                       # pragma: no cover - depends on bui
 
 # the native 3D view's title (used to create / find / close it)
 VIEW_NAME = "Landslide 3D"
+
+# Planetary Computer's public asset-signing endpoint. 3DEP 'data' COGs live in a
+# private Azure container; their SAS tokens expire (~1 h), so the pipeline stores
+# the UNSIGNED blob href in search.json and we re-sign fresh just before the warp.
+PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
+
+# machine 'dem_source' tags that mean a PGC SETSM strip (vs a 3DEP fallback)
+PGC_SOURCES = ("arcticdem", "earthdem", "rema")
+
+
+def _pc_sign(href):
+    """SAS-sign a Planetary Computer blob href. Returns the signed URL, or the
+    original href on any failure (the warp then fails cleanly and is reported).
+    Runs off the GUI thread inside the warp worker, so it uses stdlib urllib."""
+    if not href or "windows.net" not in href:
+        return href                      # already local / non-PC → leave as-is
+    try:
+        import json
+        from urllib.request import urlopen
+        from urllib.parse import quote
+        url = PC_SIGN_URL + "?href=" + quote(href, safe="")
+        with urlopen(url, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8")).get("href") or href
+    except Exception:
+        return href
 
 # warp resolution for the auto-fetched ArcticDEM terrain. 2 m is native but the
 # ranged download and the terrain tessellation both grow quadratically as the
@@ -502,30 +527,44 @@ class Viewer3DTab(QWidget):
             self._log("Search finished with no result.")
             return
         self._search_result = result
-        # merge pre + post candidates; prefer strips that actually cover the event
+        # merge pre + post candidates (ArcticDEM strips + the 3DEP fallbacks the
+        # pipeline appends); keep only those carrying a data URL.
         cands = list(result.get("pre", [])) + list(result.get("post", []))
-        cands = [c for c in cands if c.get("dem_url")]
+        cands = [c for c in cands if c.get("dem_url") or c.get("dem_urls")]
         if not cands:
-            self._log("No ArcticDEM strips found over this AOI. Try a larger radius, "
-                      "or load a DEM manually and use 'Use a DEM layer'.")
-            self._warn("No ArcticDEM strips found over the AOI.")
+            self._log("No DEM (ArcticDEM or 3DEP) found over this AOI. Try a larger "
+                      "radius, or load a DEM manually and use 'Use a DEM layer'.")
+            self._warn("No DEM found over the AOI.")
             return
         cands = self._rank_strips(cands)
         self.strip_combo.blockSignals(True)
         self.strip_combo.clear()
         for c in cands:
-            date = (c.get("date") or "?")[:10]
+            date = (c.get("date") or "seamless")[:10]
+            src = c.get("source", "DEM")
+            model = c.get("terrain_model", "")
             cov = "covers event" if c.get("_covers") else "overlaps AOI"
-            self.strip_combo.addItem(f"{date}  ·  {cov}", c)
+            label = " ".join(x for x in (date, "·", src, model, "·", cov) if x)
+            self.strip_combo.addItem(label, c)
         self.strip_combo.setEnabled(True)
+        # default selection: ArcticDEM if its footprints blanket >=50% of the AOI,
+        # otherwise the best 3DEP fallback (the <50% trigger).
+        self.strip_combo.setCurrentIndex(self._pick_default_strip(cands))
         self.strip_combo.blockSignals(False)
-        self._log(f"Found {len(cands)} ArcticDEM strip(s). Warping the top one; "
-                  f"switch strips with the dropdown if it has gaps over the AOI.")
+        n_pgc = sum(1 for c in cands if c.get("dem_source") in PGC_SOURCES)
+        n_3dep = sum(1 for c in cands if str(c.get("dem_source", "")).startswith("3dep"))
+        self._log(f"Found {n_pgc} ArcticDEM + {n_3dep} 3DEP DEM option(s). Warping "
+                  f"the selected one; switch with the dropdown if it has gaps.")
+        for note in result.get("notes", []):
+            self._log("note: " + note)
         self._warp_selected_strip()
 
     def _rank_strips(self, cands):
-        """Best-first: strips that cover the event point, then newest acquisition
-        first (the most current terrain surface)."""
+        """Best-first, in two source tiers so 3DEP never outranks usable ArcticDEM.
+
+        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), tier 1 = 3DEP. Within
+        a tier: strips covering the event point first, then ArcticDEM by newest
+        acquisition and 3DEP by finest resolution (DSM 1 m → 10 m → 30 m)."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -533,9 +572,16 @@ class Viewer3DTab(QWidget):
             lat = lon = None
         for c in cands:
             c["_covers"] = self._covers_point(c, lat, lon)
-        # stable sort: newest date first, then bring covering strips to the front
-        cands.sort(key=lambda c: (c.get("date") or ""), reverse=True)
-        cands.sort(key=lambda c: 0 if c["_covers"] else 1)
+
+        def key(c):
+            covers = 0 if c["_covers"] else 1
+            if c.get("dem_source") in PGC_SOURCES:
+                dstr = (c.get("date") or "").replace("-", "")
+                dnum = int(dstr) if dstr.isdigit() else 0
+                return (0, covers, -dnum)          # newest ArcticDEM first
+            return (1, covers, c.get("resolution_m") or 999)   # finest 3DEP first
+
+        cands.sort(key=key)
         return cands
 
     def _covers_point(self, cand, lat, lon):
@@ -549,6 +595,76 @@ class Viewer3DTab(QWidget):
             return True
         return geom.contains(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
+    def _arcticdem_footprint_cover(self, cands, lat, lon, radius_km):
+        """Fraction of the AOI box the ArcticDEM footprints (union) blanket.
+
+        Cheap, geometry-only, zero byte reads — answers 'can ArcticDEM cover this
+        AOI at all' (the <50% trigger) better than any single strip's post-warp
+        valid-pixel fraction. Uses unaryUnion so overlapping strips aren't double
+        counted. Interior holes the footprint polygon can't see are caught later
+        by the post-warp check in _on_warp_done."""
+        dlat = radius_km / 111.32
+        dlon = radius_km / (111.32 * math.cos(math.radians(lat)))
+        aoi = QgsGeometry.fromRect(
+            QgsRectangle(lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+        geoms = []
+        for c in cands:
+            if c.get("dem_source") not in PGC_SOURCES:
+                continue
+            g = self.dock._qgs_geom(c.get("geometry"))
+            if g is not None and not g.isEmpty():
+                geoms.append(g)
+        if not geoms:
+            return 0.0
+        inter = QgsGeometry.unaryUnion(geoms).intersection(aoi)
+        area = aoi.area()
+        if inter is None or inter.isEmpty() or area <= 0:
+            return 0.0
+        return min(1.0, inter.area() / area)
+
+    def _pick_default_strip(self, cands):
+        """Combo index to auto-warp: best ArcticDEM if its footprints blanket
+        >=50% of the AOI, else the best 3DEP fallback. `cands` is ranked, so the
+        first PGC entry is the best ArcticDEM and the first 3dep entry the best
+        3DEP."""
+        result = self._search_result or {}
+        try:
+            lat, lon = float(result.get("lat")), float(result.get("lon"))
+            radius = float(result.get("params", {}).get("radius_km"))
+        except (TypeError, ValueError):
+            return 0
+        cover = self._arcticdem_footprint_cover(cands, lat, lon, radius)
+        if cover >= 0.5:
+            self._log(f"ArcticDEM footprints blanket ~{cover*100:.0f}% of the AOI "
+                      f"(>=50%) — using ArcticDEM.")
+            return 0
+        for i, c in enumerate(cands):
+            if str(c.get("dem_source", "")).startswith("3dep"):
+                self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the "
+                          f"AOI (<50%) — defaulting to {c.get('source', '3DEP')}.")
+                return i
+        self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the AOI, and "
+                  f"no 3DEP tiles were found here — using ArcticDEM (may have gaps).")
+        return 0
+
+    def _has_3dep_candidate(self):
+        for i in range(self.strip_combo.count()):
+            c = self.strip_combo.itemData(i)
+            if c and str(c.get("dem_source", "")).startswith("3dep"):
+                return True
+        return False
+
+    def _select_and_warp_3dep(self):
+        """Switch the dropdown to the best 3DEP entry and re-warp it."""
+        for i in range(self.strip_combo.count()):
+            c = self.strip_combo.itemData(i)
+            if c and str(c.get("dem_source", "")).startswith("3dep"):
+                self.strip_combo.blockSignals(True)
+                self.strip_combo.setCurrentIndex(i)
+                self.strip_combo.blockSignals(False)
+                self._warp_selected_strip()
+                return
+
     def _on_strip_changed(self):
         if self.strip_combo.isEnabled() and self.strip_combo.currentData():
             self._warp_selected_strip()
@@ -561,7 +677,9 @@ class Viewer3DTab(QWidget):
         if aoi is None:
             return
         lat, lon, radius = aoi
-        res = self.res_combo.currentData()
+        # don't oversample a coarse source onto a finer grid than it carries: warp
+        # at max(user resolution, the candidate's native resolution).
+        res = max(self.res_combo.currentData(), int(cand.get("resolution_m") or 0))
         epsg = dem_diff.utm_epsg(lat, lon)
         dlat = radius / 111.32
         dlon = radius / (111.32 * math.cos(math.radians(lat)))
@@ -571,23 +689,35 @@ class Viewer3DTab(QWidget):
             self.dock.project_edit.text().strip(), "out", "interactive")
         out_dir = os.path.join(base_out, "viewer3d")
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"terrain_{epsg}_{res}m.tif")
-        url = cand["dem_url"]
+        # source in the cache name so ArcticDEM and 3DEP at the same epsg/res don't
+        # clobber each other.
+        src_tag = cand.get("dem_source", "src")
+        out_path = os.path.join(out_dir, f"terrain_{epsg}_{res}m_{src_tag}.tif")
+        urls = cand.get("dem_urls") or ([cand["dem_url"]] if cand.get("dem_url") else [])
+        if not urls:
+            self._warn("Selected DEM candidate has no data URL.")
+            return
+        src_label = cand.get("source", "DEM")
         self._gen += 1
         gen = self._gen
         self._busy(True)
-        self._log(f"Warping strip to {res} m over the AOI (EPSG:{epsg})…")
+        ntile = f" ({len(urls)} tiles)" if len(urls) > 1 else ""
+        self._log(f"Warping {src_label}{ntile} to {res} m over the AOI (EPSG:{epsg})…")
         self._warp_task = QgsTask.fromFunction(
-            "Warp ArcticDEM strip", self._warp_worker,
+            f"Warp {src_label}", self._warp_worker,
             on_finished=lambda exc, res_: self._on_warp_done(exc, res_, gen, out_path),
-            url=url, bounds=bounds, epsg=epsg, res=res, out_path=out_path)
+            url=urls, bounds=bounds, epsg=epsg, res=res, out_path=out_path,
+            sign=bool(cand.get("needs_signing")))
         QgsApplication.taskManager().addTask(self._warp_task)
 
     @staticmethod
-    def _warp_worker(task, url, bounds, epsg, res, out_path):
+    def _warp_worker(task, url, bounds, epsg, res, out_path, sign=False):
         """Runs off the GUI thread: /vsicurl ranged read + warp to the AOI grid.
-        Touches only GDAL/numpy (dem_diff), never Qt."""
-        arr, gt, proj = dem_diff.warp(url, bounds, epsg, res)
+        Touches only GDAL/numpy/urllib (dem_diff + PC signing), never Qt."""
+        urls = [url] if isinstance(url, str) else list(url)
+        if sign:                          # 3DEP: SAS-sign each blob href fresh
+            urls = [_pc_sign(u) for u in urls]
+        arr, gt, proj = dem_diff.warp(urls, bounds, epsg, res)
         valid = dem_diff.valid_heights(arr)
         cover = float(valid.mean()) if valid.size else 0.0
         if cover <= 0.0:
@@ -603,7 +733,7 @@ class Viewer3DTab(QWidget):
         self._warp_task = None
         if exc is not None:
             self._log(f"Warp failed: {exc}")
-            self._warn("ArcticDEM warp failed — see the log.")
+            self._warn("DEM warp failed — see the log.")
             return
         if not result or result.get("error"):
             msg = (result or {}).get("error", "unknown error")
@@ -611,12 +741,32 @@ class Viewer3DTab(QWidget):
                       f"larger radius.")
             return
         cover = result["cover"]
+        cand = self.strip_combo.currentData() or {}
+        is_pgc = cand.get("dem_source") in PGC_SOURCES
+        # post-warp safety net: the ArcticDEM strip's footprint claimed the AOI but
+        # it warped to <50% valid pixels (interior water/shadow/cloud holes). Switch
+        # to the 3DEP fallback rather than install a holey surface.
+        if cover < 0.5 and is_pgc and self._has_3dep_candidate():
+            self._log(f"This ArcticDEM strip resolved only {cover*100:.0f}% valid "
+                      f"pixels over the AOI (<50%); switching to the 3DEP fallback…")
+            self._select_and_warp_3dep()
+            return
         self._dem_mean_z = result["zmean"]
-        self._set_terrain_from_file(result["path"],
-                                    f"ArcticDEM terrain ({cover*100:.0f}% AOI cover)")
+        src = cand.get("source", "DEM")
+        model = cand.get("terrain_model", "")
+        name = " ".join(x for x in (src, model, "terrain",
+                                    f"({cover*100:.0f}% AOI cover)") if x)
+        self._set_terrain_from_file(result["path"], name)
+        # DSM vs DTM guardrail (this terrain may feed the volume/differencing tab).
+        if model:
+            kind = ("surface model — canopy/buildings INCLUDED" if cand.get("is_dsm")
+                    else "bare-earth model — canopy/buildings removed")
+            self._log(f"Terrain is a {model} ({kind}). Do NOT difference a DSM "
+                      f"against a DTM in the volume tab — the canopy/building height "
+                      f"offset reads as fake elevation change.")
         if cover < 0.6:
-            self._log(f"Note: this strip covers only {cover*100:.0f}% of the AOI — "
-                      f"pick another strip in the dropdown if the terrain has holes.")
+            self._log(f"Note: this DEM covers only {cover*100:.0f}% of the AOI — pick "
+                      f"another entry in the dropdown if the terrain has holes.")
 
     def _set_terrain_from_file(self, path, name):
         lyr = QgsRasterLayer(path, name)
