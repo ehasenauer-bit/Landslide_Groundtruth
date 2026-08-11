@@ -200,8 +200,21 @@ class Viewer3DTab(QWidget):
 
         # loaded-DEM picker (raster layers in the project)
         self.loaded_combo = QComboBox()
-        self.loaded_dem_row_label = QLabel("Loaded DEM")
+        self.loaded_dem_row_label = QLabel("Loaded DEM / DSM")
+        self.loaded_combo.setToolTip(
+            "Any single-band elevation raster already loaded in the project — a "
+            "DSM (surface, canopy/buildings in) or a DTM (bare earth). Pick it, "
+            "tag its model below, then Fetch / build terrain.")
         tform.addRow(self.loaded_dem_row_label, self.loaded_combo)
+
+        # tag the loaded layer's terrain model so the layer name + the volume-tab
+        # DSM-vs-DTM guardrail know what it is (the search path tags this itself).
+        self.loaded_model_combo = QComboBox()
+        self.loaded_model_combo.addItem("Surface model (DSM — canopy/buildings in)", "DSM")
+        self.loaded_model_combo.addItem("Bare-earth model (DTM)", "DTM")
+        self.loaded_model_combo.addItem("Unknown / don't tag", "")
+        self.loaded_model_row_label = QLabel("This layer is a")
+        tform.addRow(self.loaded_model_row_label, self.loaded_model_combo)
 
         # auto-fetch controls
         self.res_combo = QComboBox()
@@ -326,6 +339,15 @@ class Viewer3DTab(QWidget):
         self.add_point_btn.clicked.connect(self._add_point_to_3d)
         fbl.addWidget(self.add_point_btn)
 
+        orow = QFormLayout()
+        self.overlay_combo = QgsCheckableComboBox()
+        self.overlay_combo.setToolTip(
+            "Vector layers to drape on the exported 3D web viewer's terrain: "
+            "polygons (translucent fill + outline), lines, and points (peaks — a "
+            "marker on a short pole). Tick any you want baked into the viewer.")
+        orow.addRow("Overlays (web)", self.overlay_combo)
+        fbl.addLayout(orow)
+
         self.web_btn = QPushButton("Export instant-flip 3D web viewer")
         self.web_btn.setToolTip(
             "Bake the DEM plus the ticked Before/After image(s) into a single "
@@ -397,7 +419,8 @@ class Viewer3DTab(QWidget):
         for w in (self.res_combo, self.res_row_label, self.strip_combo,
                   self.strip_row_label):
             w.setVisible(auto)
-        for w in (self.loaded_combo, self.loaded_dem_row_label):
+        for w in (self.loaded_combo, self.loaded_dem_row_label,
+                  self.loaded_model_combo, self.loaded_model_row_label):
             w.setVisible(not auto)
         if not auto:
             self._populate_loaded_dems()
@@ -780,20 +803,29 @@ class Viewer3DTab(QWidget):
         lid = self.loaded_combo.currentData()
         lyr = QgsProject.instance().mapLayer(lid) if lid else None
         if lyr is None or not isinstance(lyr, QgsRasterLayer):
-            self._warn("Pick a single-band DEM raster loaded in the project.")
+            self._warn("Pick a single-band DEM/DSM raster loaded in the project.")
             return
         self._dem_mean_z = self._sample_center_z(lyr)
-        self._install_terrain_layer(lyr)
+        model = self.loaded_model_combo.currentData()
+        name = f"{lyr.name()} ({model})" if model else lyr.name()
+        self._install_terrain_layer(lyr, name)
+        if model:
+            kind = ("surface model — canopy/buildings INCLUDED" if model == "DSM"
+                    else "bare-earth model — canopy/buildings removed")
+            self._log(f"Loaded terrain tagged as {model} ({kind}). Do NOT difference "
+                      f"a DSM against a DTM in the volume tab.")
 
-    def _install_terrain_layer(self, lyr):
-        """Adopt `lyr` as the terrain DEM, (re)build the hillshade, refresh lists."""
+    def _install_terrain_layer(self, lyr, name=None):
+        """Adopt `lyr` as the terrain DEM, (re)build the hillshade, refresh lists.
+        `name` overrides the display label (e.g. a source/model-tagged name)."""
         self._dem_layer = lyr
-        self.terrain_label.setText(f"Terrain: {lyr.name()}")
+        label = name or lyr.name()
+        self.terrain_label.setText(f"Terrain: {label}")
         self.open_btn.setEnabled(True)
         self.web_btn.setEnabled(True)
         self._rebuild_hillshade()
         self._refresh_drape_list()
-        self._log(f"Terrain ready: {lyr.name()}. Tick drape layers, then "
+        self._log(f"Terrain ready: {label}. Tick drape layers, then "
                   f"'Open / update 3D view'.")
 
     def _rebuild_hillshade(self):
@@ -1084,6 +1116,17 @@ class Viewer3DTab(QWidget):
             self.before_btn.setChecked(False)
             self.after_btn.setChecked(False)
         self.add_point_btn.setEnabled(HAS_3D and self._find_point_layer() is not None)
+        # web-viewer overlays: any vector layer (polygon / line / point), stable
+        # order so ticks don't jump around on refresh.
+        prevv = set(self._checked_ids(self.overlay_combo))
+        self.overlay_combo.blockSignals(True)
+        self.overlay_combo.clear()
+        vlayers = sorted((l for l in QgsProject.instance().mapLayers().values()
+                          if isinstance(l, QgsVectorLayer)), key=lambda l: l.name())
+        for l in vlayers:
+            self.overlay_combo.addItem(l.name(), l.id())
+        self._set_checked(self.overlay_combo, prevv)
+        self.overlay_combo.blockSignals(False)
 
     def _checked_ids(self, combo):
         """Layer ids ticked in a QgsCheckableComboBox, in list order."""
@@ -1468,7 +1511,109 @@ class Viewer3DTab(QWidget):
             "before_uri": before_uri,
             "after_uri": after_uri,
         }
+        polys, lines, points = self._collect_overlays(scene_crs, extent)
+        cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
+        if polys or lines or points:
+            self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
+                      f"{len(points)} point layer(s).")
         return w3d.build_viewer_html(cfg)
+
+    def _collect_overlays(self, scene_crs, extent):
+        """Ticked vector layers → (polys, lines, points) in mesh-local metres.
+
+        Each feature is transformed to the scene CRS, offset to the mesh centre
+        (so it lines up with the exported terrain), and polygon rings are
+        triangulated for the draped fill. Points become peak markers, lines
+        become draped polylines."""
+        from . import web3d_export
+        from qgis.core import (QgsCoordinateTransform, QgsWkbTypes, QgsExpression,
+                               QgsExpressionContext, QgsExpressionContextUtils)
+        proj = QgsProject.instance()
+        cx, cy = extent.center().x(), extent.center().y()
+        polys, lines, points = [], [], []
+        for i, lid in enumerate(self._checked_ids(self.overlay_combo)):
+            lyr = proj.mapLayer(lid)
+            if not isinstance(lyr, QgsVectorLayer):
+                continue
+            color = self._overlay_color(lyr, i)
+            name = lyr.name()
+            try:
+                xform = QgsCoordinateTransform(lyr.crs(), scene_crs, proj)
+            except Exception:
+                xform = None
+            gtype = QgsWkbTypes.geometryType(lyr.wkbType())
+            # label expression for points (peaks): the layer's display field/expr
+            lexpr = lctx = None
+            if gtype == QgsWkbTypes.PointGeometry and lyr.displayExpression():
+                lexpr = QgsExpression(lyr.displayExpression())
+                lctx = QgsExpressionContext(
+                    QgsExpressionContextUtils.globalProjectLayerScopes(lyr))
+            rings, paths, coords, labels = [], [], [], []
+            for feat in lyr.getFeatures():
+                g = feat.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                if xform is not None:
+                    g = QgsGeometry(g)
+                    try:
+                        g.transform(xform)
+                    except Exception:
+                        continue
+                if gtype == QgsWkbTypes.PolygonGeometry:
+                    mps = g.asMultiPolygon() if g.isMultipart() else [g.asPolygon()]
+                    for poly in mps:
+                        if not poly:
+                            continue
+                        ring = [[p.x() - cx, p.y() - cy] for p in poly[0]]
+                        if len(ring) >= 3:
+                            rings.append({"outline": ring,
+                                          "tris": web3d_export.triangulate_ring(ring)})
+                elif gtype == QgsWkbTypes.LineGeometry:
+                    mls = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
+                    for ln in mls:
+                        path = [[p.x() - cx, p.y() - cy] for p in ln]
+                        if len(path) >= 2:
+                            paths.append(path)
+                elif gtype == QgsWkbTypes.PointGeometry:
+                    pts = g.asMultiPoint() if g.isMultipart() else [g.asPoint()]
+                    lbl = self._feature_label(lexpr, lctx, feat)
+                    for p in pts:
+                        # only keep peaks that fall within the terrain (hillshade)
+                        if not extent.contains(QgsPointXY(p.x(), p.y())):
+                            continue
+                        coords.append([p.x() - cx, p.y() - cy])
+                        labels.append(lbl)
+            if rings:
+                polys.append({"name": name, "color": color, "rings": rings})
+            if paths:
+                lines.append({"name": name, "color": color, "paths": paths})
+            if coords:
+                points.append({"name": name, "color": color,
+                               "coords": coords, "labels": labels})
+        return polys, lines, points
+
+    @staticmethod
+    def _feature_label(expr, ctx, feat):
+        """Evaluate a layer's display expression for one feature; '' on failure."""
+        if expr is None:
+            return ""
+        try:
+            ctx.setFeature(feat)
+            v = expr.evaluate(ctx)
+            return "" if v is None else str(v)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _overlay_color(lyr, i):
+        """The layer's single-symbol colour, else a distinct palette colour."""
+        pal = [[255, 70, 70], [255, 220, 60], [90, 200, 255],
+               [130, 230, 130], [220, 130, 230], [255, 150, 60]]
+        try:
+            col = lyr.renderer().symbol().color()
+            return [col.red(), col.green(), col.blue()]
+        except Exception:
+            return pal[i % len(pal)]
 
     def _dem_grid(self, scene_crs, extent, ncols, nrows):
         """Warp the DEM to an ncols×nrows grid over `extent` (north-first rows).

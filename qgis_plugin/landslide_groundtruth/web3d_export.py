@@ -49,6 +49,64 @@ def encode_heightfield(rows):
     return base64.b64encode(raw).decode("ascii"), ncols, nrows, zmin, zmax
 
 
+def _signed_area(ring):
+    a = 0.0
+    n = len(ring)
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return a * 0.5
+
+
+def _in_tri(p, a, b, c):
+    def cr(o, u, v):
+        return (u[0] - o[0]) * (v[1] - o[1]) - (u[1] - o[1]) * (v[0] - o[0])
+    d1, d2, d3 = cr(p, a, b), cr(p, b, c), cr(p, c, a)
+    return not (((d1 < 0) or (d2 < 0) or (d3 < 0)) and
+                ((d1 > 0) or (d2 > 0) or (d3 > 0)))
+
+
+def triangulate_ring(ring):
+    """Ear-clip a simple polygon ring ([[x,y], ...], not closed) into a flat list
+    of triangles [[x,y],[x,y],[x,y], ...] (every 3 points = one triangle).
+
+    Best-effort and dependency-free: handles convex and concave rings; ignores
+    holes and self-intersections (bails with what it has). Returns [] if the ring
+    is degenerate."""
+    pts = [list(p) for p in ring]
+    if len(pts) >= 2 and pts[0] == pts[-1]:
+        pts.pop()
+    n = len(pts)
+    if n < 3:
+        return []
+    idx = list(range(n))
+    if _signed_area(pts) < 0:                 # ensure CCW winding
+        idx.reverse()
+    tris = []
+    guard = 0
+    while len(idx) > 3 and guard < 20000:
+        guard += 1
+        m = len(idx)
+        clipped = False
+        for k in range(m):
+            i0, i1, i2 = idx[(k - 1) % m], idx[k], idx[(k + 1) % m]
+            a, b, c = pts[i0], pts[i1], pts[i2]
+            if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) <= 0:
+                continue                       # reflex corner, not an ear
+            if any(j not in (i0, i1, i2) and _in_tri(pts[j], a, b, c) for j in idx):
+                continue                       # another vertex inside
+            tris.extend((a, b, c))             # flat point list: every 3 = a tri
+            del idx[k]
+            clipped = True
+            break
+        if not clipped:
+            break                              # non-simple ring; stop early
+    if len(idx) == 3:
+        tris.extend((pts[idx[0]], pts[idx[1]], pts[idx[2]]))
+    return tris
+
+
 def build_viewer_html(cfg):
     """Assemble the standalone viewer HTML from a config dict.
 
@@ -103,17 +161,32 @@ _HTML_MID = """</title>
          color: #ffb4b4; font-size: 15px; padding: 24px; text-align: center; }
   kbd { background: #202836; border: 1px solid #33405a; border-radius: 4px;
         padding: 1px 6px; font-size: 11px; }
+  #labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .lbl { position: absolute; transform: translate(-50%, -150%);
+         background: rgba(11,14,19,.74); color: #f2f5fb;
+         border: 1px solid #99a; border-left-width: 3px; border-radius: 4px;
+         padding: 1px 6px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  #layers { position: fixed; right: 12px; top: 12px; max-height: 42vh;
+            overflow: auto; background: rgba(11,14,19,.72);
+            border: 1px solid #33405a; border-radius: 8px; padding: 8px 10px;
+            font-size: 13px; }
+  .lyr-title { color: #aeb9cc; font-weight: 600; margin-bottom: 4px; }
+  .lyr-row { display: flex; align-items: center; gap: 6px; color: #dfe6f2;
+             cursor: pointer; padding: 2px 0; }
+  .lyr-sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
+<div id="labels"></div>
+<div id="layers"></div>
 <div id="hud">
   <button id="beforeBtn" class="btn active">◀ Before</button>
   <button id="afterBtn" class="btn">After ▶</button>
 </div>
 <div id="tag"></div>
 <div id="help">
-  drag orbit · scroll zoom · shift-drag pan<br>
+  left-drag orbit · middle/right/shift-drag pan · scroll zoom<br>
   <kbd>Space</kbd> flip · <kbd>B</kbd> before · <kbd>A</kbd> after
 </div>
 <div id="err"></div>
@@ -272,6 +345,127 @@ _VIEWER_JS = r'''
   var uLight = gl.getUniformLocation(prog, "uLight");
   var uTex = gl.getUniformLocation(prog, "uTex");
 
+  // ---------- polygon overlays (draped on the terrain) ----------
+  var oprog;
+  try {
+    oprog = gl.createProgram();
+    gl.attachShader(oprog, sh(gl.VERTEX_SHADER,
+      "attribute vec3 aPos; uniform mat4 uMVP; uniform float uPtSize;" +
+      "void main(){ gl_Position = uMVP*vec4(aPos,1.0); gl_PointSize = uPtSize; }"));
+    gl.attachShader(oprog, sh(gl.FRAGMENT_SHADER,
+      "precision mediump float; uniform vec4 uColor; uniform float uPoint;" +
+      "void main(){" +
+      // uPoint>0.5: shape the point sprite as an upward triangle (a peak glyph)
+      "  if (uPoint > 0.5 && abs(gl_PointCoord.x - 0.5) > 0.5*gl_PointCoord.y) discard;" +
+      "  gl_FragColor = uColor; }"));
+    gl.linkProgram(oprog);
+    if (!gl.getProgramParameter(oprog, gl.LINK_STATUS)) oprog = null;
+  } catch (ex) { oprog = null; }
+  var oPos = oprog ? gl.getAttribLocation(oprog, "aPos") : -1;
+  var oMVP = oprog ? gl.getUniformLocation(oprog, "uMVP") : null;
+  var oColor = oprog ? gl.getUniformLocation(oprog, "uColor") : null;
+  var oPtSize = oprog ? gl.getUniformLocation(oprog, "uPtSize") : null;
+  var oPoint = oprog ? gl.getUniformLocation(oprog, "uPoint") : null;
+
+  // bilinear terrain height (in mesh Z space) at a mesh-local (x,y)
+  function sampleZ(mx, my) {
+    var gi = (mx + W/2)/dx, gj = (H/2 - my)/dy;
+    gi = Math.max(0, Math.min(NC-1, gi)); gj = Math.max(0, Math.min(NR-1, gj));
+    var i0 = Math.floor(gi), j0 = Math.floor(gj);
+    var i1 = Math.min(NC-1, i0+1), j1 = Math.min(NR-1, j0+1);
+    var fx = gi-i0, fy = gj-j0;
+    function e(i,j){ var v = elev[j*NC+i]; return (v===v) ? v : zmid; }
+    var z = e(i0,j0)*(1-fx)*(1-fy) + e(i1,j0)*fx*(1-fy) +
+            e(i0,j1)*(1-fx)*fy + e(i1,j1)*fx*fy;
+    return (z - zmid)*exag;
+  }
+
+  // multiply column-major mat4 by vec4 (to project label anchors to the screen)
+  function mVec(m, v) {
+    return [ m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3],
+             m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3],
+             m[2]*v[0]+m[6]*v[1]+m[10]*v[2]+m[14]*v[3],
+             m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3] ];
+  }
+
+  // build draw-ops for every overlay, draping each vertex onto the terrain:
+  // polygons (translucent fill + outline), lines (polylines), points (a triangle
+  // marker atop a short pole, plus an HTML label). Each op is tagged with its
+  // layer name so the on-screen panel can toggle whole layers.
+  var overlays = [], labelItems = [], vis = {}, layerMeta = [];
+  function regLayer(name, color) {
+    if (name && !(name in vis)) { vis[name] = true; layerMeta.push({name: name, color: color}); }
+  }
+  var lift = Math.max(1, (zmax - zmin)*exag*0.02);
+  var poleH = Math.max(2*lift, (zmax - zmin)*exag*0.06);
+  function drape(list, liftMul) {
+    var a = new Float32Array(list.length*3);
+    for (var i=0;i<list.length;i++){ var p=list[i];
+      a[i*3]=p[0]; a[i*3+1]=p[1]; a[i*3+2]=sampleZ(p[0],p[1])+lift*liftMul; }
+    return a;
+  }
+  function op(arr, n, mode, color, alpha, noDepth, layer) {
+    if (n > 0) overlays.push({ buf: buf(arr, gl.ARRAY_BUFFER), n: n, mode: mode,
+      color: color, alpha: (alpha == null ? 1 : alpha), noDepth: !!noDepth,
+      layer: layer });
+  }
+  (CFG.polys || []).forEach(function (P) {
+    var c = P.color || [255, 80, 80]; regLayer(P.name, c);
+    (P.rings || []).forEach(function (R) {
+      var tris = R.tris || [], out = R.outline || [];
+      if (tris.length >= 3) op(drape(tris, 1.0), tris.length, gl.TRIANGLES, c, 0.35, true, P.name);
+      if (out.length >= 2) op(drape(out, 1.4), out.length, gl.LINE_LOOP, c, 1.0, false, P.name);
+    });
+  });
+  (CFG.lines || []).forEach(function (L) {
+    var c = L.color || [90, 190, 255]; regLayer(L.name, c);
+    (L.paths || []).forEach(function (path) {
+      if (path.length >= 2) op(drape(path, 1.4), path.length, gl.LINE_STRIP, c, 1.0, false, L.name);
+    });
+  });
+  var labelsEl = document.getElementById("labels");
+  (CFG.points || []).forEach(function (PT) {
+    var c = PT.color || [255, 220, 60]; regLayer(PT.name, c);
+    var coords = PT.coords || [], labels = PT.labels || [];
+    if (!coords.length) return;
+    var poles = new Float32Array(coords.length * 6);
+    var marks = new Float32Array(coords.length * 3);
+    for (var i=0;i<coords.length;i++){ var p=coords[i];
+      var zb = sampleZ(p[0], p[1]) + lift, zt = zb + poleH;
+      poles[i*6]=p[0]; poles[i*6+1]=p[1]; poles[i*6+2]=zb;
+      poles[i*6+3]=p[0]; poles[i*6+4]=p[1]; poles[i*6+5]=zt;
+      marks[i*3]=p[0]; marks[i*3+1]=p[1]; marks[i*3+2]=zt;
+      var txt = labels[i];
+      if (txt) {
+        var el = document.createElement("div");
+        el.className = "lbl"; el.textContent = txt;
+        el.style.borderLeftColor = "rgb("+c[0]+","+c[1]+","+c[2]+")";
+        labelsEl.appendChild(el);
+        labelItems.push({ x: p[0], y: p[1], el: el, layer: PT.name });
+      }
+    }
+    op(poles, coords.length*2, gl.LINES, c, 1.0, false, PT.name);
+    op(marks, coords.length, gl.POINTS, c, 1.0, false, PT.name);
+  });
+
+  (function buildLayersPanel() {
+    var panel = document.getElementById("layers");
+    if (!layerMeta.length) { panel.style.display = "none"; return; }
+    var title = document.createElement("div");
+    title.className = "lyr-title"; title.textContent = "Overlays";
+    panel.appendChild(title);
+    layerMeta.forEach(function (m) {
+      var row = document.createElement("label"); row.className = "lyr-row";
+      var cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true;
+      cb.onchange = function () { vis[m.name] = cb.checked; draw(); };
+      var sw = document.createElement("span"); sw.className = "lyr-sw";
+      sw.style.background = "rgb("+m.color[0]+","+m.color[1]+","+m.color[2]+")";
+      var tx = document.createElement("span"); tx.textContent = m.name;
+      row.appendChild(cb); row.appendChild(sw); row.appendChild(tx);
+      panel.appendChild(row);
+    });
+  })();
+
   // ---------- textures (both preloaded on the GPU) ----------
   function makeTex() {
     var t = gl.createTexture();
@@ -316,7 +510,10 @@ _VIEWER_JS = r'''
   // ---------- interaction ----------
   var drag = null;
   canvas.addEventListener("pointerdown", function (e) {
-    drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey || e.button === 2 };
+    if (e.button === 1) e.preventDefault();     // middle: suppress autoscroll
+    // middle OR right OR shift+left = pan; plain left = orbit
+    drag = { x: e.clientX, y: e.clientY,
+             pan: e.shiftKey || e.button === 1 || e.button === 2 };
     canvas.setPointerCapture(e.pointerId);
   });
   canvas.addEventListener("pointermove", function (e) {
@@ -405,6 +602,42 @@ _VIEWER_JS = r'''
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxB);
       gl.drawElements(gl.TRIANGLES, idx.length,
         (idx instanceof Uint32Array) ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
+      // draped overlays (polygons / lines / points), one draw-op each
+      if (oprog && overlays.length) {
+        gl.useProgram(oprog);
+        gl.uniformMatrix4fv(oMVP, false, new Float32Array(mvp));
+        gl.uniform1f(oPtSize, Math.max(9, Math.min(20, canvas.height/50)));
+        for (var oi=0; oi<overlays.length; oi++) {
+          var o = overlays[oi], c = o.color;
+          if (o.layer && !vis[o.layer]) continue;   // layer toggled off
+          if (o.noDepth) {
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.depthMask(false);
+          }
+          gl.uniform1f(oPoint, o.mode === gl.POINTS ? 1.0 : 0.0);
+          gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
+          gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
+          gl.enableVertexAttribArray(oPos);
+          gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
+          gl.drawArrays(o.mode, 0, o.n);
+          if (o.noDepth) { gl.depthMask(true); gl.disable(gl.BLEND); }
+        }
+        gl.useProgram(prog);
+      }
+      // position the HTML peak labels by projecting each anchor to the screen
+      if (labelItems.length) {
+        var cw = canvas.clientWidth, ch = canvas.clientHeight;
+        for (var li=0; li<labelItems.length; li++) {
+          var it = labelItems[li];
+          if (it.layer && !vis[it.layer]) { it.el.style.display = "none"; continue; }
+          var vv = mVec(mvp, [it.x, it.y, sampleZ(it.x, it.y)+lift+poleH, 1]);
+          if (vv[3] <= 0) { it.el.style.display = "none"; continue; }
+          it.el.style.display = "block";
+          it.el.style.left = ((vv[0]/vv[3]*0.5+0.5)*cw) + "px";
+          it.el.style.top = ((1-(vv[1]/vv[3]*0.5+0.5))*ch) + "px";
+        }
+      }
     });
   }
   window.addEventListener("resize", draw);
