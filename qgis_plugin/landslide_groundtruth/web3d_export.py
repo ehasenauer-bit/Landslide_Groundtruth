@@ -521,12 +521,13 @@ _VIEWER_JS = r'''
     var ddx = e.clientX - drag.x, ddy = e.clientY - drag.y;
     drag.x = e.clientX; drag.y = e.clientY;
     if (drag.pan) {
-      // planar pan: move the look-at target in the ground plane. Screen-right
-      // maps to (sin az, -cos az); screen-up (drag toward viewer) to (cos az, sin az).
+      // planar pan (inverted: the terrain follows the cursor). Move the look-at
+      // target opposite the drag in the ground plane — screen-right maps to
+      // (sin az, -cos az); screen-up (drag toward viewer) to (cos az, sin az).
       var ce = Math.cos(cam.az), se = Math.sin(cam.az);
       var k = cam.dist / 700;
-      cam.tgt[0] -= se*ddx*k;  cam.tgt[1] += ce*ddx*k;
-      cam.tgt[0] += ce*ddy*k;  cam.tgt[1] += se*ddy*k;
+      cam.tgt[0] += se*ddx*k;  cam.tgt[1] -= ce*ddx*k;
+      cam.tgt[0] -= ce*ddy*k;  cam.tgt[1] -= se*ddy*k;
     } else {
       cam.az -= ddx*0.006;
       cam.el += ddy*0.006;

@@ -127,6 +127,7 @@ class Viewer3DTab(QWidget):
 
         self._dem_layer = None           # QgsRasterLayer used as terrain
         self._dem_mean_z = None          # mean AOI elevation, for the camera
+        self._dem_date = None            # terrain source acquisition date (display)
         self._hillshade_layer = None     # optional draped multidirectional hillshade
         self._canvas3d = None            # the native 3D canvas we created
         self._scene_extent = None        # last scene extent (scene CRS), for Reset
@@ -777,9 +778,16 @@ class Viewer3DTab(QWidget):
         self._dem_mean_z = result["zmean"]
         src = cand.get("source", "DEM")
         model = cand.get("terrain_model", "")
-        name = " ".join(x for x in (src, model, "terrain",
+        d = cand.get("date")
+        if d:
+            date_str = d[:10]                       # ArcticDEM strip acquisition day
+        elif str(cand.get("dem_source", "")).startswith("3dep-seamless"):
+            date_str = "seamless mosaic"            # 3DEP seamless is timeless
+        else:
+            date_str = "undated"
+        name = " ".join(x for x in (src, model, date_str, "terrain",
                                     f"({cover*100:.0f}% AOI cover)") if x)
-        self._set_terrain_from_file(result["path"], name)
+        self._set_terrain_from_file(result["path"], name, date_str)
         # DSM vs DTM guardrail (this terrain may feed the volume/differencing tab).
         if model:
             kind = ("surface model — canopy/buildings INCLUDED" if cand.get("is_dsm")
@@ -791,13 +799,13 @@ class Viewer3DTab(QWidget):
             self._log(f"Note: this DEM covers only {cover*100:.0f}% of the AOI — pick "
                       f"another entry in the dropdown if the terrain has holes.")
 
-    def _set_terrain_from_file(self, path, name):
+    def _set_terrain_from_file(self, path, name, date=None):
         lyr = QgsRasterLayer(path, name)
         if not lyr.isValid():
             self._warn(f"Could not load terrain raster:\n{path}")
             return
         QgsProject.instance().addMapLayer(lyr)
-        self._install_terrain_layer(lyr)
+        self._install_terrain_layer(lyr, date=date)
 
     def _use_loaded_dem(self):
         lid = self.loaded_combo.currentData()
@@ -808,25 +816,55 @@ class Viewer3DTab(QWidget):
         self._dem_mean_z = self._sample_center_z(lyr)
         model = self.loaded_model_combo.currentData()
         name = f"{lyr.name()} ({model})" if model else lyr.name()
-        self._install_terrain_layer(lyr, name)
+        # the plugin can't know a loaded raster's acquisition date, but DEM files
+        # usually carry it in the name/path (e.g. SETSM ..._20150803_...) — sniff it.
+        sniff = self._sniff_date(lyr.name(), lyr.source())
+        date = f"{sniff} (from filename)" if sniff else "unknown (loaded layer)"
+        self._install_terrain_layer(lyr, name, date)
         if model:
             kind = ("surface model — canopy/buildings INCLUDED" if model == "DSM"
                     else "bare-earth model — canopy/buildings removed")
             self._log(f"Loaded terrain tagged as {model} ({kind}). Do NOT difference "
                       f"a DSM against a DTM in the volume tab.")
 
-    def _install_terrain_layer(self, lyr, name=None):
+    def _install_terrain_layer(self, lyr, name=None, date=None):
         """Adopt `lyr` as the terrain DEM, (re)build the hillshade, refresh lists.
-        `name` overrides the display label (e.g. a source/model-tagged name)."""
+
+        `name` overrides the display label (e.g. a source/model-tagged name);
+        `date` is the source's acquisition date (or a note like 'seamless
+        mosaic' / 'unknown (loaded layer)'), shown so the terrain's provenance
+        is visible."""
         self._dem_layer = lyr
+        self._dem_date = date
         label = name or lyr.name()
-        self.terrain_label.setText(f"Terrain: {label}")
+        datetxt = f"   ·   acquired {date}" if date else ""
+        self.terrain_label.setText(f"Terrain: {label}{datetxt}")
         self.open_btn.setEnabled(True)
         self.web_btn.setEnabled(True)
         self._rebuild_hillshade()
         self._refresh_drape_list()
-        self._log(f"Terrain ready: {label}. Tick drape layers, then "
-                  f"'Open / update 3D view'.")
+        self._log(f"Terrain ready: {label}"
+                  + (f" — acquired {date}" if date else "")
+                  + ". Tick drape layers, then 'Open / update 3D view'.")
+
+    @staticmethod
+    def _sniff_date(*texts):
+        """First YYYY-MM-DD / YYYYMMDD date found in the given strings, or None.
+
+        DEM filenames commonly embed the acquisition date (ArcticDEM/SETSM strips
+        as ..._YYYYMMDD_..., Copernicus/USGS tiles as YYYY-MM-DD), so this recovers
+        it for a hand-loaded DEM the plugin has no metadata for."""
+        import re
+        for t in texts:
+            if not t:
+                continue
+            m = re.search(r"(?:19|20)\d{2}[-_]?\d{2}[-_]?\d{2}", str(t))
+            if m:
+                s = re.sub(r"[-_]", "", m.group(0))
+                mo, dy = int(s[4:6]), int(s[6:8])
+                if 1 <= mo <= 12 and 1 <= dy <= 31:      # guard against a random 8-digit run
+                    return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+        return None
 
     def _rebuild_hillshade(self):
         """Add/refresh a multidirectional hillshade of the terrain DEM as a drapeable
