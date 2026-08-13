@@ -721,6 +721,21 @@ _VIEWER_JS = r'''
   }
 
   // ---------- figure export (annotated PNG) ----------
+  // tight XY bounding box of the actual (non-NaN) terrain, in mesh metres, so the
+  // axis box hugs the topography instead of the full (possibly nodata-padded) AOI.
+  var _dbb = null;
+  function dataBBox() {
+    if (_dbb) return _dbb;
+    var i0=NC, i1=-1, j0=NR, j1=-1;
+    for (var j=0;j<NR;j++) for (var i=0;i<NC;i++) {
+      var v = elev[j*NC+i];
+      if (v===v) { if(i<i0)i0=i; if(i>i1)i1=i; if(j<j0)j0=j; if(j>j1)j1=j; }
+    }
+    if (i1<0) { _dbb = {x0:-W/2, x1:W/2, y0:-H/2, y1:H/2}; return _dbb; }
+    var ddx=W/(NC-1||1), ddy=H/(NR-1||1);
+    _dbb = { x0:-W/2+i0*ddx, x1:-W/2+i1*ddx, y0:H/2-j1*ddy, y1:H/2-j0*ddy };
+    return _dbb;
+  }
   function project(mvp, p, W, H) {
     var v = mVec(mvp, [p[0], p[1], p[2], 1]);
     if (v[3] <= 0) return null;
@@ -734,12 +749,12 @@ _VIEWER_JS = r'''
   }
   function niceTicks(lo, hi, n) {
     if (hi <= lo) return [lo];
-    var step = niceNum(niceNum(hi-lo, false)/((n||5)-1), true);
+    var step = niceNum((hi-lo)/((n||6)-1), true);   // ~n ticks across the range
     var out = [];
     for (var v=Math.ceil(lo/step)*step; v<=hi+step*0.5; v+=step) out.push(v);
     return out;
   }
-  function drawTickAxis(ctx, mvp, W, H, ws, we, vs, ve, title, fs, boxCtr, fmt) {
+  function drawTickAxis(ctx, mvp, W, H, ws, we, vs, ve, title, fs, boxCtr, fmt, n) {
     var ps = project(mvp, ws, W, H), pe = project(mvp, we, W, H);
     if (!ps || !pe) return;
     var axC = "rgba(246,249,253,0.97)", lw = Math.max(2, W/900);
@@ -757,7 +772,7 @@ _VIEWER_JS = r'''
       ctx.lineJoin = "round"; ctx.strokeText(txt, x, y);
       ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
     }
-    niceTicks(Math.min(vs,ve), Math.max(vs,ve), 4).forEach(function (v) {
+    niceTicks(Math.min(vs,ve), Math.max(vs,ve), n||6).forEach(function (v) {
       var f = (v - vs)/(ve - vs); if (f<-0.001 || f>1.001) return;
       var wp = [ws[0]+(we[0]-ws[0])*f, ws[1]+(we[1]-ws[1])*f, ws[2]+(we[2]-ws[2])*f];
       var p = project(mvp, wp, W, H); if (!p) return;
@@ -766,16 +781,17 @@ _VIEWER_JS = r'''
       label(p[0]+nx*(tl+5), p[1]+ny*(tl+5), (v*fmt.scale).toFixed(fmt.dec), false);
     });
     var mid = project(mvp, [(ws[0]+we[0])/2,(ws[1]+we[1])/2,(ws[2]+we[2])/2], W, H);
-    if (mid) { ctx.textAlign="center"; label(mid[0]+nx*(tl+3.4*fs), mid[1]+ny*(tl+3.4*fs), title, true); }
+    if (mid) { ctx.textAlign="center"; label(mid[0]+nx*(tl+5.2*fs), mid[1]+ny*(tl+5.2*fs), title, true); }
   }
   function drawAxes(ctx, mvp, W, H) {
     var zBot = (zmin - zmid)*exag, zTop = (zmax - zmid)*exag;
-    var meshW = +CFG.width_m, meshH = +CFG.height_m;
-    function corner(ix,iy,iz){ return [ ix?meshW/2:-meshW/2, iy?meshH/2:-meshH/2, iz?zTop:zBot ]; }
+    var bb = dataBBox();                       // tight to the real terrain
+    var spanE = bb.x1 - bb.x0, spanN = bb.y1 - bb.y0;
+    function corner(ix,iy,iz){ return [ ix?bb.x1:bb.x0, iy?bb.y1:bb.y0, iz?zTop:zBot ]; }
     var Cp = {};
     for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
       Cp[a+""+b+d] = project(mvp, corner(a,b,d), W, H);
-    // the full bounding box, clearly visible
+    // the bounding box, clearly visible
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
     [["000","100"],["010","110"],["001","101"],["011","111"],
      ["000","010"],["100","110"],["001","011"],["101","111"],
@@ -783,8 +799,8 @@ _VIEWER_JS = r'''
       var p=Cp[e[0]], q=Cp[e[1]];
       if (p && q) { ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); }
     });
-    // origin = the bottom corner nearest the camera, so all three axes fall on
-    // front-facing edges and read cleanly (like the Surfer reference).
+    // origin = the bottom corner nearest the camera, so the two horizontal axes
+    // fall on front-facing edges and read cleanly.
     var eye = eyePos(), O=null, best=1e18;
     [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
       var w = corner(b[0],b[1],0);
@@ -793,15 +809,15 @@ _VIEWER_JS = r'''
     });
     if (!O) return;
     var ix=O[0], iy=O[1];
-    var bc = project(mvp, [0,0,(zBot+zTop)/2], W, H);
+    var bc = project(mvp, [(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zBot+zTop)/2], W, H);
     var fs = Math.max(13, Math.round(W/60));
     function fmtAxis(sp){ return sp>=3000 ? {scale:0.001,dec:1,unit:"km"} : {scale:1,dec:0,unit:"m"}; }
-    var fE=fmtAxis(meshW), fN=fmtAxis(meshH);
-    // horizontal axes = ground DISTANCE from the near corner (0..span, km/m)
+    var fE=fmtAxis(spanE), fN=fmtAxis(spanN);
+    // horizontal axes = ground DISTANCE from the near corner (0..span, km/m), ~7 ticks
     drawTickAxis(ctx, mvp, W, H, corner(ix,iy,0), corner(1-ix,iy,0),
-                 0, meshW, "Distance E ("+fE.unit+")", fs, bc, fE);
+                 0, spanE, "Distance E ("+fE.unit+")", fs, bc, fE, 7);
     drawTickAxis(ctx, mvp, W, H, corner(ix,iy,0), corner(ix,1-iy,0),
-                 0, meshH, "Distance N ("+fN.unit+")", fs, bc, fN);
+                 0, spanN, "Distance N ("+fN.unit+")", fs, bc, fN, 7);
     // elevation (metres) on the LEFT-most vertical edge, so it never crowds the
     // Northing axis that shares the near corner.
     var Zc=null, zbest=1e18;
@@ -810,7 +826,7 @@ _VIEWER_JS = r'''
       if (pb && pt) { var sx=(pb[0]+pt[0])/2; if (sx<zbest) { zbest=sx; Zc=b; } }
     });
     if (Zc) drawTickAxis(ctx, mvp, W, H, corner(Zc[0],Zc[1],0), corner(Zc[0],Zc[1],1),
-                 zmin, zmax, "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"});
+                 zmin, zmax, "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
   }
   function drawNorth(ctx, mvp, W, H) {
     var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
@@ -861,11 +877,26 @@ _VIEWER_JS = r'''
     ];
     var sw=canvas.width, sh=canvas.height, sa=active, sv={}; for (var k in vis) sv[k]=vis[k];
     canvas.width=pxW; canvas.height=pxH; gl.viewport(0,0,pxW,pxH);   // fixed render size
-    // fixed oblique framing (like the Surfer reference): same angle every export,
-    // whole bounding box + all three axes visible with margin, no crowding.
+    // Orbit + tilt to look as PERPENDICULAR to the slope at the overlays as
+    // possible: azimuth = downslope aspect, tilt = 90deg - slope angle. This
+    // shows the most polygon surface area and collapses the empty box air above
+    // the low terrain. Falls back to a fixed oblique when there are no overlays.
     var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
     var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
-    cam.az = -2.2; cam.el = 0.5; cam.dist = meshSpan()*1.55; cam.tgt = [0, 0, (zB+zT)/2];
+    var az0 = -2.2, el0 = 0.62, ov = [];
+    (CFG.polys||[]).forEach(function(P){(P.rings||[]).forEach(function(R){(R.outline||[]).forEach(function(p){ov.push(p);});});});
+    (CFG.points||[]).forEach(function(P){(P.coords||[]).forEach(function(p){ov.push(p);});});
+    (CFG.lines||[]).forEach(function(L){(L.paths||[]).forEach(function(pa){pa.forEach(function(p){ov.push(p);});});});
+    if (ov.length) {
+      var ccx=0, ccy=0; ov.forEach(function(p){ccx+=p[0]; ccy+=p[1];}); ccx/=ov.length; ccy/=ov.length;
+      var eps=meshSpan()/120;
+      var gx=(sampleZ(ccx+eps,ccy)-sampleZ(ccx-eps,ccy))/(2*eps);   // slope of the drape
+      var gy=(sampleZ(ccx,ccy+eps)-sampleZ(ccx,ccy-eps))/(2*eps);
+      var gm=Math.hypot(gx,gy);
+      if (gm>1e-6) { az0 = Math.atan2(-gy,-gx); el0 = Math.atan2(1,gm); }
+      el0 = Math.max(0.6, Math.min(1.15, el0));   // near-perpendicular, keep some 3D
+    }
+    cam.az = az0; cam.el = el0; cam.dist = meshSpan()*1.4; cam.tgt = [0, 0, (zB+zT)/2];
     var shots=[];
     panels.forEach(function (pn) {
       active = pn.side;
@@ -910,6 +941,11 @@ _VIEWER_JS = r'''
      ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
      ["Before image", CFG.before_date||"—"],
      ["After image", CFG.after_date||"—"]].forEach(function (kv) {
+      g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
+      g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
+    });
+    (CFG.extra_details||[]).forEach(function (kv) {
+      if (!kv[1]) return;
       g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
       g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
     });

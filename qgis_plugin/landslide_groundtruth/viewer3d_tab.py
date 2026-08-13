@@ -371,6 +371,44 @@ class Viewer3DTab(QWidget):
         fbl.addWidget(self.web_btn)
         root.addWidget(flip_box)
 
+        # --- figure Details (captions for the exported PNG) ---------------
+        det_box = QgsCollapsibleGroupBox("Figure details (exported PNG)")
+        det_box.setSaveCollapsedState(False)
+        det_box.setCollapsed(True)
+        dform = QFormLayout(det_box)
+        # imagery source is a dropdown of the plugin's sources (editable for others)
+        self.det_imagery_sat = QComboBox()
+        self.det_imagery_sat.setEditable(True)
+        self.det_imagery_sat.addItems([
+            "", "PlanetScope (~3 m)", "Sentinel-2 (~10 m)", "Landsat (~30 m)",
+            "Sentinel-1 (SAR)", "Maxar / WorldView"])
+        self.det_imagery_sat.setToolTip(
+            "Satellite/source of the before & after imagery — pick one or type your own.")
+        dform.addRow("Imagery satellite", self.det_imagery_sat)
+        self.det_terrain_sat = QLineEdit()
+        self.det_area = QLineEdit()
+        self.det_cl_length = QLineEdit()
+        self.det_cl_drop = QLineEdit()
+        self.det_volume = QLineEdit()
+        for lbl, w, tip in (
+            ("Terrain satellite", self.det_terrain_sat, "auto-filled from the DEM source; editable"),
+            ("Area", self.det_area, "landslide area (Pull from the Volume tab, or type)"),
+            ("Centerline length", self.det_cl_length, "runout horizontal length"),
+            ("Vertical drop", self.det_cl_drop, "centerline elevation drop"),
+            ("Volume", self.det_volume, "paste the estimate from the Volume tab"),
+        ):
+            w.setPlaceholderText(tip)
+            w.setToolTip(tip)
+            dform.addRow(lbl, w)
+        self.pull_vol_btn = QPushButton("↻ Pull area / centerline / volume from Volume tab")
+        self.pull_vol_btn.setToolTip(
+            "Copy the latest area, centerline length + vertical drop, and volume "
+            "estimate from the 'Volume from area' tab into the fields above. Run a "
+            "measurement (and the centerline) there first.")
+        self.pull_vol_btn.clicked.connect(self._pull_volume_details)
+        dform.addRow(self.pull_vol_btn)
+        root.addWidget(det_box)
+
         # --- actions -------------------------------------------------------
         btn_row = QHBoxLayout()
         self.open_btn = QPushButton("Open / update 3D view")
@@ -870,6 +908,8 @@ class Viewer3DTab(QWidget):
         name = " ".join(x for x in (src, model, date_str, "terrain",
                                     f"({cover*100:.0f}% AOI cover)") if x)
         self._set_terrain_from_file(result["path"], name, date_str)
+        if not self.det_terrain_sat.text().strip():
+            self.det_terrain_sat.setText(self._terrain_sensor(cand))
         # DSM vs DTM guardrail (this terrain may feed the volume/differencing tab).
         if model:
             kind = ("surface model — canopy/buildings INCLUDED" if cand.get("is_dsm")
@@ -903,6 +943,8 @@ class Viewer3DTab(QWidget):
         sniff = self._sniff_date(lyr.name(), lyr.source())
         date = f"{sniff} (from filename)" if sniff else "unknown (loaded layer)"
         self._install_terrain_layer(lyr, name, date)
+        if not self.det_terrain_sat.text().strip():
+            self.det_terrain_sat.setText(lyr.name())
         if model:
             kind = ("surface model — canopy/buildings INCLUDED" if model == "DSM"
                     else "bare-earth model — canopy/buildings removed")
@@ -1520,6 +1562,62 @@ class Viewer3DTab(QWidget):
                     continue
         return False
 
+    # ------------------------------------------- figure details ----
+    def _pull_volume_details(self):
+        """Copy area / centerline / volume from the Volume tab's last result.
+
+        Reads only the volume tab's public-ish result dict (self._current);
+        defensive so it degrades to a warning if the tab hasn't run or its
+        shape changed. Every field stays user-editable afterwards."""
+        vt = getattr(self.dock, "volume_tab", None)
+        cur = getattr(vt, "_current", None) if vt is not None else None
+        if not cur:
+            self._warn("No Volume-tab result yet — run a measurement in the "
+                       "'Volume from area' tab (and compute the centerline) first.")
+            return
+
+        def num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        a = num(cur.get("a_conv")) or num(cur.get("a_total")) or num(cur.get("src_best"))
+        vb, vl, vh = num(cur.get("v_best")), num(cur.get("v_low")), num(cur.get("v_high"))
+        ln, dr = num(cur.get("length")), num(cur.get("drop"))
+        if a is not None:
+            self.det_area.setText(f"{a/1e6:.2f} km²" if a >= 1e5 else f"{a:.0f} m²")
+        if ln is not None:
+            self.det_cl_length.setText(f"{ln/1000:.2f} km" if ln >= 1000 else f"{ln:.0f} m")
+        if dr is not None:
+            self.det_cl_drop.setText(f"{dr:.0f} m")
+        if vb is not None:
+            rng = (f"  ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
+                   if vl is not None and vh is not None else "")
+            self.det_volume.setText(self._fmt_vol(vb) + rng)
+        got = [k for k, v in (("area", a), ("length", ln), ("drop", dr),
+                              ("volume", vb)) if v is not None]
+        if got:
+            self._log("Pulled from Volume tab: " + ", ".join(got) + ".")
+        else:
+            self._warn("Volume tab has a result but no area/centerline/volume "
+                       "numbers yet — measure + compute the centerline there.")
+
+    @staticmethod
+    def _fmt_vol(v):
+        if v is None:
+            return "?"
+        return f"{v/1e6:.2f} ×10⁶ m³" if abs(v) >= 1e6 else f"{v:,.0f} m³"
+
+    @staticmethod
+    def _terrain_sensor(cand):
+        """A sensor label for the terrain source, for the figure Details."""
+        s = str(cand.get("dem_source", ""))
+        if s in ("arcticdem", "earthdem", "rema"):
+            return "Maxar WorldView (stereo photogrammetry)"
+        if s.startswith("3dep"):
+            return "USGS 3DEP"
+        return cand.get("source", "DEM")
+
     # -------------------------------------- instant-flip web viewer ----
     def _export_web_viewer(self):
         """Bake DEM + before/after imagery into a standalone WebGL viewer.
@@ -1636,6 +1734,18 @@ class Viewer3DTab(QWidget):
         }
         polys, lines, points = self._collect_overlays(scene_crs, extent)
         cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
+        # extra Details rows for the figure (satellites, area, centerline, volume)
+        det = []
+        img = self.det_imagery_sat.currentText().strip()
+        if img:
+            det.append(["Imagery", img])
+        for lbl, w in (("Terrain", self.det_terrain_sat), ("Area", self.det_area),
+                       ("Centerline length", self.det_cl_length),
+                       ("Vertical drop", self.det_cl_drop), ("Volume", self.det_volume)):
+            v = w.text().strip()
+            if v:
+                det.append([lbl, v])
+        cfg["extra_details"] = det
         if polys or lines or points:
             self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
                       f"{len(points)} point layer(s).")
