@@ -46,6 +46,7 @@ from qgis.core import (
 from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 
 from . import dem_diff
+from . import layer_group as lg
 from .task import PipelineTask
 
 # The terrain settings class we build ourselves (the canvas owns its
@@ -68,8 +69,15 @@ VIEW_NAME = "Landslide 3D"
 # the UNSIGNED blob href in search.json and we re-sign fresh just before the warp.
 PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
-# machine 'dem_source' tags that mean a PGC SETSM strip (vs a 3DEP fallback)
+# machine 'dem_source' tags that mean a PGC SETSM strip (vs a fallback DEM)
 PGC_SOURCES = ("arcticdem", "earthdem", "rema")
+
+# Fallback DEM tiers, in the order they're tried when an ArcticDEM strip warps to
+# <50% valid pixels (or fails outright): USGS 3DEP first (finer where it exists,
+# but US-only), then NRCan MRDEM (30 m, seamless over Canada — the one that
+# actually delivers terrain just north of the border). Matched on dem_source
+# prefix; see _tier_of.
+FALLBACK_TIERS = ("3dep", "mrdem")
 
 
 def _pc_sign(href):
@@ -124,6 +132,8 @@ class Viewer3DTab(QWidget):
         self._warp_task = None           # in-flight ArcticDEM warp (in-process)
         self._search_result = None       # last search.json (strip candidates)
         self._gen = 0                    # terrain-build generation (drops stale warps)
+        self._pgc_fallback = None        # best ArcticDEM warp set aside while trying
+                                         # 3DEP, to install if 3DEP comes up empty
 
         self._dem_layer = None           # QgsRasterLayer used as terrain
         self._dem_mean_z = None          # mean AOI elevation, for the camera
@@ -505,6 +515,7 @@ class Viewer3DTab(QWidget):
         self.strip_combo.setEnabled(False)
         self.strip_combo.blockSignals(False)
         self._search_result = None
+        self._pgc_fallback = None
         self._busy(True)
         self._log("Searching PGC for ArcticDEM strips over the AOI (free, no download)…")
         self.task = PipelineTask(python, script, project, args, out,
@@ -584,11 +595,13 @@ class Viewer3DTab(QWidget):
         self._warp_selected_strip()
 
     def _rank_strips(self, cands):
-        """Best-first, in two source tiers so 3DEP never outranks usable ArcticDEM.
+        """Best-first, in source tiers so a fallback never outranks usable
+        ArcticDEM.
 
-        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), tier 1 = 3DEP. Within
-        a tier: strips covering the event point first, then ArcticDEM by newest
-        acquisition and 3DEP by finest resolution (DSM 1 m → 10 m → 30 m)."""
+        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), tier 1 = 3DEP,
+        tier 2 = MRDEM (Canada). Within a tier: entries covering the event point
+        first, then ArcticDEM by newest acquisition and the fallbacks by finest
+        resolution (DSM 1 m → 10 m → 30 m)."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -603,7 +616,9 @@ class Viewer3DTab(QWidget):
                 dstr = (c.get("date") or "").replace("-", "")
                 dnum = int(dstr) if dstr.isdigit() else 0
                 return (0, covers, -dnum)          # newest ArcticDEM first
-            return (1, covers, c.get("resolution_m") or 999)   # finest 3DEP first
+            ds = str(c.get("dem_source", ""))
+            tier = 1 if ds.startswith("3dep") else 2   # 3DEP before MRDEM
+            return (tier, covers, c.get("resolution_m") or 999)   # finest first
 
         cands.sort(key=key)
         return cands
@@ -648,9 +663,8 @@ class Viewer3DTab(QWidget):
 
     def _pick_default_strip(self, cands):
         """Combo index to auto-warp: best ArcticDEM if its footprints blanket
-        >=50% of the AOI, else the best 3DEP fallback. `cands` is ranked, so the
-        first PGC entry is the best ArcticDEM and the first 3dep entry the best
-        3DEP."""
+        >=50% of the AOI, else the first available fallback (3DEP, then MRDEM).
+        `cands` is ranked, so the first entry of each tier is that tier's best."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -662,35 +676,59 @@ class Viewer3DTab(QWidget):
             self._log(f"ArcticDEM footprints blanket ~{cover*100:.0f}% of the AOI "
                       f"(>=50%) — using ArcticDEM.")
             return 0
-        for i, c in enumerate(cands):
-            if str(c.get("dem_source", "")).startswith("3dep"):
-                self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the "
-                          f"AOI (<50%) — defaulting to {c.get('source', '3DEP')}.")
-                return i
+        nxt = self._fallback_index("pgc")
+        if nxt >= 0:
+            src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
+            self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the "
+                      f"AOI (<50%) — defaulting to {src}.")
+            return nxt
         self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the AOI, and "
-                  f"no 3DEP tiles were found here — using ArcticDEM (may have gaps).")
+                  f"no fallback DEM was found here — using ArcticDEM (may have gaps).")
         return 0
 
-    def _has_3dep_candidate(self):
-        for i in range(self.strip_combo.count()):
-            c = self.strip_combo.itemData(i)
-            if c and str(c.get("dem_source", "")).startswith("3dep"):
-                return True
-        return False
+    def _tier_of(self, cand):
+        """Source tier of a candidate: 'pgc' (ArcticDEM/EarthDEM/REMA), a fallback
+        tier from FALLBACK_TIERS ('3dep' / 'mrdem'), or 'other'."""
+        cand = cand or {}
+        if cand.get("dem_source") in PGC_SOURCES:
+            return "pgc"
+        ds = str(cand.get("dem_source", ""))
+        for tier in FALLBACK_TIERS:
+            if ds.startswith(tier):
+                return tier
+        return "other"
 
-    def _select_and_warp_3dep(self):
-        """Switch the dropdown to the best 3DEP entry and re-warp it."""
-        for i in range(self.strip_combo.count()):
-            c = self.strip_combo.itemData(i)
-            if c and str(c.get("dem_source", "")).startswith("3dep"):
-                self.strip_combo.blockSignals(True)
-                self.strip_combo.setCurrentIndex(i)
-                self.strip_combo.blockSignals(False)
-                self._warp_selected_strip()
-                return
+    def _fallback_index(self, after_tier):
+        """Combo index of the next fallback DEM to try after `after_tier`, or -1.
+
+        'pgc' starts at the first fallback tier; a fallback tier starts at the one
+        after it — so the chain runs ArcticDEM → 3DEP → MRDEM and stops."""
+        if after_tier == "pgc":
+            start = 0
+        elif after_tier in FALLBACK_TIERS:
+            start = FALLBACK_TIERS.index(after_tier) + 1
+        else:
+            start = 0
+        for tier in FALLBACK_TIERS[start:]:
+            for i in range(self.strip_combo.count()):
+                if self._tier_of(self.strip_combo.itemData(i)) == tier:
+                    return i
+        return -1
+
+    def _select_and_warp_index(self, idx):
+        """Switch the dropdown to a specific candidate and warp it WITHOUT firing
+        the manual-pick handler — that would clear the ArcticDEM safety net we
+        need if this fallback also comes up empty."""
+        self.strip_combo.blockSignals(True)
+        self.strip_combo.setCurrentIndex(idx)
+        self.strip_combo.blockSignals(False)
+        self._warp_selected_strip()
 
     def _on_strip_changed(self):
         if self.strip_combo.isEnabled() and self.strip_combo.currentData():
+            # a manual pick starts fresh — drop any ArcticDEM held from an earlier
+            # auto <50% → 3DEP switch, so hand-selecting 3DEP can't install it
+            self._pgc_fallback = None
             self._warp_selected_strip()
 
     def _warp_selected_strip(self):
@@ -755,26 +793,70 @@ class Viewer3DTab(QWidget):
             return                       # a newer fetch superseded this one
         self._busy(False)
         self._warp_task = None
-        if exc is not None:
-            self._log(f"Warp failed: {exc}")
-            self._warn("DEM warp failed — see the log.")
-            return
-        if not result or result.get("error"):
-            msg = (result or {}).get("error", "unknown error")
-            self._log(f"Warp produced no terrain: {msg}. Try another strip or a "
-                      f"larger radius.")
-            return
-        cover = result["cover"]
+
         cand = self.strip_combo.currentData() or {}
-        is_pgc = cand.get("dem_source") in PGC_SOURCES
-        # post-warp safety net: the ArcticDEM strip's footprint claimed the AOI but
-        # it warped to <50% valid pixels (interior water/shadow/cloud holes). Switch
-        # to the 3DEP fallback rather than install a holey surface.
-        if cover < 0.5 and is_pgc and self._has_3dep_candidate():
-            self._log(f"This ArcticDEM strip resolved only {cover*100:.0f}% valid "
-                      f"pixels over the AOI (<50%); switching to the 3DEP fallback…")
-            self._select_and_warp_3dep()
+        tier = self._tier_of(cand)
+
+        if exc is not None or not result or result.get("error"):
+            reason = (str(exc) if exc is not None
+                      else (result or {}).get("error", "unknown error"))
+            # Walk the fallback chain: the source that just failed hands off to
+            # the next tier (ArcticDEM <50% → 3DEP → MRDEM). When the chain is
+            # exhausted, install the partial ArcticDEM we set aside rather than
+            # leave the user with nothing — it was already warped to disk.
+            nxt = self._fallback_index(tier)
+            if nxt >= 0:
+                src = (self.strip_combo.itemData(nxt) or {}).get("source", "the next DEM")
+                self._log(f"{cand.get('source', 'That source')} produced no "
+                          f"terrain ({reason}); trying {src}…")
+                self._select_and_warp_index(nxt)
+                return
+            if self._pgc_fallback is not None:
+                saved = self._pgc_fallback
+                self._pgc_fallback = None
+                pct = saved["result"]["cover"] * 100
+                self._log(f"No fallback DEM resolved terrain here ({reason}); "
+                          f"installing the ArcticDEM strip despite covering just "
+                          f"{pct:.0f}% of the AOI. Expect holes — pick another "
+                          f"strip or shrink the radius if they matter.")
+                self._warn("Fallback DEMs empty here — using the partial "
+                           "ArcticDEM strip (see log).")
+                self._install_warp_result(saved["result"], saved["cand"])
+                return
+            if exc is not None:
+                self._log(f"Warp failed: {reason}")
+                self._warn("DEM warp failed — see the log.")
+            else:
+                self._log(f"Warp produced no terrain: {reason}. Try another strip "
+                          f"or a larger radius.")
             return
+
+        cover = result["cover"]
+        # post-warp safety net: the ArcticDEM strip's footprint claimed the AOI but
+        # it warped to <50% valid pixels (interior water/shadow/cloud holes). Try
+        # the fallback chain rather than install a holey surface — but hold on to
+        # THIS result so that if every fallback is empty here we still fall back
+        # to it (a partial surface beats no terrain).
+        if tier == "pgc" and cover < 0.5:
+            nxt = self._fallback_index("pgc")
+            if nxt >= 0:
+                self._pgc_fallback = {"result": result, "cand": cand}
+                src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
+                self._log(f"This ArcticDEM strip resolved only {cover*100:.0f}% "
+                          f"valid pixels over the AOI (<50%); trying {src}…")
+                self._select_and_warp_index(nxt)
+                return
+        self._pgc_fallback = None
+        self._install_warp_result(result, cand)
+
+    def _install_warp_result(self, result, cand):
+        """Install a completed warp as the terrain layer: mean Z for the camera, a
+        descriptive name, the DSM/DTM guardrail note, and a low-coverage warning.
+
+        Shared by the normal success path and the "3DEP was empty, keep the
+        partial ArcticDEM" fallback, so both name and warn about the terrain the
+        same way — the caller has already decided this result is the one to use."""
+        cover = result["cover"]
         self._dem_mean_z = result["zmean"]
         src = cand.get("source", "DEM")
         model = cand.get("terrain_model", "")
@@ -804,7 +886,7 @@ class Viewer3DTab(QWidget):
         if not lyr.isValid():
             self._warn(f"Could not load terrain raster:\n{path}")
             return
-        QgsProject.instance().addMapLayer(lyr)
+        lg.add_to_group(lyr, "3D terrain")
         self._install_terrain_layer(lyr, date=date)
 
     def _use_loaded_dem(self):
@@ -872,10 +954,7 @@ class Viewer3DTab(QWidget):
         renderer — no extra file written."""
         # drop a stale hillshade
         if self._hillshade_layer is not None:
-            try:
-                QgsProject.instance().removeMapLayer(self._hillshade_layer.id())
-            except Exception:
-                pass
+            lg.remove_layer(self._hillshade_layer)
             self._hillshade_layer = None
         if not self.hillshade_check.isChecked() or self._dem_layer is None:
             return
@@ -887,7 +966,7 @@ class Viewer3DTab(QWidget):
         renderer.setMultiDirectional(True)
         renderer.setZFactor(self.zfactor_spin.value())
         hs.setRenderer(renderer)
-        QgsProject.instance().addMapLayer(hs)
+        lg.add_to_group(hs, "3D terrain")
         self._hillshade_layer = hs
 
     @staticmethod
@@ -1548,6 +1627,12 @@ class Viewer3DTab(QWidget):
             "elev_b64": elev_b64,
             "before_uri": before_uri,
             "after_uri": after_uri,
+            # provenance + georeferencing for the exported figure's axes/caption
+            "crs": scene_crs.authid() or "",
+            "utm": [extent.xMinimum(), extent.yMinimum(),
+                    extent.xMaximum(), extent.yMaximum()],
+            "before_date": self._sniff_date(label(before)) or "",
+            "after_date": self._sniff_date(label(after)) or "",
         }
         polys, lines, points = self._collect_overlays(scene_crs, extent)
         cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
@@ -1568,6 +1653,9 @@ class Viewer3DTab(QWidget):
                                QgsExpressionContext, QgsExpressionContextUtils)
         proj = QgsProject.instance()
         cx, cy = extent.center().x(), extent.center().y()
+        # densify/subdivide target (scene metres) so draped polygons CONFORM to
+        # the terrain instead of spanning flat sheets between boundary vertices.
+        step = max(extent.width(), extent.height()) / 200.0
         polys, lines, points = [], [], []
         for i, lid in enumerate(self._checked_ids(self.overlay_combo)):
             lyr = proj.mapLayer(lid)
@@ -1604,8 +1692,10 @@ class Viewer3DTab(QWidget):
                             continue
                         ring = [[p.x() - cx, p.y() - cy] for p in poly[0]]
                         if len(ring) >= 3:
-                            rings.append({"outline": ring,
-                                          "tris": web3d_export.triangulate_ring(ring)})
+                            rings.append({
+                                "outline": web3d_export.densify_ring(ring, step),
+                                "tris": web3d_export.subdivide_tris(
+                                    web3d_export.triangulate_ring(ring), step)})
                 elif gtype == QgsWkbTypes.LineGeometry:
                     mls = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
                     for ln in mls:

@@ -107,6 +107,66 @@ def triangulate_ring(ring):
     return tris
 
 
+def densify_ring(ring, step):
+    """Insert points along each closed-ring edge so no segment exceeds `step`.
+
+    Draping only samples the terrain at vertices, so a sparse ring's long edges
+    cut straight across relief. Densifying makes the OUTLINE hug the surface."""
+    n = len(ring)
+    if n < 2 or step <= 0:
+        return [list(p) for p in ring]
+    out = []
+    for i in range(n):
+        a, b = ring[i], ring[(i + 1) % n]
+        out.append([a[0], a[1]])
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        d = (dx * dx + dy * dy) ** 0.5
+        if d > step:
+            k = int(d // step)
+            for j in range(1, k + 1):
+                t = j * step / d
+                if t < 1.0:
+                    out.append([a[0] + dx * t, a[1] + dy * t])
+    return out
+
+
+def subdivide_tris(tris, step):
+    """Longest-edge-bisect flat triangles until every edge <= `step`.
+
+    `tris` is the flat [p0,p1,p2, p3,p4,p5, ...] list from triangulate_ring;
+    returns the same flat format with more, smaller triangles. Once each vertex
+    is draped onto the terrain, a fine fill CONFORMS to the surface instead of
+    spanning flat sheets between the polygon's boundary vertices (which is what
+    makes a draped polygon float over a valley)."""
+    if step <= 0 or not tris:
+        return tris
+    s2 = step * step
+    out = []
+    stack = [(tris[i], tris[i + 1], tris[i + 2])
+             for i in range(0, len(tris) - 2, 3)]
+    guard = 0
+    while stack and guard < 4000000:
+        guard += 1
+        a, b, c = stack.pop()
+        ab = (a[0]-b[0])**2 + (a[1]-b[1])**2
+        bc = (b[0]-c[0])**2 + (b[1]-c[1])**2
+        ca = (c[0]-a[0])**2 + (c[1]-a[1])**2
+        m = max(ab, bc, ca)
+        if m <= s2:
+            out.extend((a, b, c))
+            continue
+        if m == ab:
+            mid = [(a[0]+b[0])*0.5, (a[1]+b[1])*0.5]
+            stack.append((a, mid, c)); stack.append((mid, b, c))
+        elif m == bc:
+            mid = [(b[0]+c[0])*0.5, (b[1]+c[1])*0.5]
+            stack.append((b, mid, a)); stack.append((mid, c, a))
+        else:
+            mid = [(c[0]+a[0])*0.5, (c[1]+a[1])*0.5]
+            stack.append((c, mid, b)); stack.append((mid, a, b))
+    return out
+
+
 def build_viewer_html(cfg):
     """Assemble the standalone viewer HTML from a config dict.
 
@@ -174,6 +234,13 @@ _HTML_MID = """</title>
   .lyr-row { display: flex; align-items: center; gap: 6px; color: #dfe6f2;
              cursor: pointer; padding: 2px 0; }
   .lyr-sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  #exportModal { position: fixed; inset: 0; z-index: 50; padding: 18px; gap: 12px;
+                 background: rgba(0,0,0,.9); display: flex; flex-direction: column;
+                 align-items: center; justify-content: center; }
+  #exportModal img { max-width: 96vw; max-height: 82vh; border: 1px solid #333;
+                     background: #0b0e13; }
+  .exp-bar { display: flex; gap: 10px; }
+  .exp-bar a.btn { text-decoration: none; }
 </style>
 </head>
 <body>
@@ -183,6 +250,7 @@ _HTML_MID = """</title>
 <div id="hud">
   <button id="beforeBtn" class="btn active">◀ Before</button>
   <button id="afterBtn" class="btn">After ▶</button>
+  <button id="exportBtn" class="btn">⬇ Export figure</button>
 </div>
 <div id="tag"></div>
 <div id="help">
@@ -218,7 +286,9 @@ _VIEWER_JS = r'''
   catch (ex) { return fail("Could not read scene data: " + ex); }
 
   var canvas = document.getElementById("gl");
-  var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+  var glopt = { preserveDrawingBuffer: true, antialias: true };
+  var gl = canvas.getContext("webgl", glopt) ||
+           canvas.getContext("experimental-webgl", glopt);
   if (!gl) return fail("WebGL is not available in this browser.");
 
   // ---------- tiny mat4 (column-major) ----------
@@ -396,8 +466,8 @@ _VIEWER_JS = r'''
   function regLayer(name, color) {
     if (name && !(name in vis)) { vis[name] = true; layerMeta.push({name: name, color: color}); }
   }
-  var lift = Math.max(1, (zmax - zmin)*exag*0.02);
-  var poleH = Math.max(2*lift, (zmax - zmin)*exag*0.06);
+  var lift = Math.max(0.4, (zmax - zmin)*exag*0.0025);   // tiny z-fight offset
+  var poleH = Math.max(4, (zmax - zmin)*exag*0.06);
   function drape(list, liftMul) {
     var a = new Float32Array(list.length*3);
     for (var i=0;i<list.length;i++){ var p=list[i];
@@ -576,71 +646,297 @@ _VIEWER_JS = r'''
   }
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.043, 0.055, 0.075, 1);
-  var scheduled = false;
+  var scheduled = false, lastMVP = null;
+
+  // synchronous GL render (also used per-panel by the figure export); returns mvp
+  function renderScene(skipResize) {
+    if (!skipResize) resize();
+    var asp = canvas.width / Math.max(1, canvas.height);
+    var far = cam.dist*4 + span*2 + (zmax - zmin)*exag*4 + 10;
+    var proj = mPersp(45*Math.PI/180, asp, Math.max(0.5, cam.dist*0.002), far);
+    var view = mLookAt(eyePos(), cam.tgt, [0,0,1]);
+    var mvp = mMul(proj, view); lastMVP = mvp;
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.uniformMatrix4fv(uMVP, false, new Float32Array(mvp));
+    gl.uniform3fv(uLight, new Float32Array(norm([0.5, 0.6, 0.9])));
+    gl.bindBuffer(gl.ARRAY_BUFFER, posB);
+    gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvB);
+    gl.enableVertexAttribArray(aUV); gl.vertexAttribPointer(aUV,2,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, nrmB);
+    gl.enableVertexAttribArray(aNrm); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texes[active]);
+    gl.uniform1i(uTex, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxB);
+    gl.drawElements(gl.TRIANGLES, idx.length,
+      (idx instanceof Uint32Array) ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
+    if (oprog && overlays.length) {
+      gl.useProgram(oprog);
+      gl.uniformMatrix4fv(oMVP, false, new Float32Array(mvp));
+      gl.uniform1f(oPtSize, Math.max(9, Math.min(20, canvas.height/50)));
+      for (var oi=0; oi<overlays.length; oi++) {
+        var o = overlays[oi], c = o.color;
+        if (o.layer && !vis[o.layer]) continue;
+        if (o.noDepth) {
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          gl.depthMask(false);
+        }
+        gl.uniform1f(oPoint, o.mode === gl.POINTS ? 1.0 : 0.0);
+        gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
+        gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
+        gl.enableVertexAttribArray(oPos);
+        gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(o.mode, 0, o.n);
+        if (o.noDepth) { gl.depthMask(true); gl.disable(gl.BLEND); }
+      }
+      gl.useProgram(prog);
+    }
+    return mvp;
+  }
+
+  function positionLabels(mvp) {
+    if (!labelItems.length) return;
+    var cw = canvas.clientWidth, ch = canvas.clientHeight;
+    for (var li=0; li<labelItems.length; li++) {
+      var it = labelItems[li];
+      if (it.layer && !vis[it.layer]) { it.el.style.display = "none"; continue; }
+      var vv = mVec(mvp, [it.x, it.y, sampleZ(it.x, it.y)+lift+poleH, 1]);
+      if (vv[3] <= 0) { it.el.style.display = "none"; continue; }
+      it.el.style.display = "block";
+      it.el.style.left = ((vv[0]/vv[3]*0.5+0.5)*cw) + "px";
+      it.el.style.top = ((1-(vv[1]/vv[3]*0.5+0.5))*ch) + "px";
+    }
+  }
+
   function draw() {
     if (scheduled) return;
     scheduled = true;
     requestAnimationFrame(function () {
       scheduled = false;
-      resize();
-      var asp = canvas.width / Math.max(1, canvas.height);
-      var far = cam.dist*4 + span*2 + (zmax - zmin)*exag*4 + 10;
-      var proj = mPersp(45*Math.PI/180, asp, Math.max(0.5, cam.dist*0.002), far);
-      var view = mLookAt(eyePos(), cam.tgt, [0,0,1]);
-      var mvp = mMul(proj, view);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      gl.uniformMatrix4fv(uMVP, false, new Float32Array(mvp));
-      gl.uniform3fv(uLight, new Float32Array(norm([0.5, 0.6, 0.9])));
-      gl.bindBuffer(gl.ARRAY_BUFFER, posB);
-      gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, uvB);
-      gl.enableVertexAttribArray(aUV); gl.vertexAttribPointer(aUV,2,gl.FLOAT,false,0,0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, nrmB);
-      gl.enableVertexAttribArray(aNrm); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, texes[active]);
-      gl.uniform1i(uTex, 0);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxB);
-      gl.drawElements(gl.TRIANGLES, idx.length,
-        (idx instanceof Uint32Array) ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
-      // draped overlays (polygons / lines / points), one draw-op each
-      if (oprog && overlays.length) {
-        gl.useProgram(oprog);
-        gl.uniformMatrix4fv(oMVP, false, new Float32Array(mvp));
-        gl.uniform1f(oPtSize, Math.max(9, Math.min(20, canvas.height/50)));
-        for (var oi=0; oi<overlays.length; oi++) {
-          var o = overlays[oi], c = o.color;
-          if (o.layer && !vis[o.layer]) continue;   // layer toggled off
-          if (o.noDepth) {
-            gl.enable(gl.BLEND);
-            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-            gl.depthMask(false);
-          }
-          gl.uniform1f(oPoint, o.mode === gl.POINTS ? 1.0 : 0.0);
-          gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
-          gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
-          gl.enableVertexAttribArray(oPos);
-          gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
-          gl.drawArrays(o.mode, 0, o.n);
-          if (o.noDepth) { gl.depthMask(true); gl.disable(gl.BLEND); }
-        }
-        gl.useProgram(prog);
-      }
-      // position the HTML peak labels by projecting each anchor to the screen
-      if (labelItems.length) {
-        var cw = canvas.clientWidth, ch = canvas.clientHeight;
-        for (var li=0; li<labelItems.length; li++) {
-          var it = labelItems[li];
-          if (it.layer && !vis[it.layer]) { it.el.style.display = "none"; continue; }
-          var vv = mVec(mvp, [it.x, it.y, sampleZ(it.x, it.y)+lift+poleH, 1]);
-          if (vv[3] <= 0) { it.el.style.display = "none"; continue; }
-          it.el.style.display = "block";
-          it.el.style.left = ((vv[0]/vv[3]*0.5+0.5)*cw) + "px";
-          it.el.style.top = ((1-(vv[1]/vv[3]*0.5+0.5))*ch) + "px";
-        }
-      }
+      positionLabels(renderScene());
     });
   }
+
+  // ---------- figure export (annotated PNG) ----------
+  function project(mvp, p, W, H) {
+    var v = mVec(mvp, [p[0], p[1], p[2], 1]);
+    if (v[3] <= 0) return null;
+    return [ (v[0]/v[3]*0.5+0.5)*W, (1-(v[1]/v[3]*0.5+0.5))*H ];
+  }
+  function niceNum(range, round) {
+    var e = Math.floor(Math.log(range)/Math.LN10), f = range/Math.pow(10, e), nf;
+    if (round) nf = f<1.5?1:(f<3?2:(f<7?5:10));
+    else nf = f<=1?1:(f<=2?2:(f<=5?5:10));
+    return nf*Math.pow(10, e);
+  }
+  function niceTicks(lo, hi, n) {
+    if (hi <= lo) return [lo];
+    var step = niceNum(niceNum(hi-lo, false)/((n||5)-1), true);
+    var out = [];
+    for (var v=Math.ceil(lo/step)*step; v<=hi+step*0.5; v+=step) out.push(v);
+    return out;
+  }
+  function drawTickAxis(ctx, mvp, W, H, ws, we, vs, ve, title, fs, boxCtr, fmt) {
+    var ps = project(mvp, ws, W, H), pe = project(mvp, we, W, H);
+    if (!ps || !pe) return;
+    var axC = "rgba(246,249,253,0.97)", lw = Math.max(2, W/900);
+    ctx.strokeStyle = axC; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(ps[0],ps[1]); ctx.lineTo(pe[0],pe[1]); ctx.stroke();
+    var dx=pe[0]-ps[0], dy=pe[1]-ps[1], dl=Math.hypot(dx,dy)||1, nx=-dy/dl, ny=dx/dl;
+    // orient ticks + labels OUTWARD (away from the box centre)
+    var mx=(ps[0]+pe[0])/2, my=(ps[1]+pe[1])/2;
+    if (boxCtr && ((mx+nx)-boxCtr[0])*nx + ((my+ny)-boxCtr[1])*ny < 0) { nx=-nx; ny=-ny; }
+    var tl = Math.max(6, W/130);
+    ctx.textBaseline = "middle"; ctx.textAlign = (nx < -0.2 ? "right" : (nx > 0.2 ? "left" : "center"));
+    function label(x, y, txt, bold) {
+      ctx.font = (bold?"bold ":"") + fs + "px sans-serif";
+      ctx.lineWidth = Math.max(2.5, fs/4); ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      ctx.lineJoin = "round"; ctx.strokeText(txt, x, y);
+      ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
+    }
+    niceTicks(Math.min(vs,ve), Math.max(vs,ve), 4).forEach(function (v) {
+      var f = (v - vs)/(ve - vs); if (f<-0.001 || f>1.001) return;
+      var wp = [ws[0]+(we[0]-ws[0])*f, ws[1]+(we[1]-ws[1])*f, ws[2]+(we[2]-ws[2])*f];
+      var p = project(mvp, wp, W, H); if (!p) return;
+      ctx.strokeStyle = axC; ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(p[0]+nx*tl, p[1]+ny*tl); ctx.stroke();
+      label(p[0]+nx*(tl+5), p[1]+ny*(tl+5), (v*fmt.scale).toFixed(fmt.dec), false);
+    });
+    var mid = project(mvp, [(ws[0]+we[0])/2,(ws[1]+we[1])/2,(ws[2]+we[2])/2], W, H);
+    if (mid) { ctx.textAlign="center"; label(mid[0]+nx*(tl+3.4*fs), mid[1]+ny*(tl+3.4*fs), title, true); }
+  }
+  function drawAxes(ctx, mvp, W, H) {
+    var zBot = (zmin - zmid)*exag, zTop = (zmax - zmid)*exag;
+    var meshW = +CFG.width_m, meshH = +CFG.height_m;
+    function corner(ix,iy,iz){ return [ ix?meshW/2:-meshW/2, iy?meshH/2:-meshH/2, iz?zTop:zBot ]; }
+    var Cp = {};
+    for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
+      Cp[a+""+b+d] = project(mvp, corner(a,b,d), W, H);
+    // the full bounding box, clearly visible
+    ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
+    [["000","100"],["010","110"],["001","101"],["011","111"],
+     ["000","010"],["100","110"],["001","011"],["101","111"],
+     ["000","001"],["100","101"],["010","011"],["110","111"]].forEach(function (e) {
+      var p=Cp[e[0]], q=Cp[e[1]];
+      if (p && q) { ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); }
+    });
+    // origin = the bottom corner nearest the camera, so all three axes fall on
+    // front-facing edges and read cleanly (like the Surfer reference).
+    var eye = eyePos(), O=null, best=1e18;
+    [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
+      var w = corner(b[0],b[1],0);
+      var dd = (w[0]-eye[0])*(w[0]-eye[0]) + (w[1]-eye[1])*(w[1]-eye[1]) + (w[2]-eye[2])*(w[2]-eye[2]);
+      if (dd < best) { best=dd; O=b; }
+    });
+    if (!O) return;
+    var ix=O[0], iy=O[1];
+    var bc = project(mvp, [0,0,(zBot+zTop)/2], W, H);
+    var fs = Math.max(13, Math.round(W/60));
+    function fmtAxis(sp){ return sp>=3000 ? {scale:0.001,dec:1,unit:"km"} : {scale:1,dec:0,unit:"m"}; }
+    var fE=fmtAxis(meshW), fN=fmtAxis(meshH);
+    // horizontal axes = ground DISTANCE from the near corner (0..span, km/m)
+    drawTickAxis(ctx, mvp, W, H, corner(ix,iy,0), corner(1-ix,iy,0),
+                 0, meshW, "Distance E ("+fE.unit+")", fs, bc, fE);
+    drawTickAxis(ctx, mvp, W, H, corner(ix,iy,0), corner(ix,1-iy,0),
+                 0, meshH, "Distance N ("+fN.unit+")", fs, bc, fN);
+    // elevation (metres) on the LEFT-most vertical edge, so it never crowds the
+    // Northing axis that shares the near corner.
+    var Zc=null, zbest=1e18;
+    [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
+      var pb=Cp[b[0]+""+b[1]+"0"], pt=Cp[b[0]+""+b[1]+"1"];
+      if (pb && pt) { var sx=(pb[0]+pt[0])/2; if (sx<zbest) { zbest=sx; Zc=b; } }
+    });
+    if (Zc) drawTickAxis(ctx, mvp, W, H, corner(Zc[0],Zc[1],0), corner(Zc[0],Zc[1],1),
+                 zmin, zmax, "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"});
+  }
+  function drawNorth(ctx, mvp, W, H) {
+    var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
+    if (!p0 || !p1) return;
+    var ang = Math.atan2(p1[1]-p0[1], p1[0]-p0[0]);
+    var R = Math.max(24, W/26), cx = W-R-16, cy = R+16, L = R*0.85;
+    ctx.save();
+    ctx.lineWidth = Math.max(2, W/650);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2*Math.PI); ctx.stroke();
+    var tx=cx+Math.cos(ang)*L, ty=cy+Math.sin(ang)*L;
+    var bx=cx-Math.cos(ang)*L*0.6, by=cy-Math.sin(ang)*L*0.6;
+    ctx.strokeStyle="rgba(240,244,250,0.95)";
+    ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(tx,ty); ctx.stroke();
+    var ah=L*0.4;
+    ctx.fillStyle="rgba(240,244,250,0.95)";
+    ctx.beginPath(); ctx.moveTo(tx,ty);
+    ctx.lineTo(tx-Math.cos(ang-0.42)*ah, ty-Math.sin(ang-0.42)*ah);
+    ctx.lineTo(tx-Math.cos(ang+0.42)*ah, ty-Math.sin(ang+0.42)*ah);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle="#fff"; ctx.font="bold "+Math.round(R*0.7)+"px sans-serif";
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText("N", cx+Math.cos(ang)*(R+ah*0.5), cy+Math.sin(ang)*(R+ah*0.5));
+    ctx.restore();
+  }
+  function meshSpan(){ return Math.max(+CFG.width_m, +CFG.height_m); }
+  function drawPeakLabels(ctx, mvp, W, H) {
+    ctx.save(); ctx.font = "bold "+Math.max(11, Math.round(W/95))+"px sans-serif";
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    for (var li=0; li<labelItems.length; li++) {
+      var it=labelItems[li]; if (it.layer && !vis[it.layer]) continue;
+      var p=project(mvp, [it.x, it.y, sampleZ(it.x,it.y)+lift+poleH], W, H); if(!p) continue;
+      var txt=it.el.textContent, w=ctx.measureText(txt).width, fh=Math.max(11,Math.round(W/95));
+      ctx.fillStyle="rgba(11,14,19,0.78)"; ctx.fillRect(p[0]-w/2-5, p[1]-fh*1.9, w+10, fh*1.5);
+      ctx.fillStyle="#f2f5fb"; ctx.fillText(txt, p[0], p[1]-fh*1.15);
+    }
+    ctx.restore();
+  }
+  function exportFigure() {
+    // 16:9 slide, 2x2 grid: Before | After / After+overlays | Details
+    var FW=1920, FH=1080, m=24, TH=54, capH=28;
+    var colW = Math.floor((FW - 3*m)/2), rowH = Math.floor((FH - TH - 3*m)/2);
+    var imgH = rowH - capH, pxW = colW*2, pxH = imgH*2;   // 2x supersample
+    var panels = [
+      { cap: "BEFORE" + (CFG.before_date ? " · " + CFG.before_date : ""), side:0, ov:false },
+      { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
+      { cap: "AFTER + overlays" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:true }
+    ];
+    var sw=canvas.width, sh=canvas.height, sa=active, sv={}; for (var k in vis) sv[k]=vis[k];
+    canvas.width=pxW; canvas.height=pxH; gl.viewport(0,0,pxW,pxH);   // fixed render size
+    // fixed oblique framing (like the Surfer reference): same angle every export,
+    // whole bounding box + all three axes visible with margin, no crowding.
+    var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
+    var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
+    cam.az = -2.2; cam.el = 0.5; cam.dist = meshSpan()*1.55; cam.tgt = [0, 0, (zB+zT)/2];
+    var shots=[];
+    panels.forEach(function (pn) {
+      active = pn.side;
+      for (var k in vis) vis[k] = pn.ov ? sv[k] : false;
+      var mvp = renderScene(true);
+      var cc = document.createElement("canvas"); cc.width=pxW; cc.height=pxH;
+      var g = cc.getContext("2d"); g.drawImage(canvas, 0, 0);
+      drawAxes(g, mvp, pxW, pxH); drawNorth(g, mvp, pxW, pxH);
+      if (pn.ov) drawPeakLabels(g, mvp, pxW, pxH);
+      shots.push({ img: cc, cap: pn.cap });
+    });
+    active=sa; for (var k in vis) vis[k]=sv[k];
+    cam.az=scam.az; cam.el=scam.el; cam.dist=scam.dist; cam.tgt=scam.tgt;
+    canvas.width=sw; canvas.height=sh; gl.viewport(0,0,sw,sh);       // restore live view
+    positionLabels(renderScene(true));
+    draw();
+    composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH});
+  }
+  function composeFigure(shots, L) {
+    var fig = document.createElement("canvas"); fig.width=L.FW; fig.height=L.FH;
+    var g = fig.getContext("2d");
+    g.fillStyle = "#0b0e13"; g.fillRect(0,0,L.FW,L.FH);
+    g.fillStyle = "#f2f5fb"; g.font = "bold 26px sans-serif";
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.fillText((CFG.title||"Landslide 3D"), L.m, L.TH/2 + 4);
+    var cells = [ [L.m, L.TH+L.m], [2*L.m+L.colW, L.TH+L.m],
+                  [L.m, L.TH+2*L.m+L.rowH], [2*L.m+L.colW, L.TH+2*L.m+L.rowH] ];
+    shots.forEach(function (s, i) {
+      var x=cells[i][0], y=cells[i][1];
+      g.drawImage(s.img, x, y, L.colW, L.imgH);
+      g.strokeStyle="rgba(255,255,255,0.18)"; g.lineWidth=1; g.strokeRect(x,y,L.colW,L.imgH);
+      g.fillStyle="#e6ecf6"; g.font="600 17px sans-serif";
+      g.textAlign="center"; g.textBaseline="middle";
+      g.fillText(s.cap, x+L.colW/2, y+L.imgH+L.capH/2);
+    });
+    // details cell (bottom-right)
+    var ix=cells[3][0], iy=cells[3][1], yy=iy+8;
+    g.textAlign="left"; g.textBaseline="top";
+    g.fillStyle="#f2f5fb"; g.font="bold 22px sans-serif"; g.fillText("Details", ix, yy); yy+=38;
+    g.font="17px sans-serif";
+    [["Coordinate system", CFG.crs||"—"],
+     ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
+     ["Before image", CFG.before_date||"—"],
+     ["After image", CFG.after_date||"—"]].forEach(function (kv) {
+      g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
+      g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
+    });
+    yy+=14;
+    if (layerMeta.length) {
+      g.fillStyle="#aeb9cc"; g.font="600 18px sans-serif"; g.fillText("Overlays", ix, yy); yy+=30;
+      g.font="16px sans-serif";
+      layerMeta.forEach(function (mm) {
+        g.fillStyle="rgb("+mm.color[0]+","+mm.color[1]+","+mm.color[2]+")";
+        g.fillRect(ix, yy, 16, 16);
+        g.fillStyle="#e6ecf6"; g.fillText(mm.name, ix+24, yy+1); yy+=24;
+      });
+    }
+    var url = fig.toDataURL("image/png");
+    var ov = document.createElement("div"); ov.id = "exportModal";
+    var bar = document.createElement("div"); bar.className = "exp-bar";
+    var dl = document.createElement("a"); dl.className = "btn"; dl.textContent = "⬇ Download PNG";
+    dl.href = url; dl.download = "landslide_3d_figure.png";
+    var cl = document.createElement("button"); cl.className = "btn"; cl.textContent = "Close";
+    cl.onclick = function () { document.body.removeChild(ov); };
+    var im = document.createElement("img"); im.src = url;
+    bar.appendChild(dl); bar.appendChild(cl);
+    ov.appendChild(bar); ov.appendChild(im);
+    document.body.appendChild(ov);
+  }
+  document.getElementById("exportBtn").onclick = exportFigure;
+
   window.addEventListener("resize", draw);
   setSide(0);
   draw();
