@@ -1591,9 +1591,13 @@ class Viewer3DTab(QWidget):
         if dr is not None:
             self.det_cl_drop.setText(f"{dr:.0f} m")
         if vb is not None:
-            rng = (f"  ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
-                   if vl is not None and vh is not None else "")
-            self.det_volume.setText(self._fmt_vol(vb) + rng)
+            s = self._fmt_vol(vb)
+            if vl is not None and vh is not None:
+                if abs(vb) >= 1e6 and abs(vl) >= 1e6 and abs(vh) >= 1e6:
+                    s += f"  ({vl/1e6:.2f}–{vh/1e6:.2f} Mm³)"   # unit once, for legibility
+                else:
+                    s += f"  ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
+            self.det_volume.setText(s)
         got = [k for k, v in (("area", a), ("length", ln), ("drop", dr),
                               ("volume", vb)) if v is not None]
         if got:
@@ -1606,7 +1610,7 @@ class Viewer3DTab(QWidget):
     def _fmt_vol(v):
         if v is None:
             return "?"
-        return f"{v/1e6:.2f} ×10⁶ m³" if abs(v) >= 1e6 else f"{v:,.0f} m³"
+        return f"{v/1e6:.2f} Mm³" if abs(v) >= 1e6 else f"{v:,.0f} m³"
 
     @staticmethod
     def _terrain_sensor(cand):
@@ -1641,6 +1645,14 @@ class Viewer3DTab(QWidget):
         if not scene_crs.isValid() or extent.isEmpty():
             self._warn("Could not derive a projected scene CRS/extent from the DEM.")
             return
+        # Focus the figure on the overlays (landslide + its hillside) instead of the
+        # whole DEM/AOI, so the box isn't padded out with far-away terrain.
+        ov_ext = self._overlay_extent(scene_crs)
+        if ov_ext is not None and not ov_ext.isEmpty():
+            ov_ext.grow(max(ov_ext.width(), ov_ext.height()) * 0.7)   # margin of hillside
+            ov_ext = ov_ext.intersect(extent)                          # clamp to the DEM
+            if ov_ext is not None and not ov_ext.isEmpty():
+                extent = ov_ext
         self._busy(True)
         self._log("Exporting instant-flip 3D web viewer (rendering imagery, "
                   "reading DEM)…")
@@ -1750,6 +1762,35 @@ class Viewer3DTab(QWidget):
             self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
                       f"{len(points)} point layer(s).")
         return w3d.build_viewer_html(cfg)
+
+    def _overlay_extent(self, scene_crs):
+        """Combined bounding box (scene CRS) of the ticked polygon/line overlays.
+
+        Points (peaks) are skipped — they can be scattered across the whole AOI
+        and would defeat the crop. Returns None if nothing usable is ticked, in
+        which case the export falls back to the full DEM extent."""
+        from qgis.core import QgsCoordinateTransform, QgsWkbTypes
+        proj = QgsProject.instance()
+        rect = None
+        for lid in self._checked_ids(self.overlay_combo):
+            lyr = proj.mapLayer(lid)
+            if not isinstance(lyr, QgsVectorLayer):
+                continue
+            if QgsWkbTypes.geometryType(lyr.wkbType()) == QgsWkbTypes.PointGeometry:
+                continue
+            ext = lyr.extent()
+            if ext is None or ext.isEmpty():
+                continue
+            try:
+                ext = QgsCoordinateTransform(
+                    lyr.crs(), scene_crs, proj).transformBoundingBox(ext)
+            except Exception:
+                continue
+            if rect is None:
+                rect = QgsRectangle(ext)
+            else:
+                rect.combineExtentWith(ext)
+        return rect
 
     def _collect_overlays(self, scene_crs, extent):
         """Ticked vector layers → (polys, lines, points) in mesh-local metres.

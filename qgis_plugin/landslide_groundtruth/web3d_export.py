@@ -570,6 +570,8 @@ _VIEWER_JS = r'''
   var span = Math.max(W, H);
   var cam = { az: -0.6, el: 0.75, dist: span*1.1,
               tgt: [0,0,0] };
+  autoOrient();   // smart default facing (user can orbit freely from here)
+  fitView();      // frame the whole box on load — no clipped corners
   function eyePos() {
     var ce = Math.cos(cam.el), se = Math.sin(cam.el);
     return [ cam.tgt[0] + cam.dist*ce*Math.cos(cam.az),
@@ -736,6 +738,79 @@ _VIEWER_JS = r'''
     _dbb = { x0:-W/2+i0*ddx, x1:-W/2+i1*ddx, y0:H/2-j1*ddy, y1:H/2-j0*ddy };
     return _dbb;
   }
+  // Longest line overlay = the landslide centerline. Its endpoints (+ their
+  // elevations) give a robust runout axis and downhill sense -- far steadier than
+  // a single centroid gradient on rugged terrain.
+  function centerlineAxis() {
+    var best=null, bestLen=-1;
+    (CFG.lines||[]).forEach(function(L){ (L.paths||[]).forEach(function(pa){
+      if (!pa || pa.length<2) return;
+      var d=0; for (var i=1;i<pa.length;i++){ d+=Math.hypot(pa[i][0]-pa[i-1][0], pa[i][1]-pa[i-1][1]); }
+      if (d>bestLen){ bestLen=d; best=pa; }
+    }); });
+    if (!best) return null;
+    var A=best[0], B=best[best.length-1];
+    var zA=sampleZ(A[0],A[1]), zB=sampleZ(B[0],B[1]);
+    var hi=(zA>=zB)?A:B, lo=(zA>=zB)?B:A;
+    var axx=B[0]-A[0], axy=B[1]-A[1], am=Math.hypot(axx,axy)||1;
+    var dhx=lo[0]-hi[0], dhy=lo[1]-hi[1], dm=Math.hypot(dhx,dhy)||1;
+    return { ax:[axx/am, axy/am], down:[dhx/dm, dhy/dm], len:bestLen, drop:Math.abs(zA-zB) };
+  }
+  // Smart DEFAULT orientation only (the user orbits freely afterwards; the figure
+  // export uses whatever they framed). Prefer the centerline; fall back to PCA of
+  // the overlay polygon + local slope aspect for a broadside 3/4 view.
+  function autoOrient() {
+    var TILT_IN = 0.35, az0 = -2.2, el0 = 0.55, ov = [];
+    var cl = centerlineAxis();
+    if (cl) {
+      var ux0=-cl.down[0], uy0=-cl.down[1];                 // uphill unit
+      var vx0=-cl.ax[1], vy0=cl.ax[0];                      // broadside to the runout
+      if (vx0*ux0 + vy0*uy0 < 0) { vx0=-vx0; vy0=-vy0; }    // ...from the downhill side
+      vx0=vx0*(1-TILT_IN)+ux0*TILT_IN; vy0=vy0*(1-TILT_IN)+uy0*TILT_IN;
+      var grad = cl.len>0 ? cl.drop/cl.len : 0;
+      cam.az = Math.atan2(-vy0, -vx0);                       // slide faces the camera
+      cam.el = grad>1e-6 ? Math.max(0.5, Math.min(0.85, Math.atan2(1, grad))) : 0.6;
+      return;
+    }
+    (CFG.polys||[]).forEach(function(P){(P.rings||[]).forEach(function(R){(R.outline||[]).forEach(function(p){ov.push(p);});});});
+    (CFG.points||[]).forEach(function(P){(P.coords||[]).forEach(function(p){ov.push(p);});});
+    (CFG.lines||[]).forEach(function(L){(L.paths||[]).forEach(function(pa){pa.forEach(function(p){ov.push(p);});});});
+    if (ov.length >= 2) {
+      var ccx=0, ccy=0; ov.forEach(function(p){ccx+=p[0]; ccy+=p[1];}); ccx/=ov.length; ccy/=ov.length;
+      var sxx=0, sxy=0, syy=0;
+      ov.forEach(function(p){ var dx=p[0]-ccx, dy=p[1]-ccy; sxx+=dx*dx; sxy+=dx*dy; syy+=dy*dy; });
+      sxx/=ov.length; sxy/=ov.length; syy/=ov.length;
+      var tr=sxx+syy, dsc=Math.sqrt(Math.max(0, tr*tr/4 - (sxx*syy - sxy*sxy)));
+      var l1=tr/2+dsc, l2=tr/2-dsc, ex, ey;
+      if (Math.abs(sxy) > 1e-9) { ex=l1-syy; ey=sxy; }
+      else if (sxx >= syy)      { ex=1; ey=0; }
+      else                      { ex=0; ey=1; }
+      var em=Math.hypot(ex,ey)||1; ex/=em; ey/=em;
+      var eps=meshSpan()/120;
+      var gx=(sampleZ(ccx+eps,ccy)-sampleZ(ccx-eps,ccy))/(2*eps);
+      var gy=(sampleZ(ccx,ccy+eps)-sampleZ(ccx,ccy-eps))/(2*eps);
+      var gm=Math.hypot(gx,gy), vx, vy;
+      if (l1 > 1.6*Math.max(l2, 1e-9)) {
+        vx=-ey; vy=ex;
+        if (gm>1e-6 && (vx*gx+vy*gy) < 0) { vx=-vx; vy=-vy; }
+        if (gm>1e-6) { var ux=gx/gm, uy=gy/gm; vx=vx*(1-TILT_IN)+ux*TILT_IN; vy=vy*(1-TILT_IN)+uy*TILT_IN; }
+      } else if (gm>1e-6) { vx=gx/gm; vy=gy/gm; }
+      else { vx=Math.cos(az0); vy=Math.sin(az0); }
+      az0 = Math.atan2(-vy, -vx);
+      el0 = (gm>1e-6) ? Math.max(0.42, Math.min(0.72, Math.atan2(1, gm))) : 0.55;
+    }
+    cam.az = az0; cam.el = el0;
+  }
+  // Bounding-sphere fit (like Cesium viewBoundingSphere / three.js fitToBox):
+  // frame the WHOLE data box for the current az/el so no corner is ever clipped.
+  function fitView() {
+    var bb = dataBBox();
+    var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
+    var rx=(bb.x1-bb.x0)/2, ry=(bb.y1-bb.y0)/2, rz=(zT-zB)/2;
+    var R=Math.sqrt(rx*rx+ry*ry+rz*rz) || meshSpan()*0.5;
+    cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
+    cam.dist=R/Math.sin(45*Math.PI/180/2)*1.06;   // fovy=45deg, small margin
+  }
   function project(mvp, p, W, H) {
     var v = mVec(mvp, [p[0], p[1], p[2], 1]);
     if (v[3] <= 0) return null;
@@ -791,13 +866,32 @@ _VIEWER_JS = r'''
     var Cp = {};
     for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
       Cp[a+""+b+d] = project(mvp, corner(a,b,d), W, H);
-    // the bounding box, clearly visible
+    // the bounding box, with terrain occlusion: hide edge segments the topography
+    // is in FRONT of (ray-march eye->point vs the surface) so back edges don't
+    // X-ray through the mountain.
+    var eyeP = eyePos(), mgn = (zTop-zBot)*0.004 + 0.5;
+    function occluded(P) {
+      for (var t=0.14; t<0.995; t+=1/22) {
+        var qx=eyeP[0]+(P[0]-eyeP[0])*t, qy=eyeP[1]+(P[1]-eyeP[1])*t, qz=eyeP[2]+(P[2]-eyeP[2])*t;
+        if (qx<bb.x0 || qx>bb.x1 || qy<bb.y0 || qy>bb.y1) continue;
+        if (sampleZ(qx,qy) > qz + mgn) return true;   // terrain in front of this point
+      }
+      return false;
+    }
+    function drawEdge3D(A, B) {
+      var Nn=44, prev=null, prevVis=false;
+      for (var i=0;i<=Nn;i++) {
+        var t=i/Nn, Pw=[A[0]+(B[0]-A[0])*t, A[1]+(B[1]-A[1])*t, A[2]+(B[2]-A[2])*t];
+        var vis=!occluded(Pw), scr=project(mvp, Pw, W, H);
+        if (scr && prev && vis && prevVis) { ctx.beginPath(); ctx.moveTo(prev[0],prev[1]); ctx.lineTo(scr[0],scr[1]); ctx.stroke(); }
+        prev=scr; prevVis=vis;
+      }
+    }
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
     [["000","100"],["010","110"],["001","101"],["011","111"],
      ["000","010"],["100","110"],["001","011"],["101","111"],
      ["000","001"],["100","101"],["010","011"],["110","111"]].forEach(function (e) {
-      var p=Cp[e[0]], q=Cp[e[1]];
-      if (p && q) { ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); }
+      drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
     // origin = the bottom corner nearest the camera, so the two horizontal axes
     // fall on front-facing edges and read cleanly.
@@ -877,26 +971,11 @@ _VIEWER_JS = r'''
     ];
     var sw=canvas.width, sh=canvas.height, sa=active, sv={}; for (var k in vis) sv[k]=vis[k];
     canvas.width=pxW; canvas.height=pxH; gl.viewport(0,0,pxW,pxH);   // fixed render size
-    // Orbit + tilt to look as PERPENDICULAR to the slope at the overlays as
-    // possible: azimuth = downslope aspect, tilt = 90deg - slope angle. This
-    // shows the most polygon surface area and collapses the empty box air above
-    // the low terrain. Falls back to a fixed oblique when there are no overlays.
-    var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
+    // Camera: keep the orientation the user framed in the live viewer (WYSIWYG).
+    // Only distance + target are re-fitted (bounding-sphere) so the whole box stays
+    // in frame at that angle -- no clipped corners, whatever angle they chose.
     var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
-    var az0 = -2.2, el0 = 0.62, ov = [];
-    (CFG.polys||[]).forEach(function(P){(P.rings||[]).forEach(function(R){(R.outline||[]).forEach(function(p){ov.push(p);});});});
-    (CFG.points||[]).forEach(function(P){(P.coords||[]).forEach(function(p){ov.push(p);});});
-    (CFG.lines||[]).forEach(function(L){(L.paths||[]).forEach(function(pa){pa.forEach(function(p){ov.push(p);});});});
-    if (ov.length) {
-      var ccx=0, ccy=0; ov.forEach(function(p){ccx+=p[0]; ccy+=p[1];}); ccx/=ov.length; ccy/=ov.length;
-      var eps=meshSpan()/120;
-      var gx=(sampleZ(ccx+eps,ccy)-sampleZ(ccx-eps,ccy))/(2*eps);   // slope of the drape
-      var gy=(sampleZ(ccx,ccy+eps)-sampleZ(ccx,ccy-eps))/(2*eps);
-      var gm=Math.hypot(gx,gy);
-      if (gm>1e-6) { az0 = Math.atan2(-gy,-gx); el0 = Math.atan2(1,gm); }
-      el0 = Math.max(0.6, Math.min(1.15, el0));   // near-perpendicular, keep some 3D
-    }
-    cam.az = az0; cam.el = el0; cam.dist = meshSpan()*1.4; cam.tgt = [0, 0, (zB+zT)/2];
+    fitView();
     var shots=[];
     panels.forEach(function (pn) {
       active = pn.side;
