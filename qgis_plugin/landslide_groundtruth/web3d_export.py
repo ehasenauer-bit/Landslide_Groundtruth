@@ -833,10 +833,20 @@ _VIEWER_JS = r'''
     var bb = dataBBox();
     var zB=(zmin-zmid)*exag, zT=(zCapTop()-zmid)*exag;   // capped box top
     cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
-    var corners=[];
-    for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
-      corners.push([a?bb.x1:bb.x0, b?bb.y1:bb.y0, d?zT:zB]);
-    var _pk=peakPt(); if(_pk) corners.push(_pk);         // keep the emerging summit in frame
+    // FIT to the box FLOOR + the TERRAIN SURFACE (the mountain silhouette), plus the
+    // elevation-axis top corner (added per-iteration in boxScreen). We EXCLUDE the
+    // other box-top corners so the empty upper box can't force dead air above the
+    // terrain -- the summit fills the top of the frame instead.
+    var fitPts=[];
+    for (var a=0;a<2;a++) for (var b=0;b<2;b++) fitPts.push([a?bb.x1:bb.x0, b?bb.y1:bb.y0, zB]);
+    var GS=12;
+    for (var gy=0;gy<=GS;gy++) for (var gx=0;gx<=GS;gx++){
+      var sx0=bb.x0+(bb.x1-bb.x0)*gx/GS, sy0=bb.y0+(bb.y1-bb.y0)*gy/GS;
+      fitPts.push([sx0, sy0, sampleZ(sx0,sy0)]);          // terrain surface (exag mesh z)
+    }
+    var _pk=peakPt(); if(_pk) fitPts.push(_pk);            // exact summit vertex
+    var topC=[];
+    for (var a3=0;a3<2;a3++) for (var b3=0;b3<2;b3++) topC.push([a3?bb.x1:bb.x0, b3?bb.y1:bb.y0, zT]);
     var W=canvas.width, H=Math.max(1,canvas.height), asp=W/H, fovy=45*Math.PI/180;
     var innerW=(1-m.L-m.R)*W, innerH=(1-m.T-m.B)*H;
     var icx=(m.L+(1-m.R))*0.5*W, icy=(m.T+(1-m.B))*0.5*H;   // inner-rect centre (px)
@@ -845,9 +855,13 @@ _VIEWER_JS = r'''
     function boxScreen(){
       var far=cam.dist*4+span*2+(zmax-zmin)*exag*4+10;
       var mvp=mMul(mPersp(fovy, asp, Math.max(0.5, cam.dist*0.002), far), mLookAt(eyePos(), cam.tgt, [0,0,1]));
+      var minSx=1e9, axTop=null;                            // elevation axis = left-most vertical edge
+      for (var k=0;k<4;k++){ var sb=project(mvp,[topC[k][0],topC[k][1],zB],W,H);
+        if(sb && sb[0]<minSx){ minSx=sb[0]; axTop=topC[k]; } }
       var r={minx:1e9,maxx:-1e9,miny:1e9,maxy:-1e9,cx:0,cy:0,n:0};
-      for (var ci=0;ci<corners.length;ci++){ var s=project(mvp,corners[ci],W,H);   // incl. emerging peak
-        if(s){ r.n++; r.cx+=s[0]; r.cy+=s[1]; if(s[0]<r.minx)r.minx=s[0]; if(s[0]>r.maxx)r.maxx=s[0]; if(s[1]<r.miny)r.miny=s[1]; if(s[1]>r.maxy)r.maxy=s[1]; } }
+      function acc(p){ var s=project(mvp,p,W,H); if(s){ r.n++; r.cx+=s[0]; r.cy+=s[1]; if(s[0]<r.minx)r.minx=s[0]; if(s[0]>r.maxx)r.maxx=s[0]; if(s[1]<r.miny)r.miny=s[1]; if(s[1]>r.maxy)r.maxy=s[1]; } }
+      for (var ci=0;ci<fitPts.length;ci++) acc(fitPts[ci]);
+      if(axTop) acc(axTop);
       if(r.n){ r.cx/=r.n; r.cy/=r.n; } return r;
     }
     // (A) size the box to the inner rect (it stays ~centred on the look-at point)
@@ -945,9 +959,13 @@ _VIEWER_JS = r'''
       }
     }
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
-    [["000","100"],["010","110"],["001","101"],["011","111"],
-     ["000","010"],["100","110"],["001","011"],["101","111"],
-     ["000","001"],["100","101"],["010","011"],["110","111"]].forEach(function (e) {
+    // OPEN-TOP frame: 4 floor edges + 4 vertical posts, but NOT the top rectangle.
+    // The flat box lid is what sat far above the terrain and created the dead air;
+    // dropping it lets the summit emerge into open sky with nothing framing the gap.
+    [["000","100"],["010","110"],                                  // floor (E/W)
+     ["000","010"],["100","110"],                                  // floor (N/S)
+     ["000","001"],["100","101"],["010","011"],["110","111"]       // vertical posts
+    ].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
     // origin = the bottom corner nearest the camera, so the two horizontal axes
