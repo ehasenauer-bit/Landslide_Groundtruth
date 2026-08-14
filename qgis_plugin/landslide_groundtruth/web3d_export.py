@@ -801,33 +801,49 @@ _VIEWER_JS = r'''
     }
     cam.az = az0; cam.el = el0;
   }
-  // Frame the WHOLE data box for the current az/el so no corner is ever clipped,
-  // as LARGE as possible: seed with a bounding-sphere fit (guaranteed to contain
-  // the box), then tighten to the projected box corners so the terrain fills the
-  // frame instead of floating small inside a conservative sphere.
-  function fitView() {
+  // Frame the data box for the current az/el as LARGE as possible without clipping
+  // ANYTHING: fit the projected box corners into an INNER rect that reserves margin
+  // for the axis labels (left = elevation, bottom = distance) and the N arrow (top-
+  // right), then pan the box onto that rect's centre. m = margin fractions {L,R,T,B};
+  // default ~symmetric (the live view draws no labels). The export passes larger
+  // left/bottom margins so nothing runs off the panel.
+  function fitView(m) {
+    m = m || {L:0.06, R:0.06, T:0.06, B:0.06};
     var bb = dataBBox();
     var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
     cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
     var corners=[];
     for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
       corners.push([a?bb.x1:bb.x0, b?bb.y1:bb.y0, d?zT:zB]);
+    var W=canvas.width, H=Math.max(1,canvas.height), asp=W/H, fovy=45*Math.PI/180;
+    var innerW=(1-m.L-m.R)*W, innerH=(1-m.T-m.B)*H;
+    var icx=(m.L+(1-m.R))*0.5*W, icy=(m.T+(1-m.B))*0.5*H;   // inner-rect centre (px)
     var rx=(bb.x1-bb.x0)/2, ry=(bb.y1-bb.y0)/2, rz=(zT-zB)/2;
-    cam.dist=(Math.sqrt(rx*rx+ry*ry+rz*rz)||meshSpan()*0.5)/Math.sin(45*Math.PI/180/2);
-    var asp=canvas.width/Math.max(1,canvas.height), TARGET=0.82;  // box fills ~82% (room for tick labels)
+    cam.dist=(Math.sqrt(rx*rx+ry*ry+rz*rz)||meshSpan()*0.5)/Math.sin(fovy/2);   // sphere seed
+    function boxScreen(){
+      var far=cam.dist*4+span*2+(zmax-zmin)*exag*4+10;
+      var mvp=mMul(mPersp(fovy, asp, Math.max(0.5, cam.dist*0.002), far), mLookAt(eyePos(), cam.tgt, [0,0,1]));
+      var r={minx:1e9,maxx:-1e9,miny:1e9,maxy:-1e9,cx:0,cy:0,n:0};
+      for (var ci=0;ci<8;ci++){ var s=project(mvp,corners[ci],W,H);
+        if(s){ r.n++; r.cx+=s[0]; r.cy+=s[1]; if(s[0]<r.minx)r.minx=s[0]; if(s[0]>r.maxx)r.maxx=s[0]; if(s[1]<r.miny)r.miny=s[1]; if(s[1]>r.maxy)r.maxy=s[1]; } }
+      if(r.n){ r.cx/=r.n; r.cy/=r.n; } return r;
+    }
+    // (A) size the box to the inner rect (it stays ~centred on the look-at point)
     for (var it=0; it<6; it++) {
-      var far=cam.dist*4 + span*2 + (zmax-zmin)*exag*4 + 10;
-      var mvp=mMul(mPersp(45*Math.PI/180, asp, Math.max(0.5, cam.dist*0.002), far),
-                   mLookAt(eyePos(), cam.tgt, [0,0,1]));
-      var minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,ok=false;
-      for (var ci=0; ci<corners.length; ci++) {
-        var s=project(mvp, corners[ci], canvas.width, canvas.height);
-        if (s){ ok=true; if(s[0]<minx)minx=s[0]; if(s[0]>maxx)maxx=s[0]; if(s[1]<miny)miny=s[1]; if(s[1]>maxy)maxy=s[1]; }
-      }
-      if (!ok) break;
-      var fill=Math.max((maxx-minx)/canvas.width, (maxy-miny)/canvas.height);
-      if (fill<=1e-4) break;
-      cam.dist *= fill/TARGET;                    // scale so the box fills TARGET of the frame
+      var r=boxScreen(); if(!r.n) break;
+      var fill=Math.max((r.maxx-r.minx)/(innerW*0.99), (r.maxy-r.miny)/(innerH*0.99));
+      if (fill<=1e-4) break; cam.dist *= fill;
+    }
+    // (B) pan the box centre onto the inner-rect centre (dist fixed -> size preserved)
+    for (var it2=0; it2<4; it2++) {
+      var r2=boxScreen(); if(!r2.n) break;
+      var eye=eyePos(), wpp=2*cam.dist*Math.tan(fovy/2)/H;
+      var vdir=norm([cam.tgt[0]-eye[0], cam.tgt[1]-eye[1], cam.tgt[2]-eye[2]]);
+      var right=norm(cross(vdir,[0,0,1])), up=norm(cross(right,vdir));
+      var dsx=icx-r2.cx, dsy=icy-r2.cy;
+      cam.tgt=[cam.tgt[0]+right[0]*(-dsx*wpp)+up[0]*(dsy*wpp),
+               cam.tgt[1]+right[1]*(-dsx*wpp)+up[1]*(dsy*wpp),
+               cam.tgt[2]+right[2]*(-dsx*wpp)+up[2]*(dsy*wpp)];
     }
   }
   function project(mvp, p, W, H) {
@@ -945,7 +961,9 @@ _VIEWER_JS = r'''
     var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
     if (!p0 || !p1) return;
     var ang = Math.atan2(p1[1]-p0[1], p1[0]-p0[0]);
-    var R = Math.max(24, W/26), cx = W-R-16, cy = R+16, L = R*0.85;
+    // inset by the arrow+label reach (~1.6R) so the "N" never clips the panel edge,
+    // whatever compass direction north points.
+    var R = Math.max(24, W/26), pad = 1.6*R+6, cx = W-pad, cy = pad, L = R*0.85;
     ctx.save();
     ctx.lineWidth = Math.max(2, W/650);
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -994,7 +1012,9 @@ _VIEWER_JS = r'''
     // Only distance + target are re-fitted (bounding-sphere) so the whole box stays
     // in frame at that angle -- no clipped corners, whatever angle they chose.
     var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
-    fitView();
+    // reserve margin for the labels: left (elevation) + bottom (distance) big,
+    // right small, top for the N arrow. Box fills the rest and is panned into it.
+    fitView({L:0.13, R:0.035, T:0.05, B:0.11});
     var shots=[];
     panels.forEach(function (pn) {
       active = pn.side;
