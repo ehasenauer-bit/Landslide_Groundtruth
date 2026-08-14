@@ -738,6 +738,27 @@ _VIEWER_JS = r'''
     _dbb = { x0:-W/2+i0*ddx, x1:-W/2+i1*ddx, y0:H/2-j1*ddy, y1:H/2-j0*ddy };
     return _dbb;
   }
+  // Cap the BOX + elevation-axis top near the top of the terrain (~96th percentile)
+  // so the box hugs the surface and the empty upper-box air shrinks; the true summit
+  // (mesh) still renders and emerges through the capped top. peakPt() is added to the
+  // camera fit so that emerging summit is never clipped.
+  var _zcap;
+  function zCapTop(){
+    if(typeof _zcap==="number") return _zcap;   // order-independent memo (init runs before the var)
+    var vals=[]; for(var i=0;i<elev.length;i++){ var v=elev[i]; if(v===v) vals.push(v); }
+    if(!vals.length){ _zcap=zmax; return _zcap; }
+    vals.sort(function(a,b){return a-b;});
+    _zcap=vals[Math.min(vals.length-1, Math.floor(vals.length*0.96))];
+    if(_zcap<=zmin) _zcap=zmax;
+    return _zcap;
+  }
+  function peakPt(){
+    var mi=-1,mv=-1e18;
+    for(var i=0;i<elev.length;i++){ var v=elev[i]; if(v===v && v>mv){mv=v;mi=i;} }
+    if(mi<0) return null;
+    var ddx=W/(NC-1||1), ddy=H/(NR-1||1), j=Math.floor(mi/NC), ii=mi-j*NC;
+    return [-W/2+ii*ddx, H/2-j*ddy, (mv-zmid)*exag];
+  }
   // Longest line overlay = the landslide centerline. Its endpoints (+ their
   // elevations) give a robust runout axis and downhill sense -- far steadier than
   // a single centroid gradient on rugged terrain.
@@ -810,11 +831,12 @@ _VIEWER_JS = r'''
   function fitView(m) {
     m = m || {L:0.06, R:0.06, T:0.06, B:0.06};
     var bb = dataBBox();
-    var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
+    var zB=(zmin-zmid)*exag, zT=(zCapTop()-zmid)*exag;   // capped box top
     cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
     var corners=[];
     for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
       corners.push([a?bb.x1:bb.x0, b?bb.y1:bb.y0, d?zT:zB]);
+    var _pk=peakPt(); if(_pk) corners.push(_pk);         // keep the emerging summit in frame
     var W=canvas.width, H=Math.max(1,canvas.height), asp=W/H, fovy=45*Math.PI/180;
     var innerW=(1-m.L-m.R)*W, innerH=(1-m.T-m.B)*H;
     var icx=(m.L+(1-m.R))*0.5*W, icy=(m.T+(1-m.B))*0.5*H;   // inner-rect centre (px)
@@ -824,7 +846,7 @@ _VIEWER_JS = r'''
       var far=cam.dist*4+span*2+(zmax-zmin)*exag*4+10;
       var mvp=mMul(mPersp(fovy, asp, Math.max(0.5, cam.dist*0.002), far), mLookAt(eyePos(), cam.tgt, [0,0,1]));
       var r={minx:1e9,maxx:-1e9,miny:1e9,maxy:-1e9,cx:0,cy:0,n:0};
-      for (var ci=0;ci<8;ci++){ var s=project(mvp,corners[ci],W,H);
+      for (var ci=0;ci<corners.length;ci++){ var s=project(mvp,corners[ci],W,H);   // incl. emerging peak
         if(s){ r.n++; r.cx+=s[0]; r.cy+=s[1]; if(s[0]<r.minx)r.minx=s[0]; if(s[0]>r.maxx)r.maxx=s[0]; if(s[1]<r.miny)r.miny=s[1]; if(s[1]>r.maxy)r.maxy=s[1]; } }
       if(r.n){ r.cx/=r.n; r.cy/=r.n; } return r;
     }
@@ -894,7 +916,7 @@ _VIEWER_JS = r'''
     if (mid) { ctx.textAlign="center"; label(mid[0]+nx*(tl+5.2*fs), mid[1]+ny*(tl+5.2*fs), title, true); }
   }
   function drawAxes(ctx, mvp, W, H) {
-    var zBot = (zmin - zmid)*exag, zTop = (zmax - zmid)*exag;
+    var zBot = (zmin - zmid)*exag, zTop = (zCapTop() - zmid)*exag;   // box hugs terrain top
     var bb = dataBBox();                       // tight to the real terrain
     var spanE = bb.x1 - bb.x0, spanN = bb.y1 - bb.y0;
     function corner(ix,iy,iz){ return [ ix?bb.x1:bb.x0, iy?bb.y1:bb.y0, iz?zTop:zBot ]; }
@@ -955,7 +977,7 @@ _VIEWER_JS = r'''
       if (pb && pt) { var sx=(pb[0]+pt[0])/2; if (sx<zbest) { zbest=sx; Zc=b; } }
     });
     if (Zc) drawTickAxis(ctx, mvp, W, H, corner(Zc[0],Zc[1],0), corner(Zc[0],Zc[1],1),
-                 zmin, zmax, "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
+                 zmin, zCapTop(), "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
   }
   function drawNorth(ctx, mvp, W, H) {
     var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
