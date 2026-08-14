@@ -66,7 +66,20 @@ def _resolve_cloud_frac(max_cloud_pct, auto_window):
 
 
 def _client():
+    """Planet client authenticated with the key the caller published via PL_API_KEY.
+
+    A bare `planet.Planet()` does NOT honour PL_API_KEY in SDK v3: its default
+    auth resolves an on-disk profile (PL_AUTH_PROFILE in ~/.planet.json ->
+    ~/.planet/<profile>/) BEFORE it ever consults the PL_API_KEY env var, so a
+    stale key saved to disk by a past `planet auth`/API-key session silently wins
+    over the fresh key the plugin sets — surfacing as InvalidAPIKey. Build the auth
+    explicitly from PL_API_KEY so the caller-supplied key always wins; fall back to
+    the SDK default (on-disk profile / `planet auth login`) only when it's unset."""
+    import os
     import planet
+    key = os.environ.get("PL_API_KEY", "").strip()
+    if key:
+        return planet.Planet(session=planet.Session(auth=planet.Auth.from_key(key)))
     return planet.Planet()
 
 
