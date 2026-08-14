@@ -801,15 +801,34 @@ _VIEWER_JS = r'''
     }
     cam.az = az0; cam.el = el0;
   }
-  // Bounding-sphere fit (like Cesium viewBoundingSphere / three.js fitToBox):
-  // frame the WHOLE data box for the current az/el so no corner is ever clipped.
+  // Frame the WHOLE data box for the current az/el so no corner is ever clipped,
+  // as LARGE as possible: seed with a bounding-sphere fit (guaranteed to contain
+  // the box), then tighten to the projected box corners so the terrain fills the
+  // frame instead of floating small inside a conservative sphere.
   function fitView() {
     var bb = dataBBox();
     var zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
-    var rx=(bb.x1-bb.x0)/2, ry=(bb.y1-bb.y0)/2, rz=(zT-zB)/2;
-    var R=Math.sqrt(rx*rx+ry*ry+rz*rz) || meshSpan()*0.5;
     cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
-    cam.dist=R/Math.sin(45*Math.PI/180/2)*1.06;   // fovy=45deg, small margin
+    var corners=[];
+    for (var a=0;a<2;a++) for (var b=0;b<2;b++) for (var d=0;d<2;d++)
+      corners.push([a?bb.x1:bb.x0, b?bb.y1:bb.y0, d?zT:zB]);
+    var rx=(bb.x1-bb.x0)/2, ry=(bb.y1-bb.y0)/2, rz=(zT-zB)/2;
+    cam.dist=(Math.sqrt(rx*rx+ry*ry+rz*rz)||meshSpan()*0.5)/Math.sin(45*Math.PI/180/2);
+    var asp=canvas.width/Math.max(1,canvas.height), TARGET=0.82;  // box fills ~82% (room for tick labels)
+    for (var it=0; it<6; it++) {
+      var far=cam.dist*4 + span*2 + (zmax-zmin)*exag*4 + 10;
+      var mvp=mMul(mPersp(45*Math.PI/180, asp, Math.max(0.5, cam.dist*0.002), far),
+                   mLookAt(eyePos(), cam.tgt, [0,0,1]));
+      var minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,ok=false;
+      for (var ci=0; ci<corners.length; ci++) {
+        var s=project(mvp, corners[ci], canvas.width, canvas.height);
+        if (s){ ok=true; if(s[0]<minx)minx=s[0]; if(s[0]>maxx)maxx=s[0]; if(s[1]<miny)miny=s[1]; if(s[1]>maxy)maxy=s[1]; }
+      }
+      if (!ok) break;
+      var fill=Math.max((maxx-minx)/canvas.width, (maxy-miny)/canvas.height);
+      if (fill<=1e-4) break;
+      cam.dist *= fill/TARGET;                    // scale so the box fills TARGET of the frame
+    }
   }
   function project(mvp, p, W, H) {
     var v = mVec(mvp, [p[0], p[1], p[2], 1]);

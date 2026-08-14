@@ -1755,6 +1755,8 @@ class Viewer3DTab(QWidget):
                        ("Centerline length", self.det_cl_length),
                        ("Vertical drop", self.det_cl_drop), ("Volume", self.det_volume)):
             v = w.text().strip()
+            if lbl == "Volume" and v:      # normalize any older ×10⁶ m³ text to Mm³
+                v = v.replace(" ×10⁶ m³", " Mm³").replace("×10⁶ m³", "Mm³")
             if v:
                 det.append([lbl, v])
         cfg["extra_details"] = det
