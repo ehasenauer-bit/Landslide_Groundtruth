@@ -144,6 +144,14 @@ class Viewer3DTab(QWidget):
         self._flip_cache = {}            # imagery layer id -> aligned cache layer id
         self._extra_scene_layers = []    # non-drape layer ids kept in the scene (point)
 
+        # A terrain/hillshade layer removed from the project leaves a dangling C++
+        # handle; drop our reference before the object is deleted so later access
+        # (e.g. the before/after refresh) can't hit "C/C++ object has been deleted".
+        try:
+            QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_removed)
+        except Exception:
+            pass
+
         self._build_ui()
         self._on_source_changed()
         self._refresh_drape_list()
@@ -998,9 +1006,10 @@ class Viewer3DTab(QWidget):
         if self._hillshade_layer is not None:
             lg.remove_layer(self._hillshade_layer)
             self._hillshade_layer = None
-        if not self.hillshade_check.isChecked() or self._dem_layer is None:
+        dem = self._alive(self._dem_layer)
+        if not self.hillshade_check.isChecked() or dem is None:
             return
-        src = self._dem_layer.source()
+        src = dem.source()
         hs = QgsRasterLayer(src, "Hillshade (multidirectional)")
         if not hs.isValid():
             return
@@ -1229,16 +1238,46 @@ class Viewer3DTab(QWidget):
                 return l
         return None
 
+    @staticmethod
+    def _alive(obj):
+        """Return obj if its underlying C++ object still exists, else None.
+
+        Guards against 'wrapped C/C++ object … has been deleted' when a stored
+        layer is removed from the project but our Python reference lingers."""
+        if obj is None:
+            return None
+        try:
+            from qgis.PyQt import sip
+        except ImportError:
+            try:
+                import sip
+            except ImportError:
+                return obj                     # can't check -> assume alive
+        try:
+            return None if sip.isdeleted(obj) else obj
+        except Exception:
+            return None
+
+    def _on_layers_removed(self, layer_ids):
+        """Drop terrain/hillshade references when their layers leave the project."""
+        ids = set(layer_ids)
+        for attr in ("_dem_layer", "_hillshade_layer"):
+            lyr = self._alive(getattr(self, attr, None))
+            if lyr is not None and lyr.id() in ids:
+                setattr(self, attr, None)
+
     def _candidate_rasters(self):
         """Project rasters selectable as before/after images.
 
         Excludes our own '(3D cache)' copies and the current terrain DEM /
         hillshade, so the pickers list imagery, not the surface it drapes on."""
         skip = set()
-        if self._dem_layer is not None:
-            skip.add(self._dem_layer.id())
-        if self._hillshade_layer is not None:
-            skip.add(self._hillshade_layer.id())
+        dem = self._alive(self._dem_layer)
+        if dem is not None:
+            skip.add(dem.id())
+        hs = self._alive(self._hillshade_layer)
+        if hs is not None:
+            skip.add(hs.id())
         return [l for l in self._project_rasters()
                 if not l.name().endswith("(3D cache)") and l.id() not in skip]
 
