@@ -961,13 +961,10 @@ _VIEWER_JS = r'''
       }
     }
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
-    // OPEN-TOP frame: 4 floor edges + 4 vertical posts, but NOT the top rectangle.
-    // The flat box lid is what sat far above the terrain and created the dead air;
-    // dropping it lets the summit emerge into open sky with nothing framing the gap.
-    [["000","100"],["010","110"],                                  // floor (E/W)
-     ["000","010"],["100","110"],                                  // floor (N/S)
-     ["000","001"],["100","101"],["010","011"],["110","111"]       // vertical posts
-    ].forEach(function (e) {
+    // FLOOR rectangle only: no box lid and no vertical corner posts (those stuck up
+    // into empty sky). The elevation + distance axes draw their own edges with ticks,
+    // so the scale is still there without the stray frame lines.
+    [["000","100"],["010","110"],["000","010"],["100","110"]].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
     // origin = the bottom corner nearest the camera, so the two horizontal axes
@@ -1005,7 +1002,7 @@ _VIEWER_JS = r'''
     var ang = Math.atan2(p1[1]-p0[1], p1[0]-p0[0]);
     // inset by the arrow+label reach (~1.6R) so the "N" never clips the panel edge,
     // whatever compass direction north points.
-    var R = Math.max(24, W/26), pad = 1.6*R+6, cx = W-pad, cy = pad, L = R*0.85;
+    var R = Math.max(16, W/42), pad = 1.6*R+6, cx = W-pad, cy = pad, L = R*0.85;
     ctx.save();
     ctx.lineWidth = Math.max(2, W/650);
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -1056,7 +1053,7 @@ _VIEWER_JS = r'''
     var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
     // reserve margin for the labels: left (elevation) + bottom (distance) big,
     // right small, top for the N arrow. Box fills the rest and is panned into it.
-    fitView({L:0.13, R:0.035, T:0.05, B:0.11});
+    fitView({L:0.13, R:0.075, T:0.07, B:0.085});
     var shots=[];
     panels.forEach(function (pn) {
       active = pn.side;
