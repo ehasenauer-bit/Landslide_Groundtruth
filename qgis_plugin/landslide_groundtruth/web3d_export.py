@@ -483,7 +483,7 @@ _VIEWER_JS = r'''
     var c = P.color || [255, 80, 80]; regLayer(P.name, c);
     (P.rings || []).forEach(function (R) {
       var tris = R.tris || [], out = R.outline || [];
-      if (tris.length >= 3) op(drape(tris, 1.0), tris.length, gl.TRIANGLES, c, 0.35, true, P.name);
+      if (tris.length >= 3) op(drape(tris, 1.0), tris.length, gl.TRIANGLES, c, 0.55, true, P.name);
       if (out.length >= 2) op(drape(out, 1.4), out.length, gl.LINE_LOOP, c, 1.0, false, P.name);
     });
   });
@@ -1035,6 +1035,51 @@ _VIEWER_JS = r'''
     }
     ctx.restore();
   }
+  // Crown/toe + drop + runout, computed from the longest centreline overlay.
+  function landslideMetrics(){
+    var best=null, bestLen=-1;
+    (CFG.lines||[]).forEach(function(L){ (L.paths||[]).forEach(function(pa){
+      if(!pa||pa.length<2) return;
+      var dd=0; for(var i=1;i<pa.length;i++){ dd+=Math.hypot(pa[i][0]-pa[i-1][0], pa[i][1]-pa[i-1][1]); }
+      if(dd>bestLen){ bestLen=dd; best=pa; }
+    }); });
+    if(!best) return null;
+    var A=best[0], B=best[best.length-1];
+    var crown=(sampleZ(A[0],A[1])>=sampleZ(B[0],B[1]))?A:B, toe=(crown===A)?B:A;
+    var crownZ=sampleZ(crown[0],crown[1]), toeZ=sampleZ(toe[0],toe[1]);
+    var crownElev=crownZ/exag+zmid, toeElev=toeZ/exag+zmid;
+    return { crown:crown, toe:toe, crownZ:crownZ, toeZ:toeZ, crownElev:crownElev,
+             toeElev:toeElev, drop:crownElev-toeElev, runout:bestLen, mid:best[(best.length/2)|0] };
+  }
+  function drawLandslideAnnotations(ctx, mvp, W, H){
+    var m=landslideMetrics(); if(!m) return;
+    var fs=Math.max(12, Math.round(W/82)), CY="rgba(120,220,255,0.95)";
+    function ci(n){ return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+    ctx.save(); ctx.textBaseline="middle"; ctx.lineJoin="round";
+    function box(px,py,txt,align,fg){
+      ctx.font="bold "+fs+"px sans-serif"; ctx.textAlign=align;
+      var w=ctx.measureText(txt).width, x0=(align==="right")?px-w:(align==="center"?px-w/2:px);
+      ctx.fillStyle="rgba(11,14,19,0.82)"; ctx.fillRect(x0-5, py-fs*0.85, w+10, fs*1.7);
+      ctx.fillStyle=fg||"#f2f5fb"; ctx.fillText(txt, px, py);
+    }
+    function dot(p){ ctx.fillStyle=CY; ctx.beginPath(); ctx.arc(p[0],p[1],Math.max(2.5,W/560),0,2*Math.PI); ctx.fill(); }
+    // vertical DROP line: rise from the toe surface to crown elevation
+    var pb=project(mvp,[m.toe[0],m.toe[1],m.toeZ],W,H), pt=project(mvp,[m.toe[0],m.toe[1],m.crownZ],W,H);
+    if(pb&&pt){
+      ctx.strokeStyle=CY; ctx.lineWidth=Math.max(1.6,W/850);
+      ctx.setLineDash([Math.max(4,W/200),Math.max(3,W/320)]);
+      ctx.beginPath(); ctx.moveTo(pb[0],pb[1]); ctx.lineTo(pt[0],pt[1]); ctx.stroke(); ctx.setLineDash([]);
+      box(pt[0]+8, (pb[1]+pt[1])/2, "↕ "+ci(m.drop)+" m drop", "left", "#cdeaff");
+    }
+    // runout length at the centreline midpoint
+    var pm=project(mvp,[m.mid[0],m.mid[1],sampleZ(m.mid[0],m.mid[1])],W,H);
+    if(pm){ box(pm[0], pm[1]-fs*1.7, (m.runout>=1000?(m.runout/1000).toFixed(2)+" km":ci(m.runout)+" m")+" runout", "center", "#f6c9c9"); }
+    // crown + toe markers
+    var pc=project(mvp,[m.crown[0],m.crown[1],m.crownZ],W,H);
+    if(pc){ dot(pc); box(pc[0]+9, pc[1]-fs*1.0, "Crown · "+ci(m.crownElev)+" m", "left", "#cdeaff"); }
+    if(pb){ dot(pb); box(pb[0]+9, pb[1]+fs*1.1, "Toe · "+ci(m.toeElev)+" m", "left", "#cdeaff"); }
+    ctx.restore();
+  }
   function exportFigure() {
     // 16:9 slide, 2x2 grid: Before | After / After+overlays | Details
     var FW=1920, FH=1080, m=24, TH=54, capH=28;
@@ -1062,7 +1107,7 @@ _VIEWER_JS = r'''
       var cc = document.createElement("canvas"); cc.width=pxW; cc.height=pxH;
       var g = cc.getContext("2d"); g.drawImage(canvas, 0, 0);
       drawAxes(g, mvp, pxW, pxH); drawNorth(g, mvp, pxW, pxH);
-      if (pn.ov) drawPeakLabels(g, mvp, pxW, pxH);
+      if (pn.ov) { drawPeakLabels(g, mvp, pxW, pxH); drawLandslideAnnotations(g, mvp, pxW, pxH); }
       shots.push({ img: cc, cap: pn.cap });
     });
     active=sa; for (var k in vis) vis[k]=sv[k];
