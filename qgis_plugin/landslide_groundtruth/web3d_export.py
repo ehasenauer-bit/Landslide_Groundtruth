@@ -876,7 +876,9 @@ _VIEWER_JS = r'''
       var eye=eyePos(), wpp=2*cam.dist*Math.tan(fovy/2)/H;
       var vdir=norm([cam.tgt[0]-eye[0], cam.tgt[1]-eye[1], cam.tgt[2]-eye[2]]);
       var right=norm(cross(vdir,[0,0,1])), up=norm(cross(right,vdir));
-      var dsx=icx-r2.cx, dsy=icy-r2.cy;
+      // centre the BOUNDING BOX (not the mass-weighted centroid) so a bottom-heavy
+      // mountain isn't pushed down, leaving extra sky on top.
+      var dsx=icx-(r2.minx+r2.maxx)/2, dsy=icy-(r2.miny+r2.maxy)/2;
       cam.tgt=[cam.tgt[0]+right[0]*(-dsx*wpp)+up[0]*(dsy*wpp),
                cam.tgt[1]+right[1]*(-dsx*wpp)+up[1]*(dsy*wpp),
                cam.tgt[2]+right[2]*(-dsx*wpp)+up[2]*(dsy*wpp)];
