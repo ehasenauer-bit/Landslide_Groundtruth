@@ -1053,31 +1053,36 @@ _VIEWER_JS = r'''
   }
   function drawLandslideAnnotations(ctx, mvp, W, H){
     var m=landslideMetrics(); if(!m) return;
-    var fs=Math.max(12, Math.round(W/82)), CY="rgba(120,220,255,0.95)";
+    var pc=project(mvp,[m.crown[0],m.crown[1],m.crownZ],W,H);
+    var pe=project(mvp,[m.toe[0],m.toe[1],m.toeZ],W,H);
+    if(!pc && !pe) return;
+    var fs=Math.max(12, Math.round(W/85)), CY="rgba(130,225,255,0.95)";
     function ci(n){ return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
     ctx.save(); ctx.textBaseline="middle"; ctx.lineJoin="round";
-    function box(px,py,txt,align,fg){
-      ctx.font="bold "+fs+"px sans-serif"; ctx.textAlign=align;
-      var w=ctx.measureText(txt).width, x0=(align==="right")?px-w:(align==="center"?px-w/2:px);
-      ctx.fillStyle="rgba(11,14,19,0.82)"; ctx.fillRect(x0-5, py-fs*0.85, w+10, fs*1.7);
-      ctx.fillStyle=fg||"#f2f5fb"; ctx.fillText(txt, px, py);
-    }
-    function dot(p){ ctx.fillStyle=CY; ctx.beginPath(); ctx.arc(p[0],p[1],Math.max(2.5,W/560),0,2*Math.PI); ctx.fill(); }
-    // vertical DROP line: rise from the toe surface to crown elevation
-    var pb=project(mvp,[m.toe[0],m.toe[1],m.toeZ],W,H), pt=project(mvp,[m.toe[0],m.toe[1],m.crownZ],W,H);
-    if(pb&&pt){
-      ctx.strokeStyle=CY; ctx.lineWidth=Math.max(1.6,W/850);
-      ctx.setLineDash([Math.max(4,W/200),Math.max(3,W/320)]);
-      ctx.beginPath(); ctx.moveTo(pb[0],pb[1]); ctx.lineTo(pt[0],pt[1]); ctx.stroke(); ctx.setLineDash([]);
-      box(pt[0]+8, (pb[1]+pt[1])/2, "↕ "+ci(m.drop)+" m drop", "left", "#cdeaff");
-    }
-    // runout length at the centreline midpoint
-    var pm=project(mvp,[m.mid[0],m.mid[1],sampleZ(m.mid[0],m.mid[1])],W,H);
-    if(pm){ box(pm[0], pm[1]-fs*1.7, (m.runout>=1000?(m.runout/1000).toFixed(2)+" km":ci(m.runout)+" m")+" runout", "center", "#f6c9c9"); }
-    // crown + toe markers
-    var pc=project(mvp,[m.crown[0],m.crown[1],m.crownZ],W,H);
-    if(pc){ dot(pc); box(pc[0]+9, pc[1]-fs*1.0, "Crown · "+ci(m.crownElev)+" m", "left", "#cdeaff"); }
-    if(pb){ dot(pb); box(pb[0]+9, pb[1]+fs*1.1, "Toe · "+ci(m.toeElev)+" m", "left", "#cdeaff"); }
+    // ---- corner callout box: all metrics off the scar ----
+    var lines=[
+      ["Crown · "+ci(m.crownElev)+" m", "#d6ecff"],
+      ["Toe · "+ci(m.toeElev)+" m", "#d6ecff"],
+      ["↕ "+ci(m.drop)+" m drop", "#d6ecff"],
+      [(m.runout>=1000?(m.runout/1000).toFixed(2)+" km":ci(m.runout)+" m")+" runout", "#f6c9c9"]
+    ];
+    ctx.font="bold "+fs+"px sans-serif";
+    var tw=0; lines.forEach(function(l){ tw=Math.max(tw, ctx.measureText(l[0]).width); });
+    var padX=fs*0.7, padY=fs*0.55, lineH=fs*1.5, bw=tw+padX*2, bh=lines.length*lineH+padY*2;
+    // place opposite the scar, at the top; the right slot sits below the N compass
+    var midX=((pc?pc[0]:pe[0])+(pe?pe[0]:pc[0]))/2, onLeft=midX > W*0.5;
+    var bx=onLeft ? W*0.035 : W-bw-W*0.035, by=onLeft ? H*0.05 : H*0.20;
+    ctx.fillStyle="rgba(11,14,19,0.86)"; ctx.strokeStyle="rgba(150,185,215,0.55)"; ctx.lineWidth=Math.max(1,W/1500);
+    ctx.beginPath(); ctx.rect(bx,by,bw,bh); ctx.fill(); ctx.stroke();
+    ctx.textAlign="left";
+    lines.forEach(function(l,i){ ctx.fillStyle=l[1]; ctx.fillText(l[0], bx+padX, by+padY+lineH*(i+0.5)); });
+    // ---- leader lines from the box edge to crown + toe dots ----
+    var ax=onLeft ? bx+bw : bx, ay=by+bh/2;
+    ctx.strokeStyle="rgba(130,225,255,0.75)"; ctx.lineWidth=Math.max(1.1,W/1300);
+    function leader(p){ if(!p) return;
+      ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(p[0],p[1]); ctx.stroke();
+      ctx.fillStyle=CY; ctx.beginPath(); ctx.arc(p[0],p[1],Math.max(2.5,W/520),0,2*Math.PI); ctx.fill(); }
+    leader(pc); leader(pe);
     ctx.restore();
   }
   function exportFigure() {
