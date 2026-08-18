@@ -48,6 +48,7 @@ from qgis.PyQt.QtCore import QVariant
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from . import layer_group as lg
 
 # Planet's Data API tile service (undocumented, but stable — it's what Planet
 # Explorer's "Add preview to map" relies on). POST scene ids to get a tile hash,
@@ -149,6 +150,8 @@ class PlanetTab(QWidget):
         self._preview_pix = None         # last loaded thumbnail, kept for rescaling
         self._tile_replies = []          # in-flight tile-hash POSTs
         self._detail_labels = None       # side -> layer label for the pending SR render
+        self._detail_dates = None        # side -> acquisition date for the pending SR render (folder name)
+        self._preview_group = None       # layer-tree folder the tile preview loads into
         self._preview_layers = []        # preview layers (XYZ tiles / SR GeoTIFFs) on the map
         self._preview_extent = None      # union of previewed scene footprints (EPSG:4326)
         self._footprint_layers = []      # scene-footprint vector layers on the map
@@ -1295,6 +1298,18 @@ class PlanetTab(QWidget):
         if not picks:
             self._warn("Run Search first — no PlanetScope scene to preview.")
             return
+        # Folder for the tile preview layers: "Planet <pre>/<post> preview" when the
+        # picks give a clean before/after pair, else just "Planet preview". The side
+        # comes from the label _label_for() built; the date from the search result.
+        pre = post = ""
+        for label, ids in picks:
+            side = "pre" if "before" in label else "post" if "after" in label else None
+            if side and ids:
+                if side == "pre":
+                    pre = self._date_for("pre", ids[0])
+                else:
+                    post = self._date_for("post", ids[0])
+        self._preview_group = lg.name("Planet", lg.date_pair(pre, post), "preview")
         self._clear_preview_layers()
         self._preview_extent = None
         self._append_log(f"Preview on map: requesting tiles for {len(picks)} scene(s)…")
@@ -1456,6 +1471,13 @@ class PlanetTab(QWidget):
             side: (self._label_for(side, ids[0]) if ids else None)
             for side, ids in picks.items()
         }
+        # …and the acquisition date per side, so the loaded layers land in a folder
+        # named for the pre/post dates (e.g. "Planet 7-20/7-21 HONC"). Kept across a
+        # Re-tone (same scenes) so the tone switch only changes the product suffix.
+        self._detail_dates = {
+            side: (self._date_for(side, ids[0]) if ids else "")
+            for side, ids in picks.items()
+        }
         self._append_log(
             f"Render detail: ordering {len(picks['pre'])} pre + {len(picks['post'])} "
             f"post SR scene(s), clipping to the AOI, and rendering Highlight Optimized "
@@ -1513,6 +1535,14 @@ class PlanetTab(QWidget):
         if stretch.get("black"):
             kind = "stretch" if tone == "linear" else "fitted"
             tone_word += f", {kind} {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
+        # Folder name for these layers: dates from the render + the tone as the
+        # product tag, so a Re-tone of the same scenes lands in a sibling folder
+        # ("Planet 7-20/7-21 HONC" next to "… Roll off" / "… None") instead of
+        # overwriting. Dates fall back to blank on a resume/recall we didn't launch.
+        dd = self._detail_dates or {}
+        product = {"knee": "Roll off", "natural": "HONC",
+                   "linear": "None"}.get(tone, "HONC")
+        group = lg.name("Planet", lg.date_pair(dd.get("pre"), dd.get("post")), product)
         # replace whatever the previous preview (tiles or SR) put on the map
         self._clear_preview_layers()
         self._preview_extent = None
@@ -1526,7 +1556,7 @@ class PlanetTab(QWidget):
             label += f" · SR detail ({tone_word})"
             lyr = QgsRasterLayer(path, label)
             if lyr.isValid():
-                QgsProject.instance().addMapLayer(lyr)
+                lg.add_to_group(lyr, group)
                 self._preview_layers.append(lyr)
                 loaded += 1
                 self._append_log(f"  loaded {label}")
@@ -1988,7 +2018,7 @@ class PlanetTab(QWidget):
         if not lyr.isValid():
             self._append_log(f"    could not build the tile layer for {name}")
             return
-        QgsProject.instance().addMapLayer(lyr)
+        lg.add_to_group(lyr, self._preview_group)
         self._preview_layers.append(lyr)
         self._append_log(f"    added: {name}")
 
@@ -2008,10 +2038,7 @@ class PlanetTab(QWidget):
 
     def _clear_preview_layers(self):
         for lyr in self._preview_layers:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_layers = []
         if hasattr(self, "zoom_btn"):
             self.zoom_btn.setEnabled(False)

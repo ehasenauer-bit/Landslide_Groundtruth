@@ -42,9 +42,17 @@ How the pieces fit:
   Length    A medial-axis centerline of the total landslide outline (see
             centerline.py) — a whole-slide runout length, taken from the total
             even under the scar fit; with no total assigned it spines the
-            converted outline instead. Dropped into an editable scratch layer so
-            you can trim the ends or nudge it and re-measure. Reported for
-            reference only — the volume comes from area alone.
+            converted outline instead. Which outline it spines can be overridden
+            with the "Centerline from" picker. Dropped into an editable scratch
+            layer so you can trim the ends or nudge it and re-measure. Reported
+            for reference only — the volume comes from area alone.
+
+  Relief    With an elevation raster assigned ("Elevation (DEM)"), the fall
+            height is read ALONG that centerline — its highest reading is the
+            source crown, its lowest the toe — giving the drop H and the travel
+            angle atan(H/L). A HILLSHADE is shading (0-255), not elevation, so a
+            byte raster is refused rather than reported as metres. Reference
+            only, like the length; the 3D viewer tab can fetch a DEM to sample.
 
   Results   One row per slide, accumulating across slides so a session's work
             exports as one CSV, plus a write-back that stamps the numbers onto
@@ -54,6 +62,7 @@ The volume arithmetic itself lives in volume_calc, which prefers the project's
 canonical larsen_BR_volume.py and names whichever implementation ran.
 """
 import csv
+import math
 import os
 import re
 from functools import partial
@@ -65,14 +74,16 @@ from qgis.PyQt.QtWidgets import (
     QSplitter, QFileDialog, QApplication, QHeaderView, QToolButton,
 )
 from qgis.core import (
-    QgsProject, QgsVectorLayer, QgsWkbTypes, QgsDistanceArea, QgsUnitTypes,
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
+    Qgis, QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes,
+    QgsDistanceArea, QgsUnitTypes, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform, QgsGeometry, QgsPointXY,
     QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol, QgsVectorDataProvider,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import centerline as centerline_mod
 from . import volume_calc
+from . import layer_group as lg
 
 
 def _utm_epsg(lat, lon):
@@ -139,6 +150,10 @@ WRITEBACK_FIELDS = [
     ("area_hi_m2", QVariant.Double, "a_conv_high"),
     ("total_m2", QVariant.Double, "a_total"),
     ("length_m", QVariant.Double, "length"),
+    ("z_top_m", QVariant.Double, "z_top"),
+    ("z_bot_m", QVariant.Double, "z_bottom"),
+    ("drop_m", QVariant.Double, "drop"),
+    ("reach_deg", QVariant.Double, "reach_angle"),
     ("vol_m3", QVariant.Double, "v_best"),
     ("vol_lo_m3", QVariant.Double, "v_low"),
     ("vol_hi_m3", QVariant.Double, "v_high"),
@@ -155,7 +170,7 @@ UNUSABLE_LENGTH_UNITS = (QgsUnitTypes.DistanceDegrees,
 
 TABLE_COLS = ["Slide", "Fit", "Material", "Total area (m²)", "V best (m³)",
               "V low (m³)", "V high (m³)", "Src best (m²)", "Src low (m²)",
-              "Src high (m²)", "Length (m)", "Layers"]
+              "Src high (m²)", "Length (m)", "Drop (m)", "Layers"]
 
 # CSV header + the row keys behind it, so the export carries raw numbers rather
 # than the table's thousands-separated display strings. converted_area_m2 is the
@@ -174,6 +189,9 @@ CSV_FIELDS = [
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
     ("centerline_m", "length"), ("centerline_method", "length_method"),
+    ("elev_top_m", "z_top"), ("elev_bottom_m", "z_bottom"),
+    ("drop_m", "drop"), ("reach_angle_deg", "reach_angle"),
+    ("hl_ratio", "hl_ratio"), ("elevation_layer", "dem_name"),
     ("converted_layer", "layer_name"), ("total_layer", "total_layer"),
     ("source_best_layer", "best_layer"),
     ("source_low_layer", "low_layer"), ("source_high_layer", "high_layer"),
@@ -476,7 +494,54 @@ class VolumeTab(QWidget):
                     f"A_{role} drop-down to override.")
 
         self._on_layer_changed()
+        self._refresh_relief_combos(layers)
         self._update_role_label()
+
+    def _project_rasters(self):
+        """Raster layers in layer-tree drawing order — the DEM candidates."""
+        project = QgsProject.instance()
+        try:
+            ordered = project.layerTreeRoot().layerOrder()
+        except Exception:
+            ordered = list(project.mapLayers().values())
+        return [l for l in ordered if isinstance(l, QgsRasterLayer)]
+
+    def _refresh_relief_combos(self, layers=None):
+        """Repopulate the "Centerline from" and "Elevation (DEM)" pickers,
+        each keeping its current selection so a layer add never reassigns them.
+
+        The centerline picker offers Auto (data None — follow the measurement)
+        plus every polygon layer; the DEM picker offers "— none —" plus every
+        single-band raster, the same DEM filter the 3D viewer tab uses."""
+        if not hasattr(self, "_cl_source_combo"):
+            return                        # still constructing
+        if layers is None:
+            layers = self._polygon_layers()
+
+        combo = self._cl_source_combo
+        keep = combo.currentData() if combo.count() else None
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Auto — total area (else converted)", None)
+        for layer in layers:
+            combo.addItem(layer.name(), layer.id())
+        idx = combo.findData(keep)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+        dem = self._dem_combo
+        keep_dem = dem.currentData() if dem.count() else None
+        dem.blockSignals(True)
+        dem.clear()
+        dem.addItem("— none —", None)
+        for lyr in self._project_rasters():
+            # single-band rasters are the elevation candidates; a hillshade is
+            # single-band too and is caught later, at sample time (_is_hillshade)
+            if lyr.bandCount() == 1:
+                dem.addItem(lyr.name(), lyr.id())
+        idx = dem.findData(keep_dem)
+        dem.setCurrentIndex(idx if idx >= 0 else 0)
+        dem.blockSignals(False)
 
     def _match_role_layers(self, layers):
         """{role: layer} for layers whose NAME identifies their role.
@@ -712,7 +777,7 @@ class VolumeTab(QWidget):
             "outline_width": "0.6"})
         if symbol is not None and layer.renderer() is not None:
             layer.renderer().setSymbol(symbol)
-        QgsProject.instance().addMapLayer(layer)
+        lg.add_to_group(layer, "Volume")
         self._refresh_layers()
         idx = self._layer_combo.findData(layer.id())
         if idx >= 0:
@@ -820,6 +885,8 @@ class VolumeTab(QWidget):
         f.addRow("Other areas (reported)", self.area_range_out)
         self.length_out = self._ro()
         f.addRow("Centerline length", self.length_out)
+        self.drop_out = self._ro()
+        f.addRow("Elevation drop", self.drop_out)
         self.vol_best_out = self._ro()
         f.addRow("Volume (best)", self.vol_best_out)
         self.vol_range_out = self._ro()
@@ -829,24 +896,58 @@ class VolumeTab(QWidget):
         return box
 
     def _build_centerline_box(self):
-        """Centerline tools. Collapsed by default — length is a reference
-        number, not an input to the volume, so it stays out of the way until
-        it's wanted."""
-        box = QgsCollapsibleGroupBox("Centerline (length, optional)")
+        """Centerline + elevation-drop tools. Collapsed by default — both are
+        reference numbers, not inputs to the volume, so they stay out of the way
+        until wanted.
+
+        Two optional inputs live here. "Centerline from" chooses which outline
+        the medial-axis spine is taken from; left on Auto it follows _measure's
+        choice (the total outline, or the converted one when no total is
+        assigned). "Elevation (DEM)" names a single-band elevation raster to
+        read the slide's fall height from — sampled along the centerline, so its
+        highest reading is the source crown and its lowest the toe. A HILLSHADE
+        is 0-255 shading, not elevation, so a byte raster is refused rather than
+        reported as metres (see _is_hillshade)."""
+        box = QgsCollapsibleGroupBox("Centerline & elevation drop (optional)")
         box.setSaveCollapsedState(False)
         box.setCollapsed(True)
         v = QVBoxLayout(box)
 
         note = QLabel(
-            "Derives the medial-axis spine of the total landslide outline (or "
-            "the converted outline if no total is assigned) — it follows the "
-            f"slide's bends instead of cutting across them — into “{CENTERLINE_LAYER}”, "
-            "left in edit mode so you can trim the ends with the Vertex Tool. "
-            "Re-measure afterwards to pick up your edits. Reported for "
-            "reference; the volume comes from area alone.")
+            "Derives the medial-axis spine of the chosen outline (the total "
+            "landslide outline by default) — it follows the slide's bends "
+            f"instead of cutting across them — into “{CENTERLINE_LAYER}”, left "
+            "in edit mode so you can trim the ends with the Vertex Tool. "
+            "Re-measure afterwards to pick up your edits. With an elevation "
+            "raster assigned it also reads the crown-to-toe fall height along "
+            "that spine. Reported for reference; the volume comes from area "
+            "alone.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(note)
+
+        form = QFormLayout()
+        # underscore-prefixed like the role combos: rebuilt from the project on
+        # every refresh, so persisting them would only mark the project dirty.
+        self._cl_source_combo = QComboBox()
+        self._cl_source_combo.setToolTip(
+            "Which outline the centerline is spined from. Auto follows the "
+            "measurement: the TOTAL outline when one is assigned, otherwise the "
+            "converted outline. Pick a specific polygon layer to override — e.g. "
+            "the total-area layer even under the source-scar fit.")
+        form.addRow("Centerline from", self._cl_source_combo)
+
+        self._dem_combo = QComboBox()
+        self._dem_combo.setToolTip(
+            "Optional. A single-band ELEVATION raster (DEM/DSM) to read the "
+            "slide's fall height from — sampled along the centerline, crown to "
+            "toe. Gives the drop H and the travel angle atan(H/L).\n\n"
+            "A hillshade is shading (0-255), NOT elevation, and is refused. Load "
+            "a DEM/DSM, or let the 3D viewer tab fetch ArcticDEM, then pick it "
+            "here.")
+        self._dem_combo.currentIndexChanged.connect(self._on_dem_changed)
+        form.addRow("Elevation (DEM)", self._dem_combo)
+        v.addLayout(form)
 
         row = QHBoxLayout()
         self.centerline_btn = QPushButton("Draw centerline")
@@ -855,7 +956,14 @@ class VolumeTab(QWidget):
         self.remeasure_btn = QPushButton("Re-measure (after editing)")
         self.remeasure_btn.setEnabled(False)
         self.remeasure_btn.clicked.connect(self._remeasure_centerline)
-        for b in (self.centerline_btn, self.remeasure_btn):
+        self.sample_btn = QPushButton("Sample elevation")
+        self.sample_btn.setEnabled(False)
+        self.sample_btn.setToolTip(
+            "Read the fall height from the assigned DEM along the centerline "
+            "drawn above. Runs automatically when a DEM is set; use this after "
+            "picking a DEM, or after editing the line.")
+        self.sample_btn.clicked.connect(self._sample_elevation_current)
+        for b in (self.centerline_btn, self.remeasure_btn, self.sample_btn):
             row.addWidget(b)
         v.addLayout(row)
         return box
@@ -1021,6 +1129,8 @@ class VolumeTab(QWidget):
             "src_best": a_best, "src_low": a_low, "src_high": a_high,
             "v_best": v_best, "v_low": v_low, "v_high": v_high,
             "length": None, "length_method": "",
+            "z_top": None, "z_bottom": None, "drop": None,
+            "reach_angle": None, "hl_ratio": None, "dem_name": "",
             "layer_id": conv_layer.id(), "layer_name": conv_layer.name(),
             "conv_fid": conv_feat.id(),
             "len_layer_id": len_layer_id, "len_fid": len_fid, "len_from": len_from,
@@ -1037,6 +1147,7 @@ class VolumeTab(QWidget):
         self.add_btn.setEnabled(True)
         self.centerline_btn.setEnabled(True)
         self.remeasure_btn.setEnabled(False)
+        self.sample_btn.setEnabled(False)
 
         conv_name = "Source best" if conv_role == "source" else "Total"
         self._append_log(
@@ -1123,6 +1234,15 @@ class VolumeTab(QWidget):
         else:
             self.length_out.setText(
                 f"{_fmt(c['length'])} m   ({c['length_method']})")
+        if c.get("drop") is None:
+            self.drop_out.setText("— (no elevation raster sampled)")
+        else:
+            txt = (f"crown {_fmt(c['z_top'])} m → toe {_fmt(c['z_bottom'])} m  "
+                   f"=  {_fmt(c['drop'])} m fall")
+            if c.get("reach_angle") is not None:
+                txt += (f"   (H/L {c['hl_ratio']:.3f}, "
+                        f"{c['reach_angle']:.1f}° travel angle)")
+            self.drop_out.setText(txt)
 
     def _distance_area(self, crs):
         """Ellipsoidal measurement in the given CRS.
@@ -1189,22 +1309,9 @@ class VolumeTab(QWidget):
         c = self._current
         if c is None:
             return
-        # The length spines the TOTAL outline when one was assigned (see _measure),
-        # so a scar-fit volume still gets a whole-slide runout length.
-        layer = QgsProject.instance().mapLayer(c["len_layer_id"])
+        layer, geom = self._centerline_source(c)
         if layer is None:
-            self._append_log("The outline to spine is no longer in the project.")
             return
-        feat = layer.getFeature(c["len_fid"])
-        geom = feat.geometry() if feat is not None else None
-        if geom is None or geom.isEmpty():
-            self._append_log("Could not re-read the outline's geometry.")
-            return
-        if c.get("len_from") != "total":
-            self._append_log(
-                "No total outline assigned — spining the "
-                f"{c.get('len_from', 'converted')} outline instead. Assign the "
-                "total landslide outline for a whole-slide runout length.")
 
         # the skeleton is metric: work in the local UTM zone, then hand the
         # result back in the project's CRS so it edits naturally on the canvas
@@ -1248,6 +1355,7 @@ class VolumeTab(QWidget):
         c["length_method"] = method
         self._show_current()
         self.remeasure_btn.setEnabled(True)
+        self.sample_btn.setEnabled(True)
 
         self.iface.setActiveLayer(cl_layer)
         cl_layer.removeSelection()
@@ -1262,6 +1370,43 @@ class VolumeTab(QWidget):
                 "The medial-axis skeleton degenerated (very narrow or very "
                 "simple outline), so this is the longest straight chord — it "
                 "cuts corners on a curving slide.")
+        # read the fall height straight away when a DEM is assigned, so the drop
+        # appears with the length rather than needing a second click
+        if self._dem_layer() is not None:
+            self._sample_elevation_current(auto=True)
+
+    def _centerline_source(self, c):
+        """(layer, geometry) of the outline to spine, or (None, None) with a log.
+
+        An explicit "Centerline from" choice wins; on Auto it is the outline
+        _measure recorded — the TOTAL when one was assigned, otherwise the
+        converted one — so a scar-fit volume still gets a whole-slide length."""
+        chosen = self._layer_from(self._cl_source_combo)
+        if chosen is not None:
+            _area, feat, _measured = self._layer_total(chosen)
+            if feat is None:
+                self._append_log(
+                    f"“{chosen.name()}” has no measurable polygon to spine — "
+                    "pick another layer under “Centerline from”.")
+                return None, None
+            return chosen, feat.geometry()
+
+        layer = QgsProject.instance().mapLayer(c["len_layer_id"])
+        if layer is None:
+            self._append_log("The outline to spine is no longer in the project.")
+            return None, None
+        feat = layer.getFeature(c["len_fid"])
+        geom = feat.geometry() if feat is not None else None
+        if geom is None or geom.isEmpty():
+            self._append_log("Could not re-read the outline's geometry.")
+            return None, None
+        if c.get("len_from") != "total":
+            self._append_log(
+                "No total outline assigned — spining the "
+                f"{c.get('len_from', 'converted')} outline instead. Assign the "
+                "total landslide outline (or pick one under “Centerline from”) "
+                "for a whole-slide runout length.")
+        return layer, geom
 
     def _remeasure_centerline(self):
         c = self._current
@@ -1286,6 +1431,168 @@ class VolumeTab(QWidget):
                     self._cl_fid, idx, float(length))
         self._show_current()
         self._append_log(f"Centerline re-measured: {_fmt(length)} m.")
+        # the edit moved the ends and changed L, so the drop and travel angle
+        # go stale — re-read them when a DEM is assigned
+        if self._dem_layer() is not None:
+            self._sample_elevation_current(auto=True)
+
+    # ---------- elevation drop ----------
+    def _dem_layer(self):
+        """The raster assigned to "Elevation (DEM)", or None."""
+        if not hasattr(self, "_dem_combo"):
+            return None
+        lyr = QgsProject.instance().mapLayer(self._dem_combo.currentData() or "")
+        return lyr if isinstance(lyr, QgsRasterLayer) else None
+
+    def _on_dem_changed(self, *_args):
+        """Sample as soon as a DEM is picked, if a centerline already exists —
+        so choosing the raster after drawing shows the drop without another
+        click. A genuine user change only; the repopulate blocks signals."""
+        if (self._current is not None and self._cl_fid is not None
+                and self._dem_layer() is not None):
+            self._sample_elevation_current(auto=True)
+
+    def _is_hillshade(self, dem):
+        """True when a raster is shading, not elevation.
+
+        A hillshade / shaded-relief layer is a Byte raster of 0-255 illumination
+        values; sampling it and calling the result a fall height would be a
+        confident wrong answer in the wrong units. The data type is the reliable
+        tell (an elevation DEM is Int16/Float32); the name is a backstop."""
+        try:
+            if dem.dataProvider().dataType(1) == Qgis.Byte:
+                return True
+        except Exception:
+            pass
+        return "hillshade" in _name_tokens(dem.name())
+
+    def _sample_elevation_current(self, auto=False):
+        """Read the slide's fall height from the assigned DEM along the current
+        centerline: crown (highest), toe (lowest), drop H and travel angle.
+
+        Auto=True is the call made straight after drawing/editing/picking, so it
+        stays quiet when there is simply nothing to do; a button press (auto=
+        False) explains what is missing instead."""
+        c = self._current
+        if c is None:
+            if not auto:
+                self._append_log("Measure a slide first.")
+            return
+        dem = self._dem_layer()
+        if dem is None:
+            if not auto:
+                self._append_log(
+                    "Assign a single-band elevation raster to “Elevation "
+                    "(DEM)” first.")
+            return
+        cl_layer = self._existing_centerline_layer()
+        if cl_layer is None or self._cl_fid is None:
+            if not auto:
+                self._append_log(
+                    "Draw a centerline first — the fall height is read along "
+                    "it.")
+            return
+        feat = cl_layer.getFeature(self._cl_fid)
+        geom = feat.geometry() if feat is not None else None
+        if geom is None or geom.isEmpty():
+            self._append_log("The centerline feature is gone — draw it again.")
+            return
+        if self._is_hillshade(dem):
+            self._append_log(
+                f"“{dem.name()}” looks like a hillshade (a byte, 0-255 shading "
+                "raster), not an elevation model — its values are not metres, "
+                "so no fall height was read. Load a DEM/DSM, or let the 3D "
+                "viewer tab fetch ArcticDEM, then pick that under “Elevation "
+                "(DEM)”.")
+            return
+        if not hasattr(dem.dataProvider(), "sample"):
+            self._append_log(
+                "This QGIS build can't sample raster values (needs 3.4+).")
+            return
+
+        result = self._elevation_drop(geom, cl_layer.crs(), dem)
+        if result is None:
+            self._append_log(
+                f"Could not read elevations from “{dem.name()}” under the "
+                "centerline — the DEM may not cover this slide, or every sample "
+                "fell on nodata.")
+            return
+        z_top, z_bottom, n = result
+        drop = z_top - z_bottom
+        length = c.get("length")
+        hl = reach = None
+        if length and length > 0:
+            hl = drop / length
+            reach = math.degrees(math.atan2(drop, length))
+        c.update(z_top=z_top, z_bottom=z_bottom, drop=drop,
+                 hl_ratio=hl, reach_angle=reach, dem_name=dem.name())
+        self._show_current()
+        self._write_centerline_relief(cl_layer, z_top, z_bottom, drop, reach)
+
+        msg = (f"Elevation from “{dem.name()}”: crown {_fmt(z_top)} m → toe "
+               f"{_fmt(z_bottom)} m = {_fmt(drop)} m fall ({n} samples).")
+        if reach is not None:
+            msg += (f" Over {_fmt(length)} m of centerline that is H/L "
+                    f"{hl:.3f} — a {reach:.1f}° travel angle.")
+        self._append_log(msg)
+
+    def _elevation_drop(self, line_geom, line_crs, dem):
+        """(z_top, z_bottom, n_samples) sampled along a line from a DEM, or None.
+
+        The line is reprojected to local UTM and densified so the crown and toe
+        aren't skipped between sparse medial-axis vertices; every densified
+        vertex is read from the DEM (transformed into the DEM's own CRS), and
+        the highest and lowest finite readings are the crown and toe."""
+        work, work_crs = self._to_utm(line_geom, line_crs)
+        if work is None:
+            return None
+        length = work.length()
+        step = max(length / 300.0, 1.0) if length > 0 else 1.0
+        dense = work.densifyByDistance(step) or work
+        provider = dem.dataProvider()
+        dem_crs = dem.crs()
+        xform = None
+        if work_crs != dem_crs:
+            xform = QgsCoordinateTransform(
+                work_crs, dem_crs, QgsProject.instance())
+        z_top = z_bottom = None
+        n = 0
+        for v in dense.vertices():
+            p = QgsPointXY(v.x(), v.y())
+            if xform is not None:
+                try:
+                    p = xform.transform(p)
+                except Exception:
+                    continue
+            try:
+                val, ok = provider.sample(p, 1)
+            except Exception:
+                return None
+            if not ok or val is None or math.isnan(val):
+                continue
+            n += 1
+            if z_top is None or val > z_top:
+                z_top = val
+            if z_bottom is None or val < z_bottom:
+                z_bottom = val
+        if n == 0 or z_top is None:
+            return None
+        return z_top, z_bottom, n
+
+    def _write_centerline_relief(self, cl_layer, z_top, z_bottom, drop, reach):
+        """Stamp the fall height onto the centerline feature, so the derived
+        layer carries the relief alongside its length. Silently skips fields a
+        pre-existing centerline layer (older schema) doesn't have."""
+        started = not cl_layer.isEditable()
+        if started and not cl_layer.startEditing():
+            return
+        for name, value in (("z_top_m", z_top), ("z_bot_m", z_bottom),
+                            ("drop_m", drop), ("reach_deg", reach)):
+            idx = cl_layer.fields().indexOf(name)
+            if idx >= 0 and value is not None:
+                cl_layer.changeAttributeValue(self._cl_fid, idx, float(value))
+        if started:
+            cl_layer.commitChanges()
 
     def _to_utm(self, geom, layer_crs):
         """(geometry in local UTM metres, that UTM CRS) — or (None, None).
@@ -1367,12 +1674,16 @@ class VolumeTab(QWidget):
             QgsField("slide", QVariant.String),
             QgsField("length_m", QVariant.Double),
             QgsField("method", QVariant.String),
+            QgsField("z_top_m", QVariant.Double),
+            QgsField("z_bot_m", QVariant.Double),
+            QgsField("drop_m", QVariant.Double),
+            QgsField("reach_deg", QVariant.Double),
         ])
         layer.updateFields()
         symbol = QgsLineSymbol.createSimple({"color": "255,32,32", "width": "0.7"})
         if symbol is not None and layer.renderer() is not None:
             layer.renderer().setSymbol(symbol)
-        QgsProject.instance().addMapLayer(layer)
+        lg.add_to_group(layer, "Volume")
         self._cl_layer_id = layer.id()
         self._append_log(f"Created scratch layer “{CENTERLINE_LAYER}”.")
         return layer
@@ -1391,9 +1702,11 @@ class VolumeTab(QWidget):
         self.add_btn.setEnabled(False)
         self.centerline_btn.setEnabled(False)
         self.remeasure_btn.setEnabled(False)
+        self.sample_btn.setEnabled(False)
         self.source_out.setText("assign the layer the fit needs, then Measure")
         for e in (self.area_best_out, self.area_range_out, self.length_out,
-                  self.vol_best_out, self.vol_range_out, self.calc_out):
+                  self.drop_out, self.vol_best_out, self.vol_range_out,
+                  self.calc_out):
             e.clear()
         self._append_log(f"Added “{row['name']}” to the results table.")
 
@@ -1410,11 +1723,12 @@ class VolumeTab(QWidget):
                 _fmt(row["v_best"]), _fmt(row["v_low"]), _fmt(row["v_high"]),
                 _fmt(row["src_best"]), _fmt(row["src_low"]), _fmt(row["src_high"]),
                 _fmt(row["length"]),
+                _fmt(row.get("drop")),
                 layers,
             ]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if 3 <= c <= 10:
+                if 3 <= c <= 11:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(r, c, item)
 

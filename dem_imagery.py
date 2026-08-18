@@ -75,6 +75,17 @@ DEM_SOURCE = {
 PC_SEAMLESS = "3dep-seamless"
 PC_LIDAR_DSM = "3dep-lidar-dsm"
 
+# --- NRCan MRDEM (CanElevation), the Canadian analog to the 3DEP fallback ---
+# 3DEP is a US product, so it is empty north of the border — which bites on
+# Alaska/Yukon slides that sit just INSIDE Canada (longitude east of 141 W).
+# MRDEM-30 is a 30 m SEAMLESS bare-earth DTM + surface DSM over ALL of Canada,
+# distributed as anonymous Cloud-Optimized GeoTIFFs — no signing (unlike 3DEP),
+# and one national COG per model, so a bbox search returns a single item whose
+# 'dtm'/'dsm' assets are read straight over /vsicurl. Guaranteed coverage where
+# ArcticDEM is holey and 3DEP has nothing.
+CA_STAC_URL = "https://datacube.services.geo.ca/stac/api"
+MRDEM_COLL = "mrdem-30"
+
 # how many candidates to return per side. Strip coverage is opportunistic:
 # a well-imaged Alaska geocell can hold dozens of strips over a decade while
 # a remote one holds two — 16 rows give the plugin enough to find a covering
@@ -95,6 +106,18 @@ def _client():
         c = pystac_client.Client.open(PGC_URL, stac_io=stac_io,
                                       timeout=im._TIMEOUT)
         _local.pgc_client = c
+    return c
+
+
+def _ca_client():
+    """Open (once per thread) and reuse the NRCan datacube STAC client — a
+    different API host from PGC, likewise anonymous and needing no signing."""
+    c = getattr(_local, "ca_client", None)
+    if c is None:
+        stac_io = StacApiIO(timeout=im._TIMEOUT, max_retries=im._RETRY)
+        c = pystac_client.Client.open(CA_STAC_URL, stac_io=stac_io,
+                                      timeout=im._TIMEOUT)
+        _local.ca_client = c
     return c
 
 
@@ -243,6 +266,52 @@ def search_3dep(lat, lon, radius_km):
     return [g for g in groups if g], bool(dsm)
 
 
+def _mrdem_candidate(href, source, dem_source, terrain_model, is_dsm):
+    """One MRDEM asset -> a candidate row.
+
+    Same cross-source contract as _3dep_group, but a single ANONYMOUS COG
+    (needs_signing=False) with no date (a seamless mosaic). geometry is None:
+    MRDEM blankets Canada, so — as for 3DEP — the plugin's post-warp valid-pixel
+    check is the real coverage gate, not a footprint test."""
+    return dict(id=dem_source, date=None, cloud_pct=None, gap_days=None,
+                source=source, thumb_url=None, cog_url=href,
+                geometry=None, bbox=None,
+                sensor=None, is_xtrack=None, rmse=None, valid_pct=None,
+                gsd=30,
+                dem_url=href, dem_urls=[href],
+                hillshade_url=None, hillshade_masked_url=None, mask_url=None,
+                dem_source=dem_source, terrain_model=terrain_model,
+                is_dsm=is_dsm, resolution_m=30,
+                provider="NRCan", needs_signing=False)
+
+
+def search_canada(lat, lon, radius_km):
+    """NRCan MRDEM fallback: the CanElevation 30 m Canada-wide DEM (DTM + DSM).
+
+    The Canadian counterpart to search_3dep, for AOIs north of the border where
+    3DEP (a US product) is empty. Returns up to two candidates — MRDEM 30 m DTM
+    (bare earth) and DSM (surface) — or [] outside Canada / on any error, so it
+    stays a guarded bonus source like 3DEP. Both assets are anonymous COGs read
+    without signing."""
+    try:
+        cat = _ca_client()
+        bbox = im._bbox(lat, lon, radius_km)
+        items = im._search_items(cat, collections=[MRDEM_COLL], bbox=bbox)
+    except Exception:
+        return []
+    if not items:
+        return []
+    it = items[0]
+    out = []
+    dtm = _asset_href(it, "dtm")
+    dsm = _asset_href(it, "dsm")
+    if dtm:
+        out.append(_mrdem_candidate(dtm, "MRDEM 30m", "mrdem-30", "DTM", False))
+    if dsm:
+        out.append(_mrdem_candidate(dsm, "MRDEM 30m DSM", "mrdem-30-dsm", "DSM", True))
+    return out
+
+
 def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIMIT):
     """DEM strips intersecting the AOI in [start, end], nearest-in-time first.
 
@@ -329,6 +398,14 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=1825,
         notes.append("3DEP: no lidar DSM tiles at this AOI (expected in Alaska — "
                      "ArcticDEM 2 m is the surface model there; 3DEP seamless "
                      "adds a coarser bare-earth DTM fallback)")
+    # MRDEM: the Canadian fallback, tried after 3DEP. It blankets all of Canada,
+    # so it is the source that actually delivers terrain for slides just inside
+    # the border, where ArcticDEM is holey and 3DEP (US-only) is empty.
+    ca = search_canada(lat, lon, radius_km)
+    if ca:
+        notes.append("MRDEM: added NRCan CanElevation 30 m DEM (DTM + DSM), "
+                     "seamless over all of Canada — the fallback used when "
+                     "ArcticDEM is holey and 3DEP (US-only) has no data here")
     return dict(source="DEM strips", notes=notes,
-                pre=[_candidate(i, event_time) for i in pre_items] + extra,
+                pre=[_candidate(i, event_time) for i in pre_items] + extra + ca,
                 post=[_candidate(i, event_time) for i in post_items])

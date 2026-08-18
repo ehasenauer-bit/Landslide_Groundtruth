@@ -27,6 +27,7 @@ from qgis.core import (
 from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
 from .task import PipelineTask
+from . import layer_group as lg
 
 # label -> --prefer value. PlanetScope lives in its own tab now (separate
 # Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
@@ -75,6 +76,35 @@ SENSOR_LABEL = {
     "s2": "Sentinel-2 (~10 m)",
     "landsat": "Landsat (~30 m)",
 }
+
+# Short sensor tag for the layer-tree folder name (SENSOR_LABEL is too long there).
+SENSOR_TAG = {"planet": "PlanetScope", "s2": "S2", "landsat": "Landsat"}
+
+# Which product each run-output file is, keyed off the `kind` token review_package
+# bakes into the filename. Ordered most-specific first so "dndvi" wins over "ndvi".
+# The value becomes the folder's product suffix, e.g. "S2 7-20/7-21 NDVI".
+CORE_PRODUCTS = [
+    ("dndvi", "dNDVI"), ("dndsi", "dNDSI"), ("dbright", "dBright"),
+    ("highlight", "HONC"), ("falsecolor", "False-color"),
+    ("swir", "SWIR"), ("ndvi", "NDVI"), ("rgb", "TC"),
+]
+
+
+def _core_product(basename):
+    """Product tag for a run-output filename, or '' if none matches (e.g. the
+    predicted-epicentre point.gpkg, which then sits at the top level of the run's
+    own folder rather than in a product subfolder)."""
+    low = basename.lower()
+    for token, tag in CORE_PRODUCTS:
+        if f"_{token}_" in low or low.endswith("_" + token):
+            return tag
+    return ""
+
+
+def _first_date(dates):
+    """Earliest acquisition date in a side's list, for the folder name; '' if none."""
+    uniq = sorted({d for d in (dates or []) if d})
+    return uniq[0] if uniq else ""
 
 # table row tints: pre = blue, post = green; explicit dark text so the pastel
 # backgrounds stay readable under both the light and dark QGIS themes.
@@ -947,17 +977,23 @@ class LandslideDock(QgsDockWidget):
         # The dry-run lists every acquisition near the event, nearest-first (clouds
         # included — see imagery.search_event), but an AUTOMATIC Run does not pick
         # the nearest scene: it ranks by the cloud-weighted blend fetch_event uses
-        # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. So
-        # replicate that selection here: ★ = the scene that ranking leads with, ✓ =
-        # also in its composite, plain/greyed = below its cutoff. Those marks are a
-        # SUGGESTION — the ticks decide, and a greyed row is often the right pick
-        # once you've looked at where the cloud actually sits.
+        # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. We
+        # replicate that here, with one refinement the point demands: scenes whose
+        # footprint actually COVERS the epicentre are ranked ahead of ones that
+        # only clip the AOI box (see _rank_like_run), so ★ = best covering scene,
+        # ✓ = also in its composite, plain/greyed = below its cutoff or off-point.
+        # The marks are a SUGGESTION — the ticks decide, and a greyed row is often
+        # the right pick once you've looked at where the cloud actually sits.
         sel = self._run_selection(pre, post, result.get("params", {}))
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
+        off_point = 0                    # scenes whose footprint misses the epicentre
         for r, (side, c) in enumerate(rows):
             info = sel[side]
             cid = c.get("id")
+            covers_pt = self._covers_event(c)
+            if not covers_pt:
+                off_point += 1
             is_top = cid is not None and cid == info["top"]
             in_comp = cid in info["used"]
             date = (c.get("date") or "")[:16].replace("T", " ")
@@ -1013,16 +1049,44 @@ class LandslideDock(QgsDockWidget):
                 "Run downloads EXACTLY the ticked rows (and 'Preview on map' "
                 "renders them). Nothing else is added. Sentinel-2 / Landsat only — "
                 "PlanetScope has its own tab.")
+            if not covers_pt:
+                # muted text flags it visually; the tooltip says why it's demoted
+                for col in range(self.table.columnCount()):
+                    it = self.table.item(r, col)
+                    if it is not None:
+                        it.setForeground(QBrush(MUTED_FG))
+                side_item.setToolTip(
+                    side_item.toolTip() + "\n\n⚠ This scene's footprint does NOT "
+                    "cover the epicentre — its acquisition leaves the event point "
+                    "in a nodata gap, so it is ranked last and won't be the "
+                    "Preview-on-map default. It still lists in case you want the "
+                    "surrounding area.")
+        if off_point:
+            self._append_log(
+                f"note: {off_point} of {len(rows)} candidate scene(s) do not cover "
+                f"the epicentre (footprint clips the AOI but misses the point); "
+                f"they are ranked last so the ★ and Preview-on-map favour scenes "
+                f"that actually cover the event point.")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
     def _rank_like_run(self, cands, cloud_weight, auto_window):
-        """Order candidates exactly as imagery.search_scenes would for a Run.
+        """Order candidates as imagery.search_scenes would for a Run, but with any
+        scene that actually covers the epicentre ranked ahead of one that doesn't.
 
-        auto_window: nearest day first, then clearest among same-day (cloud_weight
-        ignored). Otherwise the blend cost gap_days + cloud_weight*cloud_pct, so a
-        clearer scene a little further from the event can outrank a cloudy near one."""
+        Coverage of the event point is the PRIMARY key: a scene whose footprint
+        leaves the epicentre in a nodata gap is useless for a before/after at that
+        point, so it sinks below every scene that covers it regardless of
+        gap/cloud (this is what keeps the ★ suggestion and the Preview-on-map
+        default from landing on a granule sitting off to one side of the point).
+        Within a coverage group the Run's own order holds — auto_window: nearest
+        day first, then clearest among same-day (cloud_weight ignored); otherwise
+        the blend cost gap_days + cloud_weight*cloud_pct, so a clearer scene a
+        little further from the event can outrank a cloudy near one."""
+        def covers(c):
+            return 0 if self._covers_event(c) else 1   # point-covering scenes first
+
         def gap(c):
             g = c.get("gap_days")
             return 1e9 if g is None else g
@@ -1032,17 +1096,19 @@ class LandslideDock(QgsDockWidget):
             return 100.0 if v is None else v
 
         if auto_window:
-            return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
-        return sorted(cands, key=lambda c: gap(c) + cloud_weight * cloud(c))
+            return sorted(cands, key=lambda c: (covers(c), round(gap(c)), cloud(c)))
+        return sorted(cands, key=lambda c: (covers(c), gap(c) + cloud_weight * cloud(c)))
 
     def _run_selection(self, pre, post, params):
         """Which scenes a Run would composite per side: {'pre'/'post': {top, used}}.
 
-        Mirrors fetch_event: pick the source it would use (explicit --prefer, else
+        Follows fetch_event: pick the source it would use (explicit --prefer, else
         the first of Planet→Sentinel-2→Landsat with scenes on both sides), then take
         the top 1 (auto-window) or top 6 (default, median-composited) by the run's
-        ranking. `top` is the scene the preview should show; `used` is the full
-        composite set."""
+        ranking — except scenes that cover the epicentre are ranked first (see
+        `_rank_like_run`), so the ★ suggestion is a scene that actually covers the
+        point rather than one merely overlapping the AOI box. `top` is the scene
+        the preview should show; `used` is the full composite set."""
         cw = params.get("cloud_weight", 0.5)
         cw = 0.5 if cw is None else cw
         auto = bool(params.get("auto_window"))
@@ -1323,6 +1389,34 @@ class LandslideDock(QgsDockWidget):
             return None
         return None
 
+    def _event_point(self):
+        """QgsPointXY of the event epicentre from the last search, or None.
+
+        The same lon/lat the search box is centred on (see `_aoi_bbox`)."""
+        result = self._search_result or {}
+        try:
+            return QgsPointXY(float(result.get("lon")), float(result.get("lat")))
+        except (TypeError, ValueError):
+            return None
+
+    def _covers_event(self, candidate):
+        """True if the scene's footprint actually contains the event point.
+
+        The STAC search returns every scene whose TILE footprint intersects the
+        AOI box, so a scene can clip a corner of the box yet leave the epicentre
+        in that acquisition's diagonal nodata gap — a Preview-on-map then paints
+        imagery off to one side of the point (covering the AOI, not the point).
+        This tests real coverage of the point so the ranking can sink those
+        scenes. Absent/unparseable geometry -> True (never demote a scene we
+        cannot test)."""
+        pt = self._event_point()
+        if pt is None:
+            return True
+        g = self._qgs_geom(candidate.get("geometry"))
+        if g is None or g.isEmpty():
+            return True
+        return g.contains(pt)
+
     def _selected_ids(self):
         """Scene ids of the currently selected table rows."""
         ids = set()
@@ -1475,10 +1569,7 @@ class LandslideDock(QgsDockWidget):
         """Remove the rasters a previous Preview-on-map added, so each preview
         shows just the current pick instead of piling up."""
         for lyr in self._preview_added:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_added = []
 
     def _preview_row_on_map(self, item):
@@ -1514,14 +1605,29 @@ class LandslideDock(QgsDockWidget):
                        "tick the scene(s) you want in the table.")
             return
         scenes = []
+        off_point = 0
         for side, c, why in picks:
             date = (c.get("date") or "")[:10]
             short = "S2" if c.get("source") == "Sentinel-2" else "Landsat"
+            if not self._covers_event(c):
+                off_point += 1
             scenes.append((f"{short} {side} {date}".strip(), c["id"],
                            c.get("cog_url"), c.get("source"), why))
         self._append_log(
             f"Preview on map: rendering Highlight Optimized Natural Color over the "
             f"AOI for {len(scenes)} scene(s)…")
+        if off_point:
+            # the render still covers the AOI box, but this scene has no pixels at
+            # the epicentre — say so rather than leave the user reading a nodata gap
+            if off_point == len(scenes):
+                msg = (f"None of the {len(scenes)} scene(s) being previewed cover the "
+                       f"event point — their imagery sits to one side of the epicentre, "
+                       f"which falls in the scene's nodata gap. No Sentinel-2 / Landsat "
+                       f"scene in this window covers the point on that side.")
+            else:
+                msg = (f"{off_point} of {len(scenes)} previewed scene(s) do not cover the "
+                       f"event point (epicentre in a nodata gap); the others do.")
+            self._warn(msg)
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
         self._clear_preview_layers()   # replace the previous preview, don't pile up
@@ -1607,7 +1713,7 @@ class LandslideDock(QgsDockWidget):
                     f.write(data)
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
-                    QgsProject.instance().addMapLayer(lyr)
+                    lg.add_to_group(lyr, "Imagery preview")
                     self._preview_added.append(lyr)
                     self._append_log(
                         f"  loaded {label} (AOI render, Highlight Optimized Natural Color)")
@@ -1671,7 +1777,7 @@ class LandslideDock(QgsDockWidget):
             self._preview_failed.append(label)
             self._append_log(f"  layer would not open for {label}")
             return
-        QgsProject.instance().addMapLayer(lyr)
+        lg.add_to_group(lyr, "Imagery preview")
         self._preview_added.append(lyr)
         self._append_log(f"  loaded {label} (streamed)")
 
@@ -1790,6 +1896,41 @@ class LandslideDock(QgsDockWidget):
         self.canvas.setExtent(rect)
         self.canvas.refresh()
 
+    def _zoom_to_layers(self, layers):
+        """Frame the canvas on the combined extent of the just-created layers.
+
+        Reprojects each layer's extent into the canvas CRS and unions them, so a
+        Run lands on the imagery it produced — centred on the event AOI — instead
+        of on the first layer's raw extent (which, for the lone epicentre point,
+        collapses the zoom to a single coordinate). Zero-area layers are skipped;
+        falls back to the search AOI if nothing usable remains."""
+        dst = self.canvas.mapSettings().destinationCrs()
+        union = None
+        for lyr in layers:
+            try:
+                ext = lyr.extent()
+            except (RuntimeError, AttributeError):
+                continue
+            if ext is None or ext.isEmpty() or ext.width() <= 0 or ext.height() <= 0:
+                continue                       # skip the epicentre point (no area)
+            src = lyr.crs()
+            if dst.isValid() and src.isValid() and src != dst:
+                try:
+                    ext = QgsCoordinateTransform(
+                        src, dst, QgsProject.instance()).transformBoundingBox(ext)
+                except Exception:
+                    continue
+            if union is None:
+                union = QgsRectangle(ext)
+            else:
+                union.combineExtentWith(ext)
+        if union is None or union.isEmpty():
+            self._zoom_to_aoi()                # nothing framable -> the search box
+            return
+        union.scale(1.05)                      # a little breathing room around it
+        self.canvas.setExtent(union)
+        self.canvas.refresh()
+
     def _on_done(self):
         self._busy(False)
         result = getattr(self.task, "result", None)
@@ -1807,6 +1948,15 @@ class LandslideDock(QgsDockWidget):
         self._load_layers(result.get("layers", []), result)
 
     def _load_layers(self, layers, result):
+        # Each Run opens its OWN folder — "S2 7-20/7-21", or "… (2)" if that event's
+        # folder already exists — so a new run never merges into a previous one.
+        # Inside it: one subfolder per product (NDVI, dNDVI, HONC…), with the
+        # predicted-epicentre point sitting at the run folder's top level.
+        prefix = SENSOR_TAG.get(result.get("sensor"), "Imagery")
+        dates = lg.date_pair(_first_date(result.get("pre_dates")),
+                             _first_date(result.get("post_dates")))
+        run_group = None                 # opened on the first valid layer (never if empty)
+        subs = {}                        # product tag -> its subfolder within this run
         added = []
         for path in layers:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -1817,12 +1967,18 @@ class LandslideDock(QgsDockWidget):
             else:
                 continue
             if lyr.isValid():
-                QgsProject.instance().addMapLayer(lyr)
+                if run_group is None:
+                    run_group = lg.new_group(lg.name(prefix, dates))
+                product = _core_product(name)
+                if product:
+                    if product not in subs:
+                        subs[product] = lg.subgroup(run_group, product)
+                    lg.add_to(lyr, subs[product])
+                else:
+                    lg.add_to(lyr, run_group)   # the predicted-epicentre point
                 added.append(lyr)
         if added:
-            extent = QgsRectangle(added[0].extent())
-            self.canvas.setExtent(extent)
-            self.canvas.refresh()
+            self._zoom_to_layers(added)   # frame the new outputs, not a stale extent
 
         # End-of-run banner: spell out WHICH satellite was actually used. In 'auto'
         # mode the pipeline falls back PlanetScope -> Sentinel-2 -> Landsat silently,

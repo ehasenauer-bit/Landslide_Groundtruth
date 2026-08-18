@@ -68,6 +68,8 @@ from qgis.core import (
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import sar_change
+from . import layer_group as lg
+from .flow_layout import FlowRow
 from .task import PipelineTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
 
@@ -81,6 +83,13 @@ PC_TOKEN_URL = f"https://planetarycomputer.microsoft.com/api/sas/v1/token/{COLLE
 # Planetary Computer Explorer itself uses for the VV grayscale render; RTC
 # normalization is why one fixed stretch reads well across scenes and dates.
 DEFAULT_STRETCH = 0.20
+
+# "Preview on map (quick)" renders a small fixed-size image for speed — coarse
+# pixels, no client-side smoothing, thrown away after — so it appears almost
+# immediately at any AOI size. "Run (full detail)" instead honors the Pixel size
+# combo and saves a GeoTIFF. This is the quick preview's square dimension in px:
+# small enough to render/download fast, big enough to read the scene at a glance.
+PREVIEW_PX = 384
 
 # selectable polarizations (VV is the standard choice for land/landslides; VH
 # is more sensitive to volume scattering/vegetation structure)
@@ -172,14 +181,19 @@ class SarTab(QWidget):
         self._tif_replies = []           # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0
         self._preview_added = []         # raster layers added by the current preview
+        self._amp_group = None           # layer-tree folder the amplitude preview loads into
         self._preview_failed = []
+        self._preview_mode = "preview"   # 'preview' (quick) | 'run' (full detail + save)
+        self._preview_res = None         # effective render resolution of the last render
+        self._preview_smooth = 0         # median window applied to the last render (0=off)
+        self._preview_saved = []         # GeoTIFF paths saved by the current Run
         self._gallery_replies = []       # in-flight quicklook-thumbnail requests
         self._footprint_layers = []      # scene-footprint vector layers on the map
         self._cd_replies = []            # in-flight change-detection downloads
         self._cd_pending = 0
         self._cd_paths = {}              # role ('pre0'…/'post') -> tif path
         self._cd_meta = None             # products/pol/window of the running compute
-        self._cd_last_layers = []        # newest change maps (kept above context)
+        self._cd_last_layers = []        # newest change maps (kept above amplitude previews)
         self._build_ui()
 
     # ---------- UI ----------
@@ -254,27 +268,43 @@ class SarTab(QWidget):
         root.addWidget(self._build_filter_box())
 
         # --- buttons ---
-        btn_row = QHBoxLayout()
+        # FlowRow (not a fixed QHBoxLayout) so the four buttons wrap onto a
+        # second line instead of clipping their labels in a narrow dock.
+        btn_row = FlowRow()
         self.search_btn = QPushButton("Search (free)")
         self.search_btn.setToolTip(
             "Free STAC search for candidate before/after Sentinel-1 RTC scenes. "
             "Nothing is downloaded; no cloud filter is needed (radar sees through "
             "cloud).")
         self.search_btn.clicked.connect(self._search)
-        self.map_preview_btn = QPushButton("Preview on map")
+        self.map_preview_btn = QPushButton("Preview on map (quick)")
         self.map_preview_btn.setToolTip(
-            "Render the TICKED scene(s) — or the best same-track before/after "
-            "pair if nothing is ticked — as grayscale amplitude clipped to the "
-            "AOI, straight onto the canvas. Double-click a row to preview just "
-            "that scene. Toggle the layers to compare before vs after.")
+            "FAST, coarse look: render the TICKED scene(s) — or the best "
+            "same-track before/after pair if nothing is ticked — as grayscale "
+            "amplitude clipped to the AOI, at a small fixed resolution and with "
+            "no smoothing, so it appears almost immediately. Double-click a row "
+            "to preview just that scene. Use 'Run (full detail)' for the full-"
+            "resolution render. Toggle the layers to compare before vs after.")
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
+        self.run_btn = QPushButton("Run (full detail)")
+        self.run_btn.setToolTip(
+            "Full-resolution render of the same scene(s) at the Pixel size and "
+            "speckle filter set in 'Display && pairing options', and SAVES each "
+            "as a GeoTIFF under the tab's output folder "
+            "(out/interactive/sar/amplitude) so it persists after the session. "
+            "Lands in the same 'SAR …/… amplitude' layer folder, replacing the "
+            "quick preview. Slower than Preview — a full-size AOI render can take "
+            "a few seconds when the endpoint is cold.")
+        self.run_btn.setEnabled(False)
+        self.run_btn.clicked.connect(self._run_full)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        for b in (self.search_btn, self.map_preview_btn, self.cancel_btn):
+        for b in (self.search_btn, self.map_preview_btn, self.run_btn,
+                  self.cancel_btn):
             btn_row.addWidget(b)
-        root.addLayout(btn_row)
+        root.addWidget(btn_row)
 
         self.footprint_check = QCheckBox("Show scene footprints on map")
         self.footprint_check.setToolTip(
@@ -548,7 +578,12 @@ class SarTab(QWidget):
         checks_row = QVBoxLayout()
         checks_row.setContentsMargins(0, 0, 0, 0)
         for key, label, need, default in CD_PRODUCTS:
-            cb = QCheckBox(label)
+            # Surface the before-scene requirement in the label so it's visible
+            # before ticking (the "before" count is what blocks a run). "N+" for
+            # the detectors that also use extra before-scenes; a plain count for
+            # log-ratio, which uses exactly one.
+            req = "1 before" if need == 1 else f"{need}+ before"
+            cb = QCheckBox(f"{label}  (needs {req})")
             cb.setChecked(default)
             cb.setToolTip(cd_tips[key])
             self.cd_product_checks[key] = cb
@@ -566,29 +601,15 @@ class SarTab(QWidget):
             "7×7 at 10 m px ≈ 70 m — close to the paper's 16×16 at 3 m.")
         form.addRow("Stat window", self.cd_window_combo)
 
-        # the change map is TRANSPARENT wherever the pixel looks normal, so on
-        # an empty canvas a quiet result looks like nothing happened — render
-        # the compared amplitude scenes beneath it by default
-        self.cd_context_check = QCheckBox(
-            "Show the compared before/after amplitude beneath the change map")
-        self.cd_context_check.setChecked(True)
-        self.cd_context_check.setToolTip(
-            "The change map only colors anomalous pixels — everywhere normal "
-            "is transparent by design. This loads the nearest before scene and "
-            "the after scene as grayscale amplitude under the overlay, so the "
-            "result always has visual context (and a blank-looking map means "
-            "'no anomalies', not 'nothing happened').")
-        form.addRow(self.cd_context_check)
-
         # compute the maps and log their statistics without adding any layer to
         # the canvas — for checking whether a method/window/filter combination
         # is worth rendering before you clutter the map with it
         self.cd_stats_only_check = QCheckBox("Compute stats only (no map layer)")
         self.cd_stats_only_check.setToolTip(
             "Run the detectors and print each product's coverage and anomaly "
-            "spread to the Log, but don't add any raster layer (or the "
-            "amplitude context) to the map. Useful for comparing windows and "
-            "filters quickly without piling up layers.")
+            "spread to the Log, but don't add any raster layer to the map. "
+            "Useful for comparing windows and filters quickly without piling "
+            "up layers.")
         form.addRow(self.cd_stats_only_check)
 
         self.cd_btn = QPushButton("Compute change map")
@@ -865,6 +886,7 @@ class SarTab(QWidget):
             self._append_log("note: " + note)
         npre, npost = len(result.get("pre", [])), len(result.get("post", []))
         self.map_preview_btn.setEnabled(bool(npre or npost))
+        self.run_btn.setEnabled(bool(npre or npost))
         self.cd_btn.setEnabled(bool(npre and npost))
         self.iface.messageBar().pushInfo(
             "SAR", f"Found {npre} pre / {npost} post Sentinel-1 scene(s) "
@@ -1261,13 +1283,13 @@ class SarTab(QWidget):
         return self._labeled(picks)
 
     def _preview_row_on_map(self, item):
-        """Double-click a row -> preview exactly that one scene (ignores ticks)."""
+        """Double-click a row -> quick-preview exactly that one scene (ignores ticks)."""
         head = self.table.item(item.row(), 0)
         if head is None:
             return
         side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
         if c:
-            self._render_scenes(self._labeled([(side, c)]))
+            self._render_scenes(self._labeled([(side, c)]), mode="preview")
 
     def _aoi_bbox(self):
         """(minx, miny, maxx, maxy, radius_km) of the search AOI in lon/lat."""
@@ -1287,27 +1309,64 @@ class SarTab(QWidget):
         if not picks:
             self._warn("Run Search first — no Sentinel-1 scene to preview.")
             return
-        self._render_scenes(picks)
+        self._render_scenes(picks, mode="preview")
 
-    def _render_scenes(self, picks):
-        """Download + load the AOI amplitude render for each (label, candidate)."""
+    def _run_full(self):
+        picks = self._preview_picks()
+        if not picks:
+            self._warn("Run Search first — no Sentinel-1 scene to render.")
+            return
+        self._render_scenes(picks, mode="run")
+
+    def _render_scenes(self, picks, mode="preview"):
+        """Download + load the AOI amplitude render for each (label, candidate).
+
+        mode='preview' is the FAST coarse look: a small fixed image (PREVIEW_PX),
+        no client-side smoothing, dropped in from a throwaway temp file.
+        mode='run' is the full-detail render at the chosen Pixel size + median
+        filter, and SAVES each GeoTIFF under out/interactive/sar/amplitude so it
+        survives the session. Both land in the same "SAR <pre>/<post> amplitude"
+        folder, so a Run replaces the quick preview (and vice versa)."""
         bbox = self._aoi_bbox()
         if bbox is None:
             self._warn("Run Search first — no Sentinel-1 scene to preview.")
             return
         self.dock._ensure_network_timeout()   # AOI renders can be slow when cold
+        # Folder for the amplitude layers: "SAR <pre>/<post> amplitude" from the
+        # before/after dates in the picks (side read from the label _labeled() built).
+        pre = post = ""
+        for label, c in picks:
+            d = (c.get("date") or "")[:10]
+            if "before" in label:
+                pre = d
+            elif "after" in label:
+                post = d
+        self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude")
         self._clear_preview_layers()
-        res = self.detail_combo.currentData() or 10
-        k = self.smooth_combo.currentData()
+        minx, miny, maxx, maxy, radius = bbox
+        if mode == "run":
+            res = self.detail_combo.currentData() or 10
+            k = self.smooth_combo.currentData()
+            px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
+            res_txt = f"{res} m px"
+        else:                                    # quick preview: fixed small image
+            px = PREVIEW_PX
+            res = max(1, round(radius * 2 * 1000 / px))   # effective, for the log
+            k = 0                                         # skip smoothing for speed
+            res_txt = f"~{res} m px"
+        self._preview_mode = mode
+        self._preview_res = res
+        self._preview_smooth = k
+        self._preview_saved = []
         smooth = f", median {k}×{k}" if k else ""
+        head = "Run (full detail)" if mode == "run" else "Preview (quick)"
         self._append_log(
-            f"Preview on map: rendering {len(picks)} amplitude scene(s) over the "
-            f"AOI ({self._render_desc()} grayscale, {res} m px{smooth})…")
+            f"{head}: rendering {len(picks)} amplitude scene(s) over the AOI "
+            f"({self._render_desc()} grayscale, {res_txt}{smooth})…")
         self.map_preview_btn.setEnabled(False)
+        self.run_btn.setEnabled(False)
         self._preview_failed = []
         self._tif_pending = len(picks)
-        minx, miny, maxx, maxy, radius = bbox
-        px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
         for label, c in picks:
             self._append_log(f"  {label}")
             url = self._with_key(
@@ -1318,9 +1377,28 @@ class SarTab(QWidget):
             reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
             self._tif_replies.append(reply)
             reply.finished.connect(
-                lambda r=reply, l=label: self._tif_loaded(r, l))
+                lambda r=reply, l=label, cand=c: self._tif_loaded(r, l, cand))
 
-    def _tif_loaded(self, reply, label):
+    def _amp_out_dir(self):
+        """Output folder for saved Run amplitude GeoTIFFs, mirroring _collect's
+        search dir: <output or project/out/interactive>/sar/amplitude."""
+        base = self.dock.out_edit.text().strip() or os.path.join(
+            self.dock.project_edit.text().strip(), "out", "interactive")
+        return os.path.join(base, "sar", "amplitude")
+
+    def _amp_save_path(self, c, res):
+        """Persistent path for a Run amplitude GeoTIFF. The filename encodes
+        date/orbit/track/polarization/resolution, so re-running a scene at the
+        same settings overwrites its file instead of piling up copies."""
+        out = self._amp_out_dir()
+        os.makedirs(out, exist_ok=True)
+        date = (c.get("date") or "")[:10] or "undated"
+        orbit = (c.get("orbit_state") or "")[:4] or "orb"
+        track = c.get("relative_orbit")
+        pol = self._pol_for(c.get("polarizations")).upper()
+        return os.path.join(out, f"S1_{date}_{orbit}_t{track}_{pol}_{res}m.tif")
+
+    def _tif_loaded(self, reply, label, cand):
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
@@ -1330,20 +1408,33 @@ class SarTab(QWidget):
         added = False
         if ok and data:
             try:
-                fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_sar_")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                k = self.smooth_combo.currentData()
+                # Run saves a persistent GeoTIFF in the output folder; Preview
+                # uses a throwaway temp file (fast, coarse look).
+                if self._preview_mode == "run":
+                    path = self._amp_save_path(cand, self._preview_res)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                else:
+                    fd, path = tempfile.mkstemp(suffix=".tif",
+                                                prefix="landslide_sar_")
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                k = self._preview_smooth
                 if k:
                     self._apply_median(path, k)
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
-                    QgsProject.instance().addMapLayer(lyr)
+                    lg.add_to_group(lyr, self._amp_group)
                     self._preview_added.append(lyr)
-                    self._append_log(f"  loaded {label}")
+                    if self._preview_mode == "run":
+                        self._preview_saved.append(path)
+                        self._append_log(
+                            f"  loaded {label} → saved {os.path.basename(path)}")
+                    else:
+                        self._append_log(f"  loaded {label}")
                     added = True
-            except OSError:
-                pass
+            except OSError as e:
+                self._append_log(f"  write failed for {label}: {e}")
         if not added:
             self._preview_failed.append(label)
             hint = " (HTTP 401/403 — check the key)" if status in (401, 403) else ""
@@ -1385,9 +1476,9 @@ class SarTab(QWidget):
                 f"    median filter skipped ({type(e).__name__}: {e})")
 
     def _raise_cd_layer(self):
-        """Keep the newest change maps above the amplitude context layers —
-        addMapLayer stacks new layers on top, so the async preview renders
-        would otherwise bury the overlays they exist to support."""
+        """Keep the newest change maps above any amplitude preview layers —
+        addMapLayer stacks new layers on top, so a Preview/Run render loaded
+        after a change map would otherwise bury the overlays."""
         root = QgsProject.instance().layerTreeRoot()
         for lyr in reversed(self._cd_last_layers):
             try:
@@ -1403,11 +1494,17 @@ class SarTab(QWidget):
 
     def _finish_map_preview(self):
         self.map_preview_btn.setEnabled(bool(self._search_result))
+        self.run_btn.setEnabled(bool(self._search_result))
         self._raise_cd_layer()
         if self._preview_added:
             self._zoom_to_aoi()
-            msg = (f"Loaded {len(self._preview_added)} SAR amplitude scene(s) over "
-                   f"the AOI. Toggle the layers to compare before vs after.")
+            kind = "full-detail" if self._preview_mode == "run" else "quick"
+            msg = (f"Loaded {len(self._preview_added)} {kind} SAR amplitude "
+                   f"scene(s) over the AOI. Toggle the layers to compare before "
+                   f"vs after.")
+            if self._preview_saved:
+                msg += (f" Saved {len(self._preview_saved)} GeoTIFF(s) to "
+                        f"{self._amp_out_dir()}.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("SAR", msg)
@@ -1416,10 +1513,7 @@ class SarTab(QWidget):
 
     def _clear_preview_layers(self):
         for lyr in self._preview_added:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_added = []
 
     def _zoom_to_aoi(self):
@@ -1787,6 +1881,10 @@ class SarTab(QWidget):
         pre_d = (roles[pre_roles[0]].get("date") or "")[:10]
         post_d = (roles["post"].get("date") or "")[:10]
         tail = f"(t{track} {pol}, {k}×{k})"
+        # short product tag per change metric, for the layer-tree subfolder name
+        CD_PRODUCT = {"logratio": "Log-ratio", "intcorr": "Int-corr",
+                      "tsint": "Brightness-z", "mtcorr": "MT-corr"}
+        cd_group = None                  # this compute's own folder (opened lazily)
         added = computed = 0
         for mkey, out in outs:
             if mkey == "logratio":
@@ -1849,7 +1947,11 @@ class SarTab(QWidget):
                     self._warn(f"{label}: result raster failed to load.")
                     continue
                 self._style_cd_layer(lyr, mkey)
-                QgsProject.instance().addMapLayer(lyr)
+                if cd_group is None:
+                    cd_group = lg.new_group(
+                        lg.name("SAR", lg.date_pair(pre_d, post_d), "change"))
+                sub = lg.subgroup(cd_group, CD_PRODUCT.get(mkey, mkey))
+                lg.add_to(lyr, sub)
                 self._cd_last_layers.append(lyr)
                 added += 1
             computed += 1
@@ -1899,14 +2001,11 @@ class SarTab(QWidget):
         self._zoom_to_aoi()
         self.iface.messageBar().pushInfo(
             "SAR", f"{added} change layer(s) added — colored = anomalous, "
-                   "transparent = normal (per-layer stats in the Log). Wet "
-                   "snow / melt between scenes also reads as change — verify "
-                   "candidates against imagery.")
-        # amplitude context beneath the overlays, so a quiet (mostly
-        # transparent) result never reads as a blank canvas
-        if self.cd_context_check.isChecked():
-            self._render_scenes(self._labeled(
-                [("pre", roles[pre_roles[0]]), ("post", roles["post"])]))
+                   "transparent = normal (per-layer stats in the Log). A "
+                   "blank-looking map means 'no anomalies' — use Preview on "
+                   "map for grayscale amplitude beneath. Wet snow / melt "
+                   "between scenes also reads as change — verify candidates "
+                   "against imagery.")
 
     def _style_cd_layer(self, lyr, method):
         """Pseudocolor with alpha: no-change fades out so the map shows through.
@@ -2033,10 +2132,11 @@ class SarTab(QWidget):
         self.progress.setVisible(on)
         self.search_btn.setEnabled(not on)
         self.cancel_btn.setEnabled(on)
-        self.map_preview_btn.setEnabled(
-            (not on) and bool(self._search_result and
-                              (self._search_result.get("pre") or
-                               self._search_result.get("post"))))
+        have = bool(self._search_result and
+                    (self._search_result.get("pre") or
+                     self._search_result.get("post")))
+        self.map_preview_btn.setEnabled((not on) and have)
+        self.run_btn.setEnabled((not on) and have)
         self.cd_btn.setEnabled(
             (not on) and bool(self._search_result and
                               self._search_result.get("pre") and
