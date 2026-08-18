@@ -960,22 +960,33 @@ _VIEWER_JS = r'''
         prev=scr; prevVis=vis;
       }
     }
+    // Render the patch as a CUT-OUT BLOCK: fill the front-facing perimeter walls from
+    // the terrain surface down to the floor, so the axes sit flush on a solid block
+    // rather than floating above a detached surface. (Corner drop-lines were invisible
+    // here -- front corners are low, back corners hidden behind the mountain.)
+    var eyeW = eyePos();
+    [[bb.y0,bb.x0,bb.x1,"y", eyeW[1]<bb.y0],
+     [bb.y1,bb.x0,bb.x1,"y", eyeW[1]>bb.y1],
+     [bb.x0,bb.y0,bb.y1,"x", eyeW[0]<bb.x0],
+     [bb.x1,bb.y0,bb.y1,"x", eyeW[0]>bb.x1]].forEach(function (Wl) {
+      if (!Wl[4]) return;                                  // front-facing walls only
+      var Nn=56, top=[], bot=[];
+      for (var s=0;s<=Nn;s++){ var t=Wl[1]+(Wl[2]-Wl[1])*s/Nn;
+        var px=(Wl[3]==="x")?Wl[0]:t, py=(Wl[3]==="x")?t:Wl[0];
+        var ps=project(mvp,[px,py,sampleZ(px,py)],W,H), pf=project(mvp,[px,py,zBot],W,H);
+        if(ps&&pf){ top.push(ps); bot.push(pf); }
+      }
+      if (top.length<2) return;
+      ctx.beginPath(); ctx.moveTo(top[0][0],top[0][1]);
+      for (var i=1;i<top.length;i++) ctx.lineTo(top[i][0],top[i][1]);
+      for (var j=bot.length-1;j>=0;j--) ctx.lineTo(bot[j][0],bot[j][1]);
+      ctx.closePath(); ctx.fillStyle="rgba(104,110,122,0.85)"; ctx.fill();
+    });
+    // FLOOR rectangle + ticked axes, drawn on top of the block base.
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
-    // FLOOR rectangle (no box lid). The elevation + distance axes draw their own
-    // ticked edges, so the scale is there without the stray sky-going posts.
     [["000","100"],["010","110"],["000","010"],["100","110"]].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
-    // faint vertical drop-lines from each floor corner UP TO the terrain surface,
-    // so the box visibly connects to the patch (occlusion hides those behind the
-    // mountain). Not full posts -- they stop at the ground, not the sky.
-    ctx.save();
-    ctx.strokeStyle = "rgba(234,240,250,0.5)"; ctx.lineWidth = Math.max(1.4, W/1050);
-    [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
-      var cxw=b[0]?bb.x1:bb.x0, cyw=b[1]?bb.y1:bb.y0, zs=sampleZ(cxw,cyw);
-      if (zs > zBot + 1) drawEdge3D([cxw,cyw,zBot], [cxw,cyw,zs]);
-    });
-    ctx.restore();
     // origin = the LOWEST bottom corner on screen (front apex of the outline), so the
     // two distance axes ride the outer lower-left / lower-right silhouette edges and
     // never cross the terrain -- consistent framing at any orbit.
