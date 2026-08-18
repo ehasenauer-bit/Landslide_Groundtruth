@@ -1185,7 +1185,7 @@ _VIEWER_JS = r'''
       var nm=["before.png","after.png","after_overlays.png"];
       shots.forEach(function(s,i){ files.push({name:nm[i]||("panel"+(i+1)+".png"), data:pngBytes(s.img)}); });
       var orb=renderOrbitFrames(24, 480, 270);
-      files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 8)});
+      files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 16)});   // 16cs/frame = half speed
       var blob=new Blob([zipStore(files)], {type:"application/zip"});
       var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="landslide_3d_bundle.zip";
       document.body.appendChild(a); a.click();
