@@ -967,13 +967,13 @@ _VIEWER_JS = r'''
     [["000","100"],["010","110"],["000","010"],["100","110"]].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
-    // origin = the bottom corner nearest the camera, so the two horizontal axes
-    // fall on front-facing edges and read cleanly.
-    var eye = eyePos(), O=null, best=1e18;
+    // origin = the LOWEST bottom corner on screen (front apex of the outline), so the
+    // two distance axes ride the outer lower-left / lower-right silhouette edges and
+    // never cross the terrain -- consistent framing at any orbit.
+    var O=null, best=-1e18;
     [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
-      var w = corner(b[0],b[1],0);
-      var dd = (w[0]-eye[0])*(w[0]-eye[0]) + (w[1]-eye[1])*(w[1]-eye[1]) + (w[2]-eye[2])*(w[2]-eye[2]);
-      if (dd < best) { best=dd; O=b; }
+      var p = Cp[b[0]+""+b[1]+"0"];
+      if (p && p[1] > best) { best=p[1]; O=b; }
     });
     if (!O) return;
     var ix=O[0], iy=O[1];
