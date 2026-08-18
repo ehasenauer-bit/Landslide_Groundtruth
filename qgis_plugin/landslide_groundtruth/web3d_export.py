@@ -1085,6 +1085,115 @@ _VIEWER_JS = r'''
     leader(pc); leader(pe);
     ctx.restore();
   }
+  // ============ download bundle: hand-rolled ZIP + inline GIF encoder ============
+  function dataURLBytes(url){ var b=atob(url.split(",")[1]), n=b.length, a=new Uint8Array(n);
+    for(var i=0;i<n;i++) a[i]=b.charCodeAt(i); return a; }
+  function pngBytes(cv){ return dataURLBytes(cv.toDataURL("image/png")); }
+  var _crcT=null;
+  function crc32(buf){ if(!_crcT){ _crcT=new Uint32Array(256);
+      for(var n=0;n<256;n++){ var c=n; for(var k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1); _crcT[n]=c>>>0; } }
+    var crc=0xFFFFFFFF; for(var i=0;i<buf.length;i++) crc=_crcT[(crc^buf[i])&255]^(crc>>>8); return (crc^0xFFFFFFFF)>>>0; }
+  function zipStore(files){                       // files: [{name, data:Uint8Array}], STORED (no compress)
+    var parts=[], cds=[], off=0;
+    function u16(v){ return [v&255,(v>>8)&255]; } function u32(v){ return [v&255,(v>>8)&255,(v>>16)&255,(v>>24)&255]; }
+    files.forEach(function(f){
+      var nm=[]; for(var i=0;i<f.name.length;i++) nm.push(f.name.charCodeAt(i)&255);
+      var crc=crc32(f.data), sz=f.data.length;
+      var lfh=[0x50,0x4b,0x03,0x04].concat(u16(20),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(sz),u32(sz),u16(nm.length),u16(0),nm);
+      parts.push(new Uint8Array(lfh)); parts.push(f.data);
+      cds.push(new Uint8Array([0x50,0x4b,0x01,0x02].concat(u16(20),u16(20),u16(0),u16(0),u16(0),u16(0),
+        u32(crc),u32(sz),u32(sz),u16(nm.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(off),nm)));
+      off+=lfh.length+sz;
+    });
+    var cdSz=0; cds.forEach(function(c){ cdSz+=c.length; });
+    var eocd=new Uint8Array([0x50,0x4b,0x05,0x06].concat(u16(0),u16(0),u16(files.length),u16(files.length),u32(cdSz),u32(off),u16(0)));
+    var tot=off+cdSz+eocd.length, out=new Uint8Array(tot), pos=0;
+    parts.forEach(function(c){ out.set(c,pos); pos+=c.length; });
+    cds.forEach(function(c){ out.set(c,pos); pos+=c.length; }); out.set(eocd,pos);
+    return out;
+  }
+  function quantize(px, maxC){                     // median-cut -> up to maxC colours
+    function mk(a){ var r0=255,r1=0,g0=255,g1=0,b0=255,b1=0;
+      for(var i=0;i<a.length;i++){ var p=a[i]; if(p[0]<r0)r0=p[0]; if(p[0]>r1)r1=p[0]; if(p[1]<g0)g0=p[1]; if(p[1]>g1)g1=p[1]; if(p[2]<b0)b0=p[2]; if(p[2]>b1)b1=p[2]; }
+      return {a:a,rr:r1-r0,gr:g1-g0,br:b1-b0}; }
+    var boxes=[mk(px)];
+    while(boxes.length<maxC){
+      var bi=-1,bs=-1; for(var i=0;i<boxes.length;i++){ var b=boxes[i], m=Math.max(b.rr,b.gr,b.br); if(b.a.length>1&&m>bs){bs=m;bi=i;} }
+      if(bi<0) break; var b=boxes[bi], ch=(b.rr>=b.gr&&b.rr>=b.br)?0:(b.gr>=b.br?1:2);
+      b.a.sort(function(p,q){ return p[ch]-q[ch]; }); var mid=b.a.length>>1;
+      boxes.splice(bi,1,mk(b.a.slice(0,mid)),mk(b.a.slice(mid)));
+    }
+    return boxes.map(function(b){ var r=0,g=0,bl=0,n=b.a.length||1; for(var i=0;i<b.a.length;i++){ r+=b.a[i][0]; g+=b.a[i][1]; bl+=b.a[i][2]; }
+      return [Math.round(r/n),Math.round(g/n),Math.round(bl/n)]; });
+  }
+  function gifEncode(frames, w, h, delayCs){
+    var sample=[], tot=w*h, step=Math.max(1, ((tot*frames.length)/20000)|0);
+    for(var fi=0;fi<frames.length;fi++){ var fr=frames[fi]; for(var i=0;i<tot;i+=step) sample.push([fr[i*4],fr[i*4+1],fr[i*4+2]]); }
+    var pal=quantize(sample,256); while(pal.length<256) pal.push([0,0,0]);
+    var lut=new Uint8Array(32768);
+    for(var q=0;q<32768;q++){ var r=((q>>10)&31)<<3,g=((q>>5)&31)<<3,bb=(q&31)<<3,best=0,bd=1e12;
+      for(var p=0;p<256;p++){ var dr=r-pal[p][0],dg=g-pal[p][1],db=bb-pal[p][2],dd=dr*dr+dg*dg+db*db; if(dd<bd){bd=dd;best=p;} } lut[q]=best; }
+    var out=[]; function B(v){ out.push(v&255); } function S(s){ for(var i=0;i<s.length;i++) out.push(s.charCodeAt(i)); }
+    S("GIF89a"); B(w);B(w>>8);B(h);B(h>>8); B(0xF7);B(0);B(0);
+    for(var i=0;i<256;i++){ B(pal[i][0]);B(pal[i][1]);B(pal[i][2]); }
+    B(0x21);B(0xFF);B(0x0B);S("NETSCAPE2.0");B(0x03);B(0x01);B(0);B(0);B(0);   // loop forever
+    for(var fi2=0;fi2<frames.length;fi2++){
+      B(0x21);B(0xF9);B(0x04);B(0x00);B(delayCs&255);B((delayCs>>8)&255);B(0);B(0);
+      B(0x2C);B(0);B(0);B(0);B(0);B(w);B(w>>8);B(h);B(h>>8);B(0);
+      var rgba=frames[fi2], idx=new Uint8Array(tot);
+      for(var i=0;i<tot;i++) idx[i]=lut[((rgba[i*4]>>3)<<10)|((rgba[i*4+1]>>3)<<5)|(rgba[i*4+2]>>3)];
+      B(8); var lz=lzwEncode(8, idx);
+      for(var pp=0;pp<lz.length;){ var n=Math.min(255,lz.length-pp); B(n); for(var k=0;k<n;k++) B(lz[pp+k]); pp+=n; } B(0);
+    }
+    B(0x3B); return Uint8Array.from(out);
+  }
+  function lzwEncode(minCode, idx){
+    var clr=1<<minCode, eoi=clr+1, out=[], cur=0, bits=0, cs, nxt;
+    var dict=new Int32Array(4096*256);
+    function outp(code){ cur|=code<<bits; bits+=cs; while(bits>=8){ out.push(cur&255); cur>>>=8; bits-=8; } }
+    function rst(){ dict.fill(0); cs=minCode+1; nxt=eoi+1; }
+    rst(); outp(clr); var pfx=idx[0];
+    for(var i=1;i<idx.length;i++){ var c=idx[i], key=pfx*256+c, e=dict[key];
+      if(e!==0){ pfx=e; }
+      else { outp(pfx);
+        if(nxt<4096){ if(nxt===(1<<cs)&&cs<12) cs++; dict[key]=nxt++; }
+        else { outp(clr); rst(); }
+        pfx=c; } }
+    outp(pfx); outp(eoi); if(bits>0) out.push(cur&255); return out;
+  }
+  // Clean orbit frames (after imagery + overlays, no axes) for the GIF.
+  function renderOrbitFrames(nF, gw, gh){
+    var sw=canvas.width, sh=canvas.height, sa=active, saz=cam.az, sel=cam.el, sd=cam.dist, stg=cam.tgt.slice(), sv={};
+    for(var k in vis) sv[k]=vis[k];
+    canvas.width=gw; canvas.height=gh; gl.viewport(0,0,gw,gh);
+    active=1; for(var k2 in vis) vis[k2]=true;
+    var bb=dataBBox(), zB=(zmin-zmid)*exag, zT=(zmax-zmid)*exag;
+    var rx=(bb.x1-bb.x0)/2, ry=(bb.y1-bb.y0)/2, rz=(zT-zB)/2, R=Math.sqrt(rx*rx+ry*ry+rz*rz)||meshSpan()*0.5;
+    cam.tgt=[(bb.x0+bb.x1)/2,(bb.y0+bb.y1)/2,(zB+zT)/2]; cam.dist=R/Math.sin(45*Math.PI/180/2)*1.1; cam.el=0.52;
+    var az0=cam.az, tmp=document.createElement("canvas"); tmp.width=gw; tmp.height=gh; var t2=tmp.getContext("2d");
+    var frames=[];
+    for(var f=0;f<nF;f++){ cam.az=az0+f*(2*Math.PI/nF); renderScene(true);
+      t2.clearRect(0,0,gw,gh); t2.drawImage(canvas,0,0); frames.push(new Uint8Array(t2.getImageData(0,0,gw,gh).data)); }
+    active=sa; for(var k3 in vis) vis[k3]=sv[k3];
+    cam.az=saz; cam.el=sel; cam.dist=sd; cam.tgt=stg;
+    canvas.width=sw; canvas.height=sh; gl.viewport(0,0,sw,sh); positionLabels(renderScene(true)); draw();
+    return {frames:frames, w:gw, h:gh};
+  }
+  function buildBundle(fig, shots, status, done){
+    try {
+      var files=[{name:"slide.png", data:pngBytes(fig)}];
+      var nm=["before.png","after.png","after_overlays.png"];
+      shots.forEach(function(s,i){ files.push({name:nm[i]||("panel"+(i+1)+".png"), data:pngBytes(s.img)}); });
+      var orb=renderOrbitFrames(24, 480, 270);
+      files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 8)});
+      var blob=new Blob([zipStore(files)], {type:"application/zip"});
+      var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="landslide_3d_bundle.zip";
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
+      status.textContent="Done ✓  landslide_3d_bundle.zip";
+    } catch(e){ status.textContent="Error: "+(e&&e.message||e); }
+    done();
+  }
   function exportFigure() {
     // 16:9 slide, 2x2 grid: Before | After / After+overlays | Details
     var FW=1920, FH=1080, m=24, TH=54, capH=28;
@@ -1169,12 +1278,20 @@ _VIEWER_JS = r'''
     var url = fig.toDataURL("image/png");
     var ov = document.createElement("div"); ov.id = "exportModal";
     var bar = document.createElement("div"); bar.className = "exp-bar";
-    var dl = document.createElement("a"); dl.className = "btn"; dl.textContent = "⬇ Download PNG";
+    var zb = document.createElement("button"); zb.className = "btn";
+    zb.textContent = "⬇ Download ZIP (slide + panels + orbit GIF)";
+    var st = document.createElement("span");
+    st.style.cssText = "color:#cbd5e6;font:13px sans-serif;align-self:center;margin:0 6px;";
+    var dl = document.createElement("a"); dl.className = "btn"; dl.textContent = "PNG only";
     dl.href = url; dl.download = "landslide_3d_figure.png";
     var cl = document.createElement("button"); cl.className = "btn"; cl.textContent = "Close";
     cl.onclick = function () { document.body.removeChild(ov); };
+    zb.onclick = function () {
+      zb.disabled = true; st.textContent = "Rendering orbit + encoding GIF… (a few seconds)";
+      setTimeout(function () { buildBundle(fig, shots, st, function () { zb.disabled = false; }); }, 40);
+    };
     var im = document.createElement("img"); im.src = url;
-    bar.appendChild(dl); bar.appendChild(cl);
+    bar.appendChild(zb); bar.appendChild(st); bar.appendChild(dl); bar.appendChild(cl);
     ov.appendChild(bar); ov.appendChild(im);
     document.body.appendChild(ov);
   }
