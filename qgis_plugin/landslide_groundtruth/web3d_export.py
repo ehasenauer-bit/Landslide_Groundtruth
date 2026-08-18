@@ -961,12 +961,21 @@ _VIEWER_JS = r'''
       }
     }
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
-    // FLOOR rectangle only: no box lid and no vertical corner posts (those stuck up
-    // into empty sky). The elevation + distance axes draw their own edges with ticks,
-    // so the scale is still there without the stray frame lines.
+    // FLOOR rectangle (no box lid). The elevation + distance axes draw their own
+    // ticked edges, so the scale is there without the stray sky-going posts.
     [["000","100"],["010","110"],["000","010"],["100","110"]].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
     });
+    // faint vertical drop-lines from each floor corner UP TO the terrain surface,
+    // so the box visibly connects to the patch (occlusion hides those behind the
+    // mountain). Not full posts -- they stop at the ground, not the sky.
+    ctx.save();
+    ctx.strokeStyle = "rgba(234,240,250,0.5)"; ctx.lineWidth = Math.max(1.4, W/1050);
+    [[0,0],[1,0],[0,1],[1,1]].forEach(function (b) {
+      var cxw=b[0]?bb.x1:bb.x0, cyw=b[1]?bb.y1:bb.y0, zs=sampleZ(cxw,cyw);
+      if (zs > zBot + 1) drawEdge3D([cxw,cyw,zBot], [cxw,cyw,zs]);
+    });
+    ctx.restore();
     // origin = the LOWEST bottom corner on screen (front apex of the outline), so the
     // two distance axes ride the outer lower-left / lower-right silhouette edges and
     // never cross the terrain -- consistent framing at any orbit.
