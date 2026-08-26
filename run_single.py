@@ -86,6 +86,14 @@ def _write_render_json(a, event_id, r):
                     black=a.planet_black if a.planet_black is not None else 0.0)
         out["stretch"] = dict(tone)
         render = rp._linear
+    elif a.planet_tone == "hdr":
+        # HDR (exposure fusion): renders and fuses its own spread of exposures
+        # (rp.HDR_WHITES), so there is no single white point and no auto-stretch — the fusion
+        # IS the dynamic-range fit. Honours knee + contrast; the manual white/black don't apply.
+        tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None else rp.CONTRAST,
+                    knee=a.planet_knee if a.planet_knee is not None else rp.KNEE)
+        out["stretch"] = {"hdr": "adaptive exposures"}   # per-scene, see review_package._hdr_whites
+        render = rp._highlight_hdr
     else:
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
                     else rp.CONTRAST)
@@ -128,6 +136,12 @@ def _write_render_json(a, event_id, r):
         except Exception as e:
             out["notes"].append(f"{side}: render failed: {e}")
     out["notes"] += r.get("notes", [])
+    out["toa"] = bool(r.get("toa"))   # DN/TOA render vs SR — the plugin labels the layer
+    # scene ids actually composited per side, so the plugin can date the layers on ANY path
+    # (render/recall/re-tone) — not just when it launched the render with the scenes ticked.
+    out["scenes"] = r.get("scenes") or {
+        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
+        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
     orders = r.get("pending") or {}
     if orders:
         out["pending"] = {"orders": orders, "lat": a.lat, "lon": a.lon,
@@ -341,6 +355,14 @@ def main():
                          "write <out>/render.json with the layer paths. Unlike the free "
                          "tile preview this PLACES A PLANET ORDER (uses quota); used by "
                          "the plugin's PlanetScope tab.")
+    ap.add_argument("--planet-toa", action="store_true",
+                    help="with --planet-render, order the DN ('analytic') product instead "
+                         "of surface reflectance and convert it to TOA reflectance + "
+                         "white-balance its atmospheric cast ourselves (see planet_imagery "
+                         "TOA_BUNDLE / _toa_from_dn / _balance_cast). Avoids Planet's SR "
+                         "atmospheric correction, which over-corrects bright snow/ice. A "
+                         "recall/re-tone of a DN order is detected from the files, so this "
+                         "flag is only needed at order time.")
     ap.add_argument("--planet-recall", action="store_true",
                     help="load PlanetScope imagery ALREADY ORDERED for this event back "
                          "onto the map from the shared order cache: no search, no order, "
@@ -383,7 +405,7 @@ def main():
                          "original render used, so it finds the same workdir. Backs the "
                          "plugin's tone-mode switch.")
     ap.add_argument("--planet-tone", default="knee",
-                    choices=["knee", "natural", "linear"],
+                    choices=["knee", "natural", "linear", "hdr"],
                     help="tone curve for the --planet-render / --planet-resume GeoTIFFs. "
                          "'knee' (DEFAULT) = highlight rolloff: a plain linear stretch "
                          "below the knee, so midtones/shadows are untouched and only "
@@ -397,7 +419,11 @@ def main():
                          "never does. See review_package.TONE_MODES. 'knee' additionally "
                          "fits its black/white points to a frame that is all snow/ice — see "
                          "--planet-no-auto-stretch; 'linear' honours --planet-white/"
-                         "--planet-black but never auto-fits.")
+                         "--planet-black but never auto-fits. 'hdr' = exposure fusion: "
+                         "renders the knee curve at several exposures and fuses them "
+                         "(Mertens) so deep shadow AND blown snow both keep detail in one "
+                         "image; it fits its own dynamic range, so white/black/auto-stretch "
+                         "don't apply (see review_package._highlight_hdr).")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "
@@ -506,6 +532,7 @@ def main():
     # which no longer handles PlanetScope — this calls planet_imagery directly.
     if a.planet_render:
         import planet_imagery as pi
+        pi.set_toa_ordering(a.planet_toa)   # order DN (TOA path) vs SR; see --planet-toa
         pre_ids = [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()]
         post_ids = [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]
         if not pre_ids and not post_ids:

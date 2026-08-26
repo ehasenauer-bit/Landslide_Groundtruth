@@ -305,6 +305,8 @@ class PlanetTab(QWidget):
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
         self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
+        self.tone_combo.addItem("HDR (exposure fusion) — shadow AND snow detail at once",
+                                "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
             "• Highlight rolloff (knee) — THE DEFAULT. A plain linear stretch below "
@@ -323,6 +325,12 @@ class PlanetTab(QWidget):
             "Bright ice clips to flat white, exactly as a naive stretch would — the point "
             "is to see the un-toned pixels. Honours the Manual stretch below, but not "
             "Auto-stretch or Contrast (neither applies).\n"
+            "• HDR (exposure fusion) — renders the rolloff curve at several exposures and "
+            "fuses them (Mertens exposure fusion), so a scene with deep shadow AND blown "
+            "snow keeps detail at BOTH ends in one image. It fits its own dynamic range, so "
+            "the white point / Auto-stretch / Manual stretch don't apply. Slower to render "
+            "(a few exposures + the fusion), the local-tone-map answer when a single white "
+            "point can't hold the scene.\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
             "once; pick None to check what the raw reflectance looks like unshaped. rolloff "
@@ -381,6 +389,30 @@ class PlanetTab(QWidget):
             "clips to near-black. Switching this is FREE — see 'Re-tone'.")
         self.autostretch_check.toggled.connect(self._on_tone_changed)
         form.addRow("Auto-stretch", self.autostretch_check)
+
+        # Order the DN ('analytic') product and do our own TOA-reflectance + haze
+        # conversion, instead of Planet's Surface Reflectance. SR over-corrects bright
+        # snow/ice (impossible >1.0 reflectance, the cyan/pink cast); TOA applies no
+        # atmospheric model so it can't over-correct, and dark-object subtraction removes
+        # the residual blue haze (see run_single --planet-toa / planet_imagery). Unlike the
+        # tone controls above this changes what is ORDERED, so it needs a fresh Render
+        # detail (a Re-tone/Recall of an existing order can't apply it) and it USES QUOTA.
+        self.toa_check = QCheckBox("Raw TOA + haze (skip Planet's SR correction)")
+        self.toa_check.setChecked(self.settings.value(
+            "landslide/planet_toa", False, type=bool))
+        self.toa_check.setToolTip(
+            "OFF (default): order Surface Reflectance (analytic_sr_udm2) — Planet's own "
+            "atmospheric correction.\n"
+            "ON: order the DN 'analytic' product (analytic_udm2) and convert it to "
+            "top-of-atmosphere reflectance with a dark-object haze removal here, skipping "
+            "Planet's SR correction. SR over-corrects bright snow/ice — impossible >1.0 "
+            "reflectance and a cyan/pink cast — because atmospheric correction over bright "
+            "targets is error-prone; TOA can't over-correct because it applies no model.\n"
+            "This changes what is ORDERED, so it takes a fresh 'Render detail' and USES "
+            "QUOTA — a Re-tone or Recall of an existing SR order can't switch to it.")
+        self.toa_check.toggled.connect(
+            lambda v: self.settings.setValue("landslide/planet_toa", v))
+        form.addRow("Product", self.toa_check)
 
         # Hard override for the stretch, for when neither the fixed curve nor the fitted
         # one is what you want. 0 = leave it to the auto-stretch above.
@@ -1285,7 +1317,15 @@ class PlanetTab(QWidget):
         for c in (self._search_result or {}).get(side, []):
             if c.get("id") == cid:
                 return (c.get("date") or "")[:10]
-        return ""
+        return self._date_from_id(cid)      # fall back to the id itself (no search needed)
+
+    @staticmethod
+    def _date_from_id(cid):
+        """PlanetScope scene id -> acquisition date, e.g. '20240131_210809_72_2479' ->
+        '2024-01-31'. '' if the id isn't date-prefixed. Lets a layer be dated straight from
+        render.json's scene ids, with no dependency on the current search result."""
+        p = (cid or "")[:8]
+        return f"{p[:4]}-{p[4:6]}-{p[6:8]}" if len(p) == 8 and p.isdigit() else ""
 
     def _preview_on_map(self):
         self._render_picks(self._preview_picks())
@@ -1457,6 +1497,8 @@ class PlanetTab(QWidget):
             "--datetime", when, "--radius-km", f"{radius:.2f}",
             "--prefer", "planet", "--planet-render", "--out", out,
         ] + self._tone_args()
+        if self.toa_check.isChecked():
+            args.append("--planet-toa")   # order DN + our TOA/haze instead of Planet SR
         if picks["pre"]:
             args += ["--pre-scene-ids", ",".join(picks["pre"])]
         if picks["post"]:
@@ -1526,7 +1568,7 @@ class PlanetTab(QWidget):
         # so it is NOT the current default leaking in here.
         tone = result.get("tone") or "natural"
         tone_word = {"knee": "rolloff", "natural": "natural",
-                     "linear": "linear"}.get(tone, "natural")
+                     "linear": "linear", "hdr": "HDR"}.get(tone, "natural")
         # Two rolloff renders of the same scene can now differ in their stretch as well
         # as their curve, so say which one this is in the layer name — otherwise a fitted
         # and an unfitted layer sit on the canvas under identical labels. A nonzero black
@@ -1535,14 +1577,29 @@ class PlanetTab(QWidget):
         if stretch.get("black"):
             kind = "stretch" if tone == "linear" else "fitted"
             tone_word += f", {kind} {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
-        # Folder name for these layers: dates from the render + the tone as the
-        # product tag, so a Re-tone of the same scenes lands in a sibling folder
-        # ("Planet 7-20/7-21 HONC" next to "… Roll off" / "… None") instead of
-        # overwriting. Dates fall back to blank on a resume/recall we didn't launch.
-        dd = self._detail_dates or {}
+        # DN/TOA render (--planet-toa) vs Planet SR: stamp it so a TOA layer is obvious
+        # next to an SR one on the canvas. render.json carries the flag (set from the
+        # actual product, so recall/re-tone of a TOA order are labelled too).
+        toa = bool(result.get("toa"))
+        if toa:
+            tone_word += ", TOA"
+        # Date the layers (and their folder) from the scenes render.json says were actually
+        # composited, so a recall or re-tone still gets "PlanetScope before <date>" naming
+        # even when we didn't launch it here (e.g. after a plugin reload cleared the labels
+        # we cache at render time). The scene id carries the date, so no search is needed.
+        scenes = result.get("scenes") or {}
+        labels = dict(self._detail_labels or {})
+        dates = dict(self._detail_dates or {})
+        for s in ("pre", "post"):
+            ids = scenes.get(s) or []
+            if ids and not dates.get(s):
+                d = self._date_from_id(ids[0])
+                dates[s] = d
+                labels.setdefault(
+                    s, f"PlanetScope {'before' if s == 'pre' else 'after'} {d}".strip())
         product = {"knee": "Roll off", "natural": "HONC",
-                   "linear": "None"}.get(tone, "HONC")
-        group = lg.name("Planet", lg.date_pair(dd.get("pre"), dd.get("post")), product)
+                   "linear": "None", "hdr": "HDR"}.get(tone, "HONC") + (" TOA" if toa else "")
+        group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")), product)
         # replace whatever the previous preview (tiles or SR) put on the map
         self._clear_preview_layers()
         self._preview_extent = None
@@ -1551,7 +1608,7 @@ class PlanetTab(QWidget):
             path = result.get(side)
             if not path or not os.path.exists(path):
                 continue
-            label = (self._detail_labels or {}).get(side) \
+            label = labels.get(side) \
                 or f"PlanetScope {'before' if side == 'pre' else 'after'}"
             label += f" · SR detail ({tone_word})"
             lyr = QgsRasterLayer(path, label)
@@ -1643,17 +1700,17 @@ class PlanetTab(QWidget):
         order shows up straight away. `entries` comes from render.json's 'available'
         block when a run just produced one; otherwise the ledger is read directly.
 
-        Orders near the AOI head the list, because those are the ones that answer
-        "do I need to spend quota on this event?". Everything else the account has
-        paid for follows under a separator instead of being dropped: before a search
-        there is often no AOI to filter on, so the picker listed the whole ledger and
-        then appeared to LOSE orders the moment you hit Search. They are all still
-        recallable — an order from another location simply composites to nothing over
-        this AOI and says so — so hiding them only made paid-for imagery unreachable."""
+        Only orders whose delivered footprint COVERS the epicentre are listed (the
+        strict pc.entries(require_point=True) filter), so the picker answers "which
+        paid-for orders actually image THIS event?" instead of the whole cumulative
+        ledger. When no AOI is known yet (no lat/lon in the form, no prior search) there
+        is nothing to filter on, so the entire ledger is shown. Trade-off, chosen
+        deliberately: an order for a different location no longer appears here — set the
+        form to that location to bring its orders back into range."""
         combo = getattr(self, "recall_combo", None)
         if combo is None:
             return
-        near, rest = entries, []
+        near = entries
         pc = self._ledger()
         if near is None:
             if pc is None:
@@ -1668,41 +1725,27 @@ class PlanetTab(QWidget):
                 # project — this runs on the GUI thread and walking venv/ would stall it.
                 pc.adopt([base_out, os.path.join(project, "out"),
                           os.path.join(project, "Output")], log=lambda *_: None)
-                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2])
+                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
+                                   require_point=True)
                         if aoi else pc.entries())
             except Exception as e:
                 self._append_log(f"could not list cached Planet orders: {e}")
                 return
-        if pc is not None:
-            try:
-                seen = {e.get("order_id") for e in near or []}
-                rest = [e for e in pc.entries() if e.get("order_id") not in seen]
-            except Exception:
-                rest = []          # the near list is the important half; don't lose it
         keep = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Newest cached order per side", None)
         n = 0
 
-        def _add(e, suffix=""):
+        def _add(e):
             oid, side = e.get("order_id"), e.get("side")
             if not oid or side not in ("pre", "post"):
                 return 0
-            combo.addItem((e.get("label") or oid) + suffix, (side, oid))
+            combo.addItem(e.get("label") or oid, (side, oid))
             return 1
 
         for e in near or []:
             n += _add(e)
-        if rest:
-            added = 0
-            mark = combo.count()
-            for e in rest:
-                # the event id is what tells these apart once they're out of area
-                added += _add(e, f" · {e.get('event_id') or 'other AOI'}")
-            if added:
-                combo.insertSeparator(mark)
-                n += added
         if keep is not None:
             idx = combo.findData(keep)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
