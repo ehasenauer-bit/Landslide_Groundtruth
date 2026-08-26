@@ -274,6 +274,7 @@ class PlanetTab(QWidget):
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
         self.coverage_combo.addItem("Cover the exact epicentre (stricter)", "point")
+        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))  # default
         self.coverage_combo.setToolTip(
             "AOI overlap: accept any scene overlapping the search box — recovers "
             "partial-coverage scenes near the event date. Epicentre: require the "
@@ -283,6 +284,7 @@ class PlanetTab(QWidget):
         self.quality_combo = QComboBox()
         self.quality_combo.addItem("Standard quality only", "standard")
         self.quality_combo.addItem("Include test-quality (match Planet Explorer)", "any")
+        self.quality_combo.setCurrentIndex(self.quality_combo.findData("any"))  # default
         self.quality_combo.setToolTip(
             "Near a fresh event the nearest/clearest scenes are often published as "
             "'test' quality (looser geo/radiometric calibration). Fine for a visual "
