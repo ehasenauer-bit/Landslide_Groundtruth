@@ -71,7 +71,7 @@ from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QPlainTextEdit, QTableWidget, QTableWidgetItem,
-    QSplitter, QFileDialog, QApplication, QHeaderView, QToolButton,
+    QSplitter, QFileDialog, QApplication, QHeaderView, QToolButton, QCheckBox,
 )
 from qgis.core import (
     Qgis, QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes,
@@ -84,6 +84,7 @@ from qgis.gui import QgsCollapsibleGroupBox
 from . import centerline as centerline_mod
 from . import volume_calc
 from . import layer_group as lg
+from .flow_layout import FlowRow
 
 
 def _utm_epsg(lat, lon):
@@ -157,6 +158,9 @@ WRITEBACK_FIELDS = [
     ("vol_m3", QVariant.Double, "v_best"),
     ("vol_lo_m3", QVariant.Double, "v_low"),
     ("vol_hi_m3", QVariant.Double, "v_high"),
+    # Elevation-change (∫Δh) fit only; None under the area-scaling fits.
+    ("vol_ero_m3", QVariant.Double, "v_erosion"),
+    ("vol_dep_m3", QVariant.Double, "v_deposit"),
 ]
 
 # Measurement units we refuse to convert from. Square degrees because QGIS only
@@ -169,8 +173,9 @@ UNUSABLE_LENGTH_UNITS = (QgsUnitTypes.DistanceDegrees,
                          QgsUnitTypes.DistanceUnknownUnit)
 
 TABLE_COLS = ["Slide", "Fit", "Material", "Total area (m²)", "V best (m³)",
-              "V low (m³)", "V high (m³)", "Src best (m²)", "Src low (m²)",
-              "Src high (m²)", "Length (m)", "Drop (m)", "Layers"]
+              "V low (m³)", "V high (m³)", "V ero (m³)", "V dep (m³)",
+              "Src best (m²)", "Src low (m²)", "Src high (m²)",
+              "Length (m)", "Drop (m)", "Layers"]
 
 # CSV header + the row keys behind it, so the export carries raw numbers rather
 # than the table's thousands-separated display strings. converted_area_m2 is the
@@ -185,6 +190,11 @@ CSV_FIELDS = [
     ("converted_area_high_m2", "a_conv_high"),
     ("volume_best_m3", "v_best"), ("volume_low_m3", "v_low"),
     ("volume_high_m3", "v_high"),
+    # ∫Δh fit only: the erosion/deposition split and the change-field stats.
+    ("volume_erosion_m3", "v_erosion"), ("volume_deposition_m3", "v_deposit"),
+    ("dh_covered_area_m2", "covered_area"), ("dh_mean_m", "mean_dh"),
+    ("dh_max_rise_m", "max_rise"), ("dh_max_drop_m", "max_drop"),
+    ("dh_grid_res_m", "ddem_res"), ("dh_raster", "ddem_name"),
     ("total_area_m2", "a_total"),
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
@@ -280,7 +290,7 @@ class VolumeTab(QWidget):
         root.addLayout(form)
 
         # --- actions ---
-        btns = QHBoxLayout()
+        btns = FlowRow()
         self.measure_btn = QPushButton("Measure")
         self.measure_btn.setToolTip(
             "Measure the assigned layers and convert the area the selected Fit "
@@ -288,18 +298,23 @@ class VolumeTab(QWidget):
             "low/high widen the range), the TOTAL area for the total fit. The "
             "outline not converted is measured and recorded alongside.")
         self.measure_btn.clicked.connect(self._measure)
+        f = self.measure_btn.font()
+        f.setBold(True)
+        self.measure_btn.setFont(f)
+        self.measure_btn.setDefault(True)
         self.add_btn = QPushButton("Add to results ↓")
         self.add_btn.setToolTip(
             "Append the measurement below to the results table and move on to "
-            "the next slide.")
+            "the next slide. Enabled after a successful Measure.")
         self.add_btn.setEnabled(False)
         self.add_btn.clicked.connect(self._add_row)
         for b in (self.measure_btn, self.add_btn):
             btns.addWidget(b)
-        root.addLayout(btns)
+        root.addWidget(btns)
 
         root.addWidget(self._build_current_box())
         root.addWidget(self._build_centerline_box())
+        root.addWidget(self._build_ddem_box())
 
         # --- results ---
         split = QSplitter(Qt.Vertical)
@@ -319,7 +334,7 @@ class VolumeTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         tl.addWidget(self.table)
 
-        rbtns = QHBoxLayout()
+        rbtns = FlowRow()
         self.write_btn = QPushButton("Write to layer")
         self.write_btn.setToolTip(
             "Stamp the numbers onto the CONVERTED outline's own feature as "
@@ -339,7 +354,7 @@ class VolumeTab(QWidget):
         self.remove_btn.clicked.connect(self._remove_rows)
         for b in (self.write_btn, self.copy_btn, self.csv_btn, self.remove_btn):
             rbtns.addWidget(b)
-        tl.addLayout(rbtns)
+        tl.addWidget(rbtns)
         split.addWidget(tablebox)
 
         logbox = QWidget()
@@ -388,7 +403,7 @@ class VolumeTab(QWidget):
         row.addWidget(refresh)
         v.addLayout(row)
 
-        btns = QHBoxLayout()
+        btns = FlowRow()
         self.new_layer_btn = QPushButton("New scar layer")
         self.new_layer_btn.setToolTip(
             f"Create an empty polygon layer (“{SCAR_LAYER}”), make it active, "
@@ -405,7 +420,7 @@ class VolumeTab(QWidget):
         self.draw_btn.clicked.connect(self._draw_outline)
         for b in (self.new_layer_btn, self.draw_btn):
             btns.addWidget(b)
-        v.addLayout(btns)
+        v.addWidget(btns)
 
         self.sel_lbl = QLabel()
         self.sel_lbl.setWordWrap(True)
@@ -542,6 +557,25 @@ class VolumeTab(QWidget):
         idx = dem.findData(keep_dem)
         dem.setCurrentIndex(idx if idx >= 0 else 0)
         dem.blockSignals(False)
+
+        # The elevation-change fit's three raster pickers — the Δh input and the
+        # pre/post pair — share the single-band-raster filter with the DEM combo.
+        # Guarded with getattr because they're built after this may first run.
+        for combo in (getattr(self, "_ddem_combo", None),
+                      getattr(self, "_pre_dem_combo", None),
+                      getattr(self, "_post_dem_combo", None)):
+            if combo is None:
+                continue
+            keep = combo.currentData() if combo.count() else None
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— none —", None)
+            for lyr in self._project_rasters():
+                if lyr.bandCount() == 1:
+                    combo.addItem(lyr.name(), lyr.id())
+            idx = combo.findData(keep)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
 
     def _match_role_layers(self, layers):
         """{role: layer} for layers whose NAME identifies their role.
@@ -692,7 +726,13 @@ class VolumeTab(QWidget):
             extra = f" of {len(measured)}, largest" if len(measured) > 1 else ""
             parts.append(f"{label} {_fmt(measured[0][0])} m²{extra}")
         if not parts:
-            if self._fit() == "total":
+            fit = self._fit()
+            if fit == "ddem":
+                self.role_lbl.setText(
+                    "Assign the total landslide outline to “Total area layer” — "
+                    "the elevation-change fit sums Δh over it. A source outline "
+                    "is used instead if no total is assigned.")
+            elif fit == "total":
                 self.role_lbl.setText(
                     "Assign the total landslide outline to “Total area layer” — "
                     "the total-area fit computes the volume from it. The "
@@ -706,10 +746,14 @@ class VolumeTab(QWidget):
             return
         problem = self._role_order_problem(areas)
         if not problem:
-            if self._fit() == "total" and "total" not in areas:
+            fit = self._fit()
+            if fit == "total" and "total" not in areas:
                 problem = ("No total area layer assigned — the total-area fit "
                            "converts the total outline.")
-            elif self._fit() != "total" and "best" not in areas:
+            elif fit == "ddem" and "total" not in areas and "best" not in areas:
+                problem = ("No outline assigned — the elevation-change fit sums "
+                           "Δh over the total (or source) outline.")
+            elif fit == "scar" and "best" not in areas:
                 problem = ("No source-best layer assigned — the source-scar fit "
                            "converts the best source outline.")
         self.role_lbl.setText("  ·  ".join(parts) + (f"\n⚠ {problem}" if problem else ""))
@@ -949,12 +993,18 @@ class VolumeTab(QWidget):
         form.addRow("Elevation (DEM)", self._dem_combo)
         v.addLayout(form)
 
-        row = QHBoxLayout()
+        row = FlowRow()
         self.centerline_btn = QPushButton("Draw centerline")
         self.centerline_btn.setEnabled(False)
+        self.centerline_btn.setToolTip(
+            "Digitize a runout centerline for the measured slide, spined from the "
+            "outline the measurement used. Enabled after a successful Measure.")
         self.centerline_btn.clicked.connect(self._draw_centerline)
         self.remeasure_btn = QPushButton("Re-measure (after editing)")
         self.remeasure_btn.setEnabled(False)
+        self.remeasure_btn.setToolTip(
+            "Recompute the centerline length and elevation drop after you edit the "
+            "drawn line's vertices. Enabled once a centerline has been drawn.")
         self.remeasure_btn.clicked.connect(self._remeasure_centerline)
         self.sample_btn = QPushButton("Sample elevation")
         self.sample_btn.setEnabled(False)
@@ -965,6 +1015,105 @@ class VolumeTab(QWidget):
         self.sample_btn.clicked.connect(self._sample_elevation_current)
         for b in (self.centerline_btn, self.remeasure_btn, self.sample_btn):
             row.addWidget(b)
+        v.addWidget(row)
+        return box
+
+    def _build_ddem_box(self):
+        """Elevation-change (∫Δh) inputs — used only by the "Elevation change"
+        fit. Collapsed by default; that fit's outline instruction points here.
+
+        Two ways to feed it. Assign a Δh raster you already have (a MOSART
+        product, a lidar/photogrammetry dDEM — anything in metres of surface
+        change), OR build one here by differencing a pre/post DEM pair. Either
+        way the volume is Δh summed over the TOTAL outline, split into erosion
+        (loss) and deposition (gain). The differencing math lives in dem_diff so
+        this tab stays free of numpy/GDAL until the fit is actually used."""
+        box = QgsCollapsibleGroupBox("Elevation change → volume (∫Δh)")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        v = QVBoxLayout(box)
+
+        note = QLabel(
+            "For the “Elevation change (∫Δh over outline)” fit. Assign an "
+            "elevation-change raster (Δh, in metres) and press Measure: the "
+            "volume is Δh summed over the TOTAL outline (or the source outline "
+            "if no total is assigned), reported as net, erosion and deposition. "
+            "No Δh raster yet? Difference a pre/post DEM pair below to make one.")
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(note)
+
+        form = QFormLayout()
+        # underscore-prefixed like the other layer pickers: rebuilt from the
+        # project each refresh, so persisting them would only mark it dirty.
+        self._ddem_combo = QComboBox()
+        self._ddem_combo.setToolTip(
+            "The elevation-change raster (Δh) to integrate — single-band, in "
+            "METRES of surface change. Positive = the surface rose (deposition), "
+            "negative = it dropped (erosion), unless you flip the sign below. A "
+            "geographic (lon/lat) raster is reprojected to a metric grid before "
+            "summing, so equal-area pixels are used.")
+        form.addRow("Elevation change (Δh)", self._ddem_combo)
+
+        self.ddem_grid_edit = QLineEdit("2")
+        self.ddem_grid_edit.setToolTip(
+            "Grid resolution in metres for the integration (and for the "
+            "differencing below). The raster is warped to this square grid, so a "
+            "pixel is exactly this on a side. Finer captures more detail but "
+            "costs memory; coarser than the input's own resolution just smooths "
+            "it. Defaults to 2 m.")
+        form.addRow("Grid (m)", self.ddem_grid_edit)
+
+        self.ddem_deposit_positive = QCheckBox(
+            "Positive Δh is deposition (post − pre)")
+        self.ddem_deposit_positive.setChecked(True)
+        self.ddem_deposit_positive.setToolTip(
+            "Which way the Δh raster is signed. Checked (post − pre): a positive "
+            "value means the surface ROSE — deposition. Uncheck for a pre − post "
+            "product, where positive means loss; the sign is flipped so erosion "
+            "and deposition still come out labelled correctly.")
+        form.addRow("Sign", self.ddem_deposit_positive)
+        v.addLayout(form)
+
+        sub = QLabel("Make a Δh raster by differencing two DEMs:")
+        sub.setStyleSheet("QLabel { color: palette(mid); font-style: italic; }")
+        v.addWidget(sub)
+
+        dform = QFormLayout()
+        self._pre_dem_combo = QComboBox()
+        self._pre_dem_combo.setToolTip(
+            "The BEFORE (pre-event) elevation surface — e.g. a pre-event lidar "
+            "DSM. A tiled DEM must be loaded as a single layer (a VRT) to be "
+            "picked here.")
+        dform.addRow("Pre-event DEM", self._pre_dem_combo)
+        self._post_dem_combo = QComboBox()
+        self._post_dem_combo.setToolTip(
+            "The AFTER (post-event) elevation surface. Δh = post − pre.")
+        dform.addRow("Post-event DEM", self._post_dem_combo)
+        v.addLayout(dform)
+
+        self.ddem_coregister = QCheckBox("Vertical co-register on stable ground")
+        self.ddem_coregister.setChecked(True)
+        self.ddem_coregister.setToolTip(
+            "Remove the DC vertical bias between the two DEMs — a sigma-clipped "
+            "median of the difference, so the slide and other real change fall "
+            "out and only quasi-stable ground sets the offset. Leave on unless "
+            "the DEMs already share a vertical datum with no geolocation bias.\n\n"
+            "Caveat: where the surrounding ground is itself changing (a glacier "
+            "between epochs), the offset is drawn from moving ground — check the "
+            "stable-pixel count reported in the log.")
+        v.addWidget(self.ddem_coregister)
+
+        row = QHBoxLayout()
+        self.diff_btn = QPushButton("Difference DEMs → Δh layer")
+        self.diff_btn.setToolTip(
+            "Warp the pre and post DEMs to a shared metric grid over the "
+            "outline, co-register, subtract, and load the result as a Δh raster "
+            "— then selected above, ready to Measure. Runs in this window; a "
+            "large AOI at a fine grid can take a few seconds.")
+        self.diff_btn.clicked.connect(self._difference_dems)
+        row.addWidget(self.diff_btn)
+        row.addStretch(1)
         v.addLayout(row)
         return box
 
@@ -1042,6 +1191,10 @@ class VolumeTab(QWidget):
             return
 
         fit = self._fit()
+        # The elevation-change fit integrates a Δh raster over the outline rather
+        # than scaling an area — a wholly different path, handled on its own.
+        if fit == "ddem":
+            return self._measure_ddem()
         # Every role is measured up front; the Fit decides which one is converted
         # to a volume and which are reported alongside.
         a_total, total_feat, total_layer = self._role_area("total", "Total area")
@@ -1202,33 +1355,289 @@ class VolumeTab(QWidget):
         except Exception:
             pass
 
+    # ---------- elevation-change (∫Δh) fit ----------
+    def _ddem_outline(self):
+        """(feature, layer, role) for the outline the ∫Δh fit integrates over.
+
+        The TOTAL outline when assigned — both erosion and deposition live inside
+        it — else the best source outline. (None, None, None) with a logged
+        reason when neither is available."""
+        _a_total, total_feat, total_layer = self._role_area("total", "Total area")
+        _a_best, best_feat, best_layer = self._role_area("best", "Source best")
+        if total_feat is not None:
+            return total_feat, total_layer, "total"
+        if best_feat is not None:
+            return best_feat, best_layer, "source"
+        return None, None, None
+
+    def _outline_utm(self, feat, layer):
+        """(geom_in_utm, epsg_int, bounds_tuple) for a feature, or (None, ...).
+
+        The metric frame the differencing and integration share — a UTM zone
+        chosen from the outline's own centroid, and its bounding box (both in
+        metres). Logging of any CRS failure is done by _to_utm."""
+        geom_utm, utm_crs = self._to_utm(feat.geometry(), layer.crs())
+        if geom_utm is None:
+            return None, None, None
+        try:
+            epsg = int(utm_crs.authid().split(":")[1])
+        except (AttributeError, IndexError, ValueError):
+            self._append_log("Could not read the UTM zone's EPSG code.")
+            return None, None, None
+        return geom_utm, epsg, geom_utm.boundingBox()
+
+    def _measure_ddem(self):
+        """Volume from integrating an elevation-change raster over the outline.
+
+        The Δh raster (a MOSART product, a lidar/photogrammetry dDEM, or one
+        built by the differencing tool) is summed over the TOTAL outline — the
+        whole affected area, since both erosion and deposition count — or the
+        source outline when no total is assigned. dem_diff does the numpy/GDAL
+        work; this resolves the outline to metres, hands it over, and drops the
+        result into the same _current/results spine the area-scaling fits use."""
+        try:
+            from . import dem_diff
+        except Exception as e:
+            self._append_log(
+                "The elevation-change fit needs the DEM tools (numpy + GDAL), "
+                f"which failed to load: {e}. They ship with QGIS — if this "
+                "persists the install's Python is incomplete.")
+            return
+
+        outline_feat, outline_layer, conv_role = self._ddem_outline()
+        if outline_feat is None:
+            self._append_log(
+                "The elevation-change fit sums Δh over the TOTAL landslide "
+                "outline — assign that layer (or a source outline) first.")
+            return
+        dh_layer = self._ddem_layer()
+        if dh_layer is None:
+            self._append_log(
+                "No elevation-change raster assigned. Pick one under “Elevation "
+                "change (Δh)” — a Δh product in metres — or build one with "
+                "“Difference DEMs → Δh layer”.")
+            return
+
+        geom_utm, epsg, bb = self._outline_utm(outline_feat, outline_layer)
+        if geom_utm is None:
+            return
+        res = self._ddem_grid_res()
+        margin = 2.0 * res
+        bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                  bb.xMaximum() + margin, bb.yMaximum() + margin)
+        sign_pos = self.ddem_deposit_positive.isChecked()
+        try:
+            r = dem_diff.integrate_dh(
+                dh_layer.source(), geom_utm.asWkt(), epsg, bounds, res,
+                sign_deposit_positive=sign_pos)
+        except Exception as e:
+            self._append_log(
+                f"Could not integrate “{dh_layer.name()}” over the outline: {e}")
+            return
+        if r["pixel_count"] == 0:
+            self._append_log(
+                f"“{dh_layer.name()}” has no valid Δh pixels inside the outline "
+                "— does it cover this slide? Check its extent and nodata.")
+            return
+
+        area = self._measure_area(outline_feat.geometry(), outline_layer.crs())
+        material, material_label = self._material(), self.material_combo.currentText()
+        fit_label = self.fit_combo.currentText()
+        calc = (f"∫Δh · {res:g} m grid · "
+                f"{'post−pre' if sign_pos else 'pre−post'} (dem_diff)")
+        self._current = {
+            "name": self.name_edit.text().strip() or "slide",
+            "material": material, "material_label": material_label,
+            "fit": "ddem", "fit_label": fit_label,
+            "conv_role": "ddem",
+            "a_conv": r["covered_area_m2"], "a_conv_low": None, "a_conv_high": None,
+            # a_total is the TOTAL outline's plan area — recorded only when a
+            # total outline actually drove the integration, mirroring the
+            # area-scaling path (which leaves it None otherwise). The integrated
+            # (covered) area is carried separately in covered_area.
+            "a_total": area if conv_role == "total" else None,
+            "src_best": None, "src_low": None, "src_high": None,
+            "v_best": r["v_net"], "v_low": None, "v_high": None,
+            "v_erosion": r["v_erosion"], "v_deposit": r["v_deposit"],
+            "covered_area": r["covered_area_m2"],
+            "mean_dh": r["mean_dh_m"], "max_rise": r["max_rise_m"],
+            "max_drop": r["max_drop_m"],
+            "ddem_name": dh_layer.name(), "ddem_res": res,
+            "length": None, "length_method": "",
+            "z_top": None, "z_bottom": None, "drop": None,
+            "reach_angle": None, "hl_ratio": None, "dem_name": "",
+            "layer_id": outline_layer.id(), "layer_name": outline_layer.name(),
+            "conv_fid": outline_feat.id(),
+            "len_layer_id": outline_layer.id(), "len_fid": outline_feat.id(),
+            "len_from": conv_role,
+            "total_layer": outline_layer.name() if conv_role == "total" else "",
+            # the outline is already named by layer_name/used_text; don't also
+            # claim it as the source-best layer (which has no area under ddem).
+            "best_layer": "", "low_layer": "", "high_layer": "",
+            "fids_text": str(outline_feat.id()),
+            "used_text": (f"∫Δh “{dh_layer.name()}” over {conv_role} "
+                          f"“{outline_layer.name()}”  (feature {outline_feat.id()})"),
+            "calc": calc,
+        }
+        self._cl_fid = None
+        self._show_current()
+        self.add_btn.setEnabled(True)
+        self.centerline_btn.setEnabled(True)
+        self.remeasure_btn.setEnabled(False)
+        self.sample_btn.setEnabled(False)
+
+        self._append_log(
+            f"∫Δh over {conv_role} “{outline_layer.name()}” "
+            f"({r['covered_area_m2'] / 1e6:.3f} km² covered, "
+            f"{r['pixel_count']:,} px @ {res:g} m): net {_fmt(r['v_net'])} m³ = "
+            f"deposition {_fmt(r['v_deposit'])} + erosion {_fmt(r['v_erosion'])} "
+            f"m³. Mean Δh {r['mean_dh_m']:+.2f} m (drop {r['max_drop_m']:+.1f}, "
+            f"rise {r['max_rise_m']:+.1f}). Δh from “{dh_layer.name()}”; {calc}.")
+        if conv_role == "source":
+            self._append_log(
+                "No total outline assigned — integrated over the SOURCE outline, "
+                "so the runout deposit is excluded. Assign a total outline to "
+                "capture the whole affected area.")
+
+    def _difference_dems(self):
+        """Warp a pre/post DEM pair to one metric grid, co-register, subtract,
+        write the Δh as a GeoTIFF and load it — selected for the ∫Δh fit.
+
+        Runs synchronously: a manual button on a bounded AOI, so a few seconds of
+        blocking is acceptable and simpler than a background task."""
+        try:
+            from . import dem_diff
+        except Exception as e:
+            self._append_log(f"DEM tools (numpy + GDAL) failed to load: {e}.")
+            return
+        pre = self._raster_from(self._pre_dem_combo)
+        post = self._raster_from(self._post_dem_combo)
+        if pre is None or post is None:
+            self._append_log(
+                "Pick both a pre-event and a post-event DEM to difference.")
+            return
+        if pre.id() == post.id():
+            self._append_log("Pre and post DEM are the same layer — pick two.")
+            return
+
+        outline_feat, outline_layer, _role = self._ddem_outline()
+        if outline_feat is None:
+            self._append_log(
+                "Assign a total (or source) outline first — it sets the area to "
+                "difference over.")
+            return
+        geom_utm, epsg, bb = self._outline_utm(outline_feat, outline_layer)
+        if geom_utm is None:
+            return
+        res = self._ddem_grid_res()
+        # a generous margin so stable ground surrounds the slide for co-registration
+        margin = max(300.0, 0.25 * max(bb.width(), bb.height()))
+        bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                  bb.xMaximum() + margin, bb.yMaximum() + margin)
+        coreg = self.ddem_coregister.isChecked()
+
+        self._append_log(
+            f"Differencing “{post.name()}” − “{pre.name()}” over "
+            f"{bb.width() + 2 * margin:.0f}×{bb.height() + 2 * margin:.0f} m @ "
+            f"{res:g} m … runs here, may take a few seconds.")
+        QApplication.processEvents()
+        try:
+            dh, gt, proj, stats = dem_diff.difference_dems(
+                pre.source(), post.source(), bounds, epsg, res, coregister=coreg)
+        except Exception as e:
+            self._append_log(f"Differencing failed: {e}")
+            return
+
+        out_dir = (self.dock.out_edit.text().strip()
+                   or self.dock.project_edit.text().strip())
+        if not out_dir or not os.path.isdir(out_dir):
+            import tempfile
+            out_dir = tempfile.gettempdir()
+        name = self.name_edit.text().strip() or "slide"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "slide"
+        path = os.path.join(out_dir, f"{safe}_dh.tif")
+        # Drop any layer already reading this exact file so a re-difference
+        # updates ONE Δh layer instead of stacking duplicates — and so the file
+        # handle is released first (on Windows an open layer locks the GeoTIFF
+        # and the rewrite below would fail with a confusing "could not write").
+        for lyr in list(self._project_rasters()):
+            try:
+                if (os.path.normpath(lyr.source().split("|", 1)[0])
+                        == os.path.normpath(path)):
+                    lg.remove_layer(lyr)
+            except (RuntimeError, AttributeError):
+                pass
+        try:
+            dem_diff.write_gtiff(path, dh, gt, proj)
+        except Exception as e:
+            self._append_log(f"Could not write {path}: {e}")
+            return
+        layer = QgsRasterLayer(path, f"Δh {name} (post−pre)")
+        if not layer.isValid():
+            self._append_log(f"Wrote {path} but QGIS could not load it back.")
+            return
+        lg.add_to_group(layer, "Volume")   # registers the layer AND folders it
+        self._refresh_relief_combos()
+        idx = self._ddem_combo.findData(layer.id())
+        if idx >= 0:
+            self._ddem_combo.setCurrentIndex(idx)
+
+        warn = ""
+        if stats["valid_px"] and stats["stable_px"] < 0.05 * stats["valid_px"]:
+            warn = (f" ⚠ the offset rested on a thin slice of ground "
+                    f"({stats['stable_px']:,} px) — treat it as unreliable.")
+        self._append_log(
+            f"Δh written to {path} and loaded as “{layer.name()}”, selected "
+            f"above. Vertical offset removed: {stats['offset_m']:+.2f} m (from "
+            f"{stats['stable_px']:,} stable of {stats['valid_px']:,} valid px)."
+            f"{warn} Now press Measure with the elevation-change fit selected.")
+
     def _show_current(self):
         c = self._current
         if c is None:
             return
-        self.source_out.setText(
-            f"{c['used_text']}  (feature {c['conv_fid']})")
-        # The area that produced the volume, with its low/high range if any.
-        conv_txt = f"{_fmt(c['a_conv'])} m²   ({c['a_conv'] / 1e6:,.4f} km²)"
-        if c.get("a_conv_low") is not None and c.get("a_conv_high") is not None:
-            conv_txt += (f"   [range {_fmt(c['a_conv_low'])} – "
-                         f"{_fmt(c['a_conv_high'])} m²]")
-        self.area_best_out.setText(conv_txt)
-        # The areas measured but not converted, for context.
-        if c["conv_role"] == "source":
-            others = ([f"total {_fmt(c['a_total'])}"]
-                      if c["a_total"] is not None else [])
+        if c.get("conv_role") == "ddem":
+            # The ∫Δh fit reports a covered area (not a converted one), the
+            # change-field statistics, and an erosion/deposition split in place
+            # of the area fit's ±1σ range.
+            self.source_out.setText(c["used_text"])
+            self.area_best_out.setText(
+                f"{_fmt(c['covered_area'])} m² covered  "
+                f"({c['covered_area'] / 1e6:,.4f} km² @ "
+                f"{_fmt(c.get('ddem_res'))} m grid)")
+            self.area_range_out.setText(
+                f"mean Δh {c['mean_dh']:+.2f} m   ·   max drop "
+                f"{c['max_drop']:+.1f} m   ·   max rise {c['max_rise']:+.1f} m")
+            self.vol_best_out.setText(
+                f"net {_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
+            self.vol_range_out.setText(
+                f"erosion {_fmt(c['v_erosion'])} m³   ·   deposition "
+                f"{_fmt(c['v_deposit'])} m³")
+            self.calc_out.setText(c["calc"])
         else:
-            others = [f"{lbl} {_fmt(a)}" for lbl, a in
-                      (("src low", c["src_low"]), ("src best", c["src_best"]),
-                       ("src high", c["src_high"])) if a is not None]
-        self.area_range_out.setText(
-            ("  ·  ".join(others) + " m²") if others else "— (none assigned)")
-        self.vol_best_out.setText(
-            f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
-        self.vol_range_out.setText(
-            f"{_fmt(c['v_low'])} – {_fmt(c['v_high'])} m³")
-        self.calc_out.setText(c["calc"])
+            self.source_out.setText(
+                f"{c['used_text']}  (feature {c['conv_fid']})")
+            # The area that produced the volume, with its low/high range if any.
+            conv_txt = f"{_fmt(c['a_conv'])} m²   ({c['a_conv'] / 1e6:,.4f} km²)"
+            if c.get("a_conv_low") is not None and c.get("a_conv_high") is not None:
+                conv_txt += (f"   [range {_fmt(c['a_conv_low'])} – "
+                             f"{_fmt(c['a_conv_high'])} m²]")
+            self.area_best_out.setText(conv_txt)
+            # The areas measured but not converted, for context.
+            if c["conv_role"] == "source":
+                others = ([f"total {_fmt(c['a_total'])}"]
+                          if c["a_total"] is not None else [])
+            else:
+                others = [f"{lbl} {_fmt(a)}" for lbl, a in
+                          (("src low", c["src_low"]), ("src best", c["src_best"]),
+                           ("src high", c["src_high"])) if a is not None]
+            self.area_range_out.setText(
+                ("  ·  ".join(others) + " m²") if others else "— (none assigned)")
+            self.vol_best_out.setText(
+                f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
+            self.vol_range_out.setText(
+                f"{_fmt(c['v_low'])} – {_fmt(c['v_high'])} m³")
+            self.calc_out.setText(c["calc"])
         if c["length"] is None:
             self.length_out.setText("— (not measured)")
         else:
@@ -1443,6 +1852,27 @@ class VolumeTab(QWidget):
             return None
         lyr = QgsProject.instance().mapLayer(self._dem_combo.currentData() or "")
         return lyr if isinstance(lyr, QgsRasterLayer) else None
+
+    def _raster_from(self, combo):
+        """The raster layer a combo points at, or None."""
+        lyr = QgsProject.instance().mapLayer(combo.currentData() or "")
+        return lyr if isinstance(lyr, QgsRasterLayer) else None
+
+    def _ddem_layer(self):
+        """The raster assigned to "Elevation change (Δh)", or None."""
+        if not hasattr(self, "_ddem_combo"):
+            return None
+        return self._raster_from(self._ddem_combo)
+
+    def _ddem_grid_res(self):
+        """Integration/differencing grid resolution (m); 2 m on empty/bad input."""
+        try:
+            r = float(self.ddem_grid_edit.text().strip())
+            if r > 0:
+                return r
+        except (ValueError, AttributeError):
+            pass
+        return 2.0
 
     def _on_dem_changed(self, *_args):
         """Sample as soon as a DEM is picked, if a centerline already exists —
@@ -1721,6 +2151,7 @@ class VolumeTab(QWidget):
                 row["name"], row["fit_label"], row["material_label"],
                 _fmt(row["a_total"]),
                 _fmt(row["v_best"]), _fmt(row["v_low"]), _fmt(row["v_high"]),
+                _fmt(row.get("v_erosion")), _fmt(row.get("v_deposit")),
                 _fmt(row["src_best"]), _fmt(row["src_low"]), _fmt(row["src_high"]),
                 _fmt(row["length"]),
                 _fmt(row.get("drop")),
@@ -1728,7 +2159,7 @@ class VolumeTab(QWidget):
             ]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if 3 <= c <= 11:
+                if 3 <= c <= 13:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(r, c, item)
 

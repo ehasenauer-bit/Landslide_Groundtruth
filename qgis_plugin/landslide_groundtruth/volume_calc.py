@@ -65,6 +65,7 @@ MATERIALS = [
 FITS = [
     ("Source scar (Larsen Table S1)", "scar"),
     ("Total landslide area", "total"),
+    ("Elevation change (∫Δh over outline)", "ddem"),
 ]
 
 # What each fit expects the digitized polygon to BE — shown on the tab so the
@@ -74,6 +75,11 @@ FIT_OUTLINE = {
              "area, so including the runout track or deposit inflates the volume."),
     "total": ("Outline the TOTAL landslide area — source, runout track and "
               "deposit together, matching this fit's calibration."),
+    "ddem": ("Outline the WHOLE affected area — source scar, runout track and "
+             "deposit together. This fit sums the elevation change (Δh) over "
+             "that outline instead of scaling an area, so it must cover "
+             "everything that moved; erosion (loss) and deposition (gain) are "
+             "reported separately. Needs a Δh raster assigned below."),
 }
 
 

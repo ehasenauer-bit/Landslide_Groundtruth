@@ -68,6 +68,7 @@ from qgis.core import (
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import sar_change
+from . import sar_pairing
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .task import PipelineTask
@@ -194,6 +195,9 @@ class SarTab(QWidget):
         self._cd_paths = {}              # role ('pre0'…/'post') -> tif path
         self._cd_meta = None             # products/pol/window of the running compute
         self._cd_last_layers = []        # newest change maps (kept above amplitude previews)
+        # recent per-geometry computed change arrays, for the asc+desc merge
+        # (rec #5): each = {mkey, track, direction, out, gt, proj, thr, pre_d, post_d}
+        self._cd_results = []
         self._build_ui()
 
     # ---------- UI ----------
@@ -298,6 +302,10 @@ class SarTab(QWidget):
             "a few seconds when the endpoint is cold.")
         self.run_btn.setEnabled(False)
         self.run_btn.clicked.connect(self._run_full)
+        f = self.run_btn.font()
+        f.setBold(True)
+        self.run_btn.setFont(f)
+        self.run_btn.setDefault(True)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
@@ -331,6 +339,13 @@ class SarTab(QWidget):
         tl.addWidget(QLabel(
             "Candidate scenes  (★ = default same-track pair; tick the scenes to "
             "preview on the map)"))
+        # seismic-time bracket summary for the starred pair (see sar_pairing)
+        self.pair_summary = QLabel("")
+        self.pair_summary.setWordWrap(True)
+        self.pair_summary.setTextFormat(Qt.PlainText)
+        self.pair_summary.setVisible(False)
+        self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
+        tl.addWidget(self.pair_summary)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "Scene ID"])
@@ -477,7 +492,8 @@ class SarTab(QWidget):
         self.stretch_spin.setValue(DEFAULT_STRETCH)
         self.stretch_spin.setToolTip(
             "LINEAR mode only: gamma-naught from 0 (black) to this value (white). "
-            "0.20 matches the Planetary Computer Explorer. Ignored in dB mode.")
+            "0.20 matches the Microsoft Planetary Computer Explorer. Ignored in "
+            "dB mode.")
         form.addRow("Stretch (max γ⁰)", self.stretch_spin)
 
         # Speckle control: SAR's salt-and-pepper noise averages out when pixels
@@ -510,7 +526,9 @@ class SarTab(QWidget):
             "can dim features smaller than ~3 pixels across (at 10 m px, ~30 m). "
             "Combines well with Pixel size: median at 10 m often reads better "
             "than unfiltered 20 m. Applies to the next Preview on map.")
-        form.addRow("Speckle filter", self.smooth_combo)
+        # Named "Render smoothing" (not "Speckle filter") to distinguish it from the
+        # Noise reduction panel's analysis speckle filter, which feeds the detectors.
+        form.addRow("Render smoothing", self.smooth_combo)
         return box
 
     # ---------- change detection (drop-down) ----------
@@ -625,6 +643,23 @@ class SarTab(QWidget):
             "new layers, so you can compare products, windows and filters.")
         self.cd_btn.clicked.connect(self._run_change_detection)
         form.addRow(self.cd_btn)
+
+        # rec #5: merge the ascending + descending change maps so a scar lost to
+        # layover in one geometry is recovered from the other. Workflow: compute
+        # with an ascending after-scene, compute again with a descending one, then
+        # Merge. Degrades honestly to one geometry where the terrain has only one.
+        self.cd_merge_btn = QPushButton("Merge geometries (asc + desc)")
+        self.cd_merge_btn.setEnabled(False)
+        self.cd_merge_btn.setToolTip(
+            "Combine the most recent ascending and descending change maps of each "
+            "product into one, recovering scar pixels that layover blanked in a "
+            "single orbit. Compute once with an ascending after-scene and once "
+            "with a descending one first. If only one geometry has been computed "
+            "(common in this terrain — many areas lack both passes), it still runs "
+            "but flags that the opposite-facing slopes, possibly the source "
+            "headscarp, are unrecovered.")
+        self.cd_merge_btn.clicked.connect(self._merge_geometries_action)
+        form.addRow(self.cd_merge_btn)
         return box
 
     # ---------- noise reduction (drop-down) ----------
@@ -660,9 +695,9 @@ class SarTab(QWidget):
             "the correlation detectors, where speckle artificially "
             "decorrelates windows and invents change. Median is a simpler "
             "fallback. Set to None to feed the raw γ⁰ (noisiest). Distinct "
-            "from the Display panel's median, which only cleans the on-screen "
-            "amplitude preview.")
-        form.addRow("Speckle filter", self.speckle_cd_combo)
+            "from the Display panel's Render smoothing, which only cleans the "
+            "on-screen amplitude preview.")
+        form.addRow("Analysis speckle filter", self.speckle_cd_combo)
 
         self.blob_combo = QComboBox()
         for label, value in BLOB_MIN_AREAS:
@@ -697,7 +732,7 @@ class SarTab(QWidget):
         one Planetary Computer collection this plugin uses that requires a (free)
         account subscription key to read pixels — the Sentinel-2/Landsat tab stays
         anonymous. NOT the same thing as the Planet account on the PlanetScope tab."""
-        box = QgsCollapsibleGroupBox("Planetary Computer key (optional)")
+        box = QgsCollapsibleGroupBox("Microsoft Planetary Computer key (optional)")
         box.setSaveCollapsedState(False)
         box.setCollapsed(True)
         self.key_box = box
@@ -705,9 +740,9 @@ class SarTab(QWidget):
 
         info = QLabel(
             'No login needed — Sentinel-1 RTC works anonymously. If you have an '
-            'old Planetary Computer subscription key, storing it here raises API '
-            'rate limits; otherwise leave this blank. (Unrelated to your Planet '
-            'account on the PlanetScope tab.)')
+            'old Microsoft Planetary Computer subscription key, storing it here '
+            'raises API rate limits; otherwise leave this blank. (Unrelated to '
+            'your Planet Labs account on the PlanetScope tab.)')
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
@@ -754,7 +789,7 @@ class SarTab(QWidget):
             return                       # a check is already in flight
         key = self.key_edit.text().strip()
         if not key:
-            self._set_key_status("Paste your Planetary Computer key first.", "warn")
+            self._set_key_status("Paste your Microsoft Planetary Computer key first.", "warn")
             return
         self._set_key_status("Testing key against the token endpoint…", "info")
         self.key_btn.setEnabled(False)
@@ -779,8 +814,8 @@ class SarTab(QWidget):
             self.key_box.setCollapsed(True)
         elif status in (401, 403):
             self._set_key_status(
-                "✗ Key rejected — check it against your Planetary Computer "
-                "account page.", "error")
+                "✗ Key rejected — check it against your Microsoft Planetary "
+                "Computer account page.", "error")
         else:
             self._set_key_status(
                 f"Could not verify (HTTP {status or '—'}); nothing saved. "
@@ -854,6 +889,10 @@ class SarTab(QWidget):
         self.log.clear()
         self.table.setRowCount(0)
         self._search_result = None
+        # a new search = new AOI/event: drop any recorded per-geometry change maps
+        # so the asc+desc merge can never combine rasters from different ground
+        self._cd_results = []
+        self.cd_merge_btn.setEnabled(False)
         self._preview_pix = None
         self.preview.setText("Search, then select a scene to preview it.")
         self._clear_gallery()
@@ -1008,6 +1047,15 @@ class SarTab(QWidget):
         pre = result.get("pre", [])
         post = result.get("post", [])
         default_picks, _notes = self._default_picks()
+        # surface how the starred pair brackets the seismic event time (rec #1)
+        try:
+            ev = self.dt_edit.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+            summary = sar_pairing.summarize(default_picks, ev)
+        except Exception:
+            summary = ""
+        self.pair_summary.setText(("Event bracket —  " + summary.replace("\n", "\n                 "))
+                                  if summary else "")
+        self.pair_summary.setVisible(bool(summary))
         star = {(side, c.get("id")) for side, c in default_picks}
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
@@ -1955,6 +2003,20 @@ class SarTab(QWidget):
                 self._cd_last_layers.append(lyr)
                 added += 1
             computed += 1
+            # record this geometry's map for a later asc+desc merge (rec #5) — only
+            # for real computes: stats-only asked for NO layers, and merge writes
+            # layers. Keep the in-memory array (true signed values, not read_band's
+            # γ⁰>0 validity) plus the keys the merge must check for commensurability:
+            # shape/gt (same AOI grid) and k/pol/res (same detector settings).
+            if not stats_only:
+                self._cd_results.append(dict(
+                    mkey=mkey, track=track,
+                    direction=(roles["post"].get("orbit_state") or ""),
+                    out=out, gt=gt, proj=proj, shape=out.shape,
+                    thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
+                    pre_d=pre_d, post_d=post_d))
+                self._cd_results = self._cd_results[-12:]
+                self.cd_merge_btn.setEnabled(True)
             self._append_log(
                 ("  layer added: " if not stats_only else "  computed: ") +
                 f"{label} ({cov:.0f}% of AOI valid)")
@@ -1965,6 +2027,16 @@ class SarTab(QWidget):
                            "frames that cover your area of interest.")
             if not finite.size:
                 continue
+            # rec #2: for the signed brightness detectors, report the deposit
+            # (backscatter↑) vs scar (↓) tail split so the analyst can key on the
+            # fresh-debris signal (see sar_change.split_tails)
+            _dep, _scar, _sm = sar_change.split_tails(out, mkey, SIG[mkey][1])
+            if _sm["signed"]:
+                self._append_log(
+                    f"  sign split (|·|>{_sm['threshold']:.0f}): "
+                    f"{_sm['n_deposit']} deposit px (backscatter↑, fresh debris) "
+                    f"vs {_sm['n_scar']} scar px (↓) — favor deposit over smooth "
+                    "snow/ice/bedrock; treat both as candidates over talus/vegetation")
             if mkey == "logratio":
                 p2, p98 = np.percentile(finite, [2, 98])
                 frac = 100.0 * (np.abs(finite) > 3.0).mean()
@@ -2058,6 +2130,122 @@ class SarTab(QWidget):
         renderer.setClassificationMax(hi)
         lyr.setRenderer(renderer)
 
+    def _style_cd_confidence(self, lyr):
+        """Discrete style for the asc+desc merge confidence raster: 1 recovered
+        from a single orbit where the other was blind, 2 both orbits agree (high
+        confidence), 3 orbits disagree (suspect); 0 (no change) fades out."""
+        stops = [(0.0, "#f7f7f7", 0, "0  no change"),
+                 (1.0, "#fdae61", 160, "1  recovered (single orbit, other blind)"),
+                 (2.0, "#b2182b", 255, "2  agreement (both orbits)"),
+                 (3.0, "#762a83", 220, "3  disagree (suspect)")]
+        items = []
+        for value, color, alpha, text in stops:
+            c = QColor(color)
+            c.setAlpha(alpha)
+            items.append(QgsColorRampShader.ColorRampItem(value, c, text))
+        fn = QgsColorRampShader(0.0, 3.0, None, QgsColorRampShader.Discrete)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
+        renderer.setClassificationMin(0.0)
+        renderer.setClassificationMax(3.0)
+        lyr.setRenderer(renderer)
+
+    def _merge_geometries_action(self):
+        """Merge the most recent ascending + descending change maps of each product
+        so a scar lost to layover in one viewing geometry is recovered from the
+        other (report rec #5). Reads the in-memory computed arrays (true signed
+        values, not read_band's γ⁰>0 validity). Degrades honestly to one geometry
+        where only one pass was computed — common in this steep terrain."""
+        if not self._cd_results:
+            self._warn("Compute a change map first — ideally once with an "
+                       "ascending after-scene and once with a descending one — "
+                       "then Merge.")
+            return
+        NAME = {"logratio": "log-ratio", "intcorr": "int-corr",
+                "tsint": "brightness-z", "mtcorr": "MT-corr"}
+        # group by product, newest first; keep the latest result per orbit direction
+        by_prod = {}
+        for r in reversed(self._cd_results):
+            sel = by_prod.setdefault(r["mkey"], {})
+            # group by orbit direction; if the scene lacked orbit_state, fall back
+            # to the track so two real geometries aren't collapsed under one key
+            gk = r["direction"] or f"t{r['track']}"
+            sel.setdefault(gk, r)                  # first (newest) per geometry wins
+        merge_group = None
+        added = 0
+        for mkey, sel in by_prod.items():
+            results = list(sel.values())
+            # commensurability: 'strongest anomaly wins' only makes sense across
+            # rasters on the SAME grid computed with the SAME detector settings
+            def _grid(rr):
+                return (rr["shape"], tuple(round(float(v), 6) for v in rr["gt"]),
+                        rr["k"], rr["pol"], rr["res"])
+            if any(_grid(rr) != _grid(results[0]) for rr in results):
+                self._warn(
+                    f"Merge {NAME.get(mkey, mkey)}: geometries were computed with "
+                    "different AOI / window / polarization / resolution — recompute "
+                    "them with identical settings, then merge. Skipped.")
+                continue
+            try:
+                merged, conf, meta = sar_change.merge_geometries(
+                    [r["out"] for r in results], mkey, results[0]["thr"])
+            except Exception as e:               # noqa: BLE001 — surface, don't crash
+                self._warn(f"Merge ({NAME.get(mkey, mkey)}) failed: "
+                           f"{type(e).__name__}: {e}")
+                continue
+            dirs = "+".join(sorted({(r["direction"] or "?")[:4] for r in results}))
+            r0 = results[0]
+            gt, proj, pre_d, post_d = r0["gt"], r0["proj"], r0["pre_d"], r0["post_d"]
+            self._append_log(
+                f"Merge {NAME.get(mkey, mkey)} [{dirs}, "
+                f"{meta['n_geometries']} geometry(ies)]: {meta['note']}")
+            if meta["single_geometry"]:
+                self._warn(
+                    f"Merge {NAME.get(mkey, mkey)}: only one geometry available — "
+                    "the opposite-facing slopes (possibly the source headscarp) "
+                    "are unrecovered. Compute the other orbit direction if this "
+                    "terrain has coverage.")
+            else:
+                self._append_log(
+                    f"  recovered (single-orbit, other blind)={meta['n_single']} px · "
+                    f"agree (both orbits)={meta['n_agree']} px · "
+                    f"disagree/suspect={meta['n_conflict']} px")
+            try:
+                fd, mpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_merge_")
+                os.close(fd)
+                sar_change.write_gtiff(mpath, merged, gt, proj)
+                fd, cpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_conf_")
+                os.close(fd)
+                sar_change.write_gtiff(cpath, conf, gt, proj)
+            except Exception as e:               # noqa: BLE001
+                self._warn(f"Could not write merged {NAME.get(mkey, mkey)}: {e}")
+                continue
+            mlyr = QgsRasterLayer(
+                mpath, f"S1 change {NAME.get(mkey, mkey)} MERGED {dirs} "
+                       f"{pre_d}→{post_d}")
+            clyr = QgsRasterLayer(
+                cpath, f"S1 MERGED confidence {dirs} {pre_d}→{post_d}")
+            if not mlyr.isValid() or not clyr.isValid():
+                self._warn(f"Merged {NAME.get(mkey, mkey)}: raster failed to load.")
+                continue
+            self._style_cd_layer(mlyr, mkey)
+            self._style_cd_confidence(clyr)
+            if merge_group is None:
+                merge_group = lg.new_group(
+                    lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged"))
+            sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
+            lg.add_to(clyr, sub)          # confidence underneath
+            lg.add_to(mlyr, sub)          # merged change on top
+            self._cd_last_layers += [clyr, mlyr]
+            added += 1
+        if added:
+            self.iface.messageBar().pushInfo(
+                "SAR", f"Merged {added} product(s) across geometries — read the "
+                "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
+                "from one orbit (other blind), 3 = orbits disagree (suspect).")
+
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
         if checked:
@@ -2141,6 +2329,8 @@ class SarTab(QWidget):
             (not on) and bool(self._search_result and
                               self._search_result.get("pre") and
                               self._search_result.get("post")))
+        # merge is available only when idle and at least one geometry is recorded
+        self.cd_merge_btn.setEnabled((not on) and bool(self._cd_results))
 
     def _append_log(self, line):
         self.log.appendPlainText(line)

@@ -241,6 +241,18 @@ _HTML_MID = """</title>
                      background: #0b0e13; }
   .exp-bar { display: flex; gap: 10px; }
   .exp-bar a.btn { text-decoration: none; }
+  /* narrow screens / phones: keep the four corner overlays from colliding, and
+     grow the tap targets. HUD stays a single row at top; the legend drops below
+     it; the tag + help stack at the bottom instead of overlapping left/right. */
+  @media (max-width: 700px) {
+    #hud { left: 8px; top: 8px; gap: 6px; }
+    .btn { padding: 10px 12px; font-size: 13px; }
+    #layers { top: 56px; right: 8px; max-height: 34vh; font-size: 12px; }
+    .lyr-row { padding: 6px 0; }
+    .lyr-sw { width: 16px; height: 16px; }
+    #tag { left: 8px; right: 8px; bottom: 8px; max-width: none; }
+    #help { left: 8px; right: 8px; bottom: 42px; text-align: center; }
+  }
 </style>
 </head>
 <body>
@@ -420,8 +432,10 @@ _VIEWER_JS = r'''
   try {
     oprog = gl.createProgram();
     gl.attachShader(oprog, sh(gl.VERTEX_SHADER,
-      "attribute vec3 aPos; uniform mat4 uMVP; uniform float uPtSize;" +
-      "void main(){ gl_Position = uMVP*vec4(aPos,1.0); gl_PointSize = uPtSize; }"));
+      "attribute vec3 aPos; uniform mat4 uMVP; uniform float uPtSize; uniform vec2 uOffset;" +
+      "void main(){ gl_Position = uMVP*vec4(aPos,1.0);" +
+      "  gl_Position.xy += uOffset*gl_Position.w;" +   // screen-space nudge (line casing)
+      "  gl_PointSize = uPtSize; }"));
     gl.attachShader(oprog, sh(gl.FRAGMENT_SHADER,
       "precision mediump float; uniform vec4 uColor; uniform float uPoint;" +
       "void main(){" +
@@ -436,6 +450,7 @@ _VIEWER_JS = r'''
   var oColor = oprog ? gl.getUniformLocation(oprog, "uColor") : null;
   var oPtSize = oprog ? gl.getUniformLocation(oprog, "uPtSize") : null;
   var oPoint = oprog ? gl.getUniformLocation(oprog, "uPoint") : null;
+  var oOffset = oprog ? gl.getUniformLocation(oprog, "uOffset") : null;
 
   // bilinear terrain height (in mesh Z space) at a mesh-local (x,y)
   function sampleZ(mx, my) {
@@ -479,18 +494,35 @@ _VIEWER_JS = r'''
       color: color, alpha: (alpha == null ? 1 : alpha), noDepth: !!noDepth,
       layer: layer });
   }
+  // planar area of a flat tri list ([p0,p1,p2, ...]) -- used only to order fills
+  function trisArea(t){ var s=0; for (var i=0;i+2<t.length;i+=3){
+    var p=t[i],q=t[i+1],r=t[i+2];
+    s+=Math.abs((q[0]-p[0])*(r[1]-p[1])-(r[0]-p[0])*(q[1]-p[1]))*0.5; } return s; }
   (CFG.polys || []).forEach(function (P) {
-    var c = P.color || [255, 80, 80]; regLayer(P.name, c);
+    // mirror the QGIS symbol: fill colour + outline colour are independent, and an
+    // outline-only symbol (fill===false) draws just the ring — no translucent fill.
+    var fc = P.color || [255, 80, 80];                 // fill colour
+    var lc = P.line_color || fc;                       // outline colour
+    var hasFill = (P.fill !== false);                  // false => outline-only in QGIS
+    var hasLine = (P.outline !== false);
+    var fa = (P.fill_alpha != null) ? P.fill_alpha : 0.55;
+    regLayer(P.name, hasFill ? fc : lc);               // legend swatch = what's drawn
     (P.rings || []).forEach(function (R) {
       var tris = R.tris || [], out = R.outline || [];
-      if (tris.length >= 3) op(drape(tris, 1.0), tris.length, gl.TRIANGLES, c, 0.55, true, P.name);
-      if (out.length >= 2) op(drape(out, 1.4), out.length, gl.LINE_LOOP, c, 1.0, false, P.name);
+      if (hasFill && tris.length >= 3) {
+        op(drape(tris, 1.0), tris.length, gl.TRIANGLES, fc, fa, true, P.name);
+        overlays[overlays.length-1].fillArea = trisArea(tris);   // for draw ordering
+      }
+      if (hasLine && out.length >= 2) op(drape(out, 1.4), out.length, gl.LINE_LOOP, lc, 1.0, false, P.name);
     });
   });
   (CFG.lines || []).forEach(function (L) {
     var c = L.color || [90, 190, 255]; regLayer(L.name, c);
     (L.paths || []).forEach(function (path) {
-      if (path.length >= 2) op(drape(path, 1.4), path.length, gl.LINE_STRIP, c, 1.0, false, L.name);
+      if (path.length >= 2) {
+        op(drape(path, 1.4), path.length, gl.LINE_STRIP, c, 1.0, false, L.name);
+        overlays[overlays.length-1].casing = true;   // white halo -> readable on any terrain
+      }
     });
   });
   var labelsEl = document.getElementById("labels");
@@ -516,6 +548,17 @@ _VIEWER_JS = r'''
     }
     op(poles, coords.length*2, gl.LINES, c, 1.0, false, PT.name);
     op(marks, coords.length, gl.POINTS, c, 1.0, false, PT.name);
+  });
+
+  // Draw translucent fills largest-first, so a small polygon nested inside a bigger
+  // one (e.g. the source zone within the total area) lands ON TOP and stays visible
+  // instead of being buried under the larger fill. Outlines / lines / points follow.
+  overlays.sort(function (a, b) {
+    var ka = (a.mode === gl.TRIANGLES && a.noDepth) ? 0 : 1;
+    var kb = (b.mode === gl.TRIANGLES && b.noDepth) ? 0 : 1;
+    if (ka !== kb) return ka - kb;
+    if (ka === 0) return (b.fillArea || 0) - (a.fillArea || 0);
+    return 0;
   });
 
   (function buildLayersPanel() {
@@ -579,37 +622,67 @@ _VIEWER_JS = r'''
              cam.tgt[2] + cam.dist*se ];
   }
 
-  // ---------- interaction ----------
-  var drag = null;
+  // ---------- interaction (mouse + multitouch) ----------
+  var drag = null;             // single-pointer orbit/pan (mouse or one finger)
+  var ptrs = {};               // all active pointers, by id -> {x,y}
+  var pinch = null;            // two-finger state: finger spread + midpoint
+  function panBy(ddx, ddy) {
+    // planar pan (inverted: the terrain follows the cursor). Move the look-at
+    // target opposite the drag in the ground plane — screen-right maps to
+    // (sin az, -cos az); screen-up (drag toward viewer) to (cos az, sin az).
+    var ce = Math.cos(cam.az), se = Math.sin(cam.az), k = cam.dist / 700;
+    cam.tgt[0] += se*ddx*k;  cam.tgt[1] -= ce*ddx*k;
+    cam.tgt[0] -= ce*ddy*k;  cam.tgt[1] -= se*ddy*k;
+  }
   canvas.addEventListener("pointerdown", function (e) {
     if (e.button === 1) e.preventDefault();     // middle: suppress autoscroll
-    // middle OR right OR shift+left = pan; plain left = orbit
-    drag = { x: e.clientX, y: e.clientY,
-             pan: e.shiftKey || e.button === 1 || e.button === 2 };
+    ptrs[e.pointerId] = { x: e.clientX, y: e.clientY };
     canvas.setPointerCapture(e.pointerId);
+    var ids = Object.keys(ptrs);
+    if (ids.length === 2) {                      // second finger down: begin pinch
+      var a = ptrs[ids[0]], b = ptrs[ids[1]];
+      pinch = { d: Math.hypot(a.x-b.x, a.y-b.y) || 1,
+                cx: (a.x+b.x)/2, cy: (a.y+b.y)/2 };
+      drag = null;
+    } else {
+      // middle OR right OR shift+left = pan; plain left / one finger = orbit
+      drag = { x: e.clientX, y: e.clientY,
+               pan: e.shiftKey || e.button === 1 || e.button === 2 };
+    }
   });
   canvas.addEventListener("pointermove", function (e) {
+    if (!(e.pointerId in ptrs)) return;
+    ptrs[e.pointerId].x = e.clientX; ptrs[e.pointerId].y = e.clientY;
+    var ids = Object.keys(ptrs);
+    if (ids.length >= 2 && pinch) {              // pinch-zoom + two-finger pan
+      var a = ptrs[ids[0]], b = ptrs[ids[1]];
+      var nd = Math.hypot(a.x-b.x, a.y-b.y) || 1;
+      var ncx = (a.x+b.x)/2, ncy = (a.y+b.y)/2;
+      cam.dist *= pinch.d / nd;
+      cam.dist = Math.max(span*0.15, Math.min(span*6, cam.dist));
+      panBy(ncx - pinch.cx, ncy - pinch.cy);
+      pinch.d = nd; pinch.cx = ncx; pinch.cy = ncy;
+      draw(); return;
+    }
     if (!drag) return;
     var ddx = e.clientX - drag.x, ddy = e.clientY - drag.y;
     drag.x = e.clientX; drag.y = e.clientY;
-    if (drag.pan) {
-      // planar pan (inverted: the terrain follows the cursor). Move the look-at
-      // target opposite the drag in the ground plane — screen-right maps to
-      // (sin az, -cos az); screen-up (drag toward viewer) to (cos az, sin az).
-      var ce = Math.cos(cam.az), se = Math.sin(cam.az);
-      var k = cam.dist / 700;
-      cam.tgt[0] += se*ddx*k;  cam.tgt[1] -= ce*ddx*k;
-      cam.tgt[0] -= ce*ddy*k;  cam.tgt[1] -= se*ddy*k;
-    } else {
+    if (drag.pan) { panBy(ddx, ddy); }
+    else {
       cam.az -= ddx*0.006;
       cam.el += ddy*0.006;
       cam.el = Math.max(0.08, Math.min(1.5, cam.el));
     }
     draw();
   });
-  canvas.addEventListener("pointerup", function (e) {
-    drag = null; try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
-  });
+  function endPtr(e) {
+    delete ptrs[e.pointerId];
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (Object.keys(ptrs).length < 2) pinch = null;   // fall back to orbit
+    drag = null;
+  }
+  canvas.addEventListener("pointerup", endPtr);
+  canvas.addEventListener("pointercancel", endPtr);
   canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
   canvas.addEventListener("wheel", function (e) {
     e.preventDefault();
@@ -623,13 +696,25 @@ _VIEWER_JS = r'''
   var bBtn = document.getElementById("beforeBtn");
   var aBtn = document.getElementById("afterBtn");
   var tag = document.getElementById("tag");
+  // "…_2026-08-01_…" -> "1 Aug 2026"; falls back to the raw label if no date is found.
+  function prettyDate(s) {
+    var m = /(\d{4})-(\d{2})-(\d{2})/.exec(s || "");
+    if (!m) return s || "";
+    var MO = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    return (+m[3]) + " " + MO[+m[2]-1] + " " + m[1];
+  }
   function setSide(s) {
     active = s;
     bBtn.classList.toggle("active", s === 0);
     aBtn.classList.toggle("active", s === 1);
-    tag.textContent = (s === 0 ? "BEFORE — " + (CFG.before_label||"")
-                               : "AFTER — " + (CFG.after_label||""));
+    tag.textContent = (s === 0 ? "Before · " + prettyDate(CFG.before_date || CFG.before_label)
+                               : "After · "  + prettyDate(CFG.after_date || CFG.after_label));
     draw();
+  }
+  // touch devices have no mouse buttons or keyboard: show gesture hints instead
+  if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) {
+    var helpEl = document.getElementById("help");
+    if (helpEl) helpEl.textContent = "drag to orbit · pinch to zoom · two-finger drag to pan";
   }
   bBtn.onclick = function () { setSide(0); };
   aBtn.onclick = function () { setSide(1); };
@@ -678,6 +763,7 @@ _VIEWER_JS = r'''
       gl.useProgram(oprog);
       gl.uniformMatrix4fv(oMVP, false, new Float32Array(mvp));
       gl.uniform1f(oPtSize, Math.max(9, Math.min(20, canvas.height/50)));
+      gl.uniform2f(oOffset, 0, 0);
       for (var oi=0; oi<overlays.length; oi++) {
         var o = overlays[oi], c = o.color;
         if (o.layer && !vis[o.layer]) continue;
@@ -687,10 +773,25 @@ _VIEWER_JS = r'''
           gl.depthMask(false);
         }
         gl.uniform1f(oPoint, o.mode === gl.POINTS ? 1.0 : 0.0);
-        gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
         gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
         gl.enableVertexAttribArray(oPos);
         gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
+        if (o.casing) {
+          // white halo: redraw the line at 8 screen-space offsets (~1.2px) without
+          // writing depth, so the dark core keeps its colour but stays legible over
+          // bright OR shadowed terrain (a thin cased-line edge, not a fat white line).
+          var ox = 2.4/Math.max(1,canvas.width), oy = 2.4/Math.max(1,canvas.height);
+          var DIRS = [[1,0],[-1,0],[0,1],[0,-1],[0.7,0.7],[-0.7,0.7],[0.7,-0.7],[-0.7,-0.7]];
+          gl.depthMask(false);
+          gl.uniform4f(oColor, 1, 1, 1, 1);
+          for (var di=0; di<DIRS.length; di++) {
+            gl.uniform2f(oOffset, DIRS[di][0]*ox, DIRS[di][1]*oy);
+            gl.drawArrays(o.mode, 0, o.n);
+          }
+          gl.uniform2f(oOffset, 0, 0);
+          if (!o.noDepth) gl.depthMask(true);
+        }
+        gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
         gl.drawArrays(o.mode, 0, o.n);
         if (o.noDepth) { gl.depthMask(true); gl.disable(gl.BLEND); }
       }
@@ -752,6 +853,12 @@ _VIEWER_JS = r'''
     if(_zcap<=zmin) _zcap=zmax;
     return _zcap;
   }
+  // Pedestal floor: a flat base a bit BELOW the terrain minimum, so the axis box reads as a
+  // solid plinth (a relief model on a base) instead of a skirt that pinches to zero at the
+  // lowest corner. Shared by the camera fit and the axis/wall drawing so nothing clips.
+  // 0.28 = pedestal depth as a fraction of the relief; inlined (not a top-level var) because
+  // fitView() runs at init BEFORE mid-file var assignments would execute.
+  function pedFloor(){ var zd=(zmin-zmid)*exag, zt=(zCapTop()-zmid)*exag; return zd-(zt-zd)*0.28; }
   function peakPt(){
     var mi=-1,mv=-1e18;
     for(var i=0;i<elev.length;i++){ var v=elev[i]; if(v===v && v>mv){mv=v;mi=i;} }
@@ -831,7 +938,7 @@ _VIEWER_JS = r'''
   function fitView(m) {
     m = m || {L:0.06, R:0.06, T:0.06, B:0.06};
     var bb = dataBBox();
-    var zB=(zmin-zmid)*exag, zT=(zCapTop()-zmid)*exag;   // capped box top
+    var zB=pedFloor(), zT=(zCapTop()-zmid)*exag;   // capped box top, pedestal floor below
     cam.tgt=[(bb.x0+bb.x1)/2, (bb.y0+bb.y1)/2, (zB+zT)/2];
     // FIT to the box FLOOR + the TERRAIN SURFACE (the mountain silhouette), plus the
     // elevation-axis top corner (added per-iteration in boxScreen). We EXCLUDE the
@@ -920,19 +1027,36 @@ _VIEWER_JS = r'''
       ctx.lineJoin = "round"; ctx.strokeText(txt, x, y);
       ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
     }
+    // draw ticks + numbers, tracking how far the numbers reach outward along the normal
+    // so the axis TITLE can be parked a clear gap beyond them (not on top of them).
+    var numReach = 0;
     niceTicks(Math.min(vs,ve), Math.max(vs,ve), n||6).forEach(function (v) {
       var f = (v - vs)/(ve - vs); if (f<-0.001 || f>1.001) return;
       var wp = [ws[0]+(we[0]-ws[0])*f, ws[1]+(we[1]-ws[1])*f, ws[2]+(we[2]-ws[2])*f];
       var p = project(mvp, wp, W, H); if (!p) return;
       ctx.strokeStyle = axC; ctx.lineWidth = lw;
       ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(p[0]+nx*tl, p[1]+ny*tl); ctx.stroke();
-      label(p[0]+nx*(tl+5), p[1]+ny*(tl+5), (v*fmt.scale).toFixed(fmt.dec), false);
+      var txt = (v*fmt.scale).toFixed(fmt.dec);
+      label(p[0]+nx*(tl+5), p[1]+ny*(tl+5), txt, false);
+      ctx.font = fs+"px sans-serif";                       // measure the number's box
+      var nw = ctx.measureText(txt).width;
+      var reach = tl+5 + Math.abs(nx)*nw + Math.abs(ny)*fs*0.72;   // extent along the normal
+      if (reach > numReach) numReach = reach;
     });
     var mid = project(mvp, [(ws[0]+we[0])/2,(ws[1]+we[1])/2,(ws[2]+we[2])/2], W, H);
-    if (mid) { ctx.textAlign="center"; label(mid[0]+nx*(tl+5.2*fs), mid[1]+ny*(tl+5.2*fs), title, true); }
+    if (mid) {
+      ctx.textAlign="center"; ctx.font="bold "+fs+"px sans-serif";
+      var tw = ctx.measureText(title).width;
+      // park the title beyond the numbers: numbers' reach + half the (centred) title's own
+      // extent along the normal + a fs*1.3 breathing gap.
+      var off = numReach + 0.5*(Math.abs(nx)*tw + Math.abs(ny)*fs) + fs*1.3;
+      label(mid[0]+nx*off, mid[1]+ny*off, title, true);
+    }
   }
   function drawAxes(ctx, mvp, W, H) {
-    var zBot = (zmin - zmid)*exag, zTop = (zCapTop() - zmid)*exag;   // box hugs terrain top
+    var zTop = (zCapTop() - zmid)*exag;             // box top hugs the terrain
+    var zData = (zmin - zmid)*exag;                 // true terrain minimum (elevation-axis base)
+    var zBot = pedFloor();                          // pedestal floor a bit below the data
     var bb = dataBBox();                       // tight to the real terrain
     var spanE = bb.x1 - bb.x0, spanN = bb.y1 - bb.y0;
     function corner(ix,iy,iz){ return [ ix?bb.x1:bb.x0, iy?bb.y1:bb.y0, iz?zTop:zBot ]; }
@@ -980,12 +1104,20 @@ _VIEWER_JS = r'''
       ctx.beginPath(); ctx.moveTo(top[0][0],top[0][1]);
       for (var i=1;i<top.length;i++) ctx.lineTo(top[i][0],top[i][1]);
       for (var j=bot.length-1;j>=0;j--) ctx.lineTo(bot[j][0],bot[j][1]);
-      ctx.closePath(); ctx.fillStyle="rgba(104,110,122,0.85)"; ctx.fill();
+      // two-tone the two visible faces (E/W walls lighter, N/S walls darker) for solidity
+      ctx.closePath();
+      ctx.fillStyle = (Wl[3]==="x") ? "rgba(120,128,141,0.9)" : "rgba(92,99,112,0.9)";
+      ctx.fill();
     });
-    // FLOOR rectangle + ticked axes, drawn on top of the block base.
+    // FLOOR rectangle + vertical corner posts (floor -> surface): crisp box edges. Drawn
+    // with terrain occlusion so hidden back edges don't X-ray through the mountain.
     ctx.strokeStyle = "rgba(234,240,250,0.62)"; ctx.lineWidth = Math.max(1.4, W/1050);
     [["000","100"],["010","110"],["000","010"],["100","110"]].forEach(function (e) {
       drawEdge3D(corner(+e[0][0],+e[0][1],+e[0][2]), corner(+e[1][0],+e[1][1],+e[1][2]));
+    });
+    [[0,0],[1,0],[0,1],[1,1]].forEach(function (c) {
+      var x=c[0]?bb.x1:bb.x0, y=c[1]?bb.y1:bb.y0;
+      drawEdge3D([x,y,zBot], [x,y,sampleZ(x,y)]);            // vertical plinth edge
     });
     // origin = the LOWEST bottom corner on screen (front apex of the outline), so the
     // two distance axes ride the outer lower-left / lower-right silhouette edges and
@@ -1013,7 +1145,10 @@ _VIEWER_JS = r'''
       var pb=Cp[b[0]+""+b[1]+"0"], pt=Cp[b[0]+""+b[1]+"1"];
       if (pb && pt) { var sx=(pb[0]+pt[0])/2; if (sx<zbest) { zbest=sx; Zc=b; } }
     });
-    if (Zc) drawTickAxis(ctx, mvp, W, H, corner(Zc[0],Zc[1],0), corner(Zc[0],Zc[1],1),
+    // base at the true terrain minimum (zData), NOT the pedestal floor, so the tick values
+    // line up with the surface; the plinth below is just the plain wall.
+    if (Zc) drawTickAxis(ctx, mvp, W, H,
+                 [Zc[0]?bb.x1:bb.x0, Zc[1]?bb.y1:bb.y0, zData], corner(Zc[0],Zc[1],1),
                  zmin, zCapTop(), "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
   }
   function drawNorth(ctx, mvp, W, H) {
@@ -1199,11 +1334,24 @@ _VIEWER_JS = r'''
     canvas.width=sw; canvas.height=sh; gl.viewport(0,0,sw,sh); positionLabels(renderScene(true)); draw();
     return {frames:frames, w:gw, h:gh};
   }
+  // burn the panel caption (e.g. "BEFORE · 2026-08-01") into a standalone slide so each
+  // individual PNG in the bundle is labelled with the imagery date, not just the montage.
+  function labelledPanel(s){
+    var iw=s.img.width, ih=s.img.height, bar=Math.max(30, Math.round(ih*0.06));
+    var c=document.createElement("canvas"); c.width=iw; c.height=ih+bar;
+    var g=c.getContext("2d");
+    g.fillStyle="#0b0e13"; g.fillRect(0,0,c.width,c.height);
+    g.drawImage(s.img,0,0);
+    g.fillStyle="#e6ecf6"; g.textAlign="center"; g.textBaseline="middle";
+    g.font="600 "+Math.round(bar*0.5)+"px sans-serif";
+    g.fillText(s.cap||"", iw/2, ih+bar*0.5);
+    return c;
+  }
   function buildBundle(fig, shots, status, done){
     try {
       var files=[{name:"slide.png", data:pngBytes(fig)}];
       var nm=["before.png","after.png","after_overlays.png"];
-      shots.forEach(function(s,i){ files.push({name:nm[i]||("panel"+(i+1)+".png"), data:pngBytes(s.img)}); });
+      shots.forEach(function(s,i){ files.push({name:nm[i]||("panel"+(i+1)+".png"), data:pngBytes(labelledPanel(s))}); });
       var orb=renderOrbitFrames(24, 480, 270);
       files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 16)});   // 16cs/frame = half speed
       var blob=new Blob([zipStore(files)], {type:"application/zip"});

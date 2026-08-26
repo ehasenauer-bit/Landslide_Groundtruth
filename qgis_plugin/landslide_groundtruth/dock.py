@@ -28,6 +28,7 @@ from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
 from .task import PipelineTask
 from . import layer_group as lg
+from .flow_layout import FlowRow
 
 # label -> --prefer value. PlanetScope lives in its own tab now (separate
 # Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
@@ -420,11 +421,13 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Cloud filter", cloud_row)
         root.addLayout(form)
 
-        # --- which review "scenes" to download ---
-        # Each checked product is written by the run; uncheck what you won't use to
-        # download less. The predicted-epicentre point layer is always included.
-        # Expanded by default so the choice is visible (it's a primary control).
-        scenes_box = QgsCollapsibleGroupBox("Scenes to download")
+        # --- which review layers to export ---
+        # These are OUTPUT products (renderings), not satellite acquisitions — the
+        # "scene" word is reserved for the Candidate scenes table below. Each checked
+        # product is written by the run; uncheck what you won't use to download less.
+        # The predicted-epicentre point layer is always included. Expanded by default
+        # so the choice is visible (it's a primary control).
+        scenes_box = QgsCollapsibleGroupBox("Layers to export")
         scenes_box.setSaveCollapsedState(False)
         scenes_box.setCollapsed(False)
         sbox = QVBoxLayout(scenes_box)
@@ -440,7 +443,7 @@ class LandslideDock(QgsDockWidget):
         # (PlanetScope coverage/quality toggles moved to the PlanetScope tab.)
 
         # --- search (free dry-run) / run / cancel ---
-        btn_row = QHBoxLayout()
+        btn_row = FlowRow()
         self.search_btn = QPushButton("Search / Preview")
         self.search_btn.setToolTip(
             "Free dry-run: list the candidate before/after scenes per source, "
@@ -468,6 +471,7 @@ class LandslideDock(QgsDockWidget):
             "on its own, minus the change rasters that need both. With the table "
             "empty (no Search yet) the run falls back to picking scenes itself.")
         self.run_btn.clicked.connect(self._run)
+        f = self.run_btn.font(); f.setBold(True); self.run_btn.setFont(f); self.run_btn.setDefault(True)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
@@ -475,7 +479,7 @@ class LandslideDock(QgsDockWidget):
         btn_row.addWidget(self.map_preview_btn)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.cancel_btn)
-        root.addLayout(btn_row)
+        root.addWidget(btn_row)
 
         # draw each candidate scene's footprint on the map (off by default)
         self.footprint_check = QCheckBox("Show scene footprints on map")
@@ -519,9 +523,9 @@ class LandslideDock(QgsDockWidget):
             "Hand-picking works for Sentinel-2 / Landsat; PlanetScope has its own "
             "tab.")
         scenes_box.addWidget(scenes_lbl)
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Source", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "AOI %", "Source", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -601,8 +605,8 @@ class LandslideDock(QgsDockWidget):
 
         info = QLabel(
             'Optional: store NASA Earthdata credentials for NASA-hosted imagery '
-            'downloads. The Sentinel-2 / Landsat search above uses the Planetary '
-            'Computer and needs no login. Register at '
+            'downloads. The Sentinel-2 / Landsat search above uses the Microsoft '
+            'Planetary Computer and needs no login. Register at '
             f'<a href="{EARTHDATA_REGISTER_URL}">urs.earthdata.nasa.gov</a>.')
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
@@ -620,9 +624,7 @@ class LandslideDock(QgsDockWidget):
         self.ed_pass_edit.returnPressed.connect(self._earthdata_login)
         form.addRow("Password", self.ed_pass_edit)
 
-        row = QWidget()
-        btns = QHBoxLayout(row)
-        btns.setContentsMargins(0, 0, 0, 0)
+        row = FlowRow()
         self.ed_login_btn = QPushButton("Test && save credentials")
         self.ed_login_btn.setToolTip(
             "Check the username/password against NASA URS. If valid, save them to "
@@ -632,8 +634,8 @@ class LandslideDock(QgsDockWidget):
         self.ed_check_btn.setToolTip(
             "Report whether ~/.netrc already holds a NASA Earthdata entry.")
         self.ed_check_btn.clicked.connect(self._earthdata_check_netrc)
-        btns.addWidget(self.ed_login_btn)
-        btns.addWidget(self.ed_check_btn)
+        row.addWidget(self.ed_login_btn)
+        row.addWidget(self.ed_check_btn)
         form.addRow(row)
 
         self.ed_status = QLabel()
@@ -875,7 +877,7 @@ class LandslideDock(QgsDockWidget):
 
     def _run(self):
         if not any(cb.isChecked() for cb in self.scene_checks.values()):
-            self._warn("Select at least one scene to download.")
+            self._warn("Select at least one layer to export.")
             return
         sel = self._checked_scene_selection()
         if isinstance(sel, str):
@@ -974,16 +976,13 @@ class LandslideDock(QgsDockWidget):
     def _fill_table(self, result):
         pre = result.get("pre", [])
         post = result.get("post", [])
-        # The dry-run lists every acquisition near the event, nearest-first (clouds
-        # included — see imagery.search_event), but an AUTOMATIC Run does not pick
-        # the nearest scene: it ranks by the cloud-weighted blend fetch_event uses
-        # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. We
-        # replicate that here, with one refinement the point demands: scenes whose
-        # footprint actually COVERS the epicentre are ranked ahead of ones that
-        # only clip the AOI box (see _rank_like_run), so ★ = best covering scene,
-        # ✓ = also in its composite, plain/greyed = below its cutoff or off-point.
-        # The marks are a SUGGESTION — the ticks decide, and a greyed row is often
-        # the right pick once you've looked at where the cloud actually sits.
+        # The dry-run lists every acquisition near the event (clouds included — see
+        # imagery.search_event). We mark the best review scene per side by what a
+        # usable before/after actually needs (see _rank_like_run): ★ = covers the
+        # event point, fills the most of the AOI box, and is least cloudy; ✓ = also
+        # among the best-covering low-cloud scenes; plain/greyed = less coverage,
+        # cloudier, or off-point entirely. The marks are a SUGGESTION — the ticks
+        # decide, and a 'cloudy' (whole-scene) row is often clear over the point.
         sel = self._run_selection(pre, post, result.get("params", {}))
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
@@ -994,13 +993,15 @@ class LandslideDock(QgsDockWidget):
             covers_pt = self._covers_event(c)
             if not covers_pt:
                 off_point += 1
+            cover_frac = self._aoi_coverage(c)          # 0..1 of the AOI box filled
             is_top = cid is not None and cid == info["top"]
             in_comp = cid in info["used"]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
             cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
+            cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else ("✓ " if in_comp else "  ")
-            cells = [marker + side, date, gap, cloud,
+            cells = [marker + side, date, gap, cloud, cover,
                      c.get("source", ""), c.get("id", "")]
             base = PRE_BG if side == "pre" else POST_BG
             bg = base.darker(112) if is_top else base   # the run's pick a touch darker
@@ -1029,21 +1030,24 @@ class LandslideDock(QgsDockWidget):
             side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
             side_item.setCheckState(Qt.Unchecked)
             if c.get("thumb_url"):
-                self.table.item(r, 5).setToolTip(c["thumb_url"])
+                self.table.item(r, 6).setToolTip(c["thumb_url"])
+            self.table.item(r, 4).setToolTip(
+                f"Covers {cover}% of the search-AOI box"
+                + ("" if covers_pt else " — but NOT the event point itself"))
             if is_top:
                 side_item.setToolTip(
-                    "★ Best-ranked scene on this side (gap_days + cloud weighting) "
-                    "— a suggestion, not a selection. It is NOT ticked for you.")
+                    f"★ Best scene on this side: covers the event point and the most "
+                    f"of the AOI ({cover}%) with the least cloud. A suggestion, not a "
+                    f"selection — it is NOT ticked for you.")
             elif in_comp:
                 side_item.setToolTip(
-                    "✓ Also inside that ranking's top few on this side, so it's "
-                    "another reasonable pick.")
+                    "✓ Also among the best-covering, low-cloud scenes on this side, "
+                    "so it's another reasonable pick.")
             else:
                 side_item.setToolTip(
-                    "Ranked below where that suggestion stops (gap_days + cloud "
-                    "weighting). The ranking knows nothing about WHERE the cloud "
-                    "sits, so check the thumbnail — a 'cloudy' scene is often clear "
-                    "over the AOI and the right pick.")
+                    "Ranked below the suggestion (less AOI coverage, or cloudier). "
+                    "Cloud % is a WHOLE-scene metric, so check the thumbnail — a "
+                    "'cloudy' scene is often clear over the point and the right pick.")
             side_item.setToolTip(
                 side_item.toolTip() + "\n\nTick the checkbox to use this scene: a "
                 "Run downloads EXACTLY the ticked rows (and 'Preview on map' "
@@ -1072,43 +1076,46 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
     def _rank_like_run(self, cands, cloud_weight, auto_window):
-        """Order candidates as imagery.search_scenes would for a Run, but with any
-        scene that actually covers the epicentre ranked ahead of one that doesn't.
+        """Order candidates for the ★ / Preview-on-map: the scene that best covers
+        the point AND the AOI, with the least cloud.
 
-        Coverage of the event point is the PRIMARY key: a scene whose footprint
-        leaves the epicentre in a nodata gap is useless for a before/after at that
-        point, so it sinks below every scene that covers it regardless of
-        gap/cloud (this is what keeps the ★ suggestion and the Preview-on-map
-        default from landing on a granule sitting off to one side of the point).
-        Within a coverage group the Run's own order holds — auto_window: nearest
-        day first, then clearest among same-day (cloud_weight ignored); otherwise
-        the blend cost gap_days + cloud_weight*cloud_pct, so a clearer scene a
-        little further from the event can outrank a cloudy near one."""
+        Keys, in order:
+          1. covers the epicentre (a scene that leaves the point in a nodata gap is
+             useless for a before/after there, so it sinks below every one that
+             covers it, whatever else it has going for it);
+          2. AOI coverage, bucketed to 5% (the scene filling the most of the search
+             box — fewest nodata gaps over the area);
+          3. cloud cover, least first (whole-scene metric, so it only breaks ties
+             between similarly-covering scenes — which is why coverage is bucketed);
+          4. gap_days, nearest the event last, as a final tiebreaker.
+        cloud_weight / auto_window no longer reshuffle this: coverage of the point
+        and the area is what makes a review scene usable, so it leads regardless of
+        which Run mode produced the candidates."""
         def covers(c):
-            return 0 if self._covers_event(c) else 1   # point-covering scenes first
+            return 0 if self._covers_event(c) else 1        # point-covering first
 
-        def gap(c):
-            g = c.get("gap_days")
-            return 1e9 if g is None else g
+        def cov_bucket(c):
+            return -round(self._aoi_coverage(c) * 20)       # 5% bins, most first
 
         def cloud(c):
             v = c.get("cloud_pct")
             return 100.0 if v is None else v
 
-        if auto_window:
-            return sorted(cands, key=lambda c: (covers(c), round(gap(c)), cloud(c)))
-        return sorted(cands, key=lambda c: (covers(c), gap(c) + cloud_weight * cloud(c)))
+        def gap(c):
+            g = c.get("gap_days")
+            return 1e9 if g is None else g
+
+        return sorted(cands, key=lambda c: (covers(c), cov_bucket(c), cloud(c), gap(c)))
 
     def _run_selection(self, pre, post, params):
-        """Which scenes a Run would composite per side: {'pre'/'post': {top, used}}.
+        """Which scenes to mark per side: {'pre'/'post': {top, used}}.
 
-        Follows fetch_event: pick the source it would use (explicit --prefer, else
-        the first of Planet→Sentinel-2→Landsat with scenes on both sides), then take
-        the top 1 (auto-window) or top 6 (default, median-composited) by the run's
-        ranking — except scenes that cover the epicentre are ranked first (see
-        `_rank_like_run`), so the ★ suggestion is a scene that actually covers the
-        point rather than one merely overlapping the AOI box. `top` is the scene
-        the preview should show; `used` is the full composite set."""
+        Picks the source a Run would use (explicit --prefer, else the first of
+        Planet→Sentinel-2→Landsat with scenes on both sides), then ranks that
+        source's scenes by point+AOI coverage and cloud (see `_rank_like_run`).
+        `top` (the ★) is the scene the preview should show — best coverage of the
+        point and the box, least cloud; `used` (the ✓ set) is the top 1
+        (auto-window) or top 6 of that ranking."""
         cw = params.get("cloud_weight", 0.5)
         cw = 0.5 if cw is None else cw
         auto = bool(params.get("auto_window"))
@@ -1416,6 +1423,32 @@ class LandslideDock(QgsDockWidget):
         if g is None or g.isEmpty():
             return True
         return g.contains(pt)
+
+    def _aoi_coverage(self, candidate):
+        """Fraction (0..1) of the search-AOI box the scene footprint fills.
+
+        area(footprint ∩ AOI) / area(AOI). Drives the ★/preview toward the scene
+        that fills the MOST of the box (fewest nodata gaps over the area), which
+        is the other half of 'covers the point AND the AOI'. The ratio is taken in
+        the AOI's own lon/lat space, so the box's degree anisotropy cancels top
+        and bottom. 0.0 when geometry or AOI is missing, so an untestable scene
+        never wins on coverage."""
+        bbox = self._aoi_bbox()
+        g = self._qgs_geom(candidate.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy, _ = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
 
     def _selected_ids(self):
         """Scene ids of the currently selected table rows."""

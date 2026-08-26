@@ -30,7 +30,7 @@ by construction — same trick as the SAR tab's shared bbox renders, done
 client-side with gdal.Warp because PGC has no render API.
 """
 import numpy as np
-from osgeo import gdal, osr
+from osgeo import gdal, ogr, osr
 
 NODATA = -9999.0
 
@@ -175,3 +175,192 @@ def hillshade_thumb(url, max_px=256):
     if arr is None:
         raise IOError(f"no overview data in {url}")
     return np.ascontiguousarray(arr.astype(np.uint8)).tobytes(), ow, oh
+
+
+# ===========================================================================
+# Elevation-change (Δh) -> volume, for the Volume tab's "∫Δh over outline" fit.
+#
+# The one thing MOSART (and any dDEM workflow) leaves to the caller: turn a map
+# of elevation change into a volume by summing dh over the ground area that
+# moved. Everything here is metric — the change field is warped to a UTM grid so
+# a pixel is res×res square metres regardless of whether the input arrived in
+# radar/degree/foot units, then dh·res² is summed inside the outline. Kept in
+# dem_diff, not volume_tab, because the tab is deliberately numpy/GDAL-free.
+# ===========================================================================
+def _resolve_source(u):
+    """A GDAL-openable string. Remote http(s)/ftp get the /vsicurl/ prefix;
+    local paths, a QgsRasterLayer.source() and existing /vsi paths pass through.
+
+    Distinct from `warp`, which prefixes /vsicurl onto everything non-/vsi
+    because its inputs are always remote PGC COGs — here the inputs are usually
+    LOCAL rasters (a project DEM, a differenced Δh, a saved MOSART GeoTIFF).
+
+    A QGIS raster layer's source() can carry provider decorations GDAL can't
+    open (e.g. "…/dem.tif|band=1"); the part before the first '|' is the
+    GDAL dataset string, so keep only that."""
+    u = u.split("|", 1)[0]
+    if u.startswith("/vsi"):
+        return u
+    if u.startswith(("http://", "https://", "ftp://")):
+        return "/vsicurl/" + u
+    return u
+
+
+def _source_nodata(srcs):
+    """The nodata of the first source that declares one, else None.
+
+    Passed to gdal.Warp as srcNodata so a declared fill is MASKED rather than
+    resampled: without it, bilinear blends an undeclared but real fill value
+    (a bare -9999 or 0 with no band NoData set) into neighbouring valid pixels,
+    and valid_heights would then keep the smeared fringe."""
+    for s in srcs:
+        try:
+            ds = gdal.Open(s)
+        except Exception:
+            continue
+        if ds is None:
+            continue
+        nd = ds.GetRasterBand(1).GetNoDataValue()
+        ds = None
+        if nd is not None:
+            return nd
+    return None
+
+
+def warp_to_grid(sources, bounds, epsg, res, resample="bilinear", nodata=NODATA):
+    """Warp local file(s) (or remote COGs, or a mosaic list) onto the shared AOI
+    grid; returns (array float32, geotransform, proj).
+
+    Like `warp` but does NOT force /vsicurl onto local inputs, so it accepts a
+    project raster's .source() and a list of on-disk tiles (e.g. the 11 tiles of
+    a lidar DSM, mosaicked by GDAL onto the one grid). `bounds`/`res`/`epsg`
+    define the metric target grid every call lands on."""
+    srcs = [sources] if isinstance(sources, str) else list(sources)
+    srcs = [_resolve_source(u) for u in srcs]
+    opts = dict(format="MEM", dstSRS=f"EPSG:{epsg}",
+                outputBounds=bounds, xRes=res, yRes=res,
+                resampleAlg=resample, multithread=False, errorThreshold=0.125)
+    if nodata is not None:
+        opts["dstNodata"] = nodata
+    src_nd = _source_nodata(srcs)
+    if src_nd is not None:
+        opts["srcNodata"] = src_nd     # mask a declared fill, don't blend it
+    ds = gdal.Warp("", srcs, **opts)
+    if ds is None:
+        raise IOError(f"gdal.Warp failed for {srcs}")
+    arr = ds.GetRasterBand(1).ReadAsArray()
+    gt, proj = ds.GetGeoTransform(), ds.GetProjection()
+    ds = None
+    if arr is None:
+        raise IOError(f"no raster data warped from {srcs}")
+    return arr.astype(np.float32), gt, proj
+
+
+def difference_dems(pre_sources, post_sources, bounds, epsg, res,
+                    coregister=True):
+    """(dh, gt, proj, stats) — post minus pre on one shared UTM grid.
+
+    Both DEMs are warped to the identical (bounds, epsg, res) grid so they
+    subtract pixel-aligned. dh is metres of surface change, POSITIVE where the
+    surface rose (deposition), negative where it dropped (erosion). With
+    coregister=True the DC vertical bias between the two surfaces is removed by a
+    sigma-clipped median over the co-valid pixels (`coregister_offset`) — real
+    change falls out of that estimate so what is subtracted is the
+    geolocation/datum offset, de-meaning the quasi-stable ground to ~0.
+
+    `stats` carries offset_m, stable_px (pixels that defined the offset) and
+    valid_px, so the caller can flag a co-registration resting on a thin or
+    unstable (e.g. a glacier that itself moved between epochs) slice of ground."""
+    pre, gt, proj = warp_to_grid(pre_sources, bounds, epsg, res)
+    post, _gt2, _proj2 = warp_to_grid(post_sources, bounds, epsg, res)
+    valid = valid_heights(pre) & valid_heights(post)
+    raw = np.where(valid, post - pre, np.nan)
+    offset, stable = coregister_offset(raw, valid) if coregister else (0.0, 0)
+    dh = np.where(valid, raw - offset, np.nan).astype(np.float32)
+    stats = {"offset_m": float(offset), "stable_px": int(stable),
+             "valid_px": int(valid.sum()), "res_m": float(res),
+             "epsg": int(epsg)}
+    return dh, gt, proj, stats
+
+
+def _polygon_mask(wkt, epsg, gt, shape):
+    """Boolean mask, True inside the polygon, on the grid defined by gt/shape.
+
+    `wkt` is interpreted in EPSG:epsg — the SAME CRS as the warped grid — so the
+    burn lands pixel-aligned with the Δh array. Pixels are burned by centre
+    (GDAL's default), which is the right convention for area/volume integration:
+    each ground pixel is counted once."""
+    h, w = shape
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(epsg))
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    vds = ogr.GetDriverByName("Memory").CreateDataSource("mask")
+    lyr = vds.CreateLayer("poly", srs=srs, geom_type=ogr.wkbPolygon)
+    geom = ogr.CreateGeometryFromWkt(wkt)
+    if geom is None:
+        raise ValueError("could not parse the outline geometry (WKT)")
+    feat = ogr.Feature(lyr.GetLayerDefn())
+    feat.SetGeometry(geom)
+    lyr.CreateFeature(feat)
+    mds = gdal.GetDriverByName("MEM").Create("", w, h, 1, gdal.GDT_Byte)
+    mds.SetGeoTransform(gt)
+    mds.SetProjection(srs.ExportToWkt())
+    err = gdal.RasterizeLayer(mds, [1], lyr, burn_values=[1])
+    m = mds.GetRasterBand(1).ReadAsArray().astype(bool)
+    mds = None
+    vds = None
+    if err != 0:
+        raise IOError("rasterizing the outline onto the Δh grid failed")
+    return m
+
+
+def integrate_dh(dh_source, outline_wkt, epsg, bounds, res,
+                 sign_deposit_positive=True, offset=0.0, resample="bilinear"):
+    """Integrate an elevation-change raster over an outline -> volumes (m³).
+
+    `dh_source` is any GDAL-openable Δh raster in metres. It is warped onto the
+    metric grid (bounds, epsg, res) — reprojecting a geographic (e.g. MOSART
+    lon/lat degree) product to equal-area square pixels on the way — the outline
+    (WKT, in EPSG:epsg) is rasterized to a mask, and Δh is summed over the
+    covered valid pixels:
+
+        V_net = Σ Δh · res²        ( = V_deposit + V_erosion )
+
+    With `sign_deposit_positive` (default) a positive Δh is deposition (surface
+    rose) and negative is erosion; pass False for a pre-minus-post product, which
+    flips the sign. `offset` is subtracted from every Δh first (e.g. a residual
+    stable-ground bias). Returns a dict of volumes (m³), covered area (m²), the
+    pixel count and the Δh extremes.
+
+    Resampling: bilinear is right for a real (continuous) Δh field, and is an
+    identity when the source already sits on the target grid (a Δh made by
+    difference_dems). The net volume is resampling-invariant; only the
+    erosion/deposition SPLIT is mildly sensitive where a source pixel straddles
+    the zero crossing after reprojection, since a blended value lands on one side
+    of zero. That is a fraction-of-a-pixel effect along the zero contour, not a
+    bias in the totals."""
+    dh, gt, _proj = warp_to_grid(dh_source, bounds, epsg, res, resample=resample)
+    mask = _polygon_mask(outline_wkt, epsg, gt, dh.shape)
+    valid = valid_heights(dh) & mask
+    vals = dh[valid].astype(np.float64) - float(offset)
+    if not sign_deposit_positive:
+        vals = -vals
+    # Pixel area from the ACTUAL warped grid, not the requested res: if `bounds`
+    # weren't a whole-pixel multiple of res, gdal.Warp nudges the pixel size to
+    # fit outputBounds, and gt[1]/gt[5] are then the truth.
+    px = abs(gt[1] * gt[5])
+    n = int(vals.size)
+    v_deposit = float(vals[vals > 0].sum() * px)
+    v_erosion = float(vals[vals < 0].sum() * px)
+    return {
+        "v_net": float(vals.sum() * px),
+        "v_deposit": v_deposit,
+        "v_erosion": v_erosion,
+        "covered_area_m2": float(n * px),
+        "pixel_count": n,
+        "mean_dh_m": float(vals.mean()) if n else 0.0,
+        "max_rise_m": float(vals.max()) if n else 0.0,
+        "max_drop_m": float(vals.min()) if n else 0.0,
+        "res_m": float(res),
+        "epsg": int(epsg),
+    }

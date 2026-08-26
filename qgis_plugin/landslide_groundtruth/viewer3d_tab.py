@@ -48,6 +48,7 @@ from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 from . import dem_diff
 from . import layer_group as lg
 from .task import PipelineTask
+from .flow_layout import FlowRow
 
 # The terrain settings class we build ourselves (the canvas owns its
 # Qgs3DMapSettings; we mutate that live and only construct the terrain settings).
@@ -78,6 +79,14 @@ PGC_SOURCES = ("arcticdem", "earthdem", "rema")
 # actually delivers terrain just north of the border). Matched on dem_source
 # prefix; see _tier_of.
 FALLBACK_TIERS = ("3dep", "mrdem")
+
+# When the chosen terrain is an ArcticDEM strip, warp it together with the other
+# overlapping strips so one strip's gaps get filled by another's (a single
+# opportunistic stereo pass can leave the event point in a hole even when its
+# footprint clips the AOI). Cap the mosaic so a decade of strips over a well-
+# imaged geocell can't fan out into dozens of /vsicurl reads — the greedy
+# footprint pick in _pgc_gapfill_cands stops as soon as the AOI is blanketed.
+MAX_MOSAIC_STRIPS = 8
 
 
 def _pc_sign(href):
@@ -267,8 +276,17 @@ class Viewer3DTab(QWidget):
         self.zfactor_spin.setRange(0.5, 5.0)
         self.zfactor_spin.setSingleStep(0.5)
         self.zfactor_spin.setValue(1.0)
-        self.zfactor_spin.setPrefix("z ")
+        # Was an unlabelled "z 1.00" spinbox; give it a visible label + tooltip so
+        # it doesn't read as a mystery control next to the hillshade checkbox.
+        zfactor_lbl = QLabel("z-factor")
+        zfactor_tip = (
+            "Hillshade z-factor: vertical exaggeration applied only to the "
+            "shaded-relief calculation (steepens the shading). Separate from the "
+            "scene's Vertical exaggeration above; 1.0 = true slope.")
+        zfactor_lbl.setToolTip(zfactor_tip)
+        self.zfactor_spin.setToolTip(zfactor_tip)
         hs_row.addWidget(self.hillshade_check, 1)
+        hs_row.addWidget(zfactor_lbl)
         hs_row.addWidget(self.zfactor_spin)
         tform.addRow("Hillshade", self._wrap(hs_row))
 
@@ -294,6 +312,8 @@ class Viewer3DTab(QWidget):
         dlay.addWidget(hint)
         self.drape_list = QListWidget()
         self.drape_list.setMinimumHeight(120)
+        # (un)ticking a drape layer changes what the Before/After pickers may offer
+        self.drape_list.itemChanged.connect(self._on_drape_checks_changed)
         dlay.addWidget(self.drape_list)
         refresh_btn = QPushButton("Refresh layer list")
         refresh_btn.clicked.connect(self._refresh_drape_list)
@@ -405,8 +425,9 @@ class Viewer3DTab(QWidget):
             ("Vertical drop", self.det_cl_drop, "centerline elevation drop"),
             ("Volume", self.det_volume, "paste the estimate from the Volume tab"),
         ):
+            # the placeholder already shows `tip` in the empty field; an
+            # identical tooltip would only repeat it (rule b), so don't set one.
             w.setPlaceholderText(tip)
-            w.setToolTip(tip)
             dform.addRow(lbl, w)
         self.pull_vol_btn = QPushButton("↻ Pull area / centerline / volume from Volume tab")
         self.pull_vol_btn.setToolTip(
@@ -418,18 +439,27 @@ class Viewer3DTab(QWidget):
         root.addWidget(det_box)
 
         # --- actions -------------------------------------------------------
-        btn_row = QHBoxLayout()
+        # FlowRow (not a fixed QHBoxLayout) so the three buttons wrap onto a
+        # second line instead of clipping their labels in a narrow dock.
+        btn_row = FlowRow()
         self.open_btn = QPushButton("Open / update 3D view")
         self.open_btn.clicked.connect(self._open_view)
         self.open_btn.setEnabled(False)
+        self.open_btn.setToolTip(
+            "Fetch / build terrain first — the 3D scene needs a terrain DEM. "
+            "Once terrain is built this opens (or updates) the QGIS 3D view.")
+        # open_btn was the primary action (added with stretch 2); FlowRow has no
+        # stretch, so carry that emphasis with a bold font + default button.
+        f = self.open_btn.font(); f.setBold(True); self.open_btn.setFont(f)
+        self.open_btn.setDefault(True)
         self.reset_btn = QPushButton("Reset camera")
         self.reset_btn.clicked.connect(self._reset_camera)
         self.close_btn = QPushButton("Close 3D view")
         self.close_btn.clicked.connect(self._close_view)
-        btn_row.addWidget(self.open_btn, 2)
-        btn_row.addWidget(self.reset_btn, 1)
-        btn_row.addWidget(self.close_btn, 1)
-        root.addLayout(btn_row)
+        btn_row.addWidget(self.open_btn)
+        btn_row.addWidget(self.reset_btn)
+        btn_row.addWidget(self.close_btn)
+        root.addWidget(btn_row)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -502,6 +532,7 @@ class Viewer3DTab(QWidget):
         Preserve the user's ticks across refreshes; on the first populate (nothing
         ticked yet) default to the layers currently visible in the tree."""
         prev = set(self._checked_drape_ids())
+        self.drape_list.blockSignals(True)      # rebuild silently; refresh once below
         self.drape_list.clear()
         root = QgsProject.instance().layerTreeRoot()
         for lyr in self._project_rasters():
@@ -517,6 +548,7 @@ class Viewer3DTab(QWidget):
                 check = bool(node and node.isVisible())
             item.setCheckState(Qt.Checked if check else Qt.Unchecked)
             self.drape_list.addItem(item)
+        self.drape_list.blockSignals(False)
         self._refresh_before_after()
 
     def _checked_drape_ids(self):
@@ -526,6 +558,11 @@ class Viewer3DTab(QWidget):
             if it.checkState() == Qt.Checked:
                 ids.append(it.data(Qt.UserRole))
         return ids
+
+    def _on_drape_checks_changed(self, *_):
+        """A drape layer was (un)ticked. The Before/After pickers only offer
+        layers that are being draped, so re-populate them to match."""
+        self._refresh_before_after()
 
     def _aoi(self):
         """(lat, lon, radius_km) or None with a warning."""
@@ -707,10 +744,29 @@ class Viewer3DTab(QWidget):
             return 0.0
         return min(1.0, inter.area() / area)
 
+    def _point_in_pgc_footprint(self, cands, lat, lon):
+        """True if the event point lies inside the union of ArcticDEM strip
+        footprints — i.e. at least one strip actually has data AT the point, not
+        just somewhere in the AOI box. This is the coverage that matters: a strip
+        can blanket >=50% of the box off to one side and still leave the centred
+        point in a hole (the '56% covered but the point is bare' case). Strips
+        without footprint geometry are ignored here; if none carry geometry this
+        returns False and the box-coverage test below still gets a say."""
+        pt = QgsGeometry.fromPointXY(QgsPointXY(lon, lat))
+        for c in cands:
+            if c.get("dem_source") not in PGC_SOURCES:
+                continue
+            g = self.dock._qgs_geom(c.get("geometry"))
+            if g is not None and not g.isEmpty() and g.contains(pt):
+                return True
+        return False
+
     def _pick_default_strip(self, cands):
-        """Combo index to auto-warp: best ArcticDEM if its footprints blanket
-        >=50% of the AOI, else the first available fallback (3DEP, then MRDEM).
-        `cands` is ranked, so the first entry of each tier is that tier's best."""
+        """Combo index to auto-warp: the best ArcticDEM strip if any strip covers
+        the event point OR the strip footprints blanket >=50% of the AOI, else the
+        first available fallback (3DEP, then MRDEM). `cands` is ranked, so index 0
+        is the best ArcticDEM strip when any exist. The gaps around the chosen
+        strip get mosaicked shut at warp time (see _pgc_gapfill_cands)."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -718,18 +774,23 @@ class Viewer3DTab(QWidget):
         except (TypeError, ValueError):
             return 0
         cover = self._arcticdem_footprint_cover(cands, lat, lon, radius)
-        if cover >= 0.5:
-            self._log(f"ArcticDEM footprints blanket ~{cover*100:.0f}% of the AOI "
-                      f"(>=50%) — using ArcticDEM.")
+        point_ok = self._point_in_pgc_footprint(cands, lat, lon)
+        if point_ok or cover >= 0.5:
+            why = ("covers the event point" if point_ok
+                   else f"blankets ~{cover*100:.0f}% of the AOI (>=50%)")
+            self._log(f"ArcticDEM {why} — using ArcticDEM (overlapping strips "
+                      f"mosaicked to fill gaps).")
             return 0
         nxt = self._fallback_index("pgc")
         if nxt >= 0:
             src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
-            self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the "
-                      f"AOI (<50%) — defaulting to {src}.")
+            self._log(f"No ArcticDEM strip covers the event point and its footprints "
+                      f"blanket only ~{cover*100:.0f}% of the AOI — defaulting to "
+                      f"{src}.")
             return nxt
-        self._log(f"ArcticDEM footprints cover only ~{cover*100:.0f}% of the AOI, and "
-                  f"no fallback DEM was found here — using ArcticDEM (may have gaps).")
+        self._log(f"No ArcticDEM strip covers the event point and its footprints "
+                  f"cover only ~{cover*100:.0f}% of the AOI, and no fallback DEM was "
+                  f"found here — using ArcticDEM (may have gaps).")
         return 0
 
     def _tier_of(self, cand):
@@ -777,6 +838,79 @@ class Viewer3DTab(QWidget):
             self._pgc_fallback = None
             self._warp_selected_strip()
 
+    @staticmethod
+    def _cand_urls(cand):
+        """A candidate's data URLs (dem_urls list, or the single dem_url)."""
+        return list(cand.get("dem_urls") or
+                    ([cand["dem_url"]] if cand.get("dem_url") else []))
+
+    def _mosaic_urls_for(self, primary, lat, lon, radius):
+        """URLs to warp for `primary`. For an ArcticDEM strip, greedily fold in
+        the other overlapping strips so their footprints, unioned with the
+        primary's, blanket the AOI box — one strip's gaps get filled by another's.
+        Non-PGC sources (3DEP/MRDEM) are already AOI-wide mosaics, so they warp
+        from their own tiles unchanged.
+
+        Ordering matters: gdal.Warp paints sources in list order and the LAST
+        valid pixel wins, so `primary` (the strip the dropdown label names, and
+        whose date the layer carries) goes last to stay on top, better-ranked
+        fillers just under it, and the rest below — the others only ever show
+        through where the strips above them have no data."""
+        if self._tier_of(primary) != "pgc":
+            return self._cand_urls(primary)
+
+        dlat = radius / 111.32
+        dlon = radius / (111.32 * math.cos(math.radians(lat)))
+        box = QgsGeometry.fromRect(
+            QgsRectangle(lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+        box_area = box.area()
+
+        def cover_in_box(cand):
+            g = self.dock._qgs_geom(cand.get("geometry"))
+            if g is None or g.isEmpty():
+                return None
+            g = g.intersection(box)
+            return None if (g is None or g.isEmpty()) else g
+
+        # candidates in ranked (best-first) order, primary excluded
+        others = []
+        for i in range(self.strip_combo.count()):
+            c = self.strip_combo.itemData(i)
+            if c is not primary and self._tier_of(c) == "pgc" and self._cand_urls(c):
+                others.append(c)
+
+        covered = cover_in_box(primary)
+        chosen = []                          # fillers, best-ranked first
+        for c in others:
+            if len(chosen) + 1 >= MAX_MOSAIC_STRIPS:
+                break
+            g = cover_in_box(c)
+            if g is None:
+                continue
+            if covered is None:
+                covered, chosen = g, chosen + [c]
+                continue
+            gain = g.difference(covered)
+            if gain is not None and not gain.isEmpty() and gain.area() > 0.02 * box_area:
+                covered = covered.combine(g)
+                chosen.append(c)
+            if covered is not None and covered.area() >= 0.98 * box_area:
+                break
+
+        # painter's order: worst filler first … best filler … primary last (top).
+        # Primary's url(s) are appended last unconditionally, so even if a filler
+        # repeats one it can't pull the primary off the top of the stack.
+        primary_urls = self._cand_urls(primary)
+        pset = set(primary_urls)
+        urls, seen = [], set()
+        for c in reversed(chosen):
+            for u in self._cand_urls(c):
+                if u and u not in seen and u not in pset:
+                    seen.add(u)
+                    urls.append(u)
+        urls += [u for u in primary_urls if u]
+        return urls
+
     def _warp_selected_strip(self):
         cand = self.strip_combo.currentData()
         if not cand:
@@ -801,7 +935,7 @@ class Viewer3DTab(QWidget):
         # clobber each other.
         src_tag = cand.get("dem_source", "src")
         out_path = os.path.join(out_dir, f"terrain_{epsg}_{res}m_{src_tag}.tif")
-        urls = cand.get("dem_urls") or ([cand["dem_url"]] if cand.get("dem_url") else [])
+        urls = self._mosaic_urls_for(cand, lat, lon, radius)
         if not urls:
             self._warn("Selected DEM candidate has no data URL.")
             return
@@ -809,8 +943,13 @@ class Viewer3DTab(QWidget):
         self._gen += 1
         gen = self._gen
         self._busy(True)
-        ntile = f" ({len(urls)} tiles)" if len(urls) > 1 else ""
-        self._log(f"Warping {src_label}{ntile} to {res} m over the AOI (EPSG:{epsg})…")
+        if self._tier_of(cand) == "pgc" and len(urls) > 1:
+            extra = f" (mosaicking {len(urls)} overlapping strips to fill gaps)"
+        elif len(urls) > 1:
+            extra = f" ({len(urls)} tiles)"
+        else:
+            extra = ""
+        self._log(f"Warping {src_label}{extra} to {res} m over the AOI (EPSG:{epsg})…")
         self._warp_task = QgsTask.fromFunction(
             f"Warp {src_label}", self._warp_worker,
             on_finished=lambda exc, res_: self._on_warp_done(exc, res_, gen, out_path),
@@ -830,9 +969,16 @@ class Viewer3DTab(QWidget):
         cover = float(valid.mean()) if valid.size else 0.0
         if cover <= 0.0:
             return {"error": "no valid elevation pixels over the AOI"}
+        # whether the AOI centre — the event point, since bounds are centred on
+        # it — actually resolved to a valid pixel. A strip can cover most of the
+        # box yet leave the point itself in a hole, which is the coverage the
+        # user cares about; drives the point-aware fallback in _on_warp_done.
+        h, w = valid.shape
+        point_valid = bool(valid[h // 2, w // 2])
         zmean = float(np.nanmean(arr[valid]))
         dem_diff.write_gtiff(out_path, np.where(valid, arr, np.nan), gt, proj)
-        return {"path": out_path, "zmean": zmean, "cover": cover}
+        return {"path": out_path, "zmean": zmean, "cover": cover,
+                "point_valid": point_valid, "n_sources": len(urls)}
 
     def _on_warp_done(self, exc, result, gen, out_path):
         if gen != self._gen:
@@ -878,18 +1024,26 @@ class Viewer3DTab(QWidget):
             return
 
         cover = result["cover"]
-        # post-warp safety net: the ArcticDEM strip's footprint claimed the AOI but
-        # it warped to <50% valid pixels (interior water/shadow/cloud holes). Try
-        # the fallback chain rather than install a holey surface — but hold on to
-        # THIS result so that if every fallback is empty here we still fall back
-        # to it (a partial surface beats no terrain).
-        if tier == "pgc" and cover < 0.5:
+        point_bare = not result.get("point_valid", True)
+        # post-warp safety net: the ArcticDEM mosaic warped to <50% valid pixels
+        # over the AOI, or — even at decent box coverage — left the event point
+        # itself in a hole (no overlapping strip had data there). Either way try
+        # the fallback chain rather than install terrain that's holey where it
+        # matters, but hold on to THIS result so that if every fallback is empty
+        # here we still fall back to it (a partial surface beats no terrain).
+        if tier == "pgc" and (cover < 0.5 or point_bare):
             nxt = self._fallback_index("pgc")
             if nxt >= 0:
                 self._pgc_fallback = {"result": result, "cand": cand}
                 src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
-                self._log(f"This ArcticDEM strip resolved only {cover*100:.0f}% "
-                          f"valid pixels over the AOI (<50%); trying {src}…")
+                if point_bare:
+                    why = ("left the event point in a hole"
+                           + (f" and resolved only {cover*100:.0f}% of the AOI"
+                              if cover < 0.5 else
+                              f" ({cover*100:.0f}% of the AOI covered elsewhere)"))
+                else:
+                    why = f"resolved only {cover*100:.0f}% valid pixels over the AOI (<50%)"
+                self._log(f"The ArcticDEM mosaic {why}; trying {src}…")
                 self._select_and_warp_index(nxt)
                 return
         self._pgc_fallback = None
@@ -913,11 +1067,22 @@ class Viewer3DTab(QWidget):
             date_str = "seamless mosaic"            # 3DEP seamless is timeless
         else:
             date_str = "undated"
-        name = " ".join(x for x in (src, model, date_str, "terrain",
+        n_src = result.get("n_sources", 1)
+        is_pgc_mosaic = cand.get("dem_source") in PGC_SOURCES and n_src > 1
+        mosaic_tag = f"+{n_src - 1} strip mosaic" if is_pgc_mosaic else ""
+        name = " ".join(x for x in (src, model, date_str, mosaic_tag, "terrain",
                                     f"({cover*100:.0f}% AOI cover)") if x)
         self._set_terrain_from_file(result["path"], name, date_str)
         if not self.det_terrain_sat.text().strip():
             self.det_terrain_sat.setText(self._terrain_sensor(cand))
+        # A gap-filling mosaic mixes strips of different dates and a few metres of
+        # per-strip vertical bias — fine as context terrain, wrong for differencing.
+        if is_pgc_mosaic:
+            self._log(f"Terrain is a mosaic of {n_src} ArcticDEM strips — the gaps in "
+                      f"the {date_str} strip are filled from others. Fine for the 3D "
+                      f"view, but the patches carry different dates and small vertical "
+                      f"offsets, so don't feed THIS layer into the volume/differencing "
+                      f"tab; pick a single dated strip there.")
         # DSM vs DTM guardrail (this terrain may feed the volume/differencing tab).
         if model:
             kind = ("surface model — canopy/buildings INCLUDED" if cand.get("is_dsm")
@@ -1084,6 +1249,14 @@ class Viewer3DTab(QWidget):
         if not scene_crs.isValid() or extent.isEmpty():
             self._warn("Could not derive a projected scene CRS from the DEM.")
             return
+        # Clip the scene to where the ticked before/after imagery actually
+        # covers (their combined bbox ∩ DEM); fall back to the full DEM when
+        # nothing is ticked yet.
+        proj = QgsProject.instance()
+        ba_ids = self._checked_ids(self.before_combo) + \
+            self._checked_ids(self.after_combo)
+        extent = self._drape_crop_extent(
+            scene_crs, [proj.mapLayer(i) for i in ba_ids], extent)
         center = extent.center()
         zc = self._dem_mean_z if self._dem_mean_z is not None else 0.0
 
@@ -1287,7 +1460,18 @@ class Viewer3DTab(QWidget):
         On the first populate, default the ticks to an auto-detected pre/post
         pair (…_pre_/…_post_ or PlanetScope before/after) so the common case
         needs no picking; the user can tick any other layer(s), one or more."""
-        rasters = self._candidate_rasters()
+        # The Before/After pickers only offer layers ticked for draping — you
+        # can't flip to imagery that isn't on the terrain. Keep drape-list order;
+        # if nothing is ticked yet, fall back to all candidates so the UI isn't
+        # dead on first open.
+        cand = self._candidate_rasters()
+        checked = self._checked_drape_ids()
+        if checked:
+            rank = {lid: n for n, lid in enumerate(checked)}
+            rasters = sorted((l for l in cand if l.id() in rank),
+                             key=lambda l: rank[l.id()])
+        else:
+            rasters = cand
         first = self.before_combo.count() == 0 and self.after_combo.count() == 0
         for combo in (self.before_combo, self.after_combo):
             prev = set(self._checked_ids(combo))
@@ -1684,14 +1868,11 @@ class Viewer3DTab(QWidget):
         if not scene_crs.isValid() or extent.isEmpty():
             self._warn("Could not derive a projected scene CRS/extent from the DEM.")
             return
-        # Focus the figure on the overlays (landslide + its hillside) instead of the
-        # whole DEM/AOI, so the box isn't padded out with far-away terrain.
-        ov_ext = self._overlay_extent(scene_crs)
-        if ov_ext is not None and not ov_ext.isEmpty():
-            ov_ext.grow(max(ov_ext.width(), ov_ext.height()) * 0.7)   # margin of hillside
-            ov_ext = ov_ext.intersect(extent)                          # clamp to the DEM
-            if ov_ext is not None and not ov_ext.isEmpty():
-                extent = ov_ext
+        # Clip the terrain to where the before/after imagery actually HAS pixels —
+        # the intersection of their valid-data footprints (two scenes can share a
+        # bounding box yet cover very different ground via nodata fill), clamped to
+        # the DEM. Keeps a partial scene from padding the figure with a black void.
+        extent = self._drape_crop_extent(scene_crs, before + after, extent)
         self._busy(True)
         self._log("Exporting instant-flip 3D web viewer (rendering imagery, "
                   "reading DEM)…")
@@ -1833,6 +2014,105 @@ class Viewer3DTab(QWidget):
                 rect.combineExtentWith(ext)
         return rect
 
+    def _imagery_extent(self, scene_crs, layers):
+        """Combined bounding box (scene CRS) of the given raster layers.
+
+        Used to clip the 3D terrain to the smallest area the before/after
+        imagery actually covers, so the scene isn't padded out with DEM that
+        has no drape on it. Returns None if no layer has a usable extent."""
+        proj = QgsProject.instance()
+        rect = None
+        for lyr in layers:
+            if lyr is None:
+                continue
+            ext = lyr.extent()
+            if ext is None or ext.isEmpty():
+                continue
+            try:
+                ext = QgsCoordinateTransform(
+                    lyr.crs(), scene_crs, proj).transformBoundingBox(ext)
+            except Exception:
+                continue
+            if rect is None:
+                rect = QgsRectangle(ext)
+            else:
+                rect.combineExtentWith(ext)
+        return rect
+
+    def _valid_data_bbox(self, layer, scene_crs, max_dim=1024):
+        """Bounding box (scene CRS) of a raster layer's VALID (non-nodata) pixels.
+
+        Two drape images can share a file bounding box yet cover very different
+        ground — a partial satellite scene is padded with nodata to the AOI grid —
+        so layer.extent() over-reports coverage. Read a decimated validity mask
+        (any band off its nodata, or != 0 when none is set), take the tight box of
+        valid pixels, return it in the scene CRS. None if unreadable or all-nodata."""
+        from osgeo import gdal
+        try:
+            ds = gdal.Open(layer.source())
+        except Exception:
+            ds = None
+        if ds is None:
+            return None
+        W, H = ds.RasterXSize, ds.RasterYSize
+        if W <= 0 or H <= 0:
+            return None
+        step = max(1, int(max(W, H) / float(max_dim)))
+        ow, oh = max(1, W // step), max(1, H // step)
+        valid = np.zeros((oh, ow), dtype=bool)
+        for b in range(1, ds.RasterCount + 1):
+            band = ds.GetRasterBand(b)
+            try:
+                a = band.ReadAsArray(0, 0, W, H, ow, oh)   # decimated read
+            except Exception:
+                a = None
+            if a is None:
+                continue
+            nod = band.GetNoDataValue()
+            valid |= (a != nod) if nod is not None else (a != 0)
+        gt = ds.GetGeoTransform()
+        ds = None
+        ys, xs = np.where(valid)
+        if xs.size == 0:
+            return None
+        px0, px1 = int(xs.min()) * step, (int(xs.max()) + 1) * step
+        py0, py1 = int(ys.min()) * step, (int(ys.max()) + 1) * step
+        gxs, gys = [], []
+        for px, py in ((px0, py0), (px1, py1)):
+            gxs.append(gt[0] + px * gt[1] + py * gt[2])
+            gys.append(gt[3] + px * gt[4] + py * gt[5])
+        rect = QgsRectangle(min(gxs), min(gys), max(gxs), max(gys))
+        if layer.crs() != scene_crs:
+            try:
+                rect = QgsCoordinateTransform(
+                    layer.crs(), scene_crs,
+                    QgsProject.instance()).transformBoundingBox(rect)
+            except Exception:
+                return None
+        return rect
+
+    def _drape_crop_extent(self, scene_crs, layers, dem_extent):
+        """Extent to clip the 3D scene to: the INTERSECTION of the drape layers'
+        valid-data footprints, clamped to the DEM — so the scene is cropped to the
+        SMALLER area a partial before/after scene actually covers, not padded out
+        with the black void of its nodata fill. Falls back to the union of the full
+        layer extents, then the DEM, when nodata can't be read."""
+        layers = [l for l in layers if l is not None]
+        inter = None
+        for lyr in layers:
+            vb = self._valid_data_bbox(lyr, scene_crs)
+            if vb is None or vb.isEmpty():
+                continue
+            inter = QgsRectangle(vb) if inter is None else inter.intersect(vb)
+            if inter is None or inter.isEmpty():
+                break
+        if inter is None or inter.isEmpty():
+            inter = self._imagery_extent(scene_crs, layers)     # union of full extents
+        if inter is None or inter.isEmpty():
+            return dem_extent
+        r = inter.intersect(dem_extent)
+        return r if (r is not None and not r.isEmpty()) else dem_extent
+
     def _collect_overlays(self, scene_crs, extent):
         """Ticked vector layers → (polys, lines, points) in mesh-local metres.
 
@@ -1903,13 +2183,25 @@ class Viewer3DTab(QWidget):
                             continue
                         coords.append([p.x() - cx, p.y() - cy])
                         labels.append(lbl)
+            try:
+                rtype = type(lyr.renderer()).__name__
+            except Exception:
+                rtype = "?"
             if rings:
-                polys.append({"name": name, "color": color, "rings": rings})
+                has_fill, frgb, lrgb, falpha = self._poly_style(lyr, color)
+                polys.append({"name": name, "color": frgb, "line_color": lrgb,
+                              "fill": has_fill, "fill_alpha": falpha, "rings": rings})
+                self._log(f"overlay '{name}' [{rtype}] polygon: outline rgb={lrgb} "
+                          f"fill={'on '+str(frgb)+f' α{falpha:.2f}' if has_fill else 'off'}")
+                self._log(f"    symbol: {self._describe_symbol(lyr)}")
             if paths:
                 lines.append({"name": name, "color": color, "paths": paths})
+                self._log(f"overlay '{name}' [{rtype}] line: rgb={color}")
+                self._log(f"    symbol: {self._describe_symbol(lyr)}")
             if coords:
                 points.append({"name": name, "color": color,
                                "coords": coords, "labels": labels})
+                self._log(f"overlay '{name}' [{rtype}] point×{len(coords)}: rgb={color}")
         return polys, lines, points
 
     @staticmethod
@@ -1925,15 +2217,183 @@ class Viewer3DTab(QWidget):
             return ""
 
     @staticmethod
+    def _layer_symbol(lyr):
+        """A representative QgsSymbol for the layer across renderer types — single,
+        categorized, graduated, rule-based — so colour extraction isn't limited to
+        single-symbol renderers (which silently fell back to the palette before).
+        None if it can't be resolved."""
+        try:
+            r = lyr.renderer()
+        except Exception:
+            return None
+        if r is None:
+            return None
+        try:
+            s = r.symbol()                       # single-symbol renderer
+            if s is not None:
+                return s
+        except Exception:
+            pass
+        try:                                     # categorized / graduated / rule-based
+            from qgis.core import QgsRenderContext
+            syms = r.symbols(QgsRenderContext())
+            if syms:
+                return syms[0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _rgb_of(color):
+        return [color.red(), color.green(), color.blue()]
+
+    @staticmethod
+    def _sat(rgb):
+        """HSV-ish saturation 0..1 of an [r,g,b] — 0 for grey/black/white."""
+        mx = max(rgb)
+        return 0.0 if mx == 0 else (mx - min(rgb)) / float(mx)
+
+    @staticmethod
+    def _symbol_colors(sym):
+        """Every meaningful colour a symbol's layers draw, skipping transparent ones.
+
+        Type-aware: a line layer's only real colour is color() — its fillColor()/
+        strokeColor() are bogus (0,0,0) — while a fill layer's are stroke/fill, and a
+        marker's are color/fill/stroke. Trusting the wrong accessor is what made line-
+        styled overlays read as black."""
+        cols = []
+        try:
+            cols.append(Viewer3DTab._rgb_of(sym.color()))
+        except Exception:
+            pass
+        try:
+            for k in range(sym.symbolLayerCount()):
+                sl = sym.symbolLayer(k)
+                try:
+                    lt = sl.layerType()
+                except Exception:
+                    lt = ""
+                if "Line" in lt:
+                    attrs = ("color",)
+                elif "Fill" in lt:
+                    attrs = ("strokeColor", "fillColor")
+                else:
+                    attrs = ("color", "fillColor", "strokeColor")
+                for attr in attrs:
+                    try:
+                        c = getattr(sl, attr)()
+                        if c.alpha() > 0:
+                            cols.append([c.red(), c.green(), c.blue()])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return cols
+
+    @staticmethod
     def _overlay_color(lyr, i):
-        """The layer's single-symbol colour, else a distinct palette colour."""
+        """The layer's VISIBLE colour, else a palette colour.
+
+        symbol.color() alone is unreliable — a multi-layer line symbol reports its
+        first layer (often a dark casing), so a yellow centreline came back dark.
+        Instead pick the most-saturated colour the symbol actually draws (a vivid
+        line/marker beats a grey casing; brightness breaks ties so white markers
+        still resolve to white)."""
         pal = [[255, 70, 70], [255, 220, 60], [90, 200, 255],
                [130, 230, 130], [220, 130, 230], [255, 150, 60]]
+        s = Viewer3DTab._layer_symbol(lyr)
+        if s is not None:
+            cols = Viewer3DTab._symbol_colors(s)
+            if cols:
+                cols.sort(key=lambda c: (Viewer3DTab._sat(c), sum(c)))
+                return cols[-1]
+        return pal[i % len(pal)]
+
+    @staticmethod
+    def _describe_symbol(lyr):
+        """Dump a layer's symbol structure for the diagnostic log — symbol colour
+        plus each symbol layer's class and its color/fill/stroke/brush, so a wrong
+        overlay colour can be traced to the exact symbol without QGIS access here."""
+        sym = Viewer3DTab._layer_symbol(lyr)
+        if sym is None:
+            return "no symbol"
+        parts = []
         try:
-            col = lyr.renderer().symbol().color()
-            return [col.red(), col.green(), col.blue()]
+            parts.append("sym.color=" + str(Viewer3DTab._rgb_of(sym.color())))
         except Exception:
-            return pal[i % len(pal)]
+            pass
+        try:
+            for k in range(sym.symbolLayerCount()):
+                sl = sym.symbolLayer(k)
+                d = type(sl).__name__
+                for attr in ("fillColor", "strokeColor", "color"):
+                    try:
+                        d += " %s=%s" % (attr, Viewer3DTab._rgb_of(getattr(sl, attr)()))
+                    except Exception:
+                        pass
+                for attr in ("brushStyle", "strokeStyle"):
+                    try:
+                        d += " %s=%d" % (attr, int(getattr(sl, attr)()))
+                    except Exception:
+                        pass
+                parts.append(d)
+        except Exception:
+            pass
+        return " | ".join(parts)
+
+    @staticmethod
+    def _poly_style(lyr, fallback_rgb):
+        """Outline colour of a polygon layer's symbol (drawn OUTLINE-ONLY).
+
+        Routing on the symbol-layer TYPE is essential: a landslide 'polygon' is often
+        styled as a plain LINE symbol used as the ring (QgsSimpleLineSymbolLayer),
+        whose visible colour is color() — but which ALSO answers fillColor()/
+        strokeColor() with a bogus (0,0,0). Reading those made the rings export black.
+        So: for a fill-type layer the ring is its strokeColor(); for a line/marker
+        layer the ring is its own color(). Returns (False, fill_rgb, line_rgb, 0.0) —
+        outline-only per preference, so no translucent fill is drawn."""
+        from qgis.PyQt.QtCore import Qt
+        line_rgb = list(fallback_rgb)
+        sym = Viewer3DTab._layer_symbol(lyr)
+        if sym is None:
+            return False, list(fallback_rgb), line_rgb, 0.0
+        try:
+            sls = [sym.symbolLayer(k) for k in range(sym.symbolLayerCount())]
+        except Exception:
+            sls = []
+        outline = []                                    # candidate ring colours
+        for sl in sls:
+            try:
+                lt = sl.layerType()
+            except Exception:
+                lt = ""
+            if "Fill" in lt:                            # fill symbol -> the ring is its STROKE
+                try:
+                    pen_ok = int(sl.strokeStyle()) != int(Qt.NoPen)
+                except Exception:
+                    pen_ok = True
+                try:
+                    sc = sl.strokeColor()
+                    if pen_ok and sc.alpha() > 0:
+                        outline.append([sc.red(), sc.green(), sc.blue()])
+                except Exception:
+                    pass
+            else:                                       # line/marker symbol -> its own colour is the ring
+                try:
+                    c = sl.color()
+                    if c.alpha() > 0:
+                        outline.append([c.red(), c.green(), c.blue()])
+                except Exception:
+                    pass
+        if outline:
+            outline.sort(key=lambda c: (Viewer3DTab._sat(c), sum(c)))
+            line_rgb = outline[-1]                       # most-saturated visible ring colour
+        else:
+            try:
+                line_rgb = Viewer3DTab._rgb_of(sym.color())
+            except Exception:
+                pass
+        return False, line_rgb, line_rgb, 0.0            # outline-only: no fill
 
     def _dem_grid(self, scene_crs, extent, ncols, nrows):
         """Warp the DEM to an ncols×nrows grid over `extent` (north-first rows).

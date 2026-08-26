@@ -496,6 +496,9 @@ class PlanetTab(QWidget):
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
         self.detail_btn = QPushButton("Render detail (quota)")
+        # Primary commit button: the only action here that PLACES a Planet order and
+        # uses quota, so it gets the bold + default emphasis (FlowRow has no stretch).
+        f = self.detail_btn.font(); f.setBold(True); self.detail_btn.setFont(f); self.detail_btn.setDefault(True)
         self.detail_btn.setToolTip(
             "Planet's free tiles are pre-rendered 8-bit RGB that clips bright terrain "
             "(snow/ice) to flat white — no brightness slider can recover detail that "
@@ -714,7 +717,7 @@ class PlanetTab(QWidget):
         recovered key flows into the SAME PL_API_KEY / QgsSettings path everything
         else on this tab already uses, so login is just a friendlier front door to
         the existing key field."""
-        box = QgsCollapsibleGroupBox("Planet account")
+        box = QgsCollapsibleGroupBox("Planet Labs account")
         box.setSaveCollapsedState(False)
         # start collapsed only when actually signed in (an explicit account/pasted
         # key); a bare PL_API_KEY env var leaves the box open to prompt sign-in
@@ -723,7 +726,7 @@ class PlanetTab(QWidget):
         form = QFormLayout(box)
 
         info = QLabel(
-            'Sign in with your Planet account to search PlanetScope and stream '
+            'Sign in with your Planet Labs account to search PlanetScope and stream '
             'full-res previews. No account? '
             '<a href="https://www.planet.com/explorer/">planet.com</a>. You can also '
             'paste an API key directly instead of signing in.')
@@ -789,7 +792,7 @@ class PlanetTab(QWidget):
         if self._auth_source() == "env":
             self._set_login_status(
                 "A PL_API_KEY environment variable is set and will be used as a "
-                "fallback. Log in to use your Planet account instead.", "warn")
+                "fallback. Log in to use your Planet Labs account instead.", "warn")
         return box
 
     def _set_login_status(self, text, tone="info"):
@@ -807,14 +810,14 @@ class PlanetTab(QWidget):
         self.logout_btn.setEnabled(bool(self._stored_key()))
         if src == "account":
             self.login_box.setTitle(
-                f"Planet account — signed in{f' ({user})' if user else ''}")
+                f"Planet Labs account — signed in{f' ({user})' if user else ''}")
         elif src == "manual":
-            self.login_box.setTitle("Planet account — using a pasted API key")
+            self.login_box.setTitle("Planet Labs account — using a pasted API key")
         elif src == "env":
             self.login_box.setTitle(
-                "Planet account — using PL_API_KEY (env) · log in to use your account")
+                "Planet Labs account — using PL_API_KEY (env) · log in to use your account")
         else:
-            self.login_box.setTitle("Planet account — sign in")
+            self.login_box.setTitle("Planet Labs account — sign in")
 
     def _planet_login(self):
         if self._login_reply is not None:
@@ -1651,7 +1654,7 @@ class PlanetTab(QWidget):
             self.iface.messageBar().pushInfo(
                 "PlanetScope",
                 f"A PlanetScope order ({side_word}) is still processing. It's saved "
-                f"in your Planet account — resume it (no re-order) to finish.")
+                f"in your Planet Labs account — resume it (no re-order) to finish.")
             if self._autoresume_mode() == "auto15" and not self._resume_timer.isActive():
                 self._arm_auto_resume()
 
