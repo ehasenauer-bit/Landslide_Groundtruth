@@ -30,7 +30,7 @@ import random
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QUrl, QByteArray, QSize, QTimer
-from qgis.PyQt.QtGui import QPixmap, QIcon
+from qgis.PyQt.QtGui import QPixmap, QIcon, QBrush, QPainter
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
@@ -126,8 +126,14 @@ QSlider::handle:horizontal {{
 }}
 """
 
-# table row tints, matching the Sentinel tab (pre = blue, post = green)
-from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG  # noqa: E402
+# table row tints, matching the Sentinel tab (pre = blue, post = green), plus the
+# AOI-cloud dot thresholds/colours so the "Cloud" column reads identically to the
+# Sentinel/Landsat tab's (dock.py is the single source of truth for both).
+from .dock import (  # noqa: E402
+    PRE_BG, POST_BG, ROW_FG, MUTED_FG,
+    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX,
+    CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
+)
 
 # auto-resume wait after a Render-detail order times out, and a cap on how many
 # times we'll auto-retry before falling back to the manual button (so a genuinely
@@ -607,7 +613,7 @@ class PlanetTab(QWidget):
             "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1094,12 +1100,41 @@ class PlanetTab(QWidget):
             return 1e9 if g is None else g
 
         def cloud(c):
-            v = c.get("cloud_pct")
+            v = c.get("aoi_cloud_pct")          # cloud over the AOI, when measured
+            if v is None:
+                v = c.get("cloud_pct")          # else the whole-scene metric
             return 100.0 if v is None else v
 
         if auto:
             return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
         return sorted(cands, key=lambda c: gap(c) + cw * cloud(c))
+
+    def _cloud_dot(self, pct):
+        """A small filled circle for the 'Cloud' column, coloured by AOI cloud %.
+
+        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when pct
+        is None. Matches the Sentinel/Landsat tab's dot exactly (same thresholds and
+        colours, imported from dock.py) — replicated here rather than shared because
+        dock's version is a method bound to its own widget. For PlanetScope the dot
+        is grey on every preview row: the AOI cloud number needs a UDM2 order and so
+        isn't measured in the free dry-run (see planet_imagery.search_event)."""
+        if pct is None:
+            color = CLOUD_UNKNOWN
+        elif pct <= CLOUD_GREEN_MAX:
+            color = CLOUD_CLEAR
+        elif pct <= CLOUD_AMBER_MAX:
+            color = CLOUD_SOME
+        else:
+            color = CLOUD_HEAVY
+        pix = QPixmap(12, 12)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(2, 2, 8, 8)
+        p.end()
+        return QIcon(pix)
 
     def _fill_table(self, result):
         pre = result.get("pre", [])
@@ -1115,7 +1150,18 @@ class PlanetTab(QWidget):
             is_top = cid is not None and cid == top[side]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
-            cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
+            # "Cloud" column = cloud over YOUR AOI (per-pixel) when it's known. For
+            # PlanetScope that number is UDM2, which the free preview doesn't order,
+            # so aoi_cloud is None and a leading "~" marks the whole-scene cloud_cover
+            # fallback — never confusing the two. (See planet_imagery.search_event.)
+            aoi_cloud = c.get("aoi_cloud_pct")
+            scene_cloud = c.get("cloud_pct")
+            if aoi_cloud is not None:
+                cloud = f"{aoi_cloud:.0f}%"
+            elif scene_cloud is not None:
+                cloud = f"~{scene_cloud:.0f}%"
+            else:
+                cloud = ""
             marker = "★ " if is_top else "  "
             cells = [marker + side, date, gap, cloud, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
@@ -1130,6 +1176,25 @@ class PlanetTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
+            # colour dot + tooltip on the Cloud cell (col 3): green/amber/red by AOI
+            # cloud, grey when only the whole-scene value is known — which, for the
+            # free PlanetScope preview, is always (UDM2 is order-gated).
+            cloud_item = self.table.item(r, 3)
+            cloud_item.setIcon(self._cloud_dot(aoi_cloud))
+            if aoi_cloud is not None:
+                tip = (f"Cloud, shadow & haze over your AOI: {aoi_cloud:.0f}%.\n"
+                       f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       f"· red above.")
+                if scene_cloud is not None:
+                    tip += f"\nWhole scene (cloud_cover): {scene_cloud:.0f}%."
+            else:
+                tip = ("Whole-scene cloud cover (Planet cloud_cover), shown with a ~ "
+                       "and a grey dot. Cloud over just your AOI comes from the UDM2 "
+                       "mask, which Planet delivers only with a paid order — so it "
+                       "isn't measured in this free preview.\n")
+                tip += (f"Whole scene (cloud_cover): {scene_cloud:.0f}%."
+                        if scene_cloud is not None else "No cloud metric reported.")
+            cloud_item.setToolTip(tip)
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1176,7 +1241,18 @@ class PlanetTab(QWidget):
 
     def _make_tile(self, c):
         date = (c.get("date") or "")[:10]
-        cloud = "?" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}%"
+        # cloud over the AOI where measured; a leading "~" falls back to the whole-
+        # scene metric, matching the table's Cloud column. PlanetScope's AOI number
+        # needs a UDM2 order, so the free preview always shows the ~whole-scene value
+        # (see planet_imagery.search_event).
+        aoi_cloud = c.get("aoi_cloud_pct")
+        scene_cloud = c.get("cloud_pct")
+        if aoi_cloud is not None:
+            cloud = f"{aoi_cloud:.0f}%"
+        elif scene_cloud is not None:
+            cloud = f"~{scene_cloud:.0f}%"
+        else:
+            cloud = "?"
         gap = "" if c.get("gap_days") is None else f"gap {c['gap_days']}d"
         cid = c.get("id")
         tile = QToolButton()
@@ -1185,7 +1261,9 @@ class PlanetTab(QWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\ncloud {cloud} · {gap}")
-        tile.setToolTip(f"{cid}\n{date}  cloud {cloud}  {gap}")
+        cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
+                     else f"whole-scene cloud {cloud}")
+        tile.setToolTip(f"{cid}\n{date}  {cloud_tip}  {gap}")
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._auth_thumb(c.get("thumb_url"))
         if url:

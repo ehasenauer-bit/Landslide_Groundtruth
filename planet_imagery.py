@@ -242,19 +242,32 @@ def _geom_bbox(geom):
     return [min(xs), min(ys), max(xs), max(ys)] if xs else None
 
 
-def _candidate(item, event_time):
+def _candidate(item, event_time, aoi_cloud_pct=None):
     """One PSScene item -> a JSON-able candidate row for the dry-run preview.
 
     cloud_pct is normalized to 0-100 (Planet reports cloud_cover as 0-1, unlike
     STAC's eo:cloud_cover). thumb_url is the free browse PNG link (no order).
     geometry/bbox are the scene footprint, so the plugin can draw it on the map
-    and you can see whether the strip actually covers the AOI."""
+    and you can see whether the strip actually covers the AOI.
+
+    aoi_cloud_pct is the honest per-pixel cloud fraction over just the AOI box —
+    the counterpart to imagery.py's _stac_candidate, and what the plugin's "Cloud"
+    column really wants. But Planet's per-pixel cloud lives in the UDM2 mask, which
+    is delivered ONLY by a paid Orders API order (see _create_order / BUNDLE), not a
+    free windowed COG the way Sentinel-2's SCL is on the Planetary Computer. So the
+    free dry-run can't measure it without spending quota, and leaves it None; the
+    plugin then falls back to the whole-scene cloud_pct (marked with a leading "~"
+    and a grey dot). The argument is here so a caller that already holds the
+    AOI-clipped UDM2 on disk — the paid render/order path — can supply the real
+    number through this same contract without a preview ever paying for it. See
+    search_event for the full rationale."""
     d = _acquired(item)
     cloud = item["properties"].get("cloud_cover")
     thumb = (item.get("_links") or {}).get("thumbnail")
     geom = item.get("geometry")
     return dict(id=item["id"], date=d.isoformat(),
                 cloud_pct=round(cloud * 100, 1) if cloud is not None else None,
+                aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
                 gap_days=abs((d - event_time).days),
                 source="PlanetScope", thumb_url=thumb,
                 geometry=geom, bbox=_geom_bbox(geom))
@@ -271,7 +284,22 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     caller (the dry-run dispatcher), which records them as a per-source note.
 
     max_cloud_pct / require_point / allow_test_quality: see fetch_event — kept
-    identical here so the preview shows exactly the scenes a Run would consider."""
+    identical here so the preview shows exactly the scenes a Run would consider.
+
+    Each candidate carries aoi_cloud_pct — the honest cloud-over-your-AOI number
+    the whole-scene cloud_cover can't give — but here it is always None, on
+    purpose. Unlike Sentinel-2's SCL (a free windowed COG on the Planetary
+    Computer, read per-AOI at effectively no cost in imagery._aoi_cloud_fractions),
+    Planet's per-pixel cloud is the UDM2 mask, delivered only by a paid, minutes-
+    long Orders API order (see _create_order). Measuring it for the ~12-24 preview
+    candidates per side would mean ordering every one of them — the exact quota the
+    free dry-run exists to avoid spending before you've chosen scenes by eye. The
+    Data API item metadata is no help either: its cloud stats (cloud_cover and the
+    UDM2-derived percentages) are all WHOLE-scene over the full strip, never AOI-
+    scoped. So the preview keeps aoi_cloud_pct None and the plugin shows the whole-
+    scene cloud_pct with a grey dot and a leading "~", and the real per-AOI number
+    is left to the render/order path, which already has the AOI-clipped UDM2 in
+    hand (see _candidate)."""
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
