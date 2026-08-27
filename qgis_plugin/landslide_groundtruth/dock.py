@@ -387,21 +387,20 @@ class LandslideDock(QgsDockWidget):
             self.source_combo.addItem(label, value)
         form.addRow("Imagery source", self.source_combo)
 
-        # Cloud filtering is OFF by default: eo:cloud_cover is a whole-scene metric
-        # over a 110 km granule, so it says nothing about your few-km AOI, and
-        # filtering on it hides the cloudy-scene-wide acquisitions that are often
-        # perfectly clear over the point — plus every scene you'd need in order to
-        # judge that call yourself. Search lists them all; you look at the
-        # thumbnails and tick what's usable. Tick the box to cap it anyway.
+        # Cloud filtering is ON by default at 50%: eo:cloud_cover is a whole-scene
+        # metric over a 110 km granule, so it says nothing about your few-km AOI,
+        # but a 50% cap trims the mostly-clouded acquisitions that swamp a long
+        # list while still keeping most of the scenes worth eyeballing. Untick the
+        # box to see every scene, clouds and all, and pick purely by thumbnail.
         self.cloud_filter_check = QCheckBox("Hide scenes cloudier than")
-        self.cloud_filter_check.setChecked(False)
+        self.cloud_filter_check.setChecked(True)
         self.cloud_filter_check.setToolTip(
-            "Off (default): NO cloud filtering — every scene in the window is "
-            "listed, clouds and all, so you can see the clouds and pick by eye.\n"
-            "On: drop scenes whose WHOLE-SCENE cloud cover exceeds the value on "
-            "the right. That is a scene-wide metric, not your AOI — a scene can be "
-            "90% cloudy overall and still clear over your point, so this filter "
-            "throws away usable scenes. Use it only to thin a very long list.\n"
+            "On (default): drop scenes whose WHOLE-SCENE cloud cover exceeds the "
+            "value on the right. That is a scene-wide metric, not your AOI — a "
+            "scene can be 60% cloudy overall and still clear over your point, so "
+            "raise the cap or untick this if the list looks too thin.\n"
+            "Off: NO cloud filtering — every scene in the window is listed, clouds "
+            "and all, so you can see the clouds and pick by eye.\n"
             "Either way this only chooses WHICH scenes are listed: a Run downloads "
             "the scenes as acquired, with the cloud left in. No pixels are masked "
             "out for cloud, so you never get holes in the imagery.")
@@ -409,9 +408,9 @@ class LandslideDock(QgsDockWidget):
         self.cloud_spin.setRange(0.0, 100.0)
         self.cloud_spin.setDecimals(0)
         self.cloud_spin.setSingleStep(5.0)
-        self.cloud_spin.setValue(80.0)
+        self.cloud_spin.setValue(50.0)
         self.cloud_spin.setSuffix(" %")
-        self.cloud_spin.setEnabled(False)
+        self.cloud_spin.setEnabled(True)
         self.cloud_spin.setToolTip(self.cloud_filter_check.toolTip())
         self.cloud_filter_check.toggled.connect(self.cloud_spin.setEnabled)
         cloud_row = QHBoxLayout()
@@ -449,8 +448,8 @@ class LandslideDock(QgsDockWidget):
             "Free dry-run: list the candidate before/after scenes per source, "
             "nearest the event date first, and show them below with their browse "
             "images. Nothing is downloaded and no order is placed — use it to check "
-            "coverage and pick the scenes before a full Run. Cloudy scenes are "
-            "listed too unless you turn the cloud filter on.")
+            "coverage and pick the scenes before a full Run. Scenes over the cloud "
+            "cap are hidden by default; untick the cloud filter to list them too.")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
