@@ -8,7 +8,7 @@ import tempfile
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon, QPainter
+from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
@@ -113,13 +113,15 @@ PRE_BG = QColor(220, 235, 252)
 POST_BG = QColor(224, 244, 226)
 ROW_FG = QColor(20, 20, 20)
 
-# AOI-cloud dot in the "Cloud" column: green clear / amber some / red heavy over
-# the AOI box, grey when the per-pixel number couldn't be measured (footprint
-# misses the box, or the read failed and we fell back to the whole-scene value).
-CLOUD_CLEAR = QColor(46, 160, 67)      # <= CLOUD_GREEN_MAX % of the AOI cloudy
-CLOUD_SOME = QColor(219, 154, 4)       # <= CLOUD_AMBER_MAX %
-CLOUD_HEAVY = QColor(207, 34, 46)      # above that
-CLOUD_UNKNOWN = QColor(150, 150, 150)  # no AOI-cloud measurement
+# Colour of the number in the "Cloud" column, by cloud over the AOI box: green
+# clear / amber some / red heavy, grey when the per-pixel number couldn't be
+# measured (footprint misses the box, or the read failed and we fell back to the
+# whole-scene value shown with a ~). Darkened a touch from pure web hues so the
+# text stays legible on the pale pre/post row backgrounds.
+CLOUD_CLEAR = QColor(30, 138, 54)      # <= CLOUD_GREEN_MAX % of the AOI cloudy
+CLOUD_SOME = QColor(176, 122, 0)       # <= CLOUD_AMBER_MAX %
+CLOUD_HEAVY = QColor(197, 30, 42)      # above that
+CLOUD_UNKNOWN = QColor(130, 130, 130)  # no AOI-cloud measurement
 CLOUD_GREEN_MAX = 10.0
 CLOUD_AMBER_MAX = 40.0
 
@@ -1050,10 +1052,12 @@ class LandslideDock(QgsDockWidget):
             side_item.setCheckState(Qt.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 6).setToolTip(c["thumb_url"])
-            # colour dot + tooltip on the Cloud cell: green/amber/red by AOI cloud,
-            # grey when we only have the whole-scene value.
+            # colour the Cloud number itself: green/amber/red by AOI cloud, grey
+            # when we only have the whole-scene value. Set here (before the
+            # off-point muting below), so a scene that misses the point still
+            # greys out wholesale — its cloud colour is moot there anyway.
             cloud_item = self.table.item(r, 3)
-            cloud_item.setIcon(self._cloud_dot(aoi_cloud))
+            cloud_item.setForeground(QBrush(self._cloud_color(aoi_cloud)))
             if aoi_cloud is not None:
                 tip = (f"Cloud, cirrus & shadow over your AOI: {aoi_cloud:.0f}%.\n"
                        f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
@@ -1113,28 +1117,19 @@ class LandslideDock(QgsDockWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
-    def _cloud_dot(self, pct):
-        """A small filled circle for the 'Cloud' column, coloured by AOI cloud %.
+    def _cloud_color(self, pct):
+        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
 
         green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when
-        pct is None (no AOI measurement — the cell shows the whole-scene value)."""
+        pct is None (no AOI measurement — the cell shows the whole-scene value
+        with a ~, so it must not read as a confident clear/cloudy signal)."""
         if pct is None:
-            color = CLOUD_UNKNOWN
-        elif pct <= CLOUD_GREEN_MAX:
-            color = CLOUD_CLEAR
-        elif pct <= CLOUD_AMBER_MAX:
-            color = CLOUD_SOME
-        else:
-            color = CLOUD_HEAVY
-        pix = QPixmap(12, 12)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(color))
-        p.drawEllipse(2, 2, 8, 8)
-        p.end()
-        return QIcon(pix)
+            return CLOUD_UNKNOWN
+        if pct <= CLOUD_GREEN_MAX:
+            return CLOUD_CLEAR
+        if pct <= CLOUD_AMBER_MAX:
+            return CLOUD_SOME
+        return CLOUD_HEAVY
 
     def _rank_like_run(self, cands, cloud_weight, auto_window):
         """Order candidates for the ★ / Preview-on-map: the scene that best covers
