@@ -103,6 +103,17 @@ LS_BANDS = ["red", "nir08", "green", "blue", "swir16", "swir22", "qa_pixel"]
 # kept, so a run downloads the scene as acquired rather than a cloud-masked one.
 S2_NODATA_SCL = [0, 1]
 
+# Scene-classification values that count as cloud contamination when measuring
+# cloud OVER THE AOI (see _aoi_cloud_fractions): 3 cloud shadow, 8/9 cloud
+# medium/high, 10 thin cirrus. Snow/ice (11) is deliberately NOT counted — over
+# glaciated Alaska terrain it is the ground, not weather, and would swamp the
+# number. This is the per-pixel counterpart to the whole-tile eo:cloud_cover.
+S2_CLOUD_SCL = [3, 8, 9, 10]
+# Landsat C2 QA_PIXEL cloud-contamination bits: 1 dilated cloud, 2 cirrus,
+# 3 cloud, 4 cloud shadow. Bit 0 (fill) and bit 5 (snow) are not counted; fill
+# marks the non-measured pixels instead (the AOI-cloud denominator).
+LS_CLOUD_BITS = 0b11110
+
 # Dry-run (search_event) candidate cap per side, mirroring sar_imagery: the
 # preview's job is to show what was actually acquired near the event so the
 # scenes can be judged by eye, so it lists more than the 6 a Run composites, and
@@ -231,7 +242,59 @@ def _ids_collection(prefer, ids):
 _STAC_SOURCE = {"sentinel-2-l2a": "Sentinel-2", "landsat-c2-l2": "Landsat"}
 
 
-def _stac_candidate(item, event_time, source):
+def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor):
+    """Per-item cloud fraction (0-100) over the AOI box, keyed by item id.
+
+    The honest "cloud over your point" number that the whole-tile eo:cloud_cover
+    cannot give: a windowed read of the scene-classification band (Sentinel-2
+    SCL / Landsat QA_PIXEL) clipped to the AOI box, counting cloud/cirrus/shadow
+    pixels over the MEASURED (non-fill) pixels there. Returns {item.id: pct},
+    with pct None where the AOI has no measured pixels (the footprint misses the
+    box) so the caller can fall back to the tile metric.
+
+    The whole side is read in ONE stackstac pass at a coarse resolution (the box
+    downsampled to ~256 px — a fraction needs no more, and it keeps this off the
+    critical path of a free dry-run). Never raises: any read/network error
+    downgrades the whole batch to None so the preview still lists its scenes."""
+    if not items:
+        return {}
+    band = "SCL" if sensor == "s2" else "qa_pixel"
+    native = 20 if sensor == "s2" else 30
+    res = max(native, (2 * radius_km * 1000.0) / 256.0)
+    # fill_value marks off-footprint pixels as this sensor's own "no measurement"
+    # code, so they drop out of the denominator: SCL 0 = nodata, QA_PIXEL bit 0 = fill.
+    fill = 0 if sensor == "s2" else 1
+    try:
+        cls = stackstac.stack(
+            items, assets=[band], epsg=_utm_epsg(lat, lon), resolution=res,
+            bounds_latlon=_bbox(lat, lon, radius_km),
+            chunksize=2048, rescale=False, fill_value=fill,
+        ).squeeze("band", drop=True).compute()
+    except Exception as e:
+        print(f"    [aoi-cloud] {sensor} read failed ({type(e).__name__}: {e}); "
+              f"listing without AOI cloud")
+        return {i.id: None for i in items}
+    # stackstac keeps one time slice per item, in the given order. If that ever
+    # fails to hold (e.g. identical timestamps collapsed), don't guess — fall back.
+    if cls.sizes.get("time") != len(items):
+        return {i.id: None for i in items}
+    out = {}
+    for idx, item in enumerate(items):
+        a = np.asarray(cls.isel(time=idx).values)
+        if sensor == "s2":
+            a = a.astype("int16")
+            valid = ~np.isin(a, S2_NODATA_SCL)
+            cloudy = np.isin(a, S2_CLOUD_SCL)
+        else:
+            a = a.astype("uint16")
+            valid = (a & 1) == 0                       # bit 0 = fill
+            cloudy = (a & LS_CLOUD_BITS) > 0
+        n = int(valid.sum())
+        out[item.id] = (100.0 * float((cloudy & valid).sum()) / n) if n else None
+    return out
+
+
+def _stac_candidate(item, event_time, source, aoi_cloud_pct=None):
     """One STAC item -> a JSON-able candidate row for the dry-run preview.
 
     thumb_url is the item's free rendered preview / browse PNG (no download or
@@ -256,6 +319,7 @@ def _stac_candidate(item, event_time, source):
     cog = visual.href.split("?")[0] if visual is not None else None
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=round(cloud, 1) if cloud is not None else None,
+                aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
                 gap_days=abs((d - event_time).days) if d else None,
                 source=source, thumb_url=thumb, cog_url=cog,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
@@ -282,9 +346,13 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     returned rows with that same blend to mark the run's pick (★) among them.
 
     max_cloud_pct: whole-tile cloud cap (0-100); None or >= 100 -> no cap, every
-    acquisition in the window is listed. Tile-wide metric, and the only cloud
-    handling there is: a Run composites the scenes as acquired, with no per-pixel
-    cloud masking (see _composite), so what you see listed is what you get."""
+    acquisition in the window is listed. Tile-wide metric (the STAC filter), and
+    the only cloud handling on a Run is: it composites the scenes as acquired,
+    with no per-pixel cloud masking (see _composite), so what you see listed is
+    what you get. Each listed candidate also carries aoi_cloud_pct — the fraction
+    of the AOI box that is cloud/cirrus/shadow, read per-pixel from the
+    classification band (see _aoi_cloud_fractions) — the honest cloud-over-point
+    number the tile-wide cap can't give."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
     pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
@@ -298,9 +366,13 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                               max_cloud=cloud, limit=pre_lim, cloud_weight=None)
     post_items = search_scenes(lat, lon, radius_km, post0, post1, coll, event_time,
                                max_cloud=cloud, limit=post_lim, cloud_weight=None)
+    pre_aoi = _aoi_cloud_fractions(pre_items, lat, lon, radius_km, sensor)
+    post_aoi = _aoi_cloud_fractions(post_items, lat, lon, radius_km, sensor)
     return dict(source=src,
-                pre=[_stac_candidate(i, event_time, src) for i in pre_items],
-                post=[_stac_candidate(i, event_time, src) for i in post_items])
+                pre=[_stac_candidate(i, event_time, src, pre_aoi.get(i.id))
+                     for i in pre_items],
+                post=[_stac_candidate(i, event_time, src, post_aoi.get(i.id))
+                      for i in post_items])
 
 
 def _composite(items, lat, lon, radius_km, sensor):

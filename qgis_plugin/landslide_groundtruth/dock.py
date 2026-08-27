@@ -8,7 +8,7 @@ import tempfile
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon
+from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon, QPainter
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
@@ -112,6 +112,16 @@ def _first_date(dates):
 PRE_BG = QColor(220, 235, 252)
 POST_BG = QColor(224, 244, 226)
 ROW_FG = QColor(20, 20, 20)
+
+# AOI-cloud dot in the "Cloud" column: green clear / amber some / red heavy over
+# the AOI box, grey when the per-pixel number couldn't be measured (footprint
+# misses the box, or the read failed and we fell back to the whole-scene value).
+CLOUD_CLEAR = QColor(46, 160, 67)      # <= CLOUD_GREEN_MAX % of the AOI cloudy
+CLOUD_SOME = QColor(219, 154, 4)       # <= CLOUD_AMBER_MAX %
+CLOUD_HEAVY = QColor(207, 34, 46)      # above that
+CLOUD_UNKNOWN = QColor(150, 150, 150)  # no AOI-cloud measurement
+CLOUD_GREEN_MAX = 10.0
+CLOUD_AMBER_MAX = 40.0
 
 # Planetary Computer's public asset-signing endpoint. Given a blob href it
 # returns {"href": "<href>?<SAS>", "msft:expiry": ...}; the SAS token is short-
@@ -524,7 +534,7 @@ class LandslideDock(QgsDockWidget):
         scenes_box.addWidget(scenes_lbl)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "AOI %", "Source", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Source", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -997,7 +1007,17 @@ class LandslideDock(QgsDockWidget):
             in_comp = cid in info["used"]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
-            cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
+            # "Cloud" column = cloud over YOUR AOI (per-pixel). A leading "~"
+            # marks the fallback to the whole-scene eo:cloud_cover when the AOI
+            # number couldn't be measured, so the two are never confused.
+            aoi_cloud = c.get("aoi_cloud_pct")
+            scene_cloud = c.get("cloud_pct")
+            if aoi_cloud is not None:
+                cloud = f"{aoi_cloud:.0f}%"
+            elif scene_cloud is not None:
+                cloud = f"~{scene_cloud:.0f}%"
+            else:
+                cloud = ""
             cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else ("✓ " if in_comp else "  ")
             cells = [marker + side, date, gap, cloud, cover,
@@ -1030,9 +1050,27 @@ class LandslideDock(QgsDockWidget):
             side_item.setCheckState(Qt.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 6).setToolTip(c["thumb_url"])
+            # colour dot + tooltip on the Cloud cell: green/amber/red by AOI cloud,
+            # grey when we only have the whole-scene value.
+            cloud_item = self.table.item(r, 3)
+            cloud_item.setIcon(self._cloud_dot(aoi_cloud))
+            if aoi_cloud is not None:
+                tip = (f"Cloud, cirrus & shadow over your AOI: {aoi_cloud:.0f}%.\n"
+                       f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       f"· red above.")
+                if scene_cloud is not None:
+                    tip += f"\nWhole scene (eo:cloud_cover): {scene_cloud:.0f}%."
+            else:
+                tip = ("AOI cloud unavailable — the footprint may miss your AOI box, "
+                       "or the classification read failed, so this is the WHOLE-scene "
+                       "value (shown with a ~).\n")
+                tip += (f"Whole scene (eo:cloud_cover): {scene_cloud:.0f}%."
+                        if scene_cloud is not None else "No cloud metric reported.")
+            cloud_item.setToolTip(tip)
             self.table.item(r, 4).setToolTip(
-                f"Covers {cover}% of the search-AOI box"
-                + ("" if covers_pt else " — but NOT the event point itself"))
+                f"Footprint covers {cover}% of the AOI box — how much of the area "
+                f"has pixels, NOT how cloudy it is (that's the Cloud column)."
+                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             if is_top:
                 side_item.setToolTip(
                     f"★ Best scene on this side: covers the event point and the most "
@@ -1044,9 +1082,10 @@ class LandslideDock(QgsDockWidget):
                     "so it's another reasonable pick.")
             else:
                 side_item.setToolTip(
-                    "Ranked below the suggestion (less AOI coverage, or cloudier). "
-                    "Cloud % is a WHOLE-scene metric, so check the thumbnail — a "
-                    "'cloudy' scene is often clear over the point and the right pick.")
+                    "Ranked below the suggestion (less AOI coverage, or cloudier "
+                    "over the AOI). The Cloud column is measured over your AOI now, "
+                    "not the whole scene — but still check the thumbnail, since a "
+                    "few percent can sit right on the point.")
             side_item.setToolTip(
                 side_item.toolTip() + "\n\nTick the checkbox to use this scene: a "
                 "Run downloads EXACTLY the ticked rows (and 'Preview on map' "
@@ -1074,6 +1113,29 @@ class LandslideDock(QgsDockWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
+    def _cloud_dot(self, pct):
+        """A small filled circle for the 'Cloud' column, coloured by AOI cloud %.
+
+        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when
+        pct is None (no AOI measurement — the cell shows the whole-scene value)."""
+        if pct is None:
+            color = CLOUD_UNKNOWN
+        elif pct <= CLOUD_GREEN_MAX:
+            color = CLOUD_CLEAR
+        elif pct <= CLOUD_AMBER_MAX:
+            color = CLOUD_SOME
+        else:
+            color = CLOUD_HEAVY
+        pix = QPixmap(12, 12)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(2, 2, 8, 8)
+        p.end()
+        return QIcon(pix)
+
     def _rank_like_run(self, cands, cloud_weight, auto_window):
         """Order candidates for the ★ / Preview-on-map: the scene that best covers
         the point AND the AOI, with the least cloud.
@@ -1084,8 +1146,9 @@ class LandslideDock(QgsDockWidget):
              covers it, whatever else it has going for it);
           2. AOI coverage, bucketed to 5% (the scene filling the most of the search
              box — fewest nodata gaps over the area);
-          3. cloud cover, least first (whole-scene metric, so it only breaks ties
-             between similarly-covering scenes — which is why coverage is bucketed);
+          3. cloud cover over the AOI, least first (falls back to the whole-scene
+             metric when the AOI number is missing; only breaks ties between
+             similarly-covering scenes — which is why coverage is bucketed);
           4. gap_days, nearest the event last, as a final tiebreaker.
         cloud_weight / auto_window no longer reshuffle this: coverage of the point
         and the area is what makes a review scene usable, so it leads regardless of
@@ -1097,7 +1160,9 @@ class LandslideDock(QgsDockWidget):
             return -round(self._aoi_coverage(c) * 20)       # 5% bins, most first
 
         def cloud(c):
-            v = c.get("cloud_pct")
+            v = c.get("aoi_cloud_pct")          # cloud over the AOI, when measured
+            if v is None:
+                v = c.get("cloud_pct")          # else the whole-scene metric
             return 100.0 if v is None else v
 
         def gap(c):
@@ -1299,7 +1364,16 @@ class LandslideDock(QgsDockWidget):
 
     def _make_gallery_tile(self, c):
         date = (c.get("date") or "")[:10]
-        cloud = "—" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}%"
+        # cloud over the AOI where measured; a leading "~" falls back to the
+        # whole-scene metric, matching the table's Cloud column.
+        aoi_cloud = c.get("aoi_cloud_pct")
+        scene_cloud = c.get("cloud_pct")
+        if aoi_cloud is not None:
+            cloud = f"{aoi_cloud:.0f}%"
+        elif scene_cloud is not None:
+            cloud = f"~{scene_cloud:.0f}%"
+        else:
+            cloud = "—"
         gap = "" if c.get("gap_days") is None else f"{c['gap_days']}d"
         src = c.get("source", "")
         cid = c.get("id")
@@ -1309,7 +1383,9 @@ class LandslideDock(QgsDockWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\n{src}\ncloud {cloud} · {gap}")
-        tile.setToolTip(f"{src}\n{cid}\n{date}   cloud {cloud}   gap {gap}")
+        cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
+                     else f"whole-scene cloud {cloud}")
+        tile.setToolTip(f"{src}\n{cid}\n{date}   {cloud_tip}   gap {gap}")
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)
         if url:
