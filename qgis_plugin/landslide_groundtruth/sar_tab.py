@@ -69,6 +69,7 @@ from qgis.gui import QgsCollapsibleGroupBox
 
 from . import sar_change
 from . import sar_pairing
+from . import layover_dim
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .task import PipelineTask
@@ -125,6 +126,23 @@ CD_NEED = {k: n for k, _l, n, _d in CD_PRODUCTS}
 CD_NAMES = {"mtcorr": "multi-temporal intensity correlation",
             "tsint": "multi-temporal intensity (brightness z)",
             "intcorr": "intensity correlation", "logratio": "log-ratio"}
+
+# change-product color ramps as (lo, hi, [(value, hexcolor, alpha0_255), …]),
+# mirroring _style_cd_layer. Used to bake a pseudocolor RGBA when the layover fade
+# needs a per-pixel alpha (see sar_change.colorize / _write_change_with_fade).
+CD_RAMP = {
+    "logratio": (-6.0, 6.0, [(-6.0, "#b2182b", 255), (-1.5, "#f4a582", 120),
+                             (0.0, "#f7f7f7", 0), (1.5, "#92c5de", 120),
+                             (6.0, "#2166ac", 255)]),
+    "tsint": (-5.0, 5.0, [(-5.0, "#2166ac", 255), (-2.0, "#92c5de", 120),
+                          (0.0, "#f7f7f7", 0), (2.0, "#f4a582", 120),
+                          (5.0, "#b2182b", 255)]),
+    "intcorr": (0.0, 0.6, [(0.0, "#ffffff", 0), (0.15, "#fdae61", 90),
+                           (0.30, "#f46d43", 180), (0.60, "#a50026", 255)]),
+    "mtcorr": (0.0, 1.0, [(0.0, "#ffffff", 0), (0.60, "#ffffff", 0),
+                          (0.80, "#fdae61", 120), (0.90, "#f46d43", 200),
+                          (1.00, "#a50026", 255)]),
+}
 
 # Speckle filter applied to EACH change-detection input scene before the
 # detectors run (Gap 1). Distinct from the display-only median filter in the
@@ -198,6 +216,8 @@ class SarTab(QWidget):
         # recent per-geometry computed change arrays, for the asc+desc merge
         # (rec #5): each = {mkey, track, direction, out, gt, proj, thr, pre_d, post_d}
         self._cd_results = []
+        # AOI-grid Copernicus DEM cache for the layover fade, keyed by (gt, shape)
+        self._dem_cache = {}
         self._build_ui()
 
     # ---------- UI ----------
@@ -682,6 +702,23 @@ class SarTab(QWidget):
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
         form.addRow(info)
+
+        # fade radar-layover slopes: the layover-facing side (east on descending,
+        # west on ascending) reads as false high amplitude / false change
+        self.layover_check = QCheckBox(
+            "Fade layover slopes (dim high signal on the layover-facing side)")
+        self.layover_check.setChecked(False)
+        self.layover_check.setToolTip(
+            "Sentinel-1 is right-looking, so slopes facing the radar — east-facing "
+            "on descending passes, west-facing on ascending — are foreshortened / "
+            "laid over and read as artificially bright: false high amplitude and "
+            "false change (the main artifact at single-geometry sites like interior "
+            "Denali). With this on, those steep layover-facing pixels are dimmed to "
+            "25% opacity on BOTH the amplitude preview and the change maps, from "
+            "slope aspect off a Copernicus GLO-30 DEM fetched over the AOI. Only "
+            "high-value pixels are dimmed; flat ground and the well-imaged slopes "
+            "are untouched. The DEM downloads once per AOI the first time.")
+        form.addRow(self.layover_check)
 
         self.speckle_cd_combo = QComboBox()
         for label, value in SPECKLE_FILTERS:
@@ -1470,6 +1507,8 @@ class SarTab(QWidget):
                 k = self._preview_smooth
                 if k:
                     self._apply_median(path, k)
+                # optionally dim the layover-facing slopes (rewrites path as RGBA)
+                self._apply_layover_amplitude(path, cand)
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
                     lg.add_to_group(lyr, self._amp_group)
@@ -1986,7 +2025,9 @@ class SarTab(QWidget):
                     fd, opath = tempfile.mkstemp(suffix=".tif",
                                                  prefix="landslide_change_")
                     os.close(fd)
-                    sar_change.write_gtiff(opath, out, gt, proj)
+                    faded = self._write_change_with_fade(
+                        opath, out, gt, proj,
+                        roles["post"].get("orbit_state"), SIG[mkey][1], mkey)
                 except Exception as e:               # noqa: BLE001
                     self._warn(f"Could not write {label}: {e}")
                     continue
@@ -1994,7 +2035,8 @@ class SarTab(QWidget):
                 if not lyr.isValid():
                     self._warn(f"{label}: result raster failed to load.")
                     continue
-                self._style_cd_layer(lyr, mkey)
+                if not faded:                        # RGBA (faded) is self-styled
+                    self._style_cd_layer(lyr, mkey)
                 if cd_group is None:
                     cd_group = lg.new_group(
                         lg.name("SAR", lg.date_pair(pre_d, post_d), "change"))
@@ -2151,6 +2193,84 @@ class SarTab(QWidget):
         renderer.setClassificationMin(0.0)
         renderer.setClassificationMax(3.0)
         lyr.setRenderer(renderer)
+
+    # ---------- layover fade (dim the layover-facing slopes) ----------
+    def _aoi_dem(self, gt, shape):
+        """Copernicus GLO-30 DEM on the raster's EXACT grid, cached per
+        (geotransform, shape). None if unavailable — caller then skips dimming."""
+        key = (tuple(round(float(v), 6) for v in gt), tuple(shape))
+        if key in self._dem_cache:
+            return self._dem_cache[key]
+        h, w = shape
+        minx, maxy = gt[0], gt[3]
+        maxx, miny = gt[0] + gt[1] * w, gt[3] + gt[5] * h
+        dem = None
+        try:
+            self._append_log("  layover fade: fetching Copernicus DEM for the AOI…")
+            dem = layover_dim.fetch_dem_on_grid(minx, miny, maxx, maxy, w, h)
+            if dem is None:
+                self._append_log("  layover fade: no Copernicus DEM covers this AOI")
+        except Exception as e:                       # noqa: BLE001 — optional feature
+            self._append_log(f"  layover fade: DEM fetch failed "
+                             f"({type(e).__name__}: {e})")
+        self._dem_cache[key] = dem
+        return dem
+
+    def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey):
+        """Write a change raster. If the layover fade is on and a DEM is available,
+        bake the pseudocolor ramp into an RGBA raster whose alpha dims the layover-
+        facing steep high-anomaly pixels (QGIS renders RGBA alpha reliably, unlike a
+        single-band renderer's alpha band). Returns True if an RGBA raster was
+        written — the caller then does NOT apply the pseudocolor renderer."""
+        import numpy as np
+        if self.layover_check.isChecked():
+            dem = self._aoi_dem(gt, out.shape)
+            if dem is not None:
+                try:
+                    a, meta = layover_dim.layover_alpha(
+                        out, np.isfinite(out), dem, gt, orbit_state,
+                        lat_hint=gt[3] + gt[5] * out.shape[0] / 2.0,
+                        mode="change", thr=thr, dim=0.25)
+                    if meta["n_dimmed"]:
+                        lo, hi, stops = CD_RAMP.get(mkey, CD_RAMP["mtcorr"])
+                        rgba = sar_change.colorize(out, lo, hi, stops)
+                        rgba[..., 3] *= a            # fold the layover alpha in
+                        sar_change.write_rgba(
+                            opath, np.clip(rgba, 0, 255).astype("uint8"), gt, proj)
+                        self._append_log(f"  layover fade: {meta['note']} "
+                                         f"({meta['n_dimmed']} px)")
+                        return True
+                except Exception as e:               # noqa: BLE001
+                    self._append_log(f"  layover fade skipped: "
+                                     f"{type(e).__name__}: {e}")
+        sar_change.write_gtiff(opath, out, gt, proj)
+        return False
+
+    def _apply_layover_amplitude(self, path, cand):
+        """In place, rewrite a grayscale amplitude GeoTIFF as RGBA whose alpha dims
+        the layover-facing steep bright pixels (QGIS honors the alpha band). No-op
+        unless the fade is on and a DEM is available."""
+        if not self.layover_check.isChecked():
+            return
+        import numpy as np
+        try:
+            gray, gt, proj = sar_change.read_raster(path)
+            valid = np.isfinite(gray) & (gray > 0)
+            dem = self._aoi_dem(gt, gray.shape)
+            if dem is None:
+                return
+            a, meta = layover_dim.layover_alpha(
+                gray, valid, dem, gt, cand.get("orbit_state"),
+                lat_hint=gt[3] + gt[5] * gray.shape[0] / 2.0,
+                mode="amplitude", high_percentile=75.0, dim=0.25)
+            if not meta["n_dimmed"]:
+                return
+            gray_u8 = np.clip(np.nan_to_num(gray, nan=0.0), 0, 255).astype("uint8")
+            sar_change.write_gray_rgba(
+                path, gray_u8, layover_dim.as_alpha_band(a), gt, proj)
+            self._append_log(f"  layover fade: {meta['note']} ({meta['n_dimmed']} px)")
+        except Exception as e:                       # noqa: BLE001
+            self._append_log(f"  layover fade skipped: {type(e).__name__}: {e}")
 
     def _merge_geometries_action(self):
         """Merge the most recent ascending + descending change maps of each product

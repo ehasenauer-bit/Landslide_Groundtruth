@@ -102,6 +102,97 @@ def write_gtiff(path, arr, gt, proj):
     ds = None
 
 
+def read_raster(path, band=1):
+    """(arr float32 with NODATA→NaN, geotransform, projection) of `band`. Unlike
+    read_band this applies NO γ⁰>0 validity test, so it is safe for DEMs and for
+    already-computed change rasters that can legitimately be zero or negative."""
+    from osgeo import gdal
+    ds = gdal.Open(path)
+    if ds is None:
+        raise IOError(f"GDAL could not open {path}")
+    b = ds.GetRasterBand(band)
+    arr = b.ReadAsArray().astype(np.float32)
+    nd = b.GetNoDataValue()
+    if nd is not None:
+        arr = np.where(arr == nd, np.nan, arr)
+    gt, proj = ds.GetGeoTransform(), ds.GetProjection()
+    ds = None
+    return arr, gt, proj
+
+
+def write_gtiff_2band(path, value, alpha_u8, gt, proj):
+    """Band 1 = float value (NaN→NODATA), band 2 = 0..255 alpha. A single-band
+    renderer keeps its styling on band 1 while QGIS modulates opacity by band 2
+    (renderer.setAlphaBand(2)) — used to fade radar-layover pixels."""
+    from osgeo import gdal
+    h, w = value.shape
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 2, gdal.GDT_Float32,
+                                              options=["COMPRESS=DEFLATE"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    b1 = ds.GetRasterBand(1)
+    b1.WriteArray(np.where(np.isfinite(value), value, NODATA).astype(np.float32))
+    b1.SetNoDataValue(NODATA)
+    ds.GetRasterBand(2).WriteArray(np.asarray(alpha_u8).astype(np.float32))
+    ds.FlushCache()
+    ds = None
+
+
+def write_gray_rgba(path, gray_u8, alpha_u8, gt, proj):
+    """4-band Byte RGBA (R=G=B=gray, A=alpha) — QGIS auto-renders it with per-pixel
+    opacity, revealing the basemap beneath dimmed pixels. For the grayscale
+    amplitude preview, whose auto grayscale styling can't take an external alpha."""
+    from osgeo import gdal
+    g = np.asarray(gray_u8).astype(np.uint8)
+    a = np.asarray(alpha_u8).astype(np.uint8)
+    h, w = g.shape
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 4, gdal.GDT_Byte,
+                                              options=["COMPRESS=DEFLATE", "ALPHA=YES"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    for i in (1, 2, 3):
+        ds.GetRasterBand(i).WriteArray(g)
+    ab = ds.GetRasterBand(4)
+    ab.WriteArray(a)
+    ab.SetColorInterpretation(gdal.GCI_AlphaBand)
+    ds.FlushCache()
+    ds = None
+
+
+def colorize(value, lo, hi, stops):
+    """Map a float array to RGBA (float32, shape H×W×4, 0..255) by linear
+    interpolation over `stops` = [(value, '#rrggbb', alpha0_255), …] ascending.
+    NaN → fully transparent. Bakes a pseudocolor ramp into pixels so the result
+    can carry a per-pixel alpha (the layover fade) that QGIS renders reliably —
+    which a single-band renderer's alpha band does not."""
+    v = np.asarray(value, dtype=np.float32)
+    xs = np.array([s[0] for s in stops], dtype=np.float64)
+    cols = np.array([[int(s[1][1:3], 16), int(s[1][3:5], 16),
+                      int(s[1][5:7], 16), s[2]] for s in stops], dtype=np.float64)
+    vc = np.clip(v, lo, hi).astype(np.float64)
+    out = np.empty(v.shape + (4,), dtype=np.float32)
+    for ch in range(4):
+        out[..., ch] = np.interp(vc, xs, cols[:, ch])
+    out[~np.isfinite(v)] = 0.0
+    return out
+
+
+def write_rgba(path, rgba_u8, gt, proj):
+    """H×W×4 uint8 RGBA → GeoTIFF that QGIS auto-renders with per-pixel opacity."""
+    from osgeo import gdal
+    a = np.asarray(rgba_u8)
+    h, w = a.shape[:2]
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 4, gdal.GDT_Byte,
+                                              options=["COMPRESS=DEFLATE", "ALPHA=YES"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    for i in range(4):
+        ds.GetRasterBand(i + 1).WriteArray(a[..., i].astype(np.uint8))
+    ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ds.FlushCache()
+    ds = None
+
+
 # ---------- window statistics (integral images) ----------
 def _win_sum(a, k):
     """k×k moving-window sum, zero-padded at the edges, via an integral image."""
