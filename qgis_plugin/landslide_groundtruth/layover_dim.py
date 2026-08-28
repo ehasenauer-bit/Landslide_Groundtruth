@@ -88,7 +88,8 @@ def _box_mean(a, k):
 
 def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
                   mode="amplitude", thr=None, high_percentile=75.0,
-                  dim=0.25, slope_min_deg=12.0, aspect_tol_deg=55.0):
+                  dim=0.25, slope_min_deg=12.0, aspect_tol_deg=55.0,
+                  dem_smooth=3, feather=5):
     """Per-pixel opacity in [dim, 1] (float32): `dim` where a pixel is layover-
     facing AND steep AND high-valued, else 1.0.
 
@@ -108,7 +109,10 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
                        "n_dimmed": 0, "note": "unknown orbit — not dimmed"}
 
     dx, dy = metric_pixel_size(gt, value.shape[0], lat_hint)
-    slope, aspect = slope_aspect_deg(dem, dx, dy)
+    # smooth the DEM first: a bilinear-upsampled tile is a lattice of flat facets
+    # whose slope/aspect derivatives terrace into blocky patches
+    dem_s = _box_mean(dem, dem_smooth) if dem_smooth and dem_smooth > 1 else dem
+    slope, aspect = slope_aspect_deg(dem_s, dx, dy)
     facing = _angular_gap(aspect, lay_aspect) <= aspect_tol_deg
     steep = slope >= slope_min_deg
     if mode == "change":
@@ -119,7 +123,13 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
         cut = np.percentile(finite, high_percentile) if finite.size else np.inf
         high = value >= cut
     dim_mask = valid & facing & steep & high & np.isfinite(slope)
-    alpha[dim_mask] = float(dim)
+    # feather the hard dim/keep edge so opacity ramps over a few pixels instead of
+    # a blocky 25%/100% step; strength in [0,1] → alpha in [dim, 1]
+    if feather and feather > 1:
+        strength = np.clip(_box_mean(dim_mask.astype(np.float64), feather), 0.0, 1.0)
+    else:
+        strength = dim_mask.astype(np.float64)
+    alpha = (1.0 - strength * (1.0 - float(dim))).astype(np.float32)
     return alpha, {"orbit_state": str(orbit_state), "layover_aspect": lay_aspect,
                    "n_dimmed": int(dim_mask.sum()),
                    "note": f"dimmed layover-facing (aspect~{lay_aspect:.0f}°) "
