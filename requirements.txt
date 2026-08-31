@@ -20,6 +20,14 @@ pystac-client>=0.7        # tested 0.9.0
 planetary-computer>=1.0   # tested 1.0.0  (signs PC asset URLs)
 stackstac>=0.5            # tested 0.5.1  (windowed COG -> xarray stack)
 
+# --- AOI cloud metric: snow-robust neural cloud+shadow mask ---
+# Measures "cloud over the AOI" from Red/Green/NIR instead of the SCL/QA
+# thresholds, which over glaciers mislabel cloud-over-snow as snow. Pulls torch
+# (~110 MB; uses the Mac's MPS GPU) + segmentation-models-pytorch/timm. First run
+# downloads ~58 MB of model weights from HuggingFace (cached offline after). If
+# absent/failing, the code falls back to the SCL/QA count (a lower bound).
+omnicloudmask>=1.7        # tested 1.7.1
+
 # --- raster / array handling ---
 rioxarray>=0.15           # tested 0.22.0 (registers the .rio accessor)
 xarray>=2024.1            # tested 2026.4.0

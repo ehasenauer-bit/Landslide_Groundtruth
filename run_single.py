@@ -161,9 +161,12 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
     """Search ONE source ('planet'/'s2'/'landsat') for candidate pre/post scenes.
 
     Returns (result_dict, note): result_dict is search_event's output (or None on
-    failure) and note is a per-source message (or None). Self-contained and
-    touches no shared state, so the preview can fan several of these out across
-    threads."""
+    failure) and note is a per-source message (or None). Self-contained, so the
+    preview can fan several of these out across threads. The one piece of shared
+    state it reaches is imagery's OmniCloudMask ensemble, which guards itself
+    with a lock (see imagery._OCM_LOCK) — torch's MPS backend segfaults if two
+    threads dispatch to it at once, so anything added here that runs a model must
+    serialise the same way."""
     try:
         if s == "planet":
             import planet_imagery as pi
@@ -237,6 +240,11 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             pre += r["pre"]
             post += r["post"]
             notes += r.get("notes", [])   # source-specific hints (e.g. DEM strips)
+            # OmniCloudMask fell back to the SCL/QA lower bound for this source —
+            # surface WHY (bad venv, read error) instead of silently showing the
+            # under-counting number.
+            if r.get("aoi_cloud_note"):
+                notes.append("⚠ " + r["aoi_cloud_note"])
         if note is not None:
             notes.append(note)
     pre.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)

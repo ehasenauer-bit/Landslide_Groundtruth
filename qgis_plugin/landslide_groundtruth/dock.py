@@ -121,9 +121,16 @@ ROW_FG = QColor(20, 20, 20)
 CLOUD_CLEAR = QColor(30, 138, 54)      # <= CLOUD_GREEN_MAX % of the AOI cloudy
 CLOUD_SOME = QColor(176, 122, 0)       # <= CLOUD_AMBER_MAX %
 CLOUD_HEAVY = QColor(197, 30, 42)      # above that
-CLOUD_UNKNOWN = QColor(130, 130, 130)  # no AOI-cloud measurement
+CLOUD_UNKNOWN = QColor(130, 130, 130)  # no AOI-cloud measurement / snow-swamped
 CLOUD_GREEN_MAX = 10.0
 CLOUD_AMBER_MAX = 40.0
+# Above this share of the AOI classed snow/ice, the SCL/QA_PIXEL cloud test can't
+# be trusted: over bright glaciers the classifier routinely bins cloud tops AS
+# snow (SCL 11 / QA bit 5), which the AOI-cloud count excludes, so a cloud-choked
+# scene can read a falsely-clear few percent. We keep the number but mark it (❄,
+# greyed) so it reads as "judge by the thumbnail", not a confident clear signal.
+CLOUD_SNOW_MARK = "❄"             # snowflake prefix on a snow-swamped cell
+SNOW_UNRELIABLE_PCT = 50.0
 
 # Planetary Computer's public asset-signing endpoint. Given a blob href it
 # returns {"href": "<href>?<SAS>", "msft:expiry": ...}; the SAS token is short-
@@ -552,11 +559,14 @@ class LandslideDock(QgsDockWidget):
         # quicklook gallery: every candidate's browse thumbnail at once (before +
         # after) so you can scan for the cloud-free scene over the AOI in one
         # glance, instead of clicking the table row by row. Click a tile to select
-        # its scene (drives the big preview + Preview on map).
-        gallerybox = QWidget()
+        # its scene (drives the big preview + Preview on map). Collapsible and
+        # collapsed by default: the Cloud column is the primary signal now, so the
+        # thumbnails stay tucked away until you want to eyeball a scene.
+        gallerybox = QgsCollapsibleGroupBox(
+            "Quicklook gallery (click a thumbnail to select its scene)")
+        gallerybox.setSaveCollapsedState(False)
+        gallerybox.setCollapsed(True)
         g_layout = QVBoxLayout(gallerybox)
-        g_layout.setContentsMargins(0, 0, 0, 0)
-        g_layout.addWidget(QLabel("Quicklook gallery (click a thumbnail to select its scene)"))
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
@@ -566,11 +576,13 @@ class LandslideDock(QgsDockWidget):
         g_layout.addWidget(self.gallery_scroll, 1)
         out_split.addWidget(gallerybox)
 
-        # preview pane: free browse image of the selected scene (no order placed)
-        previewbox = QWidget()
+        # preview pane: free browse image of the selected scene (no order placed).
+        # Same deal — collapsible, collapsed by default; expand it when you want
+        # to check a scene by eye rather than by the Cloud number.
+        previewbox = QgsCollapsibleGroupBox("Scene preview")
+        previewbox.setSaveCollapsedState(False)
+        previewbox.setCollapsed(True)
         pv_layout = QVBoxLayout(previewbox)
-        pv_layout.setContentsMargins(0, 0, 0, 0)
-        pv_layout.addWidget(QLabel("Scene preview"))
         self.preview = QLabel("Select a scene to preview its browse image.")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setWordWrap(True)
@@ -588,13 +600,16 @@ class LandslideDock(QgsDockWidget):
         log_layout.addWidget(self.log)
         out_split.addWidget(logbox)
 
-        out_split.setStretchFactor(0, 3)   # table
-        out_split.setStretchFactor(1, 3)   # gallery
-        out_split.setStretchFactor(2, 2)   # preview
+        # gallery + preview are collapsible and collapsed by default, so give them
+        # no stretch: they sit as thin title bars until expanded (then drag the
+        # handle to size them). The table is the primary signal, so it dominates.
+        out_split.setStretchFactor(0, 5)   # table
+        out_split.setStretchFactor(1, 0)   # gallery (collapsible, sizes on demand)
+        out_split.setStretchFactor(2, 0)   # preview (collapsible, sizes on demand)
         out_split.setStretchFactor(3, 2)   # log
         scenes.setMinimumHeight(120)
-        gallerybox.setMinimumHeight(0)     # drag closed when you don't need it
-        previewbox.setMinimumHeight(0)     # drag closed when you don't need it
+        gallerybox.setMinimumHeight(0)     # collapsed to its title bar by default
+        previewbox.setMinimumHeight(0)     # collapsed to its title bar by default
         logbox.setMinimumHeight(80)
         root.addWidget(out_split, 1)
         return w
@@ -973,16 +988,25 @@ class LandslideDock(QgsDockWidget):
         self._load_gallery(result)
         if self.footprint_check.isChecked():
             self._draw_footprints(log=True)
+        ocm_warn = None
         for note in result.get("notes", []):
             self._append_log("note: " + note)
+            if note.lstrip().startswith("⚠") and "OmniCloudMask" in note:
+                ocm_warn = note.lstrip("⚠ ").strip()
         # the map preview renders via the data API (Sentinel-2 or Landsat); enable
         # it only when there's a streamable scene on at least one side.
         has_streamable = bool(self._best_streamable("pre") or self._best_streamable("post"))
         self.map_preview_btn.setEnabled(has_streamable)
         npre, npost = len(result.get("pre", [])), len(result.get("post", []))
-        self.iface.messageBar().pushInfo(
-            "Landslide", f"Found {npre} pre / {npost} post candidate scenes "
-                         f"(no orders placed).")
+        # A quiet fall-back to the SCL/QA lower bound is exactly what looked like
+        # "the cloud % is inaccurate", so shout it in the message bar (not just the
+        # log) with the reason and the fix.
+        if ocm_warn:
+            self.iface.messageBar().pushWarning("Landslide — cloud %", ocm_warn)
+        else:
+            self.iface.messageBar().pushInfo(
+                "Landslide", f"Found {npre} pre / {npost} post candidate scenes "
+                             f"(no orders placed).")
 
     def _fill_table(self, result):
         pre = result.get("pre", [])
@@ -1011,11 +1035,19 @@ class LandslideDock(QgsDockWidget):
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
             # "Cloud" column = cloud over YOUR AOI (per-pixel). A leading "~"
             # marks the fallback to the whole-scene eo:cloud_cover when the AOI
-            # number couldn't be measured, so the two are never confused.
+            # number couldn't be measured, so the two are never confused. A
+            # leading ❄ marks a snow-swamped AOI, where the number is only a
+            # lower bound (cloud over snow reads as snow — see SNOW_UNRELIABLE_PCT).
             aoi_cloud = c.get("aoi_cloud_pct")
+            aoi_snow = c.get("aoi_snow_pct")
+            aoi_method = c.get("aoi_cloud_method")   # 'ocm' | 'scl' | None
             scene_cloud = c.get("cloud_pct")
+            snow_swamped = (aoi_cloud is not None and aoi_snow is not None
+                            and aoi_snow >= SNOW_UNRELIABLE_PCT)
             if aoi_cloud is not None:
                 cloud = f"{aoi_cloud:.0f}%"
+                if snow_swamped:
+                    cloud = f"{CLOUD_SNOW_MARK} " + cloud
             elif scene_cloud is not None:
                 cloud = f"~{scene_cloud:.0f}%"
             else:
@@ -1057,13 +1089,44 @@ class LandslideDock(QgsDockWidget):
             # off-point muting below), so a scene that misses the point still
             # greys out wholesale — its cloud colour is moot there anyway.
             cloud_item = self.table.item(r, 3)
-            cloud_item.setForeground(QBrush(self._cloud_color(aoi_cloud)))
+            # Grey the number only when it is genuinely untrustworthy: a snow-swamped
+            # AOI with a reassuring green/amber reading that came from the SCL/QA
+            # FALLBACK (a lower bound over snow). OmniCloudMask accounts for
+            # cloud-over-snow — that is the whole reason we switched — so an 'ocm'
+            # number keeps its true green/amber/red colour even when snow-swamped.
+            mask_color = (snow_swamped and aoi_cloud <= CLOUD_AMBER_MAX
+                          and aoi_method != "ocm")
+            cloud_item.setForeground(QBrush(
+                CLOUD_UNKNOWN if mask_color else self._cloud_color(aoi_cloud)))
             if aoi_cloud is not None:
                 tip = (f"Cloud, cirrus & shadow over your AOI: {aoi_cloud:.0f}%.\n"
                        f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
                        f"· red above.")
+                if aoi_method == "ocm":
+                    tip += ("\nMeasured by OmniCloudMask (neural cloud+shadow "
+                            "mask that judges cloud by local contrast, so it is "
+                            "not fooled by bright snow).")
+                elif aoi_method == "scl":
+                    tip += ("\nOmniCloudMask unavailable — from the SCL/QA "
+                            "classification band, a LOWER BOUND over snow.")
                 if scene_cloud is not None:
                     tip += f"\nWhole scene (eo:cloud_cover): {scene_cloud:.0f}%."
+                if snow_swamped and aoi_method == "ocm":
+                    # OCM already handles cloud-over-snow, so this is a residual-risk
+                    # note, not a "don't trust the number" warning.
+                    tip += (f"\n\n{CLOUD_SNOW_MARK} Snow-dominated AOI "
+                            f"({aoi_snow:.0f}% snow/ice). This number is usable — "
+                            f"but thin cirrus over bright ice is the residual blind "
+                            f"spot of every optical mask, so give the thumbnail a "
+                            f"glance here.")
+                elif snow_swamped:
+                    tip += (f"\n\n{CLOUD_SNOW_MARK} Snow-swamped AOI: "
+                            f"{aoi_snow:.0f}% of the measured pixels are classed "
+                            f"snow/ice. Over glaciers the classifier often labels "
+                            f"cloud AS snow, which this count excludes — so the "
+                            f"cloud % is only a LOWER BOUND and may look clear when "
+                            f"it isn't. Judge this scene by its thumbnail, not the "
+                            f"number.")
             else:
                 tip = ("AOI cloud unavailable — the footprint may miss your AOI box, "
                        "or the classification read failed, so this is the WHOLE-scene "
@@ -1360,11 +1423,18 @@ class LandslideDock(QgsDockWidget):
     def _make_gallery_tile(self, c):
         date = (c.get("date") or "")[:10]
         # cloud over the AOI where measured; a leading "~" falls back to the
-        # whole-scene metric, matching the table's Cloud column.
+        # whole-scene metric and a leading ❄ marks a snow-dominated AOI — matching
+        # the table's Cloud column.
         aoi_cloud = c.get("aoi_cloud_pct")
+        aoi_snow = c.get("aoi_snow_pct")
+        aoi_method = c.get("aoi_cloud_method")   # 'ocm' | 'scl' | None
         scene_cloud = c.get("cloud_pct")
+        snow_swamped = (aoi_cloud is not None and aoi_snow is not None
+                        and aoi_snow >= SNOW_UNRELIABLE_PCT)
         if aoi_cloud is not None:
             cloud = f"{aoi_cloud:.0f}%"
+            if snow_swamped:
+                cloud = f"{CLOUD_SNOW_MARK} " + cloud
         elif scene_cloud is not None:
             cloud = f"~{scene_cloud:.0f}%"
         else:
@@ -1380,7 +1450,15 @@ class LandslideDock(QgsDockWidget):
         tile.setText(f"{date}\n{src}\ncloud {cloud} · {gap}")
         cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
                      else f"whole-scene cloud {cloud}")
-        tile.setToolTip(f"{src}\n{cid}\n{date}   {cloud_tip}   gap {gap}")
+        tip = f"{src}\n{cid}\n{date}   {cloud_tip}   gap {gap}"
+        if snow_swamped and aoi_method == "ocm":
+            tip += (f"\n{CLOUD_SNOW_MARK} snow-dominated AOI ({aoi_snow:.0f}% "
+                    f"snow/ice) — number is usable; glance at the thumbnail for "
+                    f"thin cirrus.")
+        elif snow_swamped:
+            tip += (f"\n{CLOUD_SNOW_MARK} snow-swamped AOI ({aoi_snow:.0f}% "
+                    f"snow/ice) — cloud % is a lower bound; judge by the thumbnail.")
+        tile.setToolTip(tip)
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)
         if url:
