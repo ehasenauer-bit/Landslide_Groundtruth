@@ -288,82 +288,11 @@ def _ocm_models():
         return _OCM_STATE["device"], _OCM_STATE["models"]
 
 
-def _stack_id_pos(stack):
-    """{item.id -> position on the stack's time axis} for a computed stack.
-
-    CRITICAL: stackstac orders the time axis by DATETIME, not by the input
-    `items` order, so pulling `stack.isel(time=idx)` for `items[idx]` pairs each
-    scene's pixels with the WRONG scene id — every AOI cloud/snow number then
-    lands on the wrong row. Always look scenes up by the 'id' coordinate stackstac
-    carries. Returns None only if that coord is somehow absent, and the caller
-    then falls back to positional order (the old, unsafe behaviour) as a last
-    resort rather than dropping the numbers entirely."""
-    if "id" not in stack.coords:
-        return None
-    ids = [str(x) for x in np.atleast_1d(stack.coords["id"].values)]
-    return {sid: i for i, sid in enumerate(ids)}
-
-
-def _ocm_cloud_fractions(items, lat, lon, radius_km, sensor, res):
-    """OmniCloudMask cloud+shadow boolean masks over the AOI box, per item id.
-
-    Returns {item.id: bool (H,W) mask} where True = cloud / thin cloud / shadow
-    (OCM classes 1/2/3; class 0 clear, and snow is CLEAR to OCM). Aligned to the
-    classification read's grid — same epsg/bounds/resolution — so the mask lines
-    up pixel-for-pixel with the SCL/QA 'valid' mask the caller counts over.
-
-    Reads Red/Green/NIR as raw DN with fill=0: OCM z-score-normalises each band
-    over its NONZERO pixels (model_utils.normalize), so DN scaling/offset is
-    irrelevant, but 0 must mean no-data — which off-footprint fill already is.
-
-    Returns (masks, note): masks is {item.id: bool (H,W)} for the scenes OCM
-    scored; note is None on success, or a one-line reason string when OCM could
-    NOT run for the whole batch (import/load/read failure) — the caller bubbles
-    that up so the plugin can say WHY it fell back to SCL rather than failing
-    silently. Never raises: a wholesale failure returns ({}, reason); a per-scene
-    inference failure just drops that scene from masks (caller falls back for it)."""
-    assets = (["B04", "B03", "B08"] if sensor == "s2"      # red, green, nir
-              else ["red", "green", "nir08"])              # Landsat C2 L2
-    try:
-        dev, models = _ocm_models()
-        from omnicloudmask import predict_from_array
-    except Exception as e:
-        note = (f"OmniCloudMask could not load ({type(e).__name__}: {e}) — "
-                f"cloud % is the SCL/QA lower bound. Check that the plugin's venv "
-                f"python has omnicloudmask installed.")
-        print(f"    [aoi-cloud] !! {note}")
-        return {}, note
-    try:
-        rgn = stackstac.stack(
-            items, assets=assets, epsg=_utm_epsg(lat, lon), resolution=res,
-            bounds_latlon=_bbox(lat, lon, radius_km),
-            chunksize=2048, rescale=False, fill_value=0,
-        ).compute()
-    except Exception as e:
-        note = (f"OmniCloudMask R/G/NIR read failed for {sensor} "
-                f"({type(e).__name__}: {e}) — cloud % is the SCL/QA lower bound.")
-        print(f"    [aoi-cloud] !! {note}")
-        return {}, note
-    if rgn.sizes.get("time") != len(items):
-        return {}, f"OmniCloudMask read misaligned for {sensor} — SCL/QA lower bound."
-    # stackstac reorders the time axis by datetime — index by id, never position.
-    idpos = _stack_id_pos(rgn)
-    out = {}
-    for idx, item in enumerate(items):
-        pos = idpos.get(item.id) if idpos is not None else idx
-        if pos is None:
-            continue
-        try:
-            arr = np.asarray(rgn.isel(time=pos).values, dtype="float32")  # (3,H,W)
-            with _OCM_LOCK:   # see _OCM_LOCK: concurrent MPS dispatch segfaults
-                mask = predict_from_array(arr, custom_models=models,
-                                          inference_device=dev)
-            m = np.asarray(mask).squeeze()          # (H,W): 0 clear, 1/2/3 cloud/shadow
-            out[item.id] = np.isin(m, (1, 2, 3))
-        except Exception as e:
-            print(f"    [aoi-cloud] OCM inference failed for {item.id} "
-                  f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
-    return out, None
+# _aoi_cloud_fractions fans the per-scene AOI reads across this many threads. The
+# reads are network-bound and independent; measured throughput plateaus by ~8, so
+# more workers don't help. The plugin already threads the S2 and Landsat previews,
+# so this nests under that.
+_AOI_READ_WORKERS = 8
 
 
 def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
@@ -385,78 +314,128 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     note is None, or a one-line reason when method='ocm' was asked but OCM fell
     back to SCL for the batch (so the plugin can say WHY, not fail silently).
 
-    The classification read and the OCM Red/Green/NIR read share ONE grid (same
-    epsg/bounds/resolution, run coarse — ~100 m / ~200 px across the box — to keep
-    the read cheap; see the res comment below), so the OCM mask and the SCL
-    'valid'/'snow' masks align pixel-for-pixel. Never raises: any read/inference
-    error downgrades to None/fallback so the preview still lists its scenes."""
+    Each scene is read on its own thread (network-bound, so fanning out is ~2x
+    faster than one big read); OCM inference then runs serially under _OCM_LOCK.
+    Per scene the classification and R/G/NIR reads share ONE grid (same
+    epsg/bounds/resolution, run coarse — ~100 m / ~200 px; see the res comment
+    below), so the OCM mask and the SCL 'valid'/'snow' masks align
+    pixel-for-pixel. Single-item reads also make the old stackstac-sorts-by-time
+    mislabeling impossible. Never raises: any read/inference error downgrades to
+    None/fallback so the preview still lists its scenes."""
     if not items:
         return {}, None
-    band = "SCL" if sensor == "s2" else "qa_pixel"
     native = 20 if sensor == "s2" else 30
-    # The AOI R/G/NIR read is the slow part of a preview and its cost scales with
-    # pixel count, so we run the cloud read COARSE — ~100 m, ~200 px across the
-    # box. OmniCloudMask is nominally trained for 10-50 m, but measured on these
-    # glaciated Alaska scenes its cloud% is unchanged from 50 m to 100 m (a
-    # 73%-cloud scene stays 73%, a clear one stays 0%): the thick-cloud-over-snow
-    # signal is coarse, so dropping the resolution cuts the read without moving the
-    # number. Coarsening can soften only THIN cirrus — where the ❄ flag already
-    # says "check the thumbnail". 200 px is still well above OCM's ~96 px context
-    # knee, and the same grid feeds the SCL 'valid'/'snow' masks. Floor at the
-    # sensor's native GSD so a tiny AOI is never upsampled.
+    # Coarse read (~100 m / ~200 px): OmniCloudMask is nominally trained for
+    # 10-50 m, but measured on these glaciated Alaska scenes its cloud% is
+    # unchanged from 50 m to 100 m (a 73%-cloud scene stays 73%, a clear one stays
+    # 0%) — the thick-cloud-over-snow signal is coarse, so fewer pixels cuts the
+    # read without moving the number. Coarsening can soften only THIN cirrus, where
+    # the ❄ flag already says "check the thumbnail". 200 px is well above OCM's
+    # ~96 px context knee. Floor at the sensor's native GSD so a tiny AOI is never
+    # upsampled.
     res = min(100.0, max(float(native), (2 * radius_km * 1000.0) / 200.0))
+    epsg = _utm_epsg(lat, lon)
+    bounds = _bbox(lat, lon, radius_km)
+    cls_band = "SCL" if sensor == "s2" else "qa_pixel"
     # fill_value marks off-footprint pixels as this sensor's own "no measurement"
     # code, so they drop out of the denominator: SCL 0 = nodata, QA_PIXEL bit 0 = fill.
-    fill = 0 if sensor == "s2" else 1
-    try:
-        cls = stackstac.stack(
-            items, assets=[band], epsg=_utm_epsg(lat, lon), resolution=res,
-            bounds_latlon=_bbox(lat, lon, radius_km),
-            chunksize=2048, rescale=False, fill_value=fill,
-        ).squeeze("band", drop=True).compute()
-    except Exception as e:
-        print(f"    [aoi-cloud] {sensor} read failed ({type(e).__name__}: {e}); "
-              f"listing without AOI cloud")
-        return {i.id: (None, None, None) for i in items}, None
-    # stackstac keeps one time slice per item, in the given order. If that ever
-    # fails to hold (e.g. identical timestamps collapsed), don't guess — fall back.
-    if cls.sizes.get("time") != len(items):
-        return {i.id: (None, None, None) for i in items}, None
-    # OmniCloudMask cloud+shadow masks over the SAME grid ({} -> SCL/QA fallback).
-    ocm, ocm_note = (_ocm_cloud_fractions(items, lat, lon, radius_km, sensor, res)
-                     if method == "ocm" else ({}, None))
-    # stackstac reorders the time axis by datetime — index by id, never position,
-    # or every scene's cloud/snow lands on the wrong row (see _stack_id_pos).
-    cls_idpos = _stack_id_pos(cls)
+    cls_fill = 0 if sensor == "s2" else 1
+    rgn_bands = ["B04", "B03", "B08"] if sensor == "s2" else ["red", "green", "nir08"]
+
+    def _read(item):
+        """(id, classification 2-D, R/G/NIR 3-D or None). Never raises — a failed
+        read returns None so that scene falls back (SCL) or drops out entirely.
+        One stackstac read per band-group per scene: single-item reads mean
+        `isel(time=0)` is unambiguous, so the stackstac-sorts-by-datetime
+        mislabeling simply cannot happen here."""
+        try:
+            c = stackstac.stack(
+                [item], assets=[cls_band], epsg=epsg, resolution=res,
+                bounds_latlon=bounds, chunksize=2048, rescale=False,
+                fill_value=cls_fill).squeeze("band", drop=True).compute(
+                    scheduler="synchronous")
+            cls_arr = np.asarray(c.isel(time=0).values)
+        except Exception as e:
+            print(f"    [aoi-cloud] {sensor} {getattr(item, 'id', '?')} read failed "
+                  f"({type(e).__name__}: {e})")
+            return item.id, None, None
+        rgn_arr = None
+        if method == "ocm":
+            try:
+                # Raw DN, fill=0: OCM z-score-normalises each band over its NONZERO
+                # pixels, so DN scaling is irrelevant but 0 must mean no-data.
+                r = stackstac.stack(
+                    [item], assets=rgn_bands, epsg=epsg, resolution=res,
+                    bounds_latlon=bounds, chunksize=2048, rescale=False,
+                    fill_value=0).compute(scheduler="synchronous")
+                rgn_arr = np.asarray(r.isel(time=0).values, dtype="float32")  # (3,H,W)
+            except Exception as e:
+                print(f"    [aoi-cloud] {sensor} {item.id} R/G/NIR read failed "
+                      f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
+        return item.id, cls_arr, rgn_arr
+
+    # The reads are network-bound and independent, so fan the scenes across a small
+    # thread pool — ~2x faster than one big stackstac read. Throughput plateaus at
+    # ~8 workers (measured), and the plugin already runs the S2 and Landsat previews
+    # on their own threads, so this nests under that.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(_AOI_READ_WORKERS, len(items))) as ex:
+        reads = list(ex.map(_read, items))
+
+    # OmniCloudMask inference, run SERIALLY under _OCM_LOCK (torch's MPS backend is
+    # not thread-safe). Cheap next to the reads. ocm_note is set only when OCM
+    # can't load AT ALL (the actionable "wrong venv" case) so the plugin can shout
+    # it; a per-scene read/inference miss just falls that one scene back to SCL.
+    ocm_masks, ocm_note = {}, None
+    if method == "ocm":
+        predict_from_array = None
+        try:
+            dev, models = _ocm_models()
+            from omnicloudmask import predict_from_array
+        except Exception as e:
+            ocm_note = (f"OmniCloudMask could not load ({type(e).__name__}: {e}) — "
+                        f"cloud % is the SCL/QA lower bound. Check that the plugin's "
+                        f"venv python has omnicloudmask installed.")
+            print(f"    [aoi-cloud] !! {ocm_note}")
+        if predict_from_array is not None:
+            for iid, _cls, rgn_arr in reads:
+                if rgn_arr is None:
+                    continue
+                try:
+                    with _OCM_LOCK:   # concurrent MPS dispatch segfaults; see _OCM_LOCK
+                        mask = predict_from_array(rgn_arr, custom_models=models,
+                                                  inference_device=dev)
+                    m = np.asarray(mask).squeeze()   # (H,W): 0 clear, 1/2/3 cloud/shadow
+                    ocm_masks[iid] = np.isin(m, (1, 2, 3))
+                except Exception as e:
+                    print(f"    [aoi-cloud] OCM inference failed for {iid} "
+                          f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
+
     out = {}
-    for idx, item in enumerate(items):
-        pos = cls_idpos.get(item.id) if cls_idpos is not None else idx
-        if pos is None:
-            out[item.id] = (None, None, None)
+    for iid, cls_arr, _rgn in reads:
+        if cls_arr is None:
+            out[iid] = (None, None, None)
             continue
-        a = np.asarray(cls.isel(time=pos).values)
         if sensor == "s2":
-            a = a.astype("int16")
+            a = cls_arr.astype("int16")
             valid = ~np.isin(a, S2_NODATA_SCL)
             cloudy = np.isin(a, S2_CLOUD_SCL)
             snowy = np.isin(a, S2_SNOW_SCL)
         else:
-            a = a.astype("uint16")
+            a = cls_arr.astype("uint16")
             valid = (a & 1) == 0                       # bit 0 = fill
             cloudy = (a & LS_CLOUD_BITS) > 0
             snowy = (a & LS_SNOW_BIT) > 0
         n = int(valid.sum())
         if not n:
-            out[item.id] = (None, None, None)
+            out[iid] = (None, None, None)
             continue
         snow_pct = 100.0 * float((snowy & valid).sum()) / n
-        ocm_mask = ocm.get(item.id)
-        if ocm_mask is not None and ocm_mask.shape == valid.shape:
-            cloud_pct = 100.0 * float((ocm_mask & valid).sum()) / n
-            out[item.id] = (cloud_pct, snow_pct, "ocm")
+        m = ocm_masks.get(iid)
+        if m is not None and m.shape == valid.shape:
+            out[iid] = (100.0 * float((m & valid).sum()) / n, snow_pct, "ocm")
         else:
-            cloud_pct = 100.0 * float((cloudy & valid).sum()) / n
-            out[item.id] = (cloud_pct, snow_pct, "scl")
+            out[iid] = (100.0 * float((cloudy & valid).sum()) / n, snow_pct, "scl")
     return out, ocm_note
 
 
