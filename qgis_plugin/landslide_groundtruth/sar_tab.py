@@ -366,9 +366,9 @@ class SarTab(QWidget):
         self.pair_summary.setVisible(False)
         self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
         tl.addWidget(self.pair_summary)
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -992,6 +992,31 @@ class SarTab(QWidget):
             return True
         return geom.contains(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
+    def _aoi_coverage(self, c):
+        """Fraction (0..1) of the search-AOI box this scene's footprint fills:
+        area(footprint ∩ AOI) / area(AOI), taken in the AOI's own lon/lat space
+        so the box's degree anisotropy cancels. 0.0 when geometry or AOI is
+        missing. Sentinel-1 IW frames are ~250 km wide, so this is usually 1.0;
+        a value below it flags an edge frame that clips the search box. Reuses the
+        tab's _aoi_bbox (the same box the amplitude render clips to), mirroring
+        dock._aoi_coverage."""
+        bbox = self._aoi_bbox()
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy, _ = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
+
     def _pair_for(self, pre_all, post_all, mode, direction=None):
         """(pre, post, note) — best matching-geometry pair, optionally restricted
         to one orbit direction ('ascending'/'descending').
@@ -1103,8 +1128,15 @@ class SarTab(QWidget):
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
             orbit = (c.get("orbit_state") or "")[:4]
             track = "" if c.get("relative_orbit") is None else str(c["relative_orbit"])
+            # "AOI %" = how much of the search box this frame's footprint fills
+            # (area of overlap ÷ AOI area), the same client-side geometry measure
+            # the optical tabs use. Sentinel-1 IW frames are ~250 km wide so this
+            # is usually 100; a lower value flags an along-track edge frame that
+            # clips the box (and may leave the event point in the gap — see below).
+            cover_frac = self._aoi_coverage(c)
+            cover = f"{cover_frac*100:.0f}" if cover_frac > 0 else "—"
             marker = "★ " if is_star else "  "
-            cells = [marker + side, date, gap, orbit, track, cid or ""]
+            cells = [marker + side, date, gap, orbit, track, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_star:
                 bg = bg.darker(112)
@@ -1117,6 +1149,21 @@ class SarTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
+            # "AOI %" tooltip (col 5): the fraction of the search box with pixels,
+            # with a flag when the frame clips the box but leaves the event point
+            # itself outside its footprint (the pairing already demotes those).
+            covers_pt = self._covers_event(c)
+            cover_tip = (
+                f"Footprint covers {cover}% of your search box — how much of the "
+                f"AOI this frame images (radar has no cloud, so this is coverage, "
+                f"not clarity). Sentinel-1 IW frames are ~250 km wide, so this is "
+                f"usually 100%; a lower value means an along-track edge frame that "
+                f"clips the box."
+                if cover_frac > 0 else
+                "No footprint geometry reported for this scene — coverage unknown.")
+            if not covers_pt:
+                cover_tip += "\n⚠ Does NOT cover the event point itself."
+            self.table.item(r, 5).setToolTip(cover_tip)
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1226,7 +1273,9 @@ class SarTab(QWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\n{orbit} {track} · {gap}")
-        tile.setToolTip(f"{cid}\n{date}  {orbit} track {track}  {gap}")
+        cover_frac = self._aoi_coverage(c)
+        cover = f"AOI coverage {cover_frac*100:.0f}%" if cover_frac > 0 else "AOI coverage —"
+        tile.setToolTip(f"{cid}\n{date}  {orbit} track {track}  {gap}\n{cover}")
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         if cid:
             url = self._preview_url(cid, c.get("polarizations"), max_size=512)
