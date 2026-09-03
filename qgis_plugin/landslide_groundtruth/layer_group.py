@@ -4,9 +4,12 @@ project root.
 
 The folder-name convention (built by each tab) is
 
-    <source> <pre>/<post> <product>
+    <source> <pre>/<post> [<radius>] <product>
 
-e.g. "Planet 7-20/7-21 HONC", "SAR 7-20/7-21 Log-ratio", "S2 7-20/7-21 NDVI".
+e.g. "Planet 7-20/7-21 20km HONC", "SAR 7-20/7-21 Log-ratio",
+"S2 7-20/7-21 20km NDVI". The optional <radius> is the search radius the run
+used (radius_tag()); it lets two runs over the same dates but different AOI
+sizes sit in their own folders instead of colliding.
 Same scenes re-rendered with a different tone/product get a different <product>,
 so they land in their own folder side by side instead of overwriting each other.
 
@@ -41,6 +44,21 @@ def date_pair(pre, post):
     if a and b:
         return f"{a}/{b}"
     return a or b or ""
+
+
+def radius_tag(km):
+    """Format a search radius for a group name: 20.0 -> '20km', 2.5 -> '2.5km'.
+
+    Returns '' for a missing/zero/unparseable radius so name() simply drops it
+    (a group without a known radius keeps the old, radius-less name)."""
+    try:
+        v = float(km)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    # drop a trailing '.0' so whole-km radii read '20km', not '20.0km'
+    return f"{v:.1f}".rstrip("0").rstrip(".") + "km"
 
 
 def name(*parts):

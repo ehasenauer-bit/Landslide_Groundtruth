@@ -1421,9 +1421,10 @@ class PlanetTab(QWidget):
         if not picks:
             self._warn("Run Search first — no PlanetScope scene to preview.")
             return
-        # Folder for the tile preview layers: "Planet <pre>/<post> preview" when the
-        # picks give a clean before/after pair, else just "Planet preview". The side
-        # comes from the label _label_for() built; the date from the search result.
+        # Folder for the tile preview layers: "Planet <pre>/<post> <radius> preview"
+        # when the picks give a clean before/after pair, else just "Planet preview".
+        # The side comes from the label _label_for() built; the date from the search
+        # result; the radius from this tab's own search AOI.
         pre = post = ""
         for label, ids in picks:
             side = "pre" if "before" in label else "post" if "after" in label else None
@@ -1432,7 +1433,8 @@ class PlanetTab(QWidget):
                     pre = self._date_for("pre", ids[0])
                 else:
                     post = self._date_for("post", ids[0])
-        self._preview_group = lg.name("Planet", lg.date_pair(pre, post), "preview")
+        self._preview_group = lg.name("Planet", lg.date_pair(pre, post),
+                                      lg.radius_tag(self.radius_spin.value()), "preview")
         self._clear_preview_layers()
         self._preview_extent = None
         self._append_log(f"Preview on map: requesting tiles for {len(picks)} scene(s)…")
@@ -1682,7 +1684,11 @@ class PlanetTab(QWidget):
                     s, f"PlanetScope {'before' if s == 'pre' else 'after'} {d}".strip())
         product = {"knee": "Roll off", "natural": "HONC",
                    "linear": "None", "hdr": "HDR"}.get(tone, "HONC") + (" TOA" if toa else "")
-        group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")), product)
+        # radius the detail was rendered at (from _last_render); after a plugin reload
+        # or recall that cache is gone, so fall back to the current search-AOI spinner.
+        radius = (self._last_render or {}).get("radius", self.radius_spin.value())
+        group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")),
+                        lg.radius_tag(radius), product)
         # replace whatever the previous preview (tiles or SR) put on the map
         self._clear_preview_layers()
         self._preview_extent = None

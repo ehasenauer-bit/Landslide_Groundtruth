@@ -221,6 +221,8 @@ class LandslideDock(QgsDockWidget):
         self._preview_pix = None     # last loaded preview, kept for rescaling
         self._preview_fallback = None  # baked thumb to retry if a render URL fails
         self._search_result = None   # last Search/Preview result (for map preview)
+        self._search_sig = None      # inputs the current table was searched under
+        self._run_radius = None      # search radius the in-flight Run used (group name)
         self._sign_replies = []      # in-flight COG-signing requests
         self._sign_pending = 0       # signs still outstanding this preview
         self._tif_replies = []       # in-flight AOI-GeoTIFF downloads
@@ -901,9 +903,37 @@ class LandslideDock(QgsDockWidget):
                     "Landsat. They can't be composited together.")
         return dict(source=next(iter(sources)), pre=picked["pre"], post=picked["post"])
 
+    def _search_signature(self):
+        """The inputs that define WHICH candidate scenes a Search lists and how
+        they're labelled: location, event date, AOI radius, and the pre/post
+        window. The table's rows (and their ticked scene IDs) are only meaningful
+        for these exact values, so _run compares this against the signature
+        captured at Search time to reject a stale table — see _run."""
+        return (
+            self.lat_edit.text().strip(),
+            self.lon_edit.text().strip(),
+            self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm"),
+            f"{self.radius_spin.value():.2f}",
+            self.pre_slider.value(),
+            self.post_slider.value(),
+            self.auto_check.isChecked(),
+        )
+
     def _run(self):
         if not any(cb.isChecked() for cb in self.scene_checks.values()):
             self._warn("Select at least one layer to export.")
+            return
+        # The listed scenes belong to the last Search / Preview. If the location or
+        # event date has changed since then, the table is stale: a Run rebuilds its
+        # --datetime and output folder from the CURRENT inputs, so it would download
+        # those old scenes under the new date (mislabelling them). Force a fresh
+        # Search rather than guess. An empty table is the automatic path — nothing
+        # ticked to protect — and is left alone.
+        if self.table.rowCount() > 0 and self._search_signature() != self._search_sig:
+            self._warn("Location / event date changed since the last Search / "
+                       "Preview, so the listed scenes are from the old search. Run "
+                       "Search / Preview again so the candidates match the current "
+                       "inputs before downloading.")
             return
         sel = self._checked_scene_selection()
         if isinstance(sel, str):
@@ -922,6 +952,9 @@ class LandslideDock(QgsDockWidget):
         if c is None:
             return
         python, script, project, out, args = c
+        # radius the run is actually launching with, so _load_layers can name the
+        # run folder for it even if the spinner is nudged while the run executes.
+        self._run_radius = self.radius_spin.value()
         if sel:
             # only pass the sides that were actually ticked — a missing side means
             # "don't fetch that side", not "fall back to the automatic search"
@@ -954,6 +987,9 @@ class LandslideDock(QgsDockWidget):
             return
         python, script, project, out, args = c
         args = args + ["--search-only"]
+        # remember what this search was run under; _run rejects the table once any
+        # of these change (so old scenes can't download under a new date/location).
+        self._search_sig = self._search_signature()
         self.log.clear()
         # drop the old result BEFORE emptying the table: clearing rows fires a
         # selection change, and the footprint refresh that hangs off it would
@@ -2129,13 +2165,14 @@ class LandslideDock(QgsDockWidget):
         self._load_layers(result.get("layers", []), result)
 
     def _load_layers(self, layers, result):
-        # Each Run opens its OWN folder — "S2 7-20/7-21", or "… (2)" if that event's
-        # folder already exists — so a new run never merges into a previous one.
-        # Inside it: one subfolder per product (NDVI, dNDVI, HONC…), with the
+        # Each Run opens its OWN folder — "S2 7-20/7-21 20km", or "… (2)" if that
+        # event's folder already exists — so a new run never merges into a previous
+        # one. Inside it: one subfolder per product (NDVI, dNDVI, HONC…), with the
         # predicted-epicentre point sitting at the run folder's top level.
         prefix = SENSOR_TAG.get(result.get("sensor"), "Imagery")
         dates = lg.date_pair(_first_date(result.get("pre_dates")),
                              _first_date(result.get("post_dates")))
+        radius = lg.radius_tag(self._run_radius)   # e.g. "20km"; "" if unknown
         run_group = None                 # opened on the first valid layer (never if empty)
         subs = {}                        # product tag -> its subfolder within this run
         added = []
@@ -2149,7 +2186,7 @@ class LandslideDock(QgsDockWidget):
                 continue
             if lyr.isValid():
                 if run_group is None:
-                    run_group = lg.new_group(lg.name(prefix, dates))
+                    run_group = lg.new_group(lg.name(prefix, dates, radius))
                 product = _core_product(name)
                 if product:
                     if product not in subs:
