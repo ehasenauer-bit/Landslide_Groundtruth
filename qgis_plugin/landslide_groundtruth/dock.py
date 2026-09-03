@@ -23,6 +23,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsField, QgsFeature, QgsGeometry, QgsPointXY, QgsFillSymbol,
     QgsMarkerSymbol,
+    QgsSingleBandPseudoColorRenderer, QgsColorRampShader, QgsRasterShader,
 )
 from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
 
@@ -40,8 +41,10 @@ SOURCES = [
 ]
 
 # Downloadable review "scenes": (--scenes token, checkbox label, tooltip).
-# Keys must match review_package.SCENE_KEYS. All checked by default = the full
-# review package (the historical behaviour); uncheck to download fewer products.
+# Keys must match review_package.SCENE_KEYS. Only HONC (highlight_natural) is
+# ticked by default — the one layer wanted on nearly every run — so a Run stays
+# light; tick more products before running to download the rest.
+DEFAULT_SCENE = "highlight_natural"
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
@@ -444,9 +447,10 @@ class LandslideDock(QgsDockWidget):
         # --- which review layers to export ---
         # These are OUTPUT products (renderings), not satellite acquisitions — the
         # "scene" word is reserved for the Candidate scenes table below. Each checked
-        # product is written by the run; uncheck what you won't use to download less.
-        # The predicted-epicentre point layer is always included. Expanded by default
-        # so the choice is visible (it's a primary control).
+        # product is written by the run; only HONC is ticked by default, so tick the
+        # extra products you want before running. The predicted-epicentre point layer
+        # is always included. Expanded by default so the choice is visible (a primary
+        # control).
         scenes_box = QgsCollapsibleGroupBox("Layers to export")
         scenes_box.setSaveCollapsedState(False)
         scenes_box.setCollapsed(False)
@@ -454,7 +458,7 @@ class LandslideDock(QgsDockWidget):
         self.scene_checks = {}
         for key, label, tip in SCENES:
             cb = QCheckBox(label)
-            cb.setChecked(True)
+            cb.setChecked(key == DEFAULT_SCENE)   # only HONC on by default
             cb.setToolTip(tip)
             self.scene_checks[key] = cb
             sbox.addWidget(cb)
@@ -2164,6 +2168,36 @@ class LandslideDock(QgsDockWidget):
             return
         self._load_layers(result.get("layers", []), result)
 
+    def _style_dbright(self, lyr):
+        """Show ONLY where brightness DECREASED (dBright < 0); everything else clear.
+
+        dBright = post − pre broadband albedo (each 0–1), so a negative value means
+        the ground got darker after the event. An interpolated colour ramp runs from
+        an opaque blue at the strong-darkening end up to a fully transparent stop at
+        0. The ramp isn't clipped, so any value at or above 0 (no change, or a
+        brightening) clamps to that transparent 0-stop and doesn't render, while
+        values below the low bound clamp to the opaque end and stay visible."""
+        lo = -0.30   # ≤ this reads as strong darkening (full opacity); 0–1 albedo scale
+        stops = [
+            (lo,    "#08306b", 255, "≤ −0.30 (strong darkening)"),
+            (-0.15, "#2171b5", 210, "−0.15"),
+            (-0.05, "#6baed6", 110, "−0.05"),
+            (0.0,   "#6baed6", 0,   "0 (no decrease — transparent)"),
+        ]
+        items = []
+        for value, color, alpha, text in stops:
+            c = QColor(color)
+            c.setAlpha(alpha)
+            items.append(QgsColorRampShader.ColorRampItem(value, c, text))
+        fn = QgsColorRampShader(lo, 0.0, None, QgsColorRampShader.Interpolated)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
+        renderer.setClassificationMin(lo)
+        renderer.setClassificationMax(0.0)
+        lyr.setRenderer(renderer)
+
     def _load_layers(self, layers, result):
         # Each Run opens its OWN folder — "S2 7-20/7-21 20km", or "… (2)" if that
         # event's folder already exists — so a new run never merges into a previous
@@ -2187,6 +2221,9 @@ class LandslideDock(QgsDockWidget):
             if lyr.isValid():
                 if run_group is None:
                     run_group = lg.new_group(lg.name(prefix, dates, radius))
+                # dBright: show only brightness DECREASES (< 0); rest transparent
+                if "dbright" in name.lower():
+                    self._style_dbright(lyr)
                 product = _core_product(name)
                 if product:
                     if product not in subs:
