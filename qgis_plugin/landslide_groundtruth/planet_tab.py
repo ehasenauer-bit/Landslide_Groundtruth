@@ -226,13 +226,6 @@ class PlanetTab(QWidget):
         # --- Search window (drop-down) — what dates to look at, per event ---
         form = self._options_group(root, "Search window", collapsed=False)
 
-        self.auto_check = QCheckBox("Auto: tightest window (nearest clear scene each side)")
-        self.auto_check.setToolTip(
-            "Use only the clear scene nearest the event date on each side. The day "
-            "sliders below then set the MAXIMUM days to search each side.")
-        self.auto_check.toggled.connect(self._update_day_labels)
-        form.addRow(self.auto_check)
-
         # Window: how far before / after the event to search, as day sliders.
         self.pre_slider = QSlider(Qt.Horizontal)
         self.pre_slider.setRange(1, 365)
@@ -705,9 +698,8 @@ class PlanetTab(QWidget):
         return form
 
     def _update_day_labels(self, *_):
-        suffix = " (max)" if self.auto_check.isChecked() else ""
-        self.pre_lbl.setText(f"{self.pre_slider.value()} d{suffix}")
-        self.post_lbl.setText(f"{self.post_slider.value()} d{suffix}")
+        self.pre_lbl.setText(f"{self.pre_slider.value()} d")
+        self.post_lbl.setText(f"{self.post_slider.value()} d")
 
     def _section(self, text):
         """A section heading styled in Planet teal (see THEME_QSS QLabel#section)."""
@@ -929,7 +921,6 @@ class PlanetTab(QWidget):
         self.lon_edit.setText(d.lon_edit.text())
         self.radius_spin.setValue(d.radius_spin.value())
         self.dt_edit.setDateTime(d.dt_edit.dateTime())
-        self.auto_check.setChecked(d.auto_check.isChecked())
         self.pre_slider.setValue(d.pre_slider.value())
         self.post_slider.setValue(d.post_slider.value())
 
@@ -1027,8 +1018,6 @@ class PlanetTab(QWidget):
             "--quality", self.quality_combo.currentData(),
             "--search-only", "--out", out,
         ]
-        if self.auto_check.isChecked():
-            args.append("--auto-window")
         return python, script, project, out, args
 
     # ---------- search ----------

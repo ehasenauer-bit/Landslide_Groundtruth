@@ -390,18 +390,10 @@ class LandslideDock(QgsDockWidget):
         pa_row.addWidget(add_pa_btn)
         form.addRow("Point and area", pa_row)
 
-        self.auto_check = QCheckBox("Auto: tightest window (nearest clear scene each side)")
-        self.auto_check.setToolTip(
-            "Use only the clear scene nearest the event date on each side, for the "
-            "smallest before/after gap. The sliders below then set the MAXIMUM days "
-            "to search each side.")
-        self.auto_check.toggled.connect(self._update_day_labels)
-
         self.pre_slider, self.pre_lbl = self._day_slider(60)
         self.post_slider, self.post_lbl = self._day_slider(90)
         for s in (self.pre_slider, self.post_slider):
             s.valueChanged.connect(self._update_day_labels)
-        form.addRow(self.auto_check)
         form.addRow("Days before", self._slider_row(self.pre_slider, self.pre_lbl))
         form.addRow("Days after", self._slider_row(self.post_slider, self.post_lbl))
         self._update_day_labels()
@@ -784,9 +776,8 @@ class LandslideDock(QgsDockWidget):
         return s, QLabel()
 
     def _update_day_labels(self, *_):
-        suffix = " (max)" if self.auto_check.isChecked() else ""
-        self.pre_lbl.setText(f"{self.pre_slider.value()} d{suffix}")
-        self.post_lbl.setText(f"{self.post_slider.value()} d{suffix}")
+        self.pre_lbl.setText(f"{self.pre_slider.value()} d")
+        self.post_lbl.setText(f"{self.post_slider.value()} d")
 
     def _slider_row(self, slider, lbl):
         row = QWidget()
@@ -855,8 +846,6 @@ class LandslideDock(QgsDockWidget):
             "--max-cloud", f"{max_cloud:.0f}",
             "--out", out,
         ]
-        if self.auto_check.isChecked():
-            args.append("--auto-window")
         # which review layers to download (ignored by the Search dry-run). Always
         # pass the explicit list so "all checked" and "none checked" stay distinct.
         scenes = [k for k, cb in self.scene_checks.items() if cb.isChecked()]
@@ -920,7 +909,6 @@ class LandslideDock(QgsDockWidget):
             f"{self.radius_spin.value():.2f}",
             self.pre_slider.value(),
             self.post_slider.value(),
-            self.auto_check.isChecked(),
         )
 
     def _run(self):
