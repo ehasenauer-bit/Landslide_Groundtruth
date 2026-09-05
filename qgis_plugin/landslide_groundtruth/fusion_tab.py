@@ -26,8 +26,8 @@ import re
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
-    QVBoxLayout, QWidget,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
+    QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 from qgis.core import (
     QgsColorRampShader, QgsProject, QgsRasterLayer, QgsRasterShader,
@@ -77,6 +77,15 @@ SCORE_RAMP = [(0.0, "#ffffff", 0), (0.20, "#ffffcc", 0), (0.40, "#fed976", 140),
               (0.60, "#fd8d3c", 200), (0.80, "#e31a1c", 230),
               (1.00, "#800026", 255)]
 
+# A small, deliberately restrained palette. Mid-tone hues so they stay legible on
+# both the light and dark QGIS themes — QGIS does not tell a widget which theme is
+# active, so anything near black or near white would vanish on one of them.
+CLR_OK = "#2e9e5b"       # a step is satisfied
+CLR_WARN = "#d98324"     # usable but worth reading
+CLR_BAD = "#c0392b"      # blocks the run, or a failed step
+CLR_ACCENT = "#2c7fb8"   # step numbers, headline figures
+CLR_MUTED = "#8a8a8a"    # not reached yet
+
 ISO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 EVENT_ID = re.compile(r"(event_\d{6}_\d{4})")
 
@@ -110,6 +119,11 @@ class FusionTab(QWidget):
         # Watch the project so a raster produced in another tab shows up here
         # without a button press. Debounced: loading a project adds layers one
         # at a time and would otherwise re-scan (and re-log) once per layer.
+        self._bbox_cache = {}
+        self._sar_user_choice = False  # True once the user picks SAR by hand
+        self._refreshing = False
+        self._applying_preset = False
+        self._pair_overlap = None      # last auto-pair's footprint overlap
         self._rescan = QTimer(self)
         self._rescan.setSingleShot(True)
         self._rescan.setInterval(400)
@@ -120,48 +134,265 @@ class FusionTab(QWidget):
         for sig, slot in self._project_signals:
             sig.connect(slot)
 
+        self._watch_for_custom()
         self._refresh_layers()
+        self._update_steps()
 
     # ---------- UI ----------
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(8)
-        intro = QLabel(
-            "Combines an optical change raster (Sentinel-2 / Landsat tab) with a "
-            "SAR change raster (SAR tab) into a single landslide score. A pixel "
-            "scores only when BOTH sensors agree — dark debris where snow was, "
-            "rougher surface where smooth snow was — which is what separates a "
-            "slide from a snowfall, a cloud shadow or speckle. Steep-source and "
-            "glacier weighting are applied on top.")
-        intro.setWordWrap(True)
-        intro.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(intro)
+        root.addWidget(self._intro())
+        root.addWidget(self._steps_panel())
+        root.addWidget(self._preset_row())
 
-        root.addWidget(self._inputs_box())
-        root.addWidget(self._detect_box())
-        root.addWidget(self._terrain_box())
-        root.addWidget(self._glacier_box())
-        root.addWidget(self._cloud_box())
-        root.addWidget(self._outputs_box())
+        self.pages = QTabWidget()
+        self.pages.addTab(self._run_page(), "Run")
+        self.pages.addTab(self._advanced_page(), "Advanced")
+        self.pages.setTabToolTip(0, "The two inputs and what to produce.")
+        self.pages.setTabToolTip(
+            1, "Thresholds, terrain, glacier and cloud options. Every default in "
+               "here was measured against three truthed events — you should not "
+               "need to open this tab for a normal run.")
+        root.addWidget(self.pages)
 
+        root.addWidget(self._action_row())
+        root.addWidget(self._log_pane(), 1)
+
+    # ---------- header ----------
+    def _intro(self):
+        lbl = QLabel(
+            "Combines an <b>optical</b> change raster with a <b>SAR</b> change "
+            "raster into one landslide score. A pixel scores when the sensors "
+            "agree — dark debris where snow was, rougher surface where smooth "
+            "snow was — which is what separates a slide from a snowfall, a cloud "
+            "shadow or speckle.")
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setStyleSheet("QLabel { color: palette(mid); }")
+        return lbl
+
+    def _steps_panel(self):
+        """Three numbered steps that report the project's ACTUAL state.
+
+        A newcomer should be able to tell what to do next without reading a
+        manual, and an expert should be able to see at a glance that the tab is
+        about to fuse the pair they think it is — which is why step 2 shows the
+        footprint overlap and not just a tick."""
+        box = QFrame()
+        box.setFrameShape(QFrame.StyledPanel)
+        grid = QGridLayout(box)
+        grid.setContentsMargins(10, 8, 10, 8)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+        self._step_status = []
+        for i, title in enumerate(("Optical change raster",
+                                   "SAR change raster",
+                                   "Fuse")):
+            num = QLabel(f"{i + 1}")
+            num.setAlignment(Qt.AlignCenter)
+            num.setFixedWidth(20)
+            num.setStyleSheet(
+                f"QLabel {{ color: white; background: {CLR_ACCENT};"
+                " border-radius: 9px; font-weight: bold; }")
+            name = QLabel(title)
+            name.setStyleSheet("QLabel { font-weight: bold; }")
+            status = QLabel("…")
+            status.setWordWrap(True)
+            status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            grid.addWidget(num, i, 0)
+            grid.addWidget(name, i, 1)
+            grid.addWidget(status, i, 2)
+            grid.setColumnStretch(2, 1)
+            self._step_status.append(status)
+        return box
+
+    def _set_step(self, i, text, colour):
+        lbl = self._step_status[i]
+        lbl.setText(text)
+        lbl.setStyleSheet(f"QLabel {{ color: {colour}; }}")
+
+    def _update_steps(self):
+        """Refresh the three status lines from what is actually selected."""
+        opt = self._optical_combo.currentData()
+        sar = self._sar_combo.currentData()
+        if opt:
+            ev = self._event_id(opt)
+            kind = self.optical_kind_combo.currentText().split(" —")[0]
+            extra = ""
+            if self.pair_optical_check.isChecked():
+                sib, _k = self._optical_sibling(opt, self.optical_kind_combo.currentData())
+                if sib:
+                    extra = " + its dBright/dNDSI pair"
+            self._set_step(0, f"✓ {ev or os.path.basename(opt)} · {kind}{extra}",
+                           CLR_OK)
+        else:
+            self._set_step(0, "Choose a dNDSI or dBright raster from the "
+                              "Sentinel-2 / Landsat Run", CLR_BAD)
+        if sar:
+            n = 1 + (len(self._sar_siblings(sar))
+                     if self.pair_sar_check.isChecked() else 0)
+            ov = self._pair_overlap
+            bits = [f"✓ {n} detector{'s' if n != 1 else ''}"]
+            if ov is not None:
+                bits.append(f"{ov:.0%} footprint overlap with the optical raster")
+            self._set_step(1, " · ".join(bits),
+                           CLR_OK if (ov is None or ov >= 0.5) else CLR_WARN)
+        elif not self.out_fused_check.isChecked():
+            self._set_step(1, "Not needed — 'Fused score' is unticked, this is an "
+                              "optical-only run", CLR_MUTED)
+        else:
+            ov = self._pair_overlap
+            if ov is not None and ov < 0.30:
+                self._set_step(1, f"No SAR raster overlaps the optical one "
+                                  f"(best {ov:.0%}) — pick one, or run SAR change "
+                                  "detection for this event", CLR_BAD)
+            else:
+                self._set_step(1, "Choose a change raster from the SAR tab",
+                               CLR_BAD)
+        outs = [n for n, c in (("fused score", self.out_fused_check),
+                               ("optical-only", self.out_optical_check))
+                if c.isChecked()]
+        ready = bool(opt) and (bool(sar) or not self.out_fused_check.isChecked())
+        if not outs:
+            self._set_step(2, "Nothing to produce — tick an output on the Run tab",
+                           CLR_BAD)
+        elif ready:
+            self._set_step(2, "Ready — will produce " + " and ".join(outs), CLR_OK)
+        else:
+            self._set_step(2, "Waiting on the inputs above", CLR_MUTED)
+        self.run_btn.setEnabled(ready and bool(outs))
+
+    # ---------- presets ----------
+    def _preset_row(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        lab = QLabel("Settings")
+        lab.setStyleSheet("QLabel { font-weight: bold; }")
+        h.addWidget(lab)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Validated default", "default")
+        self.preset_combo.addItem("Optical only (ignore SAR)", "optical")
+        self.preset_combo.addItem("Custom", "custom")
+        self.preset_combo.setToolTip(
+            "<b>Validated default</b> — the configuration measured against the "
+            "Iliamna, Hubbard and Valdez truth polygons: average the channels, "
+            "5×5 smoothing, no terrain or glacier weighting.<br><br>"
+            "<b>Optical only</b> — drops SAR entirely. Better on events where the "
+            "deposit is quieter in radar than its surroundings (Hubbard).<br><br>"
+            "<b>Custom</b> — selected automatically as soon as you change any "
+            "control, so you always know when you have left the validated setup.")
+        self.preset_combo.currentIndexChanged.connect(self._preset_changed)
+        h.addWidget(self.preset_combo, 1)
+        return w
+
+    def _preset_changed(self, _i):
+        key = self.preset_combo.currentData()
+        if key == "custom" or self._applying_preset:
+            return
+        self._applying_preset = True
+        try:
+            self.smooth_combo.setCurrentIndex(self.smooth_combo.findData(5))
+            self.mode_combo.setCurrentIndex(self.mode_combo.findData("mean"))
+            self.detrend_check.setChecked(True)
+            self.pair_optical_check.setChecked(True)
+            self.pair_sar_check.setChecked(True)
+            self.terrain_check.setChecked(False)
+            self.glacier_check.setChecked(False)
+            self.lowland_check.setChecked(True)
+            self.cloud_check.setChecked(True)
+            self.min_area_spin.setValue(0.05)
+            self.saronly_cap_spin.setValue(fusion_core.SAR_ONLY_WEIGHT)
+            self.out_optical_check.setChecked(True)
+            self.out_fused_check.setChecked(key == "default")
+            self._append_log(f"preset: {self.preset_combo.currentText()}")
+        finally:
+            self._applying_preset = False
+        self._update_steps()
+
+    def _mark_custom(self, *_a):
+        """Any hand edit moves the preset to Custom, so the label never lies."""
+        if self._applying_preset or self._refreshing:
+            return
+        idx = self.preset_combo.findData("custom")
+        if idx >= 0 and self.preset_combo.currentIndex() != idx:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(idx)
+            self.preset_combo.blockSignals(False)
+        self._update_steps()
+
+    def _watch_for_custom(self):
+        """Connect every tunable control to the Custom switch, by reflection so a
+        control added later is covered without extra bookkeeping."""
+        for name, obj in vars(self).items():
+            if name.startswith("_") or name == "preset_combo":
+                continue
+            sig = (getattr(obj, "toggled", None) if isinstance(obj, QCheckBox)
+                   else getattr(obj, "valueChanged", None)
+                   if isinstance(obj, (QSpinBox, QDoubleSpinBox))
+                   else getattr(obj, "currentIndexChanged", None)
+                   if isinstance(obj, QComboBox) else None)
+            if sig is not None:
+                sig.connect(self._mark_custom)
+
+    # ---------- pages ----------
+    def _run_page(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(8)
+        v.addWidget(self._inputs_box())
+        v.addWidget(self._outputs_box())
+        v.addStretch(1)
+        return w
+
+    def _advanced_page(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(8)
+        note = QLabel(
+            "Every default here was measured against three truthed events. "
+            "Changing them switches the preset to Custom.")
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(note)
+        v.addWidget(self._detect_box())
+        v.addWidget(self._terrain_box())
+        v.addWidget(self._glacier_box())
+        v.addWidget(self._cloud_box())
+        v.addStretch(1)
+        return w
+
+    def _action_row(self):
         btn_row = FlowRow()
         self.run_btn = QPushButton("Fuse")
         self.run_btn.setDefault(True)
         f = self.run_btn.font()
         f.setBold(True)
         self.run_btn.setFont(f)
+        self.run_btn.setStyleSheet(
+            f"QPushButton {{ background: {CLR_ACCENT}; color: white;"
+            " padding: 6px 18px; border-radius: 3px; }"
+            f"QPushButton:disabled {{ background: {CLR_MUTED}; color: #eeeeee; }}"
+            "QPushButton:hover:!disabled { background: #24699b; }")
         self.run_btn.setToolTip(
             "Warp both inputs onto the coarser of the two grids, rank each above "
-            "its absolute floor, combine, weight by terrain and glacier cover, "
-            "and write a multiband GeoTIFF plus a styled score layer.")
+            "its floor, average the channels, and write a multiband GeoTIFF plus "
+            "styled layers.")
         self.run_btn.clicked.connect(self._run)
         btn_row.addWidget(self.run_btn)
-        root.addWidget(btn_row)
+        return btn_row
 
-        self.log = QPlainTextEdit()
+    def _log_pane(self):
+        self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(120)
-        root.addWidget(self.log, 1)
+        self.log.setMinimumHeight(150)
+        self.log.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.log.setStyleSheet(
+            "QTextEdit { font-family: Menlo, Consolas, monospace; font-size: 11px; }")
+        return self.log
 
     def _inputs_box(self):
         box = QgsCollapsibleGroupBox("Inputs")
@@ -233,8 +464,7 @@ class FusionTab(QWidget):
             "here greyed out as 'no longer on disk'.")
         self._sar_browse = QPushButton("…")
         self._sar_browse.setMaximumWidth(32)
-        self._sar_combo.currentIndexChanged.connect(
-            lambda _i: self._autodetect_measure("sar"))
+        self._sar_combo.currentIndexChanged.connect(self._sar_chosen)
         self._sar_browse.clicked.connect(
             lambda: self._browse_into(self._sar_combo, "SAR change raster"))
         form.addRow("SAR change raster",
@@ -667,6 +897,7 @@ class FusionTab(QWidget):
         explicitly browsed to are preserved across a refresh — clearing the combo
         would otherwise drop the user's own choice and let _best_match quietly
         substitute a different layer."""
+        self._refreshing = True
         survey = self._survey_layers()
         rasters = sorted([(n, p) for n, p, r in survey if p],
                          key=lambda t: t[0].lower())
@@ -707,12 +938,40 @@ class FusionTab(QWidget):
             combo.setCurrentIndex(max(0, idx))
             combo.blockSignals(False)
 
+        # Pair the SAR input to the OPTICAL one by geography, not by name order.
+        # Alphabetical order pairs whichever event happens to spell earliest: with
+        # three events loaded it put Hubbard optical against Iliamna SAR, 0%
+        # overlap. Only re-pick when the user has not chosen the SAR layer
+        # themselves.
+        self._pair_overlap = None
+        opt_path = self._optical_combo.currentData()
+        if opt_path and not self._sar_user_choice:
+            anchor = self._bbox4326(opt_path)
+            idx, ov = self._best_overlapping(self._sar_combo, SAR_HINTS, anchor,
+                                             SAR_EXCLUDE)
+            self._pair_overlap = ov
+            self._sar_combo.blockSignals(True)
+            if idx > 0 and ov >= 0.30:
+                self._sar_combo.setCurrentIndex(idx)
+            else:
+                self._sar_combo.setCurrentIndex(0)   # no honest pair — ask
+            self._sar_combo.blockSignals(False)
+            self._autodetect_measure("sar")
+            if idx > 0 and ov < 0.30 and not quiet:
+                self._warn(
+                    "No SAR change raster overlaps the selected optical raster "
+                    f"(best overlap {ov:.0%}). They would describe different "
+                    "places. Pick the SAR layer for THIS event, or run SAR change "
+                    "detection for it.")
+
         # blockSignals above suppressed currentIndexChanged, so the measure
         # auto-detect never ran for a selection made BY the refresh — which is
         # every selection except a manual one. Run it explicitly.
         self._autodetect_measure("optical")
         self._autodetect_measure("sar")
 
+        self._refreshing = False
+        self._update_steps()
         if quiet:
             return
         self._append_log(f"{len(rasters)} usable raster layer(s), "
@@ -723,6 +982,62 @@ class FusionTab(QWidget):
             self._warn("No usable raster layers found. Every raster in the "
                        "project is listed greyed-out in the dropdowns with the "
                        "reason; the log pane has the same list.")
+
+    def _bbox4326(self, path):
+        """Lon/lat bounding box of a raster, cached by (path, mtime).
+
+        Only the geotransform is read — no pixel access — so this stays cheap
+        enough to run for every candidate layer on every refresh."""
+        try:
+            key = (path, os.path.getmtime(path))
+        except OSError:
+            return None
+        hit = self._bbox_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            gt, shape, proj = fusion_grid.reference_grid(path)
+            bb = fusion_cloud.bbox_4326(gt, shape, proj)
+        except Exception:                            # noqa: BLE001
+            bb = None
+        self._bbox_cache[key] = bb
+        return bb
+
+    @staticmethod
+    def _overlap_fraction(a, b):
+        """Area of intersection / area of `a`, for two lon/lat boxes."""
+        if not a or not b:
+            return 0.0
+        ox = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        oy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        area = (a[2] - a[0]) * (a[3] - a[1])
+        return (ox * oy / area) if area > 0 else 0.0
+
+    def _best_overlapping(self, combo, hints, anchor_bbox, exclude=()):
+        """Index of the hint-matching entry that overlaps `anchor_bbox` most.
+
+        Name order is NOT a safe way to pair the two inputs. Sorting is
+        alphabetical, so which event lands first depends on how its dates happen
+        to spell — with three events loaded the tab paired Hubbard optical with
+        Iliamna SAR (0% overlap) purely because one layer name began with an
+        earlier character. Geography is the only thing that actually says two
+        rasters describe the same place, so pair on it.
+
+        Returns (index, overlap) with index -1 when nothing matches."""
+        best, best_ov = -1, 0.0
+        for i in range(1, combo.count()):
+            path = combo.itemData(i)
+            if not path:
+                continue
+            text = combo.itemText(i).lower()
+            if not any(h in text for h in hints):
+                continue
+            if any(x in text for x in exclude):
+                continue
+            ov = self._overlap_fraction(anchor_bbox, self._bbox4326(path))
+            if ov > best_ov:
+                best, best_ov = i, ov
+        return best, best_ov
 
     @staticmethod
     def _best_match(combo, hints, exclude=()):
@@ -771,6 +1086,12 @@ class FusionTab(QWidget):
                 ("tsint", "tsint"), ("log-ratio", "logratio"),
                 ("logratio", "logratio"), ("log_ratio", "logratio")),
     }
+
+    def _sar_chosen(self, _idx):
+        """A SAR pick made through the UI wins over automatic re-pairing."""
+        if not self._refreshing:
+            self._sar_user_choice = True
+        self._autodetect_measure("sar")
 
     def _autodetect_measure(self, side):
         """Set the measure combo from the chosen layer's name.
@@ -914,7 +1235,9 @@ class FusionTab(QWidget):
             self._warn(f"Fusion failed: {e}")
         finally:
             QApplication.restoreOverrideCursor()
-            self.run_btn.setEnabled(True)
+            # not setEnabled(True): the button's state is derived from whether the
+            # inputs are actually runnable, so ask that rather than assert it
+            self._update_steps()
 
     def _step(self, msg):
         self._append_log(msg)
@@ -1527,8 +1850,49 @@ class FusionTab(QWidget):
         layer.triggerRepaint()
 
     # ---------- plumbing ----------
+    # log line -> colour. Ordered: the first match wins, so the loud categories
+    # are tested before the quiet ones.
+    LOG_RULES = (
+        ("FAILED", CLR_BAD, True), ("WARNING", CLR_WARN, True),
+        ("NO OVERLAP", CLR_BAD, True), ("NOTHING cleared", CLR_WARN, True),
+        ("could not", CLR_WARN, False), ("unusable —", CLR_MUTED, False),
+        ("skipped", CLR_MUTED, False),
+        ("CORROBORATED COVERAGE", CLR_ACCENT, True),
+        ("SENSOR", CLR_ACCENT, True), ("EVENT:", CLR_ACCENT, True),
+        ("peak fused score", CLR_ACCENT, True),
+        ("effective event bracket", CLR_ACCENT, False),
+        ("saved:", CLR_OK, False), ("layer group:", CLR_OK, False),
+        ("preset:", CLR_ACCENT, False),
+        ("← fusion grid", CLR_ACCENT, False),
+    )
+
     def _append_log(self, line):
-        self.log.appendPlainText(line)
+        """Append one line, coloured by what it says.
+
+        The log is the tab's diagnostic surface and it is long; a wall of
+        identical grey makes the two lines that matter — a warning, or the
+        corroborated-coverage figure — as invisible as the thirty that do not.
+
+        Every line is wrapped in a span, even an uncoloured one: QTextEdit.append
+        only parses a string as rich text when it contains markup, so a bare
+        string would show its own HTML entities as literal text. `white-space:pre`
+        keeps the leading indentation that gives the log its structure."""
+        from qgis.PyQt.QtGui import QTextCursor
+        text = str(line)
+        colour, bold = None, False
+        for needle, c, b in self.LOG_RULES:
+            if needle in text:
+                colour, bold = c, b
+                break
+        esc = (text.replace("&", "&amp;").replace("<", "&lt;")
+               .replace(">", "&gt;"))
+        style = "white-space:pre;"
+        if colour:
+            style += f"color:{colour};"
+        if bold:
+            style += "font-weight:bold;"
+        self.log.append(f'<span style="{style}">{esc}</span>')
+        self.log.moveCursor(QTextCursor.End)
 
     def _warn(self, text):
         self.iface.messageBar().pushWarning("Fusion", text)
