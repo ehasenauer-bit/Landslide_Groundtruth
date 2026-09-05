@@ -96,8 +96,12 @@ def write_gtiff(path, arr, gt, proj):
     ds.SetGeoTransform(gt)
     ds.SetProjection(proj)
     band = ds.GetRasterBand(1)
-    band.WriteArray(np.where(np.isfinite(arr), arr, NODATA).astype(np.float32))
+    # nodata BEFORE the write: on GDAL 3.12 an uncompressed GTiff never writes
+    # all-zero blocks, and a SetNoDataValue arriving afterwards backfills them
+    # with nodata (measured: 72000 of 90000 px). COMPRESS=DEFLATE above happens
+    # to suppress it, but the ordering should not depend on a creation option.
     band.SetNoDataValue(NODATA)
+    band.WriteArray(np.where(np.isfinite(arr), arr, NODATA).astype(np.float32))
     band.FlushCache()
     ds = None
 

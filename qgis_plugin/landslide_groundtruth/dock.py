@@ -285,6 +285,7 @@ class LandslideDock(QgsDockWidget):
         (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
         Data/Orders/Tiles system). Environment (venv/project/out) is shared because
         both tabs launch the SAME venv subprocess."""
+        from .fusion_tab import FusionTab
         from .planet_tab import PlanetTab
         from .sar_tab import SarTab
         from .viewer3d_tab import Viewer3DTab
@@ -300,6 +301,11 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self.planet_tab, "PlanetScope")
         self.sar_tab = SarTab(self)
         tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
+        # Consumes the two tabs above rather than searching for imagery itself:
+        # one optical change raster AND one SAR change raster into a single
+        # landslide score. Sits after them because that is the workflow order.
+        self.fusion_tab = FusionTab(self)
+        tabs.addTab(self.fusion_tab, "Fusion")
         self.viewer3d_tab = Viewer3DTab(self)
         tabs.addTab(self.viewer3d_tab, "3D viewer")
         # The one tab that consumes the review step's output rather than
@@ -2305,5 +2311,7 @@ class LandslideDock(QgsDockWidget):
             self.planet_tab.teardown()
         if getattr(self, "sar_tab", None) is not None:
             self.sar_tab.teardown()
+        if getattr(self, "fusion_tab", None) is not None:
+            self.fusion_tab.teardown()
         if getattr(self, "viewer3d_tab", None) is not None:
             self.viewer3d_tab.teardown()

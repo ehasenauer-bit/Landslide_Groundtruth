@@ -59,6 +59,7 @@ OWNERS = (
     ("", ""),
     ("planet_tab", "planet"),
     ("sar_tab", "sar"),
+    ("fusion_tab", "fusion"),
     ("viewer3d_tab", "viewer3d"),
     ("volume_tab", "volume"),
 )

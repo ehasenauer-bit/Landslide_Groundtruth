@@ -47,6 +47,7 @@ scene nearest the event, then the nearest pre scene from the SAME track (the
 """
 import math
 import os
+import re
 import tempfile
 from urllib.parse import quote
 
@@ -2070,6 +2071,12 @@ class SarTab(QWidget):
             cov = 100.0 * np.isfinite(out).mean() if out.size else 0.0
 
             if not stats_only:
+                # Durable float32 export FIRST, before any display baking. The
+                # layover fade writes RGBA and destroys the signed values, and a
+                # tempfile does not survive the session — so the ANALYSIS product
+                # is written unconditionally, under the layer's own name, for the
+                # Fusion tab to consume.
+                data_path = self._cd_export_float(label, out, gt, proj, meta)
                 try:
                     fd, opath = tempfile.mkstemp(suffix=".tif",
                                                  prefix="landslide_change_")
@@ -2080,6 +2087,15 @@ class SarTab(QWidget):
                 except Exception as e:               # noqa: BLE001
                     self._warn(f"Could not write {label}: {e}")
                     continue
+                if not faded and data_path:
+                    # unfaded, the temp file is byte-identical to the durable one
+                    # — point the layer at the durable copy so the map does not
+                    # go stale when the temp dir is cleaned
+                    try:
+                        os.remove(opath)
+                    except OSError:
+                        pass
+                    opath = data_path
                 lyr = QgsRasterLayer(opath, label)
                 if not lyr.isValid():
                     self._warn(f"{label}: result raster failed to load.")
@@ -2264,6 +2280,75 @@ class SarTab(QWidget):
                              f"({type(e).__name__}: {e})")
         self._dem_cache[key] = dem
         return dem
+
+    def _cd_out_dir(self):
+        """Output folder for the durable float32 change rasters, mirroring
+        _amp_out_dir: <output or project/out/interactive>/sar/change.
+
+        "" when neither Environment path is set — both default to empty, and
+        os.path.join("", "out", "interactive") is the RELATIVE "out/interactive",
+        which would drop rasters wherever QGIS happened to be launched from."""
+        out = self.dock.out_edit.text().strip()
+        proj = self.dock.project_edit.text().strip()
+        if not out and not proj:
+            return ""
+        base = out or os.path.join(proj, "out", "interactive")
+        return os.path.join(base, "sar", "change")
+
+    @staticmethod
+    def _safe_name(label):
+        """Layer name -> filesystem-safe basename. Kept recognisable rather than
+        hashed: the file is meant to be findable by eye next to the layer it came
+        from, so only the characters that cannot survive a filesystem change."""
+        s = label.replace("\u2192", "_to_").replace("\u00d7", "x")
+        s = re.sub(r"[^\w.+-]+", "_", s)
+        return s.strip("_") or "change"
+
+    @staticmethod
+    def _cd_settings_tag(meta):
+        """Compact tag for the settings that change the PIXELS but not the label.
+
+        The layer label carries only dates, track, polarization and window k, but
+        resolution changes the grid itself, and the speckle filter, radiometric
+        normalization and blob sieve all change the values. Without these in the
+        filename, re-running the same scene pair at a different resolution
+        overwrites the previous file in place — and the Fusion tab would then be
+        reading pixels that no longer match the layer it was told to fuse."""
+        res = meta.get("res")
+        sp = meta.get("speckle")
+        parts = [f"{int(res)}m" if res else "nativem",
+                 f"{sp[0]}{sp[1]}" if sp else "nosp"]
+        if meta.get("radionorm"):
+            parts.append("rn")
+        if meta.get("min_area"):
+            parts.append(f"a{int(meta['min_area'])}")
+        return "_".join(parts)
+
+    def _cd_export_float(self, label, out, gt, proj, meta=None):
+        """Write the signed float32 change raster under the layer's own name.
+
+        Always written, even when the layover fade is on: the fade bakes a colour
+        ramp into RGBA, so true values would otherwise survive only in
+        self._cd_results -- in memory, capped at 12 and cleared on the next
+        Search. The fusion tab consumes these files, so a tempfile would not do.
+        Returns the path, or None if the write failed (never fatal: the layer
+        still loads from the temp copy)."""
+        try:
+            d = self._cd_out_dir()
+            if not d:
+                self._append_log("  not saved: set the Output or Project folder "
+                                 "in the Environment box to keep change rasters")
+                return None
+            os.makedirs(d, exist_ok=True)
+            tag = self._cd_settings_tag(meta or {})
+            path = os.path.join(d, f"{self._safe_name(label)}_{tag}.tif")
+            sar_change.write_gtiff(path, out, gt, proj)
+            self._append_log(f"  saved: {path}")
+            return path
+        except Exception as e:                       # noqa: BLE001
+            self._append_log("  could not save the float32 change raster: "
+                             f"{type(e).__name__}: {e}")
+            return None
 
     def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey):
         """Write a change raster. If the layover fade is on and a DEM is available,
