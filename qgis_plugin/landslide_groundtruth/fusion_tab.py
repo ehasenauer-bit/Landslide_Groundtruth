@@ -85,6 +85,8 @@ CLR_WARN = "#d98324"     # usable but worth reading
 CLR_BAD = "#c0392b"      # blocks the run, or a failed step
 CLR_ACCENT = "#2c7fb8"   # step numbers, headline figures
 CLR_MUTED = "#8a8a8a"    # not reached yet
+CLR_OPTICAL = "#e08a2e"  # the optical input, everywhere it appears
+CLR_SAR = "#3d8fd1"      # the SAR input, everywhere it appears
 
 ISO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 EVENT_ID = re.compile(r"(event_\d{6}_\d{4})")
@@ -207,60 +209,71 @@ class FusionTab(QWidget):
             self._step_status.append(status)
         return box
 
-    def _set_step(self, i, text, colour):
+    def _set_step(self, i, text, colour, detail=""):
+        """Headline in `colour`, supporting `detail` smaller and quieter.
+
+        Each step answers two things — is it satisfied, and on what — and those
+        deserve different weight. The headline is what you scan; the detail is
+        what you check when something looks wrong."""
         lbl = self._step_status[i]
-        lbl.setText(text)
-        lbl.setStyleSheet(f"QLabel {{ color: {colour}; }}")
+        html = f'<span style="color:{colour};">{text}</span>'
+        if detail:
+            html += (f'<span style="color:palette(mid); font-size:10px;">'
+                     f'&nbsp; {detail}</span>')
+        lbl.setText(html)
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setStyleSheet("")
 
     def _update_steps(self):
         """Refresh the three status lines from what is actually selected."""
         opt = self._optical_combo.currentData()
         sar = self._sar_combo.currentData()
         if opt:
-            ev = self._event_id(opt)
+            date = self._event_date(opt)
             kind = self.optical_kind_combo.currentText().split(" —")[0]
             extra = ""
             if self.pair_optical_check.isChecked():
                 sib, _k = self._optical_sibling(opt, self.optical_kind_combo.currentData())
                 if sib:
-                    extra = " + its dBright/dNDSI pair"
-            self._set_step(0, f"✓ {ev or os.path.basename(opt)} · {kind}{extra}",
-                           CLR_OK)
+                    extra = " + dBright/dNDSI pair"
+            self._set_step(0, f"✓ {date or os.path.basename(opt)}", CLR_OK,
+                           f"{kind}{extra}")
         else:
-            self._set_step(0, "Choose a dNDSI or dBright raster from the "
-                              "Sentinel-2 / Landsat Run", CLR_BAD)
+            self._set_step(0, "Choose an optical raster", CLR_BAD,
+                           "a dNDSI or dBright from the Sentinel-2 / Landsat Run")
         if sar:
             n = 1 + (len(self._sar_siblings(sar))
                      if self.pair_sar_check.isChecked() else 0)
             ov = self._pair_overlap
-            bits = [f"✓ {n} detector{'s' if n != 1 else ''}"]
-            if ov is not None:
-                bits.append(f"{ov:.0%} footprint overlap with the optical raster")
-            self._set_step(1, " · ".join(bits),
-                           CLR_OK if (ov is None or ov >= 0.5) else CLR_WARN)
+            detail = (f"{ov:.0%} footprint overlap with the optical raster"
+                      if ov is not None else "")
+            self._set_step(1, f"✓ {n} detector{'s' if n != 1 else ''}",
+                           CLR_OK if (ov is None or ov >= 0.5) else CLR_WARN,
+                           detail)
         elif not self.out_fused_check.isChecked():
-            self._set_step(1, "Not needed — 'Fused score' is unticked, this is an "
-                              "optical-only run", CLR_MUTED)
+            self._set_step(1, "Not needed", CLR_MUTED,
+                           "'Fused score' is unticked — this is an optical-only run")
         else:
             ov = self._pair_overlap
             if ov is not None and ov < 0.30:
-                self._set_step(1, f"No SAR raster overlaps the optical one "
-                                  f"(best {ov:.0%}) — pick one, or run SAR change "
-                                  "detection for this event", CLR_BAD)
+                self._set_step(1, "No SAR raster covers this area", CLR_BAD,
+                               f"best overlap {ov:.0%} — pick one, or run SAR "
+                               "change detection for this event")
             else:
-                self._set_step(1, "Choose a change raster from the SAR tab",
-                               CLR_BAD)
+                self._set_step(1, "Choose a SAR raster", CLR_BAD,
+                               "a change raster from the SAR tab")
         outs = [n for n, c in (("fused score", self.out_fused_check),
                                ("optical-only", self.out_optical_check))
                 if c.isChecked()]
         ready = bool(opt) and (bool(sar) or not self.out_fused_check.isChecked())
         if not outs:
-            self._set_step(2, "Nothing to produce — tick an output on the Run tab",
-                           CLR_BAD)
+            self._set_step(2, "Nothing to produce", CLR_BAD,
+                           "tick an output below")
         elif ready:
-            self._set_step(2, "Ready — will produce " + " and ".join(outs), CLR_OK)
+            self._set_step(2, "Ready", CLR_OK,
+                           "will produce " + " and ".join(outs))
         else:
-            self._set_step(2, "Waiting on the inputs above", CLR_MUTED)
+            self._set_step(2, "Waiting", CLR_MUTED, "on the inputs above")
         self.run_btn.setEnabled(ready and bool(outs))
 
     # ---------- presets ----------
@@ -358,10 +371,14 @@ class FusionTab(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(note)
-        v.addWidget(self._detect_box())
-        v.addWidget(self._terrain_box())
-        v.addWidget(self._glacier_box())
-        v.addWidget(self._cloud_box())
+        # Collapsed on open. Four expanded panels of spinboxes is the choice
+        # paralysis this split exists to remove; the titles say what is inside,
+        # and a normal run never needs any of it.
+        for build in (self._detect_box, self._terrain_box,
+                      self._glacier_box, self._cloud_box):
+            gb = build()
+            gb.setCollapsed(True)
+            v.addWidget(gb)
         v.addStretch(1)
         return w
 
@@ -398,6 +415,10 @@ class FusionTab(QWidget):
         box = QgsCollapsibleGroupBox("Inputs")
         box.setSaveCollapsedState(False)
         form = QFormLayout(box)
+        # the dock can be as narrow as 360 px; without this the label column is
+        # squeezed until "Optical change raster" elides to "Optica"
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self._optical_combo = QComboBox()
         self._optical_combo.setToolTip(
@@ -406,11 +427,11 @@ class FusionTab(QWidget):
             "so prefer the file in its package folder over a copy.")
         self._optical_browse = QPushButton("…")
         self._optical_browse.setMaximumWidth(32)
-        self._optical_combo.currentIndexChanged.connect(
-            lambda _i: self._autodetect_measure("optical"))
         self._optical_browse.clicked.connect(
             lambda: self._browse_into(self._optical_combo, "optical change raster"))
-        form.addRow("Optical change raster",
+        self._optical_combo.currentIndexChanged.connect(
+            lambda _i: self._autodetect_measure("optical"))
+        form.addRow(self._tag("Optical change raster", CLR_OPTICAL),
                     self._row(self._optical_combo, self._optical_browse))
         self.optical_kind_combo = QComboBox()
         for label, key, _floor in OPTICAL_KINDS:
@@ -422,25 +443,50 @@ class FusionTab(QWidget):
             "matters here, because nothing in this plugin does a topographic "
             "illumination correction. dBright is the broadband brightness change.")
         self.optical_kind_combo.currentIndexChanged.connect(self._kind_changed)
-        form.addRow("↳ is a", self.optical_kind_combo)
+        form.addRow(self._tag("is a", CLR_OPTICAL, bold=False),
+                    self.optical_kind_combo)
 
-        self.pair_sar_check = QCheckBox(
-            "Also use the other SAR detectors from the same run")
-        self.pair_sar_check.setChecked(True)
-        self.pair_sar_check.setToolTip(
-            "Takes the MAXIMUM across every detector the SAR tab produced for this "
-            "scene pair — log-ratio, int-corr, brightness-z, MT int-corr.\n\n"
-            "They measure different physics: log-ratio a change in backscattered "
-            "POWER, int-corr loss of the scattering PATTERN. Each is blind to "
-            "different events — int-corr is the best channel measured on Iliamna "
-            "(2.76% background at 50% recall, 24.0% precision) and the worst at "
-            "Valdez (8.09%); log-ratio is the reverse. Max means either firing "
-            "counts.\n\nMeasured worst-case / mean background: log-ratio alone "
-            "4.57% / 3.02%, max over detectors 3.35% / 2.40%. Generate the others "
-            "by ticking them in the SAR tab; found automatically here.")
+        self._sar_combo = QComboBox()
+        self._sar_combo.setToolTip(
+            "The change map from the SAR tab — chosen automatically as the one "
+            "whose footprint overlaps the optical raster above.\n\nThe SAR tab "
+            "saves a float32 copy under the layer's own name in "
+            "<output>/sar/change. Older runs left only a temporary file, and a "
+            "temp file that has since been cleaned up shows here greyed out as "
+            "'no longer on disk'.")
+        self._sar_browse = QPushButton("…")
+        self._sar_browse.setMaximumWidth(32)
+        self._sar_browse.clicked.connect(
+            lambda: self._browse_into(self._sar_combo, "SAR change raster"))
+        self._sar_combo.currentIndexChanged.connect(self._sar_chosen)
+        form.addRow(self._tag("SAR change raster", CLR_SAR),
+                    self._row(self._sar_combo, self._sar_browse))
+        self.sar_kind_combo = QComboBox()
+        for label, key, _floor in SAR_KINDS:
+            self.sar_kind_combo.addItem(label, key)
+        self.sar_kind_combo.setToolTip(
+            "Detected from the layer name — touch it only if the guess is wrong.\n\n"
+            "It fixes the SIGN for the amplitude detectors: log-ratio is "
+            "10·log10(pre/post), so a brighter-after deposit reads NEGATIVE, while "
+            "the brightness z-score is post-minus-pre and reads POSITIVE.\n\n"
+            "The correlation detectors (int-corr, MT int-corr) have no polarity to "
+            "get wrong — they measure how much the scattering pattern was "
+            "rearranged.")
+        self.sar_kind_combo.currentIndexChanged.connect(self._kind_changed)
+        form.addRow(self._tag("is a", CLR_SAR, bold=False), self.sar_kind_combo)
+
+        # --- everything below is "use more of what you already have" ---
+        rule = QFrame()
+        rule.setFrameShape(QFrame.HLine)
+        rule.setFrameShadow(QFrame.Sunken)
+        form.addRow(rule)
+        more = QLabel("Use every companion raster the same run produced")
+        more.setStyleSheet("QLabel { color: palette(mid); }")
+        more.setWordWrap(True)
+        form.addRow(more)
 
         self.pair_optical_check = QCheckBox(
-            "Also use the matching dBright/dNDSI from the same Run")
+            "the matching dBright/dNDSI  (optical)")
         self.pair_optical_check.setChecked(True)
         self.pair_optical_check.setToolTip(
             "The Run writes dNDSI and dBright side by side. They come from "
@@ -453,47 +499,22 @@ class FusionTab(QWidget):
             "(background at 50% recall 98.8% vs 8.1% averaged).\n\nFound "
             "automatically; nothing to pick.")
         form.addRow(self.pair_optical_check)
+
+        self.pair_sar_check = QCheckBox(
+            "the other SAR detectors  (int-corr, brightness-z, MT int-corr)")
+        self.pair_sar_check.setChecked(True)
+        self.pair_sar_check.setToolTip(
+            "Takes the MAXIMUM across every detector the SAR tab produced for this "
+            "scene pair.\n\nThey measure different physics: log-ratio a change in "
+            "backscattered POWER, int-corr loss of the scattering PATTERN. Each is "
+            "blind to different events — int-corr is the best channel measured on "
+            "Iliamna (2.76% background at 50% recall, 24.0% precision) and the "
+            "worst at Valdez (8.09%); log-ratio is the reverse. Max means either "
+            "firing counts.\n\nMeasured worst-case / mean background: log-ratio "
+            "alone 4.57% / 3.02%, max over detectors 3.38% / 2.46%. Generate the "
+            "others by ticking them in the SAR tab; found automatically here.")
         form.addRow(self.pair_sar_check)
 
-        self._sar_combo = QComboBox()
-        self._sar_combo.setToolTip(
-            "The log-ratio change map from the SAR tab — that is the only SAR "
-            "input this needs.\n\nThe SAR tab now saves a float32 copy under the "
-            "layer's own name in <output>/sar/change. Older runs left only a "
-            "temporary file, and a temp file that has since been cleaned up shows "
-            "here greyed out as 'no longer on disk'.")
-        self._sar_browse = QPushButton("…")
-        self._sar_browse.setMaximumWidth(32)
-        self._sar_combo.currentIndexChanged.connect(self._sar_chosen)
-        self._sar_browse.clicked.connect(
-            lambda: self._browse_into(self._sar_combo, "SAR change raster"))
-        form.addRow("SAR change raster",
-                    self._row(self._sar_combo, self._sar_browse))
-        self.sar_kind_combo = QComboBox()
-        for label, key, _floor in SAR_KINDS:
-            self.sar_kind_combo.addItem(label, key)
-        self.sar_kind_combo.setToolTip(
-            "Detected from the layer name — touch it only if the guess is wrong.\n\n"
-            "It fixes the SIGN for the amplitude detectors: log-ratio is "
-            "10·log10(pre/post), so a brighter-after deposit reads NEGATIVE, while "
-            "the brightness z-score is post-minus-pre and reads POSITIVE.\n\n"
-            "All four detectors were generated for three truthed events in both "
-            "polarizations and scored as the fusion channel. Worst-case "
-            "background at 50% recall:\n\n"
-            "  log-ratio VV   4.57%      brightness-z VV  4.52%\n"
-            "  (no SAR)       6.38%      MT int-corr VV   7.34%\n"
-            "  int-corr VV    8.09%      every VH channel 7.7-8.5%\n\n"
-            "The two amplitude detectors in VV are the only ones that beat using "
-            "no SAR at all. The correlation family is superb on snow and ice "
-            "(int-corr VV on Iliamna: 3.20% background, 21.4% precision — the best "
-            "single result measured) and collapses on rock and moraine (Valdez "
-            "8.09%). VH lost to VV on every detector.")
-        self.sar_kind_combo.currentIndexChanged.connect(self._kind_changed)
-        form.addRow("↳ is a", self.sar_kind_combo)
-
-        # lives here rather than beside Fuse: it acts on these two pickers, and
-        # you need it whenever a new change raster is produced in another tab —
-        # the combos are built once and do not watch the project for new layers
         self.refresh_btn = QPushButton("⟳ Refresh layer list")
         self.refresh_btn.setToolTip(
             "Re-scan the project for raster layers. Use it after running the "
@@ -770,7 +791,7 @@ class FusionTab(QWidget):
         box = QgsCollapsibleGroupBox("Outputs")
         box.setSaveCollapsedState(False)
         form = QFormLayout(box)
-        self.out_fused_check = QCheckBox("Fused score (optical × SAR)")
+        self.out_fused_check = QCheckBox("Fused score  (optical + SAR)")
         self.out_fused_check.setChecked(True)
         self.out_fused_check.setToolTip(
             "The soft AND across both sensors. Worth having when SAR corroborates "
@@ -779,7 +800,7 @@ class FusionTab(QWidget):
             "SAR raster involved at all: the SAR input then becomes optional.")
         form.addRow(self.out_fused_check)
 
-        self.out_optical_check = QCheckBox("Optical only (no SAR)")
+        self.out_optical_check = QCheckBox("Optical only  (no SAR)")
         self.out_optical_check.setChecked(True)
         self.out_optical_check.setToolTip(
             "The optical channel with the same terrain and glacier weighting but "
@@ -796,6 +817,19 @@ class FusionTab(QWidget):
         note.setStyleSheet("QLabel { color: palette(mid); }")
         form.addRow(note)
         return box
+
+    @staticmethod
+    def _tag(text, colour=None, bold=True):
+        """A form label with an optional colour bar.
+
+        Rich text on a QLabel rather than a stylesheet on the QComboBox: styling
+        a combo partially makes Qt drop its native rendering, including the
+        drop-down arrow, so the colour goes beside the control instead of on it."""
+        bar = f'<span style="color:{colour};">&#9612;</span> ' if colour else ""
+        weight = "font-weight:bold;" if bold else "color:palette(mid);"
+        lbl = QLabel(f'{bar}<span style="{weight}">{text}</span>')
+        lbl.setTextFormat(Qt.RichText)
+        return lbl
 
     @staticmethod
     def _row(*widgets):
@@ -1729,6 +1763,25 @@ class FusionTab(QWidget):
             return None, None
         ok, _why = fusion_grid.describe_raster(cand)
         return (cand, other) if ok else (None, None)
+
+    def _event_date(self, path):
+        """The event's calendar date, for the step panel.
+
+        Read from the Run's <event>_metadata.json when it is beside the raster,
+        because that is the date the raster was actually built for. The event id
+        encodes it too (YYMMDD_HHMM) and is the fallback — deriving it from the
+        raster either way means the panel cannot drift from the file the way
+        reading the Sentinel-2 tab's live date field could."""
+        meta, _p = fusion_cloud.find_metadata(path)
+        if meta:
+            dt = str(meta.get("datetime_utc") or "")[:10]
+            if ISO_DATE.fullmatch(dt):
+                return dt
+        m = re.search(r"event_(\d{2})(\d{2})(\d{2})_", os.path.basename(path or ""))
+        if m:
+            yy, mm, dd = m.groups()
+            return f"20{yy}-{mm}-{dd}"
+        return ""
 
     @staticmethod
     def _event_id(path):
