@@ -1717,7 +1717,8 @@ class SarTab(QWidget):
         else:
             self._append_log("note: no after-scene footprint contains the "
                              "event point — using the nearest anyway")
-        post = min(post_pool, key=self._gap)
+        need = max(CD_NEED[m] for m in requested)
+        post = self._cd_post(post_pool, pre_all, need)
         track = post.get("relative_orbit")
         direction = post.get("orbit_state") or "?"
         same_track = [c for c in pre_all if c.get("relative_orbit") == track]
@@ -1747,7 +1748,6 @@ class SarTab(QWidget):
             self._append_log(
                 f"note: no ticked before-scene is a usable t{track} frame — "
                 f"using the same-track scenes instead")
-        need = max(CD_NEED[m] for m in requested)
         if chosen and len(chosen) < need:
             days = {(c.get("date") or "")[:10] for c in chosen}
             extra = [c for c in pool if (c.get("date") or "")[:10] not in days]
@@ -1794,6 +1794,73 @@ class SarTab(QWidget):
         count = (MT_MAX_PRE if any(m in ("mtcorr", "tsint") for m in products)
                  else max(CD_NEED[m] for m in products))
         return products, post, pre_pool[:count]
+
+    def _cd_post(self, post_pool, pre_all, need):
+        """Nearest after-scene, broken toward the track that can actually be
+        differenced and has the freshest reference stack.
+
+        Ordering is (after-scene DATE, staleness of the before-stack) over the
+        tracks that have `need` before-DATES imaging the event point — the same
+        test the reference stack is built with below, so this cannot prefer a
+        track that then fails. An earlier after-date still wins outright; the
+        before-stack only separates tracks that image on the same day.
+
+        Both halves are needed, and one real event shows why. Knik-Barry is
+        imaged on 2026-08-21 by t65 (ascending) AND t160 (descending), so the
+        gap ties. On a 60-day before-window t65 has no usable before-scene at
+        all and picking it starves every detector — that is the usability half.
+        Widen the window to 150 days and t65 gains three before-dates 78-127
+        days back, enough to look usable while spanning a seasonal snow change;
+        t160 has the same after date with before-scenes 12-36 days back — that
+        is the staleness half. Counting dates alone would pick t65 again, and so
+        would sorting on gap, because t65's pass is a few hours earlier.
+
+        Ticks still win: post_pool is already the ticked subset when the user
+        ticked an after-row, and a single ticked scene is returned unchanged."""
+        blind = min(post_pool, key=self._gap)
+        by_track = {}
+        for c in pre_all:
+            if self._covers_event(c):
+                by_track.setdefault(c.get("relative_orbit"), []).append(c)
+
+        def stack(c):
+            return self._one_per_day(by_track.get(c.get("relative_orbit"), []))
+
+        def staleness(c):
+            # how far back the reference stack has to reach. Only ever called
+            # for a track already known to have `need` dates — the filter below
+            # is the single gate, so this is allowed to index straight in.
+            return self._gap(stack(c)[need - 1])
+
+        def order(c):
+            # Rank on the after-scene's DATE, not its rounded gap. Two tracks
+            # imaging the same day differ only by time of day — Knik-Barry is
+            # 11 days on t65 (03:35) and 12 on t160 (16:12), which is not a real
+            # difference in recency, yet it is enough to stop a plain gap sort
+            # from ever reaching the tie-break. Within one date the freshest
+            # before-stack wins; _gap only settles the remainder.
+            return ((c.get("date") or "9999")[:10], staleness(c), self._gap(c))
+
+        usable = [c for c in post_pool if len(stack(c)) >= need]
+        if not usable:
+            return blind                      # the existing warning explains it
+        post = min(usable, key=order)
+        if post.get("id") == blind.get("id"):
+            return post
+        if len(stack(blind)) < need:
+            why = (f"only {len(stack(blind))} of {need} before-date(s) imaging "
+                   f"the event point")
+        else:
+            why = (f"its {need} nearest before-date(s) reach back "
+                   f"{staleness(blind):.0f} days, against "
+                   f"{staleness(post):.0f} days")
+        self._append_log(
+            f"note: the nearest after-scene is on t{blind.get('relative_orbit')} "
+            f"({(blind.get('date') or '')[:10]}) — {why}. Using "
+            f"t{post.get('relative_orbit')} "
+            f"({(post.get('date') or '')[:10]}) instead. Tick an after-scene to "
+            f"override.")
+        return post
 
     def _one_per_day(self, cands, what=None):
         """`cands` nearest-first, one scene per acquisition day.
