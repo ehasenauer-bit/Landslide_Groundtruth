@@ -1159,12 +1159,20 @@ class LandslideDock(QgsDockWidget):
                 existing = netrc_path.read_text()
             except OSError:
                 existing = ""
-        # keep every line except the old urs.earthdata.nasa.gov machine block
+        # Keep every line except the old urs.earthdata.nasa.gov machine block.
+        # A .netrc top-level entry is 'machine <host>', 'default', or 'macdef
+        # <name>'; skipping must END at the NEXT top-level entry of ANY kind, not
+        # only the next 'machine' — otherwise a 'default' (or 'macdef') block that
+        # happens to follow the URS entry gets swallowed with it, silently dropping
+        # other services' credentials/macros. Match the host as a whole token, not
+        # a substring, so 'machine noturs.earthdata.nasa.gov.example' is preserved.
         kept = []
         skip = False
         for line in (existing.splitlines() if existing.strip() else []):
-            if line.strip().startswith("machine"):
-                skip = EARTHDATA_HOST in line
+            tokens = line.split()
+            keyword = tokens[0] if tokens else ""
+            if keyword in ("machine", "default", "macdef"):
+                skip = keyword == "machine" and EARTHDATA_HOST in tokens[1:2]
             if not skip:
                 kept.append(line)
         entry = (f"machine {EARTHDATA_HOST}\n"
