@@ -124,16 +124,27 @@ def coregister_offset(diff, valid, iters=5, nsig=3.0):
     if vals.size == 0:
         return 0.0, 0
     keep = vals
+    clipped = False       # did any sigma-clip iteration actually remove outliers?
+    thin = None           # the size a clip WOULD have produced when stopped for <100
     for _ in range(iters):
         med = np.median(keep)
         sd = keep.std()
         if not np.isfinite(sd) or sd == 0:
             break
         nxt = keep[np.abs(keep - med) <= nsig * sd]
-        if nxt.size == keep.size or nxt.size < 100:
+        if nxt.size == keep.size:
+            break                      # converged: no outliers left to drop
+        if nxt.size < 100:
+            thin = int(nxt.size)       # clipping wanted to continue but too few remain
             break
         keep = nxt
-    return float(np.median(keep)), int(keep.size)
+        clipped = True
+    # If the FIRST clip was refused for being too thin, no outliers were ever removed:
+    # the offset is the slide-contaminated unclipped median. Report the thin would-be
+    # count as stable_px (not the full unclipped size) so the tab's thin-stable-ground
+    # warning fires instead of trusting a contaminated offset.
+    stable = thin if (thin is not None and not clipped) else keep.size
+    return float(np.median(keep)), int(stable)
 
 
 # ---------- GeoTIFF output ----------
@@ -207,12 +218,19 @@ def _resolve_source(u):
 
 
 def _source_nodata(srcs):
-    """The nodata of the first source that declares one, else None.
+    """The common nodata value when the sources AGREE on one, else None.
 
     Passed to gdal.Warp as srcNodata so a declared fill is MASKED rather than
     resampled: without it, bilinear blends an undeclared but real fill value
     (a bare -9999 or 0 with no band NoData set) into neighbouring valid pixels,
-    and valid_heights would then keep the smeared fringe."""
+    and valid_heights would then keep the smeared fringe.
+
+    Only returned when every declaring source uses the SAME value, because a single
+    srcNodata is applied to the WHOLE warp: forcing the first tile's fill (say
+    -9999) onto a mosaic tile that fills with 0 would both mask real 0-height data
+    and suppress GDAL's per-source NoData. When the sources disagree, return None
+    and let gdal.Warp honour each source's own internal NoData."""
+    found = set()
     for s in srcs:
         try:
             ds = gdal.Open(s)
@@ -223,8 +241,8 @@ def _source_nodata(srcs):
         nd = ds.GetRasterBand(1).GetNoDataValue()
         ds = None
         if nd is not None:
-            return nd
-    return None
+            found.add(nd)
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def warp_to_grid(sources, bounds, epsg, res, resample="bilinear", nodata=NODATA):
