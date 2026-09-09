@@ -16,10 +16,15 @@ creates/updates that native 3D view and points the camera at the AOI. The 3D doc
 a normal QGIS dock — drag it onto this panel's tab to sit them side by side.
 
 Terrain sources:
-  * Auto-fetch ArcticDEM 2 m — reuses the project's DEM-strip search
-    (`run_single.py --prefer dem --search-only`, PGC's anonymous AWS Open Data) to
-    find strips over the AOI, then warps the chosen strip to a local UTM GeoTIFF via
-    dem_diff.warp (/vsicurl ranged COG reads — only the AOI's bytes are fetched).
+  * Auto-fetch a DEM over the AOI — reuses the project's DEM search
+    (`run_single.py --prefer dem --search-only`) to find every DEM over the AOI,
+    then warps the chosen one to a local UTM GeoTIFF via dem_diff.warp (/vsicurl
+    ranged COG reads — only the AOI's bytes are fetched). A 'Preferred source'
+    picker chooses which to use: Auto (coverage-driven fallback chain) or a forced
+    ArcticDEM (PGC 2 m, Arctic/Alaska) / USGS 3DEP (US) / NRCan MRDEM (Canada) /
+    Copernicus GLO-30 (near-global 30 m) — the last making terrain resolvable
+    anywhere on Earth, not just the Arctic. Every found DEM is also listed in the
+    'DEM candidate' dropdown to override the pick by hand.
   * A DEM raster already loaded in the project (e.g. a local ArcticDEM / Copernicus
     GLO-30 mosaic) — used directly, nothing fetched.
 
@@ -76,9 +81,10 @@ PGC_SOURCES = ("arcticdem", "earthdem", "rema")
 # Fallback DEM tiers, in the order they're tried when an ArcticDEM strip warps to
 # <50% valid pixels (or fails outright): USGS 3DEP first (finer where it exists,
 # but US-only), then NRCan MRDEM (30 m, seamless over Canada — the one that
-# actually delivers terrain just north of the border). Matched on dem_source
-# prefix; see _tier_of.
-FALLBACK_TIERS = ("3dep", "mrdem")
+# actually delivers terrain just north of the border), and finally Copernicus
+# GLO-30 (near-global 30 m, so terrain resolves ANYWHERE the regional sources
+# don't reach). Matched on dem_source prefix; see _tier_of.
+FALLBACK_TIERS = ("3dep", "mrdem", "cop-glo30")
 
 # When the chosen terrain is an ArcticDEM strip, warp it together with the other
 # overlapping strips so one strip's gaps get filled by another's (a single
@@ -222,10 +228,33 @@ class Viewer3DTab(QWidget):
         tform = QFormLayout(terr_box)
 
         self.source_combo = QComboBox()
-        self.source_combo.addItem("Auto-fetch ArcticDEM 2 m (PGC)", "arcticdem")
+        # data "arcticdem" is the legacy tag for the auto-fetch MODE (it now spans
+        # ArcticDEM/3DEP/MRDEM/GLO-30 — the actual source is the 'Preferred source'
+        # picker below); "loaded" uses a DEM already in the project.
+        self.source_combo.addItem("Auto-fetch a DEM over the AOI", "arcticdem")
         self.source_combo.addItem("Use a DEM layer loaded in the project", "loaded")
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         tform.addRow("Source", self.source_combo)
+
+        # which DEM the auto-fetch actually resolves terrain from. 'Auto' keeps the
+        # coverage-driven fallback chain; the rest force one source and fall back to
+        # the best available only if it has no data over the AOI.
+        self.pref_combo = QComboBox()
+        self.pref_combo.addItem("Auto — best coverage (recommended)", "auto")
+        self.pref_combo.addItem("ArcticDEM — PGC 2 m (Arctic / Alaska)", "pgc")
+        self.pref_combo.addItem("USGS 3DEP (United States)", "3dep")
+        self.pref_combo.addItem("NRCan MRDEM (Canada)", "mrdem")
+        self.pref_combo.addItem("Copernicus GLO-30 (global 30 m)", "cop-glo30")
+        self.pref_combo.setToolTip(
+            "Which DEM the auto-fetch builds terrain from. 'Auto' picks the best "
+            "coverage over the AOI — ArcticDEM (2 m, Arctic/Alaska) first, then "
+            "3DEP (US), MRDEM (Canada) and Copernicus GLO-30 (near-global 30 m) as "
+            "fallbacks. Force one to override that; if it has no data here the "
+            "search falls back to the best available (see the DEM candidate list). "
+            "Change it after a search to re-pick without re-searching.")
+        self.pref_row_label = QLabel("Preferred source")
+        self.pref_combo.currentIndexChanged.connect(self._on_pref_changed)
+        tform.addRow(self.pref_row_label, self.pref_combo)
 
         # loaded-DEM picker (raster layers in the project)
         self.loaded_combo = QComboBox()
@@ -254,7 +283,11 @@ class Viewer3DTab(QWidget):
 
         self.strip_combo = QComboBox()
         self.strip_combo.setEnabled(False)
-        self.strip_row_label = QLabel("ArcticDEM strip")
+        self.strip_combo.setToolTip(
+            "Every DEM found over the AOI, best-first — ArcticDEM strips plus any "
+            "3DEP / MRDEM / GLO-30 fallbacks. The 'Preferred source' picks which "
+            "one is selected here; override it by hand to warp a specific one.")
+        self.strip_row_label = QLabel("DEM candidate")
         self.strip_combo.currentIndexChanged.connect(self._on_strip_changed)
         tform.addRow(self.strip_row_label, self.strip_combo)
 
@@ -504,8 +537,8 @@ class Viewer3DTab(QWidget):
 
     def _on_source_changed(self):
         auto = self.source_combo.currentData() == "arcticdem"
-        for w in (self.res_combo, self.res_row_label, self.strip_combo,
-                  self.strip_row_label):
+        for w in (self.pref_combo, self.pref_row_label, self.res_combo,
+                  self.res_row_label, self.strip_combo, self.strip_row_label):
             w.setVisible(auto)
         for w in (self.loaded_combo, self.loaded_dem_row_label,
                   self.loaded_model_combo, self.loaded_model_row_label):
@@ -668,9 +701,10 @@ class Viewer3DTab(QWidget):
             label = " ".join(x for x in (date, "·", src, model, "·", cov) if x)
             self.strip_combo.addItem(label, c)
         self.strip_combo.setEnabled(True)
-        # default selection: ArcticDEM if its footprints blanket >=50% of the AOI,
-        # otherwise the best 3DEP fallback (the <50% trigger).
-        self.strip_combo.setCurrentIndex(self._pick_default_strip(cands))
+        # default selection: honor the 'Preferred source' picker if it forces one,
+        # else auto — ArcticDEM if its footprints blanket >=50% of the AOI,
+        # otherwise the best fallback (the <50% trigger).
+        self.strip_combo.setCurrentIndex(self._default_strip_index(cands))
         self.strip_combo.blockSignals(False)
         n_pgc = sum(1 for c in cands if c.get("dem_source") in PGC_SOURCES)
         n_3dep = sum(1 for c in cands if str(c.get("dem_source", "")).startswith("3dep"))
@@ -684,10 +718,10 @@ class Viewer3DTab(QWidget):
         """Best-first, in source tiers so a fallback never outranks usable
         ArcticDEM.
 
-        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), tier 1 = 3DEP,
-        tier 2 = MRDEM (Canada). Within a tier: entries covering the event point
-        first, then ArcticDEM by newest acquisition and the fallbacks by finest
-        resolution (DSM 1 m → 10 m → 30 m)."""
+        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), then the fallbacks
+        in FALLBACK_TIERS order (3DEP → MRDEM → GLO-30). Within a tier: entries
+        covering the event point first, then ArcticDEM by newest acquisition and
+        the fallbacks by finest resolution (DSM 1 m → 10 m → 30 m)."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -702,9 +736,9 @@ class Viewer3DTab(QWidget):
                 dstr = (c.get("date") or "").replace("-", "")
                 dnum = int(dstr) if dstr.isdigit() else 0
                 return (0, covers, -dnum)          # newest ArcticDEM first
-            ds = str(c.get("dem_source", ""))
-            tier = 1 if ds.startswith("3dep") else 2   # 3DEP before MRDEM
-            return (tier, covers, c.get("resolution_m") or 999)   # finest first
+            tier = self._tier_of(c)                # 3DEP → MRDEM → GLO-30
+            rank = 1 + FALLBACK_TIERS.index(tier) if tier in FALLBACK_TIERS else 99
+            return (rank, covers, c.get("resolution_m") or 999)   # finest first
 
         cands.sort(key=key)
         return cands
@@ -763,6 +797,47 @@ class Viewer3DTab(QWidget):
             if g is not None and not g.isEmpty() and g.contains(pt):
                 return True
         return False
+
+    def _preferred_source(self):
+        """The 'Preferred source' picker's tag ('auto' / 'pgc' / '3dep' /
+        'mrdem' / 'cop-glo30'). 'auto' means the coverage-driven fallback chain."""
+        try:
+            return self.pref_combo.currentData() or "auto"
+        except Exception:
+            return "auto"
+
+    def _default_strip_index(self, cands):
+        """Combo index to auto-warp, honoring the 'Preferred source' picker.
+
+        'Auto' defers to _pick_default_strip (coverage-driven). A forced source
+        selects its best-ranked candidate; if that source found nothing over the
+        AOI, it logs and falls back to the auto pick rather than leaving the user
+        with no terrain. `cands` is ranked, so the first tier match is the best."""
+        pref = self._preferred_source()
+        if pref == "auto":
+            return self._pick_default_strip(cands)
+        for i, c in enumerate(cands):
+            if self._tier_of(c) == pref:
+                self._log(f"Preferred source: using {c.get('source', pref)} "
+                          f"(forced — change 'Preferred source' to Auto to let "
+                          f"coverage decide).")
+                return i
+        label = self.pref_combo.currentText()
+        self._log(f"Preferred source '{label}' found no DEM over this AOI — "
+                  f"using the best available instead.")
+        return self._pick_default_strip(cands)
+
+    def _on_pref_changed(self):
+        """Re-apply the source preference to the current search without re-
+        fetching. Does nothing until a search has populated the candidate list."""
+        if not self.strip_combo.isEnabled() or self.strip_combo.count() == 0:
+            return
+        cands = [self.strip_combo.itemData(i)
+                 for i in range(self.strip_combo.count())]
+        # a fresh, deliberate source choice — drop any ArcticDEM held from an
+        # earlier auto <50% → fallback switch so the forced pick installs cleanly.
+        self._pgc_fallback = None
+        self._select_and_warp_index(self._default_strip_index(cands))
 
     def _pick_default_strip(self, cands):
         """Combo index to auto-warp: the best ArcticDEM strip if any strip covers
@@ -1034,7 +1109,10 @@ class Viewer3DTab(QWidget):
         # the fallback chain rather than install terrain that's holey where it
         # matters, but hold on to THIS result so that if every fallback is empty
         # here we still fall back to it (a partial surface beats no terrain).
-        if tier == "pgc" and (cover < 0.5 or point_bare):
+        # Only in Auto mode: a user who FORCED ArcticDEM gets ArcticDEM (holes and
+        # a coverage warning), not a silent switch to a coarser source.
+        if (self._preferred_source() == "auto" and tier == "pgc"
+                and (cover < 0.5 or point_bare)):
             nxt = self._fallback_index("pgc")
             if nxt >= 0:
                 self._pgc_fallback = {"result": result, "cand": cand}
@@ -1846,6 +1924,10 @@ class Viewer3DTab(QWidget):
             return "Maxar WorldView (stereo photogrammetry)"
         if s.startswith("3dep"):
             return "USGS 3DEP"
+        if s.startswith("mrdem"):
+            return "NRCan MRDEM (CanElevation)"
+        if s.startswith("cop-glo30"):
+            return "Copernicus GLO-30 (TanDEM-X)"
         return cand.get("source", "DEM")
 
     # -------------------------------------- instant-flip web viewer ----

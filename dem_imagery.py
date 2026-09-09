@@ -36,6 +36,7 @@ it is reported, not filtered on).
 """
 from __future__ import annotations
 import datetime as dt
+import math
 import threading
 
 import pystac_client
@@ -85,6 +86,16 @@ PC_LIDAR_DSM = "3dep-lidar-dsm"
 # ArcticDEM is holey and 3DEP has nothing.
 CA_STAC_URL = "https://datacube.services.geo.ca/stac/api"
 MRDEM_COLL = "mrdem-30"
+
+# --- Copernicus GLO-30, the GLOBAL fallback (works anywhere on Earth) ---
+# ArcticDEM (Arctic), 3DEP (US) and MRDEM (Canada) are all REGIONAL: an AOI
+# outside them — the Alps, Andes, Himalaya, New Zealand, most of the world — gets
+# no terrain from any of the above. Copernicus GLO-30 is a near-global 30 m
+# SURFACE model (DSM, from TanDEM-X) distributed as anonymous Cloud-Optimized
+# GeoTIFFs in a public S3 bucket: no login, no signing, GDAL reads the COGs
+# straight over /vsicurl (same access path layover_dim already uses). Tiles are
+# 1°×1°, named by their SW-corner integer lat/lon; ocean cells have no tile.
+COP_DEM_BASE = "https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com"
 
 # how many candidates to return per side. Strip coverage is opportunistic:
 # a well-imaged Alaska geocell can hold dozens of strips over a decade while
@@ -312,6 +323,62 @@ def search_canada(lat, lon, radius_km):
     return out
 
 
+def _cop_dem_tile_url(sw_lat, sw_lon):
+    """URL of the 1°×1° Copernicus GLO-30 DSM COG whose SW corner is (sw_lat,
+    sw_lon). Mirrors layover_dim._cop_dem_tile_url so both read the same bucket."""
+    ns = f"N{sw_lat:02d}" if sw_lat >= 0 else f"S{abs(sw_lat):02d}"
+    ew = f"E{sw_lon:03d}" if sw_lon >= 0 else f"W{abs(sw_lon):03d}"
+    name = f"Copernicus_DSM_COG_10_{ns}_00_{ew}_00_DEM"
+    return f"{COP_DEM_BASE}/{name}/{name}.tif"
+
+
+def _url_exists(url, timeout=30):
+    """HEAD-check a COG so ocean/missing GLO-30 tiles are skipped before they're
+    handed to gdal.Warp (a non-existent /vsicurl source fails the whole warp)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200) == 200
+    except Exception:
+        return False
+
+
+def search_glo30(lat, lon, radius_km):
+    """Copernicus GLO-30 fallback: the near-global 30 m surface model (DSM).
+
+    The GLOBAL safety net, tried after every regional source — it delivers
+    terrain wherever ArcticDEM/3DEP/MRDEM don't reach. Returns a single mosaic
+    candidate whose `dem_urls` lists every intersecting 1°×1° tile COG that
+    actually exists (ocean cells have none), read straight over /vsicurl and
+    reprojected to the AOI grid by the plugin's warp — exactly like the 3DEP
+    mosaic, minus the signing. geometry is None (a near-global mosaic; the
+    plugin's post-warp valid-pixel check is the real coverage gate). Returns []
+    when no tile covers the AOI or on any error, so it stays a guarded bonus
+    source like 3DEP / MRDEM. Anonymous COGs, no signing."""
+    try:
+        west, south, east, north = im._bbox(lat, lon, radius_km)
+        tiles = [(la, lo)
+                 for la in range(math.floor(south), math.floor(north) + 1)
+                 for lo in range(math.floor(west), math.floor(east) + 1)]
+        hrefs = [u for u in (_cop_dem_tile_url(la, lo) for la, lo in tiles)
+                 if _url_exists(u)]
+    except Exception:
+        return []
+    if not hrefs:
+        return []
+    return [dict(id=f"cop-glo30-{len(hrefs)}tile", date=None,
+                 cloud_pct=None, gap_days=None,
+                 source="Copernicus GLO-30", thumb_url=None, cog_url=hrefs[0],
+                 geometry=None, bbox=None,
+                 sensor=None, is_xtrack=None, rmse=None, valid_pct=None,
+                 gsd=30,
+                 dem_url=hrefs[0], dem_urls=hrefs,
+                 hillshade_url=None, hillshade_masked_url=None, mask_url=None,
+                 dem_source="cop-glo30", terrain_model="DSM", is_dsm=True,
+                 resolution_m=30, provider="Copernicus", needs_signing=False)]
+
+
 def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIMIT):
     """DEM strips intersecting the AOI in [start, end], nearest-in-time first.
 
@@ -406,6 +473,13 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=1825,
         notes.append("MRDEM: added NRCan CanElevation 30 m DEM (DTM + DSM), "
                      "seamless over all of Canada — the fallback used when "
                      "ArcticDEM is holey and 3DEP (US-only) has no data here")
+    # Copernicus GLO-30: the GLOBAL last resort, so the viewer/differencer can
+    # resolve terrain anywhere the regional sources above don't reach.
+    glo = search_glo30(lat, lon, radius_km)
+    if glo:
+        notes.append("GLO-30: added Copernicus GLO-30 (near-global 30 m surface "
+                     "model) — the global fallback used when no regional DEM "
+                     "(ArcticDEM / 3DEP / MRDEM) covers the AOI")
     return dict(source="DEM strips", notes=notes,
-                pre=[_candidate(i, event_time) for i in pre_items] + extra + ca,
+                pre=[_candidate(i, event_time) for i in pre_items] + extra + ca + glo,
                 post=[_candidate(i, event_time) for i in post_items])
