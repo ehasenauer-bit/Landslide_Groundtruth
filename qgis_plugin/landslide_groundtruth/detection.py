@@ -27,13 +27,16 @@ Two fields in there are load-bearing and the plugin used to ignore both:
   three independent volumes of the same event is the actual validation, and it
   cannot happen if the seismic one has nowhere to live.
 
-`parse()` is deliberately tolerant: the record gets pasted from a figure caption,
-an email, a PDF or a terminal, so field order, separators, unicode degree/minus
-signs and stray labels all vary. Nothing here imports Qt — it is plain stdlib so
-it can be unit-tested outside QGIS.
+The record arrives as a FIGURE — a station map with the numbers printed in the
+corner — so there is nothing to paste and no text to parse. The analyst reads
+the values off the image; this class exists so they do that ONCE instead of
+four times across four tabs, and so the two fields the plugin used to discard
+(location error, seismic volume) reach the code that needs them.
+
+Nothing here imports Qt — it is plain stdlib, so it can be unit-tested outside
+QGIS.
 """
 
-import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 
@@ -192,143 +195,3 @@ class Detection:
             except ValueError:
                 det.origin_utc = None
         return det
-
-
-# ---------------------------------------------------------------- parsing
-
-# Unicode the record picks up from PDFs and figure captions: minus sign, en/em
-# dash, non-breaking and thin spaces. Normalised before matching so the patterns
-# below only ever see ASCII.
-_SUBS = {
-    "−": "-", "–": "-", "—": "-", "‒": "-",
-    " ": " ", " ": " ", " ": " ", "°": " ",
-    # superscripts: the record almost always writes m³, not m^3 or m3
-    "³": "3", "²": "2", "⁴": "4",
-}
-
-_NUM = r"[-+]?\d+(?:\.\d+)?"
-
-_PAT = {
-    "lat": rf"\blat(?:itude)?\b\s*[=:]?\s*({_NUM})",
-    "lon": rf"\blon(?:g|gitude)?\b\s*[=:]?\s*({_NUM})",
-    "loc_error": rf"\bloc\.?\s*(?:ation)?\s*error\b\s*[=:]?\s*({_NUM})",
-    "coherency": rf"\bcoherenc(?:y|e)\b\s*[=:]?\s*({_NUM})",
-    "hf_lf": rf"\bhf\s*/?\s*lf\b\s*[=:]?\s*({_NUM})",
-    "detection": r"\bdetection\b\s*[=:]?\s*([YN])\b",
-    "event_id": r"\bevent(?:\s*id)?\b\s*[=:]\s*([A-Za-z0-9_\-]+)",
-}
-
-# "Vol range = 0.9 - 1.7 M m^3" must be tried BEFORE the bare "Vol = 1.3",
-# otherwise the range's first number is read as the best estimate.
-_RE_VOL_RANGE = re.compile(
-    rf"\bvol(?:ume)?\s*range\b\s*[=:]?\s*({_NUM})\s*-\s*({_NUM})\s*(M|k)?\s*m\s*\^?3",
-    re.I)
-_RE_VOL_BEST = re.compile(
-    rf"\bvol(?:ume)?\b\s*(?!range)[=:]?\s*({_NUM})\s*(M|k)?\s*m\s*\^?3", re.I)
-# full timestamp with an explicit UTC marker — the only form we trust for origin
-_RE_ORIGIN_UTC = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?\s*(?:UTC|Z)\b", re.I)
-# ... and a bare timestamp, used only if no UTC-marked one is present
-_RE_ORIGIN_ANY = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
-# "Org time = 08:48:37" — a time with no date, to refine the date we already have
-_RE_ORG_TIME = re.compile(r"\borg(?:in)?\.?\s*time\b\s*[=:]?\s*(\d{2}):(\d{2})(?::(\d{2}))?", re.I)
-
-_MULT = {"m": 1e6, "k": 1e3, None: 1.0, "": 1.0}
-
-
-def _norm(text):
-    for a, b in _SUBS.items():
-        text = text.replace(a, b)
-    return text
-
-
-def _f(m, g=1):
-    try:
-        return float(m.group(g))
-    except (TypeError, ValueError):
-        return None
-
-
-def _dt(m):
-    try:
-        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                        int(m.group(4)), int(m.group(5)), int(m.group(6) or 0))
-    except (TypeError, ValueError):
-        return None
-
-
-def parse(text):
-    """Read a pasted detection record into a Detection.
-
-    Returns (detection, warnings). Never raises: a record that parses partially
-    is more useful than an exception, and the warnings tell the analyst exactly
-    which fields they still have to fill in by hand."""
-    det = Detection(raw=text or "")
-    warn = []
-    t = _norm(text or "")
-
-    for key in ("lat", "lon", "loc_error", "coherency", "hf_lf"):
-        m = re.search(_PAT[key], t, re.I)
-        if m:
-            setattr(det, {"loc_error": "loc_error_km"}.get(key, key), _f(m))
-
-    m = re.search(_PAT["detection"], t, re.I)
-    if m:
-        det.detection = m.group(1).upper()
-    m = re.search(_PAT["event_id"], t, re.I)
-    if m:
-        det.event_id = m.group(1)
-
-    # volumes: range first, then the best estimate
-    m = _RE_VOL_RANGE.search(t)
-    if m:
-        k = _MULT.get((m.group(3) or "").lower(), 1.0)
-        det.vol_low_m3, det.vol_high_m3 = _f(m, 1) * k, _f(m, 2) * k
-    m = _RE_VOL_BEST.search(t)
-    if m:
-        det.vol_best_m3 = _f(m, 1) * _MULT.get((m.group(2) or "").lower(), 1.0)
-    if det.vol_best_m3 is None and det.vol_low_m3 and det.vol_high_m3:
-        det.vol_best_m3 = (det.vol_low_m3 * det.vol_high_m3) ** 0.5   # log-mid
-
-    # origin time: prefer the UTC-marked stamp. A record that shows both UTC and
-    # local (they differ by a calendar day) must never be read local-first.
-    m = _RE_ORIGIN_UTC.search(t)
-    if m:
-        det.origin_utc = _dt(m)
-    else:
-        m = _RE_ORIGIN_ANY.search(t)
-        if m:
-            det.origin_utc = _dt(m)
-            warn.append("The timestamp had no 'UTC' marker — it was read as UTC. "
-                        "Check it against the record before searching.")
-    # "Org time" is the authoritative seconds-resolution origin; if it disagrees
-    # with the header stamp's clock, trust it for the time-of-day.
-    mo = _RE_ORG_TIME.search(t)
-    if mo and det.origin_utc:
-        det.origin_utc = det.origin_utc.replace(
-            hour=int(mo.group(1)), minute=int(mo.group(2)),
-            second=int(mo.group(3) or 0))
-
-    # sanity — a dropped minus sign on longitude is the classic error, and in
-    # Alaska/Yukon it puts the AOI in Siberia or the Bering Sea without failing.
-    if det.lat is not None and not (-90 <= det.lat <= 90):
-        warn.append(f"Latitude {det.lat} is out of range — ignored.")
-        det.lat = None
-    if det.lon is not None and not (-180 <= det.lon <= 180):
-        warn.append(f"Longitude {det.lon} is out of range — ignored.")
-        det.lon = None
-    if det.lon is not None and det.lon > 0 and det.lat is not None and det.lat > 50:
-        warn.append(f"Longitude {det.lon:+g} is POSITIVE (eastern hemisphere). "
-                    "Alaska and the Yukon are negative — check for a dropped minus sign.")
-
-    if not det.event_id and det.origin_utc:
-        det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
-    if not det.is_locatable():
-        warn.append("No latitude/longitude found — enter them by hand.")
-    if det.origin_utc is None:
-        warn.append("No origin time found — enter it by hand.")
-    if det.loc_error_km is None:
-        warn.append("No location error found — the search radius was left at its "
-                    "current value.")
-    return det, warn

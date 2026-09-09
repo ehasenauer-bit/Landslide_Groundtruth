@@ -474,41 +474,88 @@ class LandslideDock(QgsDockWidget):
         all, so the search radius ignored the uncertainty it was supposed to cover
         and the seismic volume could never be compared against the digitized one.
 
-        Paste-parsing rather than eleven spin boxes because the record is already
-        on screen in another window; see detection.parse()."""
-        box = QgsCollapsibleGroupBox("Detection — paste the seismic record")
+        Typed fields rather than a paste box: the record arrives as a FIGURE (a
+        station map with the numbers printed in the corner), so there is no text
+        to paste. Reading them off an image is the analyst's job — but doing it
+        ONCE here, instead of four times across four tabs, is the point."""
+        box = QgsCollapsibleGroupBox("Detection — the seismic record")
         box.setSaveCollapsedState(False)
         self.detection_box = box
         v = QVBoxLayout(box)
 
         hint = QLabel(
-            "Paste the detection record (epicentre, origin time, location error, "
-            "volume) and press <b>Read it</b>. Everything below is filled in for "
-            "you, including a search radius that actually covers the location "
-            "error.")
+            "Copy the numbers off the detection figure once. They fill in every "
+            "tab below, set a search radius that actually covers the location "
+            "error, and give the Volume tab something to check its own answer "
+            "against.")
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(hint)
 
-        self.det_paste = QPlainTextEdit()
-        self.det_paste.setPlaceholderText(
-            "Detection = Y\nCoherency = 0.61\nHF / LF = 11.8\n"
-            "Org time = 08:48:37\nLatitude = 60.50\nLongitude = -140.60\n"
-            "Loc error = 17 km\nVol = 1.3 M m³\nVol range = 0.9 - 1.7 M m³")
-        self.det_paste.setMaximumHeight(96)
-        self.det_paste.setToolTip(
-            "Anything with latitude, longitude and a time in it will do — the "
-            "order does not matter and unrecognised lines are ignored. A "
-            "timestamp marked UTC is always preferred over a local one.")
-        v.addWidget(self.det_paste)
+        form = QFormLayout()
+        self.det_id_edit = QLineEdit()
+        self.det_id_edit.setPlaceholderText("AK2026-0204   (filled in from the date if left blank)")
+        self.det_id_edit.setToolTip(
+            "The catalogue key for this event. It is stamped onto the output "
+            "filenames and the exported CSV so the results can be joined back "
+            "to the detection catalogue.")
+        form.addRow("Event ID", self.det_id_edit)
 
-        read_btn = QPushButton("Read it")
-        read_btn.setDefault(True)
-        f = read_btn.font(); f.setBold(True); read_btn.setFont(f)
-        read_btn.setToolTip("Parse the pasted record and show what was understood.")
-        read_btn.clicked.connect(self._read_detection)
+        self.det_time_edit = QDateTimeEdit(QDateTime.currentDateTimeUtc())
+        self.det_time_edit.setCalendarPopup(True)
+        self.det_time_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.det_time_edit.setToolTip(
+            "The origin time, in UTC. Read the UTC line off the figure, not the "
+            "Alaska one — they are often a different calendar day, and the local "
+            "one shifts the before/after boundary by nine hours.")
+        form.addRow("Origin time (UTC)", self.det_time_edit)
+
+        self.det_lat_edit = QLineEdit()
+        self.det_lat_edit.setPlaceholderText("60.50")
+        self.det_lon_edit = QLineEdit()
+        self.det_lon_edit.setPlaceholderText("-140.60   (negative in Alaska/Yukon)")
+        form.addRow("Latitude", self.det_lat_edit)
+        form.addRow("Longitude", self.det_lon_edit)
+
+        self.det_err_spin = QDoubleSpinBox()
+        self.det_err_spin.setRange(0.0, 200.0)
+        self.det_err_spin.setDecimals(1)
+        self.det_err_spin.setSingleStep(1.0)
+        self.det_err_spin.setSuffix(" km")
+        self.det_err_spin.setSpecialValueText("not given")
+        self.det_err_spin.setToolTip(
+            "The 'Loc error' on the figure — the radius the scar is somewhere "
+            "inside. This drives the search radius: at 17 km of error, the old "
+            "5 km default covered about a twelfth of the ground the slide could "
+            "be on, so an empty result meant 'never looked there'.")
+        form.addRow("Location error", self.det_err_spin)
+
+        self.det_vol_edit = QLineEdit()
+        self.det_vol_edit.setPlaceholderText("1.3        million m³")
+        self.det_vol_edit.setToolTip(
+            "The seismic volume estimate, in millions of m³ — the 'Vol' line. "
+            "The Volume tab compares its own area-derived volume against this.")
+        self.det_vol_lo_edit = QLineEdit()
+        self.det_vol_lo_edit.setPlaceholderText("0.9")
+        self.det_vol_hi_edit = QLineEdit()
+        self.det_vol_hi_edit.setPlaceholderText("1.7")
+        form.addRow("Volume (M m³)", self.det_vol_edit)
+        rng = QHBoxLayout()
+        rng.addWidget(self.det_vol_lo_edit)
+        rng.addWidget(QLabel("to"))
+        rng.addWidget(self.det_vol_hi_edit)
+        form.addRow("Volume range", rng)
+        v.addLayout(form)
+
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
+                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+            w.textChanged.connect(self._read_detection)
+        self.det_time_edit.dateTimeChanged.connect(self._read_detection)
+        self.det_err_spin.valueChanged.connect(self._read_detection)
+
         self.det_apply_btn = QPushButton("Use it in every tab")
         self.det_apply_btn.setEnabled(False)
+        f = self.det_apply_btn.font(); f.setBold(True); self.det_apply_btn.setFont(f)
         self.det_apply_btn.setToolTip(
             "Copy the epicentre, the event time and a radius covering the "
             "location error into the Sentinel-2, PlanetScope, SAR and 3D tabs, "
@@ -518,62 +565,98 @@ class LandslideDock(QgsDockWidget):
         clear_btn.setToolTip("Forget the current detection.")
         clear_btn.clicked.connect(self._clear_detection)
         row = FlowRow()
-        for b in (read_btn, self.det_apply_btn, clear_btn):
-            row.addWidget(b)
+        row.addWidget(self.det_apply_btn)
+        row.addWidget(clear_btn)
         v.addWidget(row)
 
         self.det_summary = QLabel()
         self.det_summary.setWordWrap(True)
         self.det_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.det_summary)
-        self._render_detection()
-        box.setCollapsed(getattr(self, "detection", None) is not None)
+        self._read_detection()
+        box.setCollapsed(False)
         return box
 
-    def _read_detection(self):
-        """Parse the paste box and report exactly what was understood."""
-        from . import detection as _d
-        text = self.det_paste.toPlainText().strip()
-        if not text:
-            self._warn("Paste a detection record into the box first.")
-            return
-        det, warn = _d.parse(text)
-        if not det.is_locatable() and det.origin_utc is None:
-            self.detection = None
-            self._render_detection(
-                ["Nothing recognisable in that text — no coordinates and no time."])
-            return
-        self.detection = det
+    def _num_or_none(self, edit, scale=1.0):
+        """A line edit's contents as a float (times `scale`), or None if blank
+        or not a number — so a half-typed field never reaches the arithmetic."""
+        try:
+            t = edit.text().strip()
+            return float(t) * scale if t else None
+        except (ValueError, AttributeError):
+            return None
+
+    def _read_detection(self, *_):
+        """Rebuild the Detection from the fields, and echo it back."""
+        from .detection import Detection
+        lat = self._num_or_none(self.det_lat_edit)
+        lon = self._num_or_none(self.det_lon_edit)
+        warn = []
+        if lat is not None and not (-90.0 <= lat <= 90.0):
+            warn.append(f"Latitude {lat:g} is out of range."); lat = None
+        if lon is not None and not (-180.0 <= lon <= 180.0):
+            warn.append(f"Longitude {lon:g} is out of range."); lon = None
+        # The classic error, and in Alaska/Yukon it lands the AOI in Siberia
+        # without failing loudly anywhere.
+        if lat is not None and lon is not None and lon > 0 and lat > 50:
+            warn.append(f"Longitude {lon:+g} is POSITIVE (eastern hemisphere). "
+                        "Alaska and the Yukon are negative — check for a dropped "
+                        "minus sign.")
+        det = Detection(
+            event_id=self.det_id_edit.text().strip(),
+            origin_utc=self.det_time_edit.dateTime().toPyDateTime(),
+            lat=lat, lon=lon,
+            loc_error_km=(self.det_err_spin.value() or None),
+            vol_best_m3=self._num_or_none(self.det_vol_edit, 1e6),
+            vol_low_m3=self._num_or_none(self.det_vol_lo_edit, 1e6),
+            vol_high_m3=self._num_or_none(self.det_vol_hi_edit, 1e6))
+        if not det.event_id and det.origin_utc:
+            det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
+        self.detection = det if det.is_locatable() else None
         self._render_detection(warn)
-        self._append_log("Detection read: " + " | ".join(det.summary_lines()))
 
     def _clear_detection(self):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
+                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+            w.clear()
+        self.det_err_spin.setValue(0.0)
         self.detection = None
-        self.det_paste.clear()
         self._render_detection()
 
     def _render_detection(self, warn=None):
         """Echo the record back — above all the LOCAL time.
 
         A record shows 08:48 UTC and 23:48 the previous day in Alaska. An analyst
-        who types the local one into a field labelled 'Event time (UTC)' shifts the
-        pre/post boundary nine hours, which silently reclassifies a bracketing
-        Sentinel-1 scene from before the failure to after it. The change map then
-        compares two pre-event scenes, finds nothing, and gives no way to find out
-        why. So the conversion is stated, every time, not left to the reader."""
+        reading the local one off the figure and typing it into a field labelled
+        UTC shifts the pre/post boundary nine hours, which silently reclassifies
+        a bracketing Sentinel-1 scene from before the failure to after it. The
+        change map then compares two pre-event scenes, finds nothing, and gives
+        no way to find out why. So the conversion is stated, every time."""
         det = getattr(self, "detection", None)
         if det is None:
             self.det_summary.setText(
-                "<i>No detection loaded — the tabs use whatever you type into them.</i>")
+                "<i>Enter at least a latitude and longitude — the tabs otherwise "
+                "use whatever you type into them individually.</i>")
             self.det_summary.setStyleSheet("QLabel { color: palette(mid); }")
             if hasattr(self, "det_apply_btn"):
                 self.det_apply_btn.setEnabled(False)
+            for w in (warn or []):
+                self.det_summary.setText(
+                    self.det_summary.text() + f'<br><span style="color:#b3541e;">⚠ {w}</span>')
             return
-        lines = ["<b>Read:</b> " + det.summary_lines()[0]]
-        lines += det.summary_lines()[1:]
+        lines = ["<b>" + (det.event_id or "Detection") + "</b>"]
+        if det.origin_utc:
+            lines.append(f"{det.origin_utc:%Y-%m-%d %H:%M:%S} UTC   =   {det.local_str()}")
+        pos = f"{det.lat:.4f}, {det.lon:.4f}"
+        if det.loc_error_km:
+            pos += f"  ± {det.loc_error_km:g} km"
+        lines.append(pos)
+        v = det.vol_str()
+        if v:
+            lines.append(f"Seismic volume {v}")
         r = det.suggested_radius_km()
         lines.append(f"<b>Search radius suggested: {r:g} km</b>"
-                     + ("" if det.loc_error_km else " (no location error in the record)"))
+                     + ("" if det.loc_error_km else " (no location error entered)"))
         html = "<br>".join(lines)
         for w in (warn or []):
             html += f'<br><span style="color:#b3541e;">⚠ {w}</span>'
