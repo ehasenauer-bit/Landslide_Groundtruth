@@ -504,7 +504,23 @@ def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=18
     aoi = pc.aoi_from_disk(dest)
     if aoi:
         meta.update(lat=aoi["lat"], lon=aoi["lon"], bbox=aoi["bbox"])
-    pc.record(order_id, dest, bundle=_order_bundle,
+    # A re-download of an order ALREADY in the ledger (its clips were cleaned up, so
+    # they're re-fetched for free) must NOT overwrite how it was originally PLACED:
+    # radius_km (the requested AOI the cache-size gate checks), bundle (SR vs TOA),
+    # created_utc and source. `meta`/_order_bundle here describe the CURRENT
+    # recall/render context — a possibly narrower AOI or different mode — and writing
+    # them would corrupt the double-charge guard (record() replaces, not merges).
+    # Preserve the prior values; only backfill fields the old record lacked.
+    prev = next((r for r in pc.load() if r.get("order_id") == str(order_id)), None)
+    bundle, created_utc, source = _order_bundle, None, "order"
+    if prev is not None:
+        if prev.get("radius_km") is not None:
+            meta["radius_km"] = prev["radius_km"]
+        if prev.get("bundle") is not None:
+            bundle = prev["bundle"]
+        created_utc = prev.get("created_utc")
+        source = prev.get("source") or "order"
+    pc.record(order_id, dest, bundle=bundle, created_utc=created_utc, source=source,
               scene_ids=pc.scene_ids_on_disk(dest), **meta)
     return pairs
 
@@ -586,9 +602,12 @@ def _toa_from_dn(da, scene_path):
     """Analytic DN scene -> TOA reflectance: DN * per-band reflectanceCoefficient. `da`
     still carries rasterio's integer band coords 1..4 (= blue, green, red, nir)."""
     coeffs = _reflectance_coeffs(scene_path)
-    if len(coeffs) < int(da.sizes.get("band", 0)):
+    # Check that EVERY band we hold has a coefficient, not just the count: a metadata
+    # gap (e.g. bands {1,2,3,5} for data bands {1,2,3,4}) satisfies a count test yet
+    # KeyErrors on the lookup below. Membership catches that and gives the guidance.
+    if not all(int(b) in coeffs for b in da.band.values):
         raise IncompleteDownload(
-            f"{os.path.basename(scene_path)}: the scene metadata has no per-band "
+            f"{os.path.basename(scene_path)}: the scene metadata is missing a per-band "
             f"reflectanceCoefficient, so the DN ('analytic') product can't be converted "
             f"to TOA reflectance — re-order it, or use the SR bundle")
     factors = xr.DataArray([coeffs[int(b)] for b in da.band.values],
