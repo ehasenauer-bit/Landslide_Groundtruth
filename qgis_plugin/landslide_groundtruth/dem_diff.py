@@ -110,7 +110,13 @@ def valid_heights(arr):
 
 # ---------- vertical co-registration ----------
 def coregister_offset(diff, valid, iters=5, nsig=3.0):
-    """(offset_m, stable_px) — robust vertical bias between the two strips.
+    """(offset_m, stable_px, sigma_m) — robust vertical bias between two strips.
+
+    sigma_m is the scatter of the difference over the quasi-stable ground the
+    clipping converged on: the per-pixel vertical error of the Δh field. It was
+    already computed here to drive the clip and then thrown away, which left the
+    most direct volume estimate the plugin can make with no uncertainty at all,
+    and therefore unable to take part in any agreement test.
 
     Sigma-clipped median of the difference over valid pixels: start from all
     of them, then iteratively drop pixels beyond nsig·σ of the current median
@@ -122,7 +128,7 @@ def coregister_offset(diff, valid, iters=5, nsig=3.0):
     vals = diff[valid]
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
-        return 0.0, 0
+        return 0.0, 0, 0.0
     keep = vals
     clipped = False       # did any sigma-clip iteration actually remove outliers?
     thin = None           # the size a clip WOULD have produced when stopped for <100
@@ -144,7 +150,14 @@ def coregister_offset(diff, valid, iters=5, nsig=3.0):
     # count as stable_px (not the full unclipped size) so the tab's thin-stable-ground
     # warning fires instead of trusting a contaminated offset.
     stable = thin if (thin is not None and not clipped) else keep.size
-    return float(np.median(keep)), int(stable)
+    # Scatter of the SURVIVING (quasi-stable) pixels — the per-pixel vertical
+    # error. Robust (MAD-based), because a few unclipped outliers would inflate a
+    # plain std and quietly widen every volume error bar downstream.
+    sigma = (float(np.median(np.abs(keep - np.median(keep))) * 1.4826)
+             if keep.size else 0.0)
+    if not np.isfinite(sigma):
+        sigma = 0.0
+    return float(np.median(keep)), int(stable), sigma
 
 
 # ---------- GeoTIFF output ----------
@@ -293,9 +306,11 @@ def difference_dems(pre_sources, post_sources, bounds, epsg, res,
     post, _gt2, _proj2 = warp_to_grid(post_sources, bounds, epsg, res)
     valid = valid_heights(pre) & valid_heights(post)
     raw = np.where(valid, post - pre, np.nan)
-    offset, stable = coregister_offset(raw, valid) if coregister else (0.0, 0)
+    offset, stable, sigma = (coregister_offset(raw, valid) if coregister
+                             else (0.0, 0, 0.0))
     dh = np.where(valid, raw - offset, np.nan).astype(np.float32)
     stats = {"offset_m": float(offset), "stable_px": int(stable),
+             "sigma_dh_m": float(sigma),
              "valid_px": int(valid.sum()), "res_m": float(res),
              "epsg": int(epsg)}
     return dh, gt, proj, stats
@@ -332,8 +347,56 @@ def _polygon_mask(wkt, epsg, gt, shape):
     return m
 
 
+def stable_ground_stats(dh_source, outline_wkt, epsg, bounds, res,
+                        resample="bilinear", exclude_buffer_px=3):
+    """Residual bias and per-pixel noise of an IMPORTED Δh, from ground OUTSIDE
+    the outline. Returns {"offset_m", "sigma_m", "stable_px", "ok"}.
+
+    Why this exists, specifically for MOSART. MOSART reconstructs elevation
+    change from Sentinel-1 AMPLITUDE by a least-squares shape-from-shading
+    inversion (its `sfs` / `lsquares` modules), and the notebook writes
+    `demdefs[post] - demdefs[ref]` straight to GeoTIFF. An inversion of that kind
+    constrains the SHAPE of the change field far better than its absolute datum,
+    so the product carries a DC offset that nothing upstream removes — and volume
+    is LINEAR in that offset. Half a metre of residual bias over a 1 km² outline
+    integrates to 500,000 m³, which is a large fraction of a real event's whole
+    volume, reported as signal.
+
+    `difference_dems` already solves this for a pair it computed itself
+    (coregister_offset over the whole AOI). An imported Δh never went through
+    that path, so the same estimate is made here from the pixels around the
+    slide: sigma-clipped so the slide's own signal, snow and rivers fall out.
+
+    The outline is dilated by `exclude_buffer_px` before being excluded, because
+    the deposit usually runs past the digitized scar and would otherwise pull the
+    "stable" median toward the event.
+    """
+    dh, gt, _proj = warp_to_grid(dh_source, bounds, epsg, res, resample=resample)
+    inside = _polygon_mask(outline_wkt, epsg, gt, dh.shape)
+    if exclude_buffer_px > 0:
+        # cheap binary dilation without scipy: shift-and-OR in 8 directions
+        grown = inside.copy()
+        for _ in range(int(exclude_buffer_px)):
+            g = grown
+            grown = (g | np.roll(g, 1, 0) | np.roll(g, -1, 0)
+                     | np.roll(g, 1, 1) | np.roll(g, -1, 1))
+        inside = grown
+    outside = valid_heights(dh) & ~inside
+    n = int(outside.sum())
+    if n < 100:
+        # Too little surrounding ground to say anything. Explicitly NOT falling
+        # back to "offset 0, sigma 0": that would silently claim the product is
+        # unbiased and noiseless, which is the failure this function exists to
+        # stop.
+        return {"offset_m": 0.0, "sigma_m": 0.0, "stable_px": n, "ok": False}
+    offset, stable, sigma = coregister_offset(dh, outside)
+    return {"offset_m": float(offset), "sigma_m": float(sigma),
+            "stable_px": int(stable), "ok": True}
+
+
 def integrate_dh(dh_source, outline_wkt, epsg, bounds, res,
-                 sign_deposit_positive=True, offset=0.0, resample="bilinear"):
+                 sign_deposit_positive=True, offset=0.0, resample="bilinear",
+                 sigma_dh_m=0.0, outline_area_m2=None):
     """Integrate an elevation-change raster over an outline -> volumes (m³).
 
     `dh_source` is any GDAL-openable Δh raster in metres. It is warped onto the
@@ -370,8 +433,43 @@ def integrate_dh(dh_source, outline_wkt, epsg, bounds, res,
     n = int(vals.size)
     v_deposit = float(vals[vals > 0].sum() * px)
     v_erosion = float(vals[vals < 0].sum() * px)
+    covered = float(n * px)
+
+    # Volume uncertainty from the per-pixel vertical error. Two bounds, because
+    # which one applies depends on how the Δh was made and they differ by
+    # sqrt(N) — for a 1 km² outline at 10 m that is a factor of 10, so quoting
+    # the wrong one is not a detail:
+    #
+    #   correlated  σ_V = σ_h · A          a DC/long-wavelength bias. This is
+    #                                      the realistic case for MOSART, whose
+    #                                      shape-from-shading inversion produces
+    #                                      a smooth error field, not white noise.
+    #   random      σ_V = σ_h · px · √N    independent per-pixel noise.
+    #
+    # The correlated bound is reported as `v_sigma_m3` because it is the honest
+    # one for this plugin's inputs; the random bound is carried alongside so a
+    # caller with a genuinely uncorrelated product can use it instead.
+    sig = max(0.0, float(sigma_dh_m or 0.0))
+    v_sigma_corr = sig * covered
+    v_sigma_rand = sig * px * (n ** 0.5)
+
+    # How much of the outline the Δh actually covers. Only ZERO coverage used to
+    # be caught, so a layer overlapping 40% of the slide returned 40% of the
+    # volume with nothing said — indistinguishable from a small landslide.
+    coverage = None
+    if outline_area_m2:
+        try:
+            coverage = float(covered) / float(outline_area_m2)
+        except (TypeError, ZeroDivisionError):
+            coverage = None
+
     return {
         "v_net": float(vals.sum() * px),
+        "v_sigma_m3": float(v_sigma_corr),
+        "v_sigma_random_m3": float(v_sigma_rand),
+        "sigma_dh_m": sig,
+        "coverage_frac": coverage,
+        "offset_applied_m": float(offset),
         "v_deposit": v_deposit,
         "v_erosion": v_erosion,
         "covered_area_m2": float(n * px),
