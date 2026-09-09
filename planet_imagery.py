@@ -821,8 +821,10 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
 
     Shared by render_preview (orders it just created) and resume_preview (orders an
     earlier render placed but didn't finish waiting on). Returns
-    (comps, notes, pending): comps is {'pre': comp|None, 'post': comp|None}; pending
-    is {side: order_id} for orders that didn't finish but are worth coming back to —
+    (comps, notes, pending, products): comps is {'pre': comp|None, 'post': comp|None};
+    products is {side: 'sr'|'toa'|None} (the product the downloaded clips actually are,
+    from _pairs_toa) so the caller can refuse to difference an SR side against a TOA one;
+    pending is {side: order_id} for orders that didn't finish but are worth coming back to —
     still processing after the wait budget, or finished and downloading when the
     network cut out. Either way the order is already placed and paid for, so the
     caller persists the id and can hand it back here later WITHOUT re-ordering (no
@@ -838,11 +840,15 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
     event_id + AOI, which is what makes it recallable for free later
     (recall_preview) instead of ordered a second time."""
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}
     notes, pending = [], {}
     meta = dict(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
     for side, order_id in orders.items():
         try:
             pairs = _wait_download(pl, order_id, dict(meta, side=side))
+            # what this side actually is (DN/TOA vs SR), from the clips on disk — so a
+            # caller differencing pre against post can tell they're the same product.
+            products[side] = "toa" if _pairs_toa(pairs) else "sr"
             # mask_clouds=False: a visual detail preview should show every real pixel
             # (esp. bright snow UDM2 may misflag), not punch cloud-masked holes.
             comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
@@ -867,9 +873,18 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
                     f"the files that did arrive are kept — resume it (don't re-order) "
                     f"to pull the rest without spending quota again.")
             else:
+                # Unrecognised failure. The order was already PLACED AND PAID FOR,
+                # so always surface its id (and keep it in `pending` so recall can
+                # find it) — dropping it here would leave the user paying again for
+                # scenes they can't locate. Resuming a truly-failed order is a no-op,
+                # but a recoverable one (transient API/state error) then succeeds.
+                pending[side] = order_id
                 notes.append(
-                    f"{side}: order/download failed: {type(e).__name__}: {e}")
-    return comps, notes, pending
+                    f"{side}: order/download failed for order {order_id} "
+                    f"({type(e).__name__}: {e}). The order is placed in your Planet "
+                    f"account — try resuming it (don't re-order) before spending quota "
+                    f"again.")
+    return comps, notes, pending, products
 
 
 class _LazyClient:
@@ -973,6 +988,7 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
     """
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
     notes, reused = [], {}
     client = _LazyClient()
     recs = pc.find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
@@ -1003,6 +1019,7 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
             notes.append(note)
         if comp is not None:
             comps[side] = comp
+            products[side] = "toa" if rec.get("bundle") == TOA_BUNDLE else "sr"
             reused[side] = rec["order_id"]
             pc.stamp_footprint(rec["order_id"], event_id=event_id)
 
@@ -1013,7 +1030,7 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
             + f". The ledger lives in {pc.cache_root()}; 'Render detail' places the "
             f"first order, and every order after that is recallable for free.")
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending={}, reused=reused, available=available,
+                pending={}, reused=reused, available=available, product=products,
                 toa=any((picked.get(s) or {}).get("bundle") == TOA_BUNDLE
                         for s in ("pre", "post")),
                 scenes={s: list((picked.get(s) or {}).get("scene_ids") or [])
@@ -1051,6 +1068,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
     the other side load."""
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
     notes, reused, to_order = [], {}, {}
     client = _LazyClient()
     for side, ids in (("pre", pre_ids), ("post", post_ids)):
@@ -1070,6 +1088,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
             to_order[side] = ids
             continue
         comps[side] = comp
+        products[side] = "toa" if rec.get("bundle") == TOA_BUNDLE else "sr"
         reused[side] = rec["order_id"]
         pc.stamp_footprint(rec["order_id"], event_id=event_id)
 
@@ -1086,14 +1105,16 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
                 orders[side] = _create_order(pl, ids, aoi)
             except Exception as e:
                 notes.append(f"{side}: order create failed: {type(e).__name__}: {e}")
-        fresh, dl_notes, pending = _finish_orders(pl, orders, lat, lon, radius_km,
-                                                  epsg, event_id=event_id)
+        fresh, dl_notes, pending, fresh_products = _finish_orders(
+            pl, orders, lat, lon, radius_km, epsg, event_id=event_id)
         notes += dl_notes
         for side in ("pre", "post"):
             if fresh[side] is not None:
                 comps[side] = fresh[side]
+                products[side] = fresh_products[side]
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
                 pending=pending, reused=reused, toa=(_order_bundle == TOA_BUNDLE),
+                product=products,
                 scenes={"pre": list(pre_ids or []), "post": list(post_ids or [])})
 
 
@@ -1118,6 +1139,7 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
     None with a note rather than raising, so one downloaded side still re-tones."""
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
     notes, reused, toa = [], {}, False
     scenes = {"pre": [], "post": []}
     cached = pc.newest_by_side(pc.find(event_id=event_id, lat=lat, lon=lon,
@@ -1132,7 +1154,9 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
                 reused[side] = rec["order_id"]
         if not pairs:
             continue
-        toa = toa or _pairs_toa(pairs)   # DN clips on disk -> label this a TOA re-tone
+        side_toa = _pairs_toa(pairs)     # DN clips on disk -> this side came via the TOA path
+        toa = toa or side_toa            # label the whole re-tone TOA if either side is
+        products[side] = "toa" if side_toa else "sr"
         scenes[side] = _scene_ids(pairs)
         try:
             # mask_clouds=False mirrors _finish_orders: same pixels in, so only the
@@ -1152,7 +1176,7 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
                      f"'Render detail' once, or 'Recall order' if you've ordered it "
                      f"before.")
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending={}, reused=reused, toa=toa, scenes=scenes)
+                pending={}, reused=reused, toa=toa, product=products, scenes=scenes)
 
 
 def resume_preview(lat, lon, radius_km, orders, event_id=None):
@@ -1169,7 +1193,8 @@ def resume_preview(lat, lon, radius_km, orders, event_id=None):
     pl = _client()
     epsg = im._utm_epsg(lat, lon)
     orders = {s: o for s, o in (orders or {}).items() if o and s in ("pre", "post")}
-    comps, notes, pending = _finish_orders(pl, orders, lat, lon, radius_km, epsg,
-                                           event_id=event_id)
+    comps, notes, pending, products = _finish_orders(pl, orders, lat, lon, radius_km,
+                                                     epsg, event_id=event_id)
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending=pending, reused={}, toa=(_order_bundle == TOA_BUNDLE))
+                pending=pending, reused={}, toa=(_order_bundle == TOA_BUNDLE),
+                product=products)
