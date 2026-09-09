@@ -34,6 +34,7 @@ helpers it shared (dem_diff.warp / utm_bounds / write_gtiff) are reused above.
 import os
 import math
 import re
+import hashlib
 
 import numpy as np
 
@@ -1732,9 +1733,13 @@ class Viewer3DTab(QWidget):
             return None
         src_uri = src.source()
         safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in src.name())
+        # Disambiguate by SOURCE, not just display name: two different layers can
+        # sanitize to the same `safe` string and would otherwise share one cache
+        # file, so one layer would flip to the other's imagery.
+        uid = hashlib.sha1(src_uri.encode("utf-8", "surrogatepass")).hexdigest()[:8]
         crs = self._scene_crs()
         dtag = ((crs.authid() if crs else "") or "utm").replace(":", "_")
-        out_path = os.path.join(d, f"{safe}__{dtag}.3dcache.tif")
+        out_path = os.path.join(d, f"{safe}__{uid}__{dtag}.3dcache.tif")
         if not os.path.exists(out_path):
             self._log(f"flip cache: building {os.path.basename(out_path)} …")
             opts = dict(
@@ -2177,7 +2182,11 @@ class Viewer3DTab(QWidget):
             if a is None:
                 continue
             nod = band.GetNoDataValue()
-            valid |= (a != nod) if nod is not None else (a != 0)
+            # NaN-filled float overlays (dNDVI/dNDSI/SWIR): NaN != nod and NaN != 0
+            # both test True, so NaN would count as data and defeat the crop. Treat
+            # only FINITE non-nodata cells as valid (isfinite is all-True on ints).
+            finite = np.isfinite(a)
+            valid |= finite & ((a != nod) if nod is not None else (a != 0))
         gt = ds.GetGeoTransform()
         ds = None
         ys, xs = np.where(valid)
