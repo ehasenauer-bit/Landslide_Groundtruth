@@ -2457,8 +2457,28 @@ class VolumeTab(QWidget):
     # ---------- write-back ----------
     def _write_to_layer(self):
         if not self._rows:
-            self._append_log("Nothing to write — add a measurement first.")
+            self._notify("Nothing to write — measure a slide first.")
             return
+        # _selected_rows() falls back to EVERY row when nothing is clicked, which
+        # is the right default for Copy and Export CSV — they only read. This one
+        # writes attributes onto the outline features and COMMITS the edit, so
+        # doing that to a whole table because the user had not clicked a row is a
+        # data-loss trap. Ask first, and say how many.
+        explicit = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not explicit and len(self._rows) > 1:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            names = ", ".join(str(r.get("name") or "?") for r in self._rows[:4])
+            if len(self._rows) > 4:
+                names += f", … ({len(self._rows)} in total)"
+            ok = QMessageBox.question(
+                self, "Write to layer",
+                f"No rows are selected, so this will stamp attributes onto ALL "
+                f"{len(self._rows)} measured slides and commit the edit:\n\n"
+                f"{names}\n\nSelect rows first to write just those. Continue?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if ok != QMessageBox.Yes:
+                self._append_log("Write to layer cancelled.")
+                return
         project = QgsProject.instance()
         written = 0
         for r in self._selected_rows():
@@ -2472,9 +2492,12 @@ class VolumeTab(QWidget):
             if self._write_one(layer, row):
                 written += 1
         if written:
-            self._append_log(
+            self._notify(
                 f"Wrote attributes for {written} slide(s). The layer's edits "
                 "are committed — save the project/layer as usual.")
+        else:
+            self._notify("Nothing was written — see the log for why.",
+                         level=Qgis.Warning)
 
     def _write_one(self, layer, row):
         caps = layer.dataProvider().capabilities()

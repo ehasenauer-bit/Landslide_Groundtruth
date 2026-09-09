@@ -1896,11 +1896,19 @@ class Viewer3DTab(QWidget):
         except OSError as e:
             self._warn(f"Cannot create output dir: {e}")
             return
-        path = os.path.join(out_dir, "instant_flip_3d.html")
+        # Named for the event and never clobbered. Every export used to write
+        # the same instant_flip_3d.html, so a second event — or a second render
+        # of the same one with different layers — silently destroyed the figure
+        # you had already sent someone. These are ~600 KB self-contained pages
+        # that people keep and share, not scratch output.
+        path = _unique_path(out_dir, self._viewer_stem(), ".html")
         try:
-            with open(path, "w") as f:
+            # utf-8 explicitly: the HTML declares utf-8 and always contains non-ASCII
+            # glyphs (◀ ▶ ⬇ · —), so the platform default encoding (e.g. cp1252 on a
+            # non-UTF-8 locale) would raise UnicodeEncodeError and fail the export.
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(html)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             self._warn(f"Could not write the viewer: {e}")
             return
         self._log(f"Wrote {path} ({round(len(html)/1024)} KB). Opening in browser…")
@@ -1910,6 +1918,21 @@ class Viewer3DTab(QWidget):
         self.iface.messageBar().pushInfo(
             "3D viewer", "Opened the instant-flip 3D viewer in your browser — "
             "orbit freely; Space or the buttons flip before/after with no loading.")
+
+
+    def _viewer_stem(self):
+        """A filename stem naming the event, e.g. 'AK2026-0204_3d' — falling back
+        to the imagery dates, then to the old fixed name."""
+        det = getattr(self.dock, "detection", None)
+        if det is not None and getattr(det, "event_id", ""):
+            return _safe_name(det.event_id) + "_3d"
+        try:
+            when = self.dt_edit.dateTime().toString("yyyy-MM-dd")
+            if when:
+                return f"landslide_{when}_3d"
+        except (AttributeError, RuntimeError):
+            pass
+        return "instant_flip_3d"
 
     def _build_web_viewer(self, w3d, scene_crs, extent, before, after):
         """Render the two image sets + DEM to embedded assets; return the HTML."""
@@ -2431,3 +2454,24 @@ class Viewer3DTab(QWidget):
                 except Exception:
                     pass
         self.task = self._warp_task = None
+
+
+def _safe_name(text):
+    """Filesystem-safe stem: keep word characters, dot and dash; collapse rest."""
+    import re as _re
+    out = _re.sub(r"[^\w.\-]+", "_", str(text or "")).strip("._-")
+    return out or "landslide"
+
+
+def _unique_path(directory, stem, ext):
+    """`<stem><ext>`, or the first free `<stem> (2)<ext>` / `(3)` … in `directory`.
+
+    An export must never silently replace a figure the user may already have
+    shared; a new file beside the old one is always recoverable, an overwrite is
+    not."""
+    path = os.path.join(directory, stem + ext)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, f"{stem} ({n}){ext}")
+        n += 1
+    return path
