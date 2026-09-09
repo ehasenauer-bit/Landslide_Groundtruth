@@ -1006,6 +1006,19 @@ class Viewer3DTab(QWidget):
         dlon = radius / (111.32 * math.cos(math.radians(lat)))
         bounds = dem_diff.utm_bounds(lon - dlon, lat - dlat, lon + dlon, lat + dlat,
                                      epsg, res)
+        # Radius and resolution are independent controls, so nothing stopped a
+        # combination that cannot finish: 50 km at 2 m is a 50000x50000 grid,
+        # ~10 GB per float32 array. QGIS gives no warning for that, it just stops
+        # responding. Refuse it here and say which of the two knobs to turn.
+        from . import limits
+        ok, msg = limits.check_grid(bounds[2] - bounds[0], bounds[3] - bounds[1],
+                                    res, what="terrain grid")
+        if not ok:
+            self._warn(msg)
+            self._log(msg)
+            return
+        if msg:
+            self._log(msg)
         base_out = self.dock.out_edit.text().strip() or os.path.join(
             self.dock.project_edit.text().strip(), "out", "interactive")
         out_dir = os.path.join(base_out, "viewer3d")

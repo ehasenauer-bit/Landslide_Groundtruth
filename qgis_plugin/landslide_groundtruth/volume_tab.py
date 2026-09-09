@@ -1812,6 +1812,19 @@ class VolumeTab(QWidget):
                   bb.xMaximum() + margin, bb.yMaximum() + margin)
         coreg = self.ddem_coregister.isChecked()
 
+        # The outline size and the grid resolution are set independently, and
+        # this path holds several arrays of the same shape at once (pre, post,
+        # difference, mask). Refuse a grid that cannot finish rather than warping
+        # into a hang the user cannot tell from a slow run.
+        from . import limits
+        ok, lmsg = limits.check_grid(bounds[2] - bounds[0], bounds[3] - bounds[1],
+                                     res, what="difference grid")
+        if not ok:
+            self._notify(lmsg, level=Qgis.Warning)
+            return
+        if lmsg:
+            self._append_log(lmsg)
+
         self._append_log(
             f"Differencing “{post.name()}” − “{pre.name()}” over "
             f"{bb.width() + 2 * margin:.0f}×{bb.height() + 2 * margin:.0f} m @ "

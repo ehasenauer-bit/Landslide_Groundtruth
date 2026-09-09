@@ -131,29 +131,28 @@ def _first_date(dates):
     uniq = sorted({d for d in (dates or []) if d})
     return uniq[0] if uniq else ""
 
-# table row tints: pre = blue, post = green; explicit dark text so the pastel
-# backgrounds stay readable under both the light and dark QGIS themes.
-PRE_BG = QColor(220, 235, 252)
-POST_BG = QColor(224, 244, 226)
-ROW_FG = QColor(20, 20, 20)
+# Every colour the plugin uses now lives in theme.py, named for what it means
+# and with its contrast against both QGIS themes recorded. Re-exported here so
+# sar_tab and planet_tab keep importing them from .dock unchanged.
+from . import theme as _theme
+from .theme import (            # noqa: F401  (re-exported for the other tabs)
+    PRE_BG, POST_BG, ROW_FG, MUTED_FG,
+    CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
+    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX, CLOUD_SNOW_MARK,
+    STATUS_COLORS,
+    status_css, status_text, status_html, invalid_field_css,
+)
 
 # Colour of the number in the "Cloud" column, by cloud over the AOI box: green
 # clear / amber some / red heavy, grey when the per-pixel number couldn't be
 # measured (footprint misses the box, or the read failed and we fell back to the
 # whole-scene value shown with a ~). Darkened a touch from pure web hues so the
 # text stays legible on the pale pre/post row backgrounds.
-CLOUD_CLEAR = QColor(30, 138, 54)      # <= CLOUD_GREEN_MAX % of the AOI cloudy
-CLOUD_SOME = QColor(176, 122, 0)       # <= CLOUD_AMBER_MAX %
-CLOUD_HEAVY = QColor(197, 30, 42)      # above that
-CLOUD_UNKNOWN = QColor(130, 130, 130)  # no AOI-cloud measurement / snow-swamped
-CLOUD_GREEN_MAX = 10.0
-CLOUD_AMBER_MAX = 40.0
 # Above this share of the AOI classed snow/ice, the SCL/QA_PIXEL cloud test can't
 # be trusted: over bright glaciers the classifier routinely bins cloud tops AS
 # snow (SCL 11 / QA bit 5), which the AOI-cloud count excludes, so a cloud-choked
 # scene can read a falsely-clear few percent. We keep the number but mark it (❄,
 # greyed) so it reads as "judge by the thumbnail", not a confident clear signal.
-CLOUD_SNOW_MARK = "❄"             # snowflake prefix on a snow-swamped cell
 SNOW_UNRELIABLE_PCT = 50.0
 
 # Planetary Computer's public asset-signing endpoint. Given a blob href it
@@ -432,9 +431,9 @@ class LandslideDock(QgsDockWidget):
     def _refresh_env_status(self, *_):
         """Repaint the status line, and clear any red border once a path is fixed."""
         ok, msg = self._env_ok()
-        self.env_status.setText(("✓ " if ok else "⚠ ") + msg)
-        self.env_status.setStyleSheet(
-            "QLabel { color: %s; }" % ("#1b7f37" if ok else "#b3541e"))
+        kind = "success" if ok else "warn"
+        self.env_status.setText(status_text(kind, msg))
+        self.env_status.setStyleSheet(status_css(kind))
         for edit in (self.python_edit, self.project_edit, self.out_edit):
             if edit.styleSheet() and edit.text().strip():
                 edit.setStyleSheet("")
@@ -459,7 +458,7 @@ class LandslideDock(QgsDockWidget):
                 target = (self.python_edit
                           if not os.path.exists(self.python_edit.text().strip() or "\0")
                           else self.project_edit)
-            target.setStyleSheet("QLineEdit { border: 1px solid #c0392b; }")
+            target.setStyleSheet(invalid_field_css())
             target.setFocus()
         except (AttributeError, RuntimeError):
             pass
@@ -643,7 +642,7 @@ class LandslideDock(QgsDockWidget):
                 self.det_apply_btn.setEnabled(False)
             for w in (warn or []):
                 self.det_summary.setText(
-                    self.det_summary.text() + f'<br><span style="color:#b3541e;">⚠ {w}</span>')
+                    self.det_summary.text() + "<br>" + status_html("warn", w))
             return
         lines = ["<b>" + (det.event_id or "Detection") + "</b>"]
         if det.origin_utc:
@@ -660,7 +659,7 @@ class LandslideDock(QgsDockWidget):
                      + ("" if det.loc_error_km else " (no location error entered)"))
         html = "<br>".join(lines)
         for w in (warn or []):
-            html += f'<br><span style="color:#b3541e;">⚠ {w}</span>'
+            html += "<br>" + status_html("warn", w)
         self.det_summary.setText(html)
         self.det_summary.setStyleSheet("")
         if hasattr(self, "det_apply_btn"):
@@ -815,7 +814,7 @@ class LandslideDock(QgsDockWidget):
         # than after a download that returns nothing.
         self.window_warn = QLabel()
         self.window_warn.setWordWrap(True)
-        self.window_warn.setStyleSheet("QLabel { color: #b3541e; }")
+        self.window_warn.setStyleSheet(status_css("warn"))
         self.window_warn.setVisible(False)
         form.addRow("", self.window_warn)
         self.dt_edit.dateTimeChanged.connect(self._check_event_window)
@@ -2782,14 +2781,7 @@ class LandslideDock(QgsDockWidget):
     # Break values are EXPLICIT rather than derived from `lo`, so the dBright
     # ramp stays exactly the one that is already in use and validated (-0.30 /
     # -0.15 / -0.05); deriving them shifted its last stop to -0.051.
-    CHANGE_RAMPS = {
-        "dbright": ((-0.30, -0.15, -0.05), ["#08306b", "#2171b5", "#6baed6"],
-                    "brightness drop (dark debris on bright snow)"),
-        "dndsi": ((-0.50, -0.25, -0.10), ["#3f007d", "#6a51a3", "#9e9ac8"],
-                  "snow-index drop (debris is not snow)"),
-        "dndvi": ((-0.60, -0.30, -0.10), ["#7f2704", "#d94801", "#fd8d3c"],
-                  "vegetation loss"),
-    }
+    CHANGE_RAMPS = _theme.CHANGE_RAMPS     # see theme.py; used by _style_change
 
     def _style_dbright(self, lyr):
         """Backwards-compatible shim — see _style_change."""
