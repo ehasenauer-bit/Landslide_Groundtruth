@@ -30,7 +30,7 @@ import random
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QUrl, QByteArray, QSize, QTimer
-from qgis.PyQt.QtGui import QPixmap, QIcon, QBrush, QPainter
+from qgis.PyQt.QtGui import QPixmap, QIcon, QBrush
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
@@ -41,7 +41,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
     QgsNetworkAccessManager, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsField, QgsFeature, QgsFillSymbol,
+    QgsField, QgsFeature, QgsFillSymbol, QgsGeometry, QgsPointXY,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import QVariant
@@ -127,7 +127,7 @@ QSlider::handle:horizontal {{
 """
 
 # table row tints, matching the Sentinel tab (pre = blue, post = green), plus the
-# AOI-cloud dot thresholds/colours so the "Cloud" column reads identically to the
+# AOI-cloud thresholds/colours so the "Cloud" number reads identically to the
 # Sentinel/Landsat tab's (dock.py is the single source of truth for both).
 from .dock import (  # noqa: E402
     PRE_BG, POST_BG, ROW_FG, MUTED_FG,
@@ -629,9 +629,9 @@ class PlanetTab(QWidget):
         tl.setContentsMargins(0, 0, 0, 0)
         tl.addWidget(self._section(
             "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)"))
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1125,32 +1125,87 @@ class PlanetTab(QWidget):
             return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
         return sorted(cands, key=lambda c: gap(c) + cw * cloud(c))
 
-    def _cloud_dot(self, pct):
-        """A small filled circle for the 'Cloud' column, coloured by AOI cloud %.
+    def _cloud_color(self, pct):
+        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
 
         green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when pct
-        is None. Matches the Sentinel/Landsat tab's dot exactly (same thresholds and
+        is None. Matches the Sentinel/Landsat tab exactly (same thresholds and
         colours, imported from dock.py) — replicated here rather than shared because
-        dock's version is a method bound to its own widget. For PlanetScope the dot
+        dock's version is a method bound to its own widget. For PlanetScope the number
         is grey on every preview row: the AOI cloud number needs a UDM2 order and so
-        isn't measured in the free dry-run (see planet_imagery.search_event)."""
+        isn't measured in the free dry-run (see planet_imagery.search_event), so the
+        cell shows the whole-scene value with a ~ and must not read as clear/cloudy."""
         if pct is None:
-            color = CLOUD_UNKNOWN
-        elif pct <= CLOUD_GREEN_MAX:
-            color = CLOUD_CLEAR
-        elif pct <= CLOUD_AMBER_MAX:
-            color = CLOUD_SOME
-        else:
-            color = CLOUD_HEAVY
-        pix = QPixmap(12, 12)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(color))
-        p.drawEllipse(2, 2, 8, 8)
-        p.end()
-        return QIcon(pix)
+            return CLOUD_UNKNOWN
+        if pct <= CLOUD_GREEN_MAX:
+            return CLOUD_CLEAR
+        if pct <= CLOUD_AMBER_MAX:
+            return CLOUD_SOME
+        return CLOUD_HEAVY
+
+    # ---------- AOI coverage for the "Coverage" column ----------
+    # Mirrors dock.py's Sentinel/Landsat coverage helpers, but measured against
+    # THIS tab's own search AOI: the Planet tab has its own lat/lon/radius inputs
+    # (self._search_result), which need not match the Sentinel tab's, so dock's
+    # AOI-bound versions can't be reused directly. The stateless GeoJSON→geometry
+    # parser (dock._qgs_geom) is shared.
+    def _aoi_bbox(self):
+        """(minx, miny, maxx, maxy) of the Planet search AOI box in lon/lat, or None.
+
+        Same lat/lon + radius_km box the search covers (see _aoi); degree
+        conversion matches dock._aoi_bbox so both tabs measure coverage alike."""
+        aoi = self._aoi()
+        if aoi is None:
+            return None
+        lat, lon, radius = aoi
+        dlat = radius / 111.32
+        dlon = radius / (111.32 * math.cos(math.radians(lat)))
+        return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
+    def _event_point(self):
+        """QgsPointXY of the event epicentre from this tab's last search, or None."""
+        aoi = self._aoi()
+        if aoi is None:
+            return None
+        lat, lon, _ = aoi
+        return QgsPointXY(lon, lat)
+
+    def _covers_event(self, c):
+        """True if the scene footprint actually contains the event point.
+
+        A strip can clip a corner of the AOI box yet leave the epicentre in a
+        nodata gap. Absent/unparseable geometry or point -> True (never flag a
+        scene we cannot test). Mirrors dock._covers_event."""
+        pt = self._event_point()
+        if pt is None:
+            return True
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if g is None or g.isEmpty():
+            return True
+        return g.contains(pt)
+
+    def _aoi_coverage(self, c):
+        """Fraction (0..1) of the AOI box the scene footprint fills.
+
+        area(footprint ∩ AOI) / area(AOI), taken in the AOI's own lon/lat space so
+        the box's degree anisotropy cancels. 0.0 when geometry or AOI is missing.
+        Mirrors dock._aoi_coverage against this tab's Planet AOI."""
+        bbox = self._aoi_bbox()
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
 
     def _fill_table(self, result):
         pre = result.get("pre", [])
@@ -1178,8 +1233,14 @@ class PlanetTab(QWidget):
                 cloud = f"~{scene_cloud:.0f}%"
             else:
                 cloud = ""
+            # "Coverage" = how much of your AOI box this scene's footprint fills
+            # (area of overlap ÷ AOI area), same client-side geometry measure as the
+            # Sentinel/Landsat tab. A PlanetScope strip often clips the box, so this
+            # flags the scenes with the fewest nodata gaps over your area.
+            cover_frac = self._aoi_coverage(c)
+            cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else "  "
-            cells = [marker + side, date, gap, cloud, cid or ""]
+            cells = [marker + side, date, gap, cloud, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_top:
                 bg = bg.darker(112)
@@ -1192,11 +1253,11 @@ class PlanetTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
-            # colour dot + tooltip on the Cloud cell (col 3): green/amber/red by AOI
-            # cloud, grey when only the whole-scene value is known — which, for the
-            # free PlanetScope preview, is always (UDM2 is order-gated).
+            # colour the Cloud number itself + tooltip (col 3): green/amber/red by
+            # AOI cloud, grey when only the whole-scene value is known — which, for
+            # the free PlanetScope preview, is always (UDM2 is order-gated).
             cloud_item = self.table.item(r, 3)
-            cloud_item.setIcon(self._cloud_dot(aoi_cloud))
+            cloud_item.setForeground(QBrush(self._cloud_color(aoi_cloud)))
             if aoi_cloud is not None:
                 tip = (f"Cloud, shadow & haze over your AOI: {aoi_cloud:.0f}%.\n"
                        f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
@@ -1205,12 +1266,19 @@ class PlanetTab(QWidget):
                     tip += f"\nWhole scene (cloud_cover): {scene_cloud:.0f}%."
             else:
                 tip = ("Whole-scene cloud cover (Planet cloud_cover), shown with a ~ "
-                       "and a grey dot. Cloud over just your AOI comes from the UDM2 "
+                       "and a grey number. Cloud over just your AOI comes from the UDM2 "
                        "mask, which Planet delivers only with a paid order — so it "
                        "isn't measured in this free preview.\n")
                 tip += (f"Whole scene (cloud_cover): {scene_cloud:.0f}%."
                         if scene_cloud is not None else "No cloud metric reported.")
             cloud_item.setToolTip(tip)
+            # "Coverage" tooltip (col 4): AOI-box fill %, with a flag when the strip
+            # clips the box but leaves the epicentre itself in a nodata gap.
+            covers_pt = self._covers_event(c)
+            self.table.item(r, 4).setToolTip(
+                f"Footprint covers {cover}% of your AOI box — how much of the search "
+                f"area has pixels, NOT how cloudy it is (that's the Cloud column)."
+                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1953,8 +2021,11 @@ class PlanetTab(QWidget):
         self._last_render = dict(lat=lat, lon=lon, radius=radius, when=when,
                                  event_id=None)
         # the recalled scenes need not be in the current search result, so let
-        # _on_detail_done fall back to generic before/after labels
+        # _on_detail_done fall back to generic before/after labels — and clear the
+        # stale date-pair too, or the recalled imagery is filed under the PREVIOUS
+        # render's dates (its layer group name / folder come from _detail_dates).
         self._detail_labels = None
+        self._detail_dates = None
         self._append_log(
             "Recall: loading PlanetScope scenes already ordered for this event"
             + (f" (order {picked[1][:12]})" if picked else "")
@@ -2312,13 +2383,25 @@ class PlanetTab(QWidget):
 
     # ---------- misc ----------
     def _aoi(self):
-        """(lat, lon, radius_km) from the last search result, or None."""
+        """(lat, lon, radius_km) from the last search result, else the last render's
+        AOI, else None.
+
+        Recall / re-tone / resume set _last_render but run no search, so without the
+        fallback _search_result is None and the imagery just loaded can't be framed
+        (_zoom_to_aoi / 'Zoom to scene' would do nothing)."""
         result = self._search_result or {}
         try:
             return (float(result.get("lat")), float(result.get("lon")),
                     float(result.get("params", {}).get("radius_km")))
         except (TypeError, ValueError):
-            return None
+            pass
+        last = self._last_render
+        if last:
+            try:
+                return (float(last["lat"]), float(last["lon"]), float(last["radius"]))
+            except (TypeError, ValueError, KeyError):
+                pass
+        return None
 
     def _zoom_to_preview(self):
         """Frame the previewed scene footprint(s); fall back to the AOI box."""
