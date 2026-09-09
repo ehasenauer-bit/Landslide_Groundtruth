@@ -147,11 +147,16 @@ VERDICT_CSV_FIELDS = [
     ("vol_seismic_m3", "vol_seismic_m3"),
     ("vol_seismic_lo_m3", "vol_seismic_lo_m3"),
     ("vol_seismic_hi_m3", "vol_seismic_hi_m3"),
-    ("vol_larsen_m3", "v_best"),
-    ("vol_larsen_lo_m3", "v_low"),
-    ("vol_larsen_hi_m3", "v_high"),
+    # NOT mapped straight to v_best: under the "ddem" fit v_best holds the NET
+    # volume, so reading it as the area-scaling estimate would compare a seismic
+    # inversion against a near-zero difference of two large numbers. volume_tab
+    # splits it per row by the row's own `fit` before writing.
+    ("vol_larsen_m3", "vol_larsen_m3"),
+    ("vol_larsen_lo_m3", "vol_larsen_lo_m3"),
+    ("vol_larsen_hi_m3", "vol_larsen_hi_m3"),
     ("vol_dh_erosion_m3", "v_erosion"),
     ("vol_dh_deposit_m3", "v_deposit"),
+    ("vol_dh_net_m3", "vol_dh_net_m3"),
     ("implied_depth_m", "implied_depth"),
     # the comparison
     ("D_larsen_log10", "d_larsen"),

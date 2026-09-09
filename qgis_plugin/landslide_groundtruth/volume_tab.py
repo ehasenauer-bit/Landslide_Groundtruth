@@ -2258,12 +2258,30 @@ class VolumeTab(QWidget):
         self._refresh_verdict()
         return box
 
-    def _latest_row(self):
-        """The most recently measured slide, or {} — what the cross-check uses."""
+    def _latest_row(self, fit=None):
+        """The most recent measured row, optionally restricted by fit family.
+
+        The Fit combo makes area scaling and ∫Δh MUTUALLY EXCLUSIVE per Measure,
+        so no single row ever holds both volumes: under "ddem" v_best is the NET
+        change, not a Larsen estimate. Reading v_best blindly would therefore
+        compare a seismic inversion against a near-zero difference of two large
+        numbers and label it "area scaling". So the cross-check reaches back for
+        the most recent row of EACH kind instead — which is also what lets the
+        three-way comparison work at all across two separate Measure runs.
+
+        fit=None  -> the most recent row, whatever it was
+        fit="area"-> the most recent area-scaling row (scar / total)
+        fit="ddem"-> the most recent elevation-change row
+        """
         try:
-            return self._rows[-1] if self._rows else {}
-        except (AttributeError, IndexError):
+            rows = list(self._rows or [])
+        except AttributeError:
             return {}
+        if fit == "area":
+            rows = [r for r in rows if r.get("fit") not in ("ddem",)]
+        elif fit == "ddem":
+            rows = [r for r in rows if r.get("fit") == "ddem"]
+        return rows[-1] if rows else {}
 
     def _scar_centroid(self):
         """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
@@ -2315,16 +2333,22 @@ class VolumeTab(QWidget):
         row["analyst"] = self.analyst_edit.text().strip()
         row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
                                if row["verdict"] else "")
-        last = self._latest_row()
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
         rec = V.reconcile(
             seismic=(det.vol_best_m3 if det is not None else None),
-            larsen=_num(last.get("v_best")),
-            dh_erosion=_num(last.get("v_erosion")))
+            larsen=_num(area.get("v_best")),
+            dh_erosion=_num(dh.get("v_erosion")))
+        # split v_best by the row's own fit so the columns never lie
+        row["vol_larsen_m3"] = area.get("v_best")
+        row["vol_larsen_lo_m3"] = area.get("v_low")
+        row["vol_larsen_hi_m3"] = area.get("v_high")
+        row["vol_dh_net_m3"] = dh.get("v_best")
         row["d_larsen"] = "" if rec["d_larsen"] is None else f"{rec['d_larsen']:.3f}"
         row["d_dh"] = "" if rec["d_dh"] is None else f"{rec['d_dh']:.3f}"
         row["agreement"] = rec["agreement"]
-        depth = V.implied_depth_m(_num(last.get("v_best")),
-                                  _num(last.get("a_conv")) or _num(last.get("src_best")))
+        depth = V.implied_depth_m(_num(area.get("v_best")),
+                                  _num(area.get("a_conv")) or _num(area.get("src_best")))
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
         lat, lon = self._scar_centroid()
         row["scar_lat"] = "" if lat is None else f"{lat:.6f}"
@@ -2345,9 +2369,11 @@ class VolumeTab(QWidget):
         never put them next to each other."""
         from . import verdict as V
         det = getattr(self.dock, "detection", None)
-        last = self._latest_row()
-        larsen = _num(last.get("v_best"))
-        eros = _num(last.get("v_erosion"))
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
+        larsen = _num(area.get("v_best"))
+        eros = _num(dh.get("v_erosion"))
+        net = _num(dh.get("v_best"))
         seis = det.vol_best_m3 if det is not None else None
         lines = []
         if seis is not None:
@@ -2358,15 +2384,24 @@ class VolumeTab(QWidget):
         if larsen:
             lines.append(f"Area scaling&nbsp;&nbsp;{larsen / 1e6:.3g} ×10⁶ m³"
                          f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
-                         f"({last.get('material') or 'material?'}, ×2 typical spread)</span>")
+                         f"({area.get('material') or 'material?'}, ×2 typical spread)</span>")
         if eros:
-            lines.append(f"∫Δh erosion&nbsp;&nbsp;{eros / 1e6:.3g} ×10⁶ m³")
+            extra = ("" if net is None else
+                     f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
+                     f"(net {net / 1e6:+.2g})</span>")
+            lines.append(f"∫Δh erosion&nbsp;&nbsp;{eros / 1e6:.3g} ×10⁶ m³{extra}")
         if larsen:
             depth = V.implied_depth_m(
-                larsen, _num(last.get("a_conv")) or _num(last.get("src_best")))
+                larsen, _num(area.get("a_conv")) or _num(area.get("src_best")))
             if depth:
                 lines.append('<span style="color:palette(mid);">'
                              f"implied mean depth {depth:.1f} m</span>")
+        if larsen and not eros and dh:
+            pass
+        elif not larsen and eros:
+            lines.append('<span style="color:palette(mid);">Area scaling not run '
+                         "for this slide — the Fit combo does one at a time; "
+                         "measure again under a Source-scar fit to compare.</span>")
         rec = V.reconcile(seismic=seis, larsen=larsen, dh_erosion=eros)
         colour = {"agree": "#1b7f37", "marginal": "#b3541e",
                   "disagree": "#c0392b"}.get(rec["agreement"], "")
