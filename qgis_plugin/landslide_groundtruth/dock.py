@@ -52,14 +52,20 @@ SOURCES = [
 # exists to answer, and the layers that do answer it were an opt-in the user had
 # to know to look for.
 #
-# swir_falsecolor is in the default set because these events are rock and ice
-# avalanches: its own tooltip calls it "the highest-contrast combo for spotting
-# debris on a glacier". dndvi is kept even though vegetation change is near
-# meaningless above the treeline, because it is the one that works for the
-# vegetated coastal events and it costs nothing extra to render.
+# The set is the three CHANGE rasters plus one context image. dNDSI and
+# dBright are the validated detectors — fusion_core scores an event as
+# mean(dNDSI, dBright, SAR), benchmarked across Iliamna/Hubbard/Valdez, and
+# carries a floor for each (0.10, 0.05). dNDVI is the weakest of the three
+# above the treeline but is the one that works for the vegetated coastal
+# events, and it is a rendering of bands already fetched.
+#
+# swir_falsecolor is deliberately NOT here despite being excellent to look at.
+# It is a single-date 3-band composite, not a change detector: Fusion never
+# reads it, it cannot be differenced, and PlanetScope — the primary source —
+# has no SWIR bands at all, so defaulting it on does nothing on a Planet run.
+# It stays one tick away for interpreting a scene by eye.
 DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
-DEFAULT_SCENES = ("highlight_natural", "swir_falsecolor",
-                  "dndvi", "dndsi", "dbright")
+DEFAULT_SCENES = ("highlight_natural", "dndvi", "dndsi", "dbright")
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
