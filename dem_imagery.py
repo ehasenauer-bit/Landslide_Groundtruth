@@ -170,7 +170,7 @@ def _candidate(item, event_time):
     dem = _asset_href(item, "dem")
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=pct("pgc:cloud_area_percent"),
-                gap_days=abs((d - event_time).days) if d else None,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=COLLECTIONS.get(item.collection_id, "DEM strip"),
                 thumb_url=None, cog_url=dem,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None,

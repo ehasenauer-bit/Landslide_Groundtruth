@@ -30,7 +30,12 @@ def parse_dt(value):
     for cut in (len(s), 19, 16, 10):          # full, seconds, minutes, date-only
         try:
             d = dt.datetime.fromisoformat(s[:cut])
-            return d.replace(tzinfo=None) if d.tzinfo else d
+            # A non-UTC offset must be CONVERTED to UTC, not just dropped:
+            # .replace(tzinfo=None) alone would keep the local wall-clock time and
+            # mis-time the scene by the offset (breaking the pre-/post-event gaps).
+            if d.tzinfo is not None:
+                d = d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            return d
         except ValueError:
             continue
     return None

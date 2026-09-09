@@ -468,7 +468,7 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
                 aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
                 aoi_snow_pct=round(aoi_snow_pct, 1) if aoi_snow_pct is not None else None,
                 aoi_cloud_method=aoi_cloud_method,
-                gap_days=abs((d - event_time).days) if d else None,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=source, thumb_url=thumb, cog_url=cog,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
 

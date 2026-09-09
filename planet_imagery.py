@@ -268,7 +268,7 @@ def _candidate(item, event_time, aoi_cloud_pct=None):
     return dict(id=item["id"], date=d.isoformat(),
                 cloud_pct=round(cloud * 100, 1) if cloud is not None else None,
                 aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
-                gap_days=abs((d - event_time).days),
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0),
                 source="PlanetScope", thumb_url=thumb,
                 geometry=geom, bbox=_geom_bbox(geom))
 

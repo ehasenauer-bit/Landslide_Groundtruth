@@ -119,7 +119,7 @@ def _candidate(item, event_time):
     props = item.properties
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=None,
-                gap_days=abs((d - event_time).days) if d else None,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source="Sentinel-1", thumb_url=thumb, cog_url=None,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None,
                 orbit_state=props.get("sat:orbit_state"),
