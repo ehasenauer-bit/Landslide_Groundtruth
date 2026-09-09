@@ -1,6 +1,7 @@
 """The dock panel: location pick, date, pre/post sliders, source preference, run."""
 import base64
 import json
+import re
 import math
 import os
 import platform
@@ -25,7 +26,8 @@ from qgis.core import (
     QgsMarkerSymbol,
     QgsSingleBandPseudoColorRenderer, QgsColorRampShader, QgsRasterShader,
 )
-from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
+from qgis.gui import (QgsDockWidget, QgsCollapsibleGroupBox,
+                      QgsMapToolEmitPoint)
 
 from .task import PipelineTask
 from . import layer_group as lg
@@ -603,14 +605,40 @@ class LandslideDock(QgsDockWidget):
         # --- event inputs ---
         form = QFormLayout()
         self.lat_edit = QLineEdit()
-        self.lat_edit.setPlaceholderText("e.g. 59.906992")
-        self.lat_edit.setValidator(QDoubleValidator(-90.0, 90.0, 8))
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
+        # No QDoubleValidator here on purpose. It rejected any string containing a
+        # separator, and Qt drops a rejected paste SILENTLY — so pasting a
+        # "lat, lon" pair from a detection record, a spreadsheet or a map site
+        # left the box empty with no message at all. The pair is split below and
+        # the value is validated in _collect, which can explain what is wrong.
+        self.lat_edit.textChanged.connect(self._split_pasted_pair)
         form.addRow("Latitude", self.lat_edit)
 
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
-        self.lon_edit.setValidator(QDoubleValidator(-180.0, 180.0, 8))
         form.addRow("Longitude", self.lon_edit)
+
+        # Pick the epicentre off the canvas. The docs have promised this since
+        # the first release (metadata.txt, both READMEs) and it was never
+        # implemented; typing was the only way in. It matters more than it
+        # sounds: the detection's location error is often 10-20 km, so the
+        # analyst hunts around inside that disc rather than knowing one point,
+        # and README.md calls clicking the defence against the classic dropped
+        # minus sign on longitude.
+        self.pick_btn = QPushButton("Pick on map")
+        self.pick_btn.setCheckable(True)
+        self.pick_btn.setToolTip(
+            "Click a point on the QGIS map to fill in the latitude and "
+            "longitude. Click this button again (or press Esc) to stop.")
+        self.pick_btn.toggled.connect(self._toggle_pick)
+        centre_btn = QPushButton("Use map centre")
+        centre_btn.setToolTip(
+            "Fill in the latitude and longitude of the middle of the map view.")
+        centre_btn.clicked.connect(self._use_map_centre)
+        pick_row = FlowRow()
+        pick_row.addWidget(self.pick_btn)
+        pick_row.addWidget(centre_btn)
+        form.addRow("", pick_row)
 
         self.radius_spin = QDoubleSpinBox()
         self.radius_spin.setRange(0.2, 50.0)
@@ -1056,6 +1084,107 @@ class LandslideDock(QgsDockWidget):
         p = QFileDialog.getExistingDirectory(self, "Select output dir")
         if p:
             self.out_edit.setText(p)
+
+    # ---------- picking the epicentre off the canvas ----------
+    def _split_pasted_pair(self, text):
+        """Accept a whole 'lat, lon' pair pasted into the Latitude box.
+
+        Coordinates travel as a pair everywhere the analyst gets them, so
+        requiring two separate paste actions (and silently discarding the pair if
+        they try one) is friction for nothing."""
+        t = (text or "").strip()
+        if not t or not any(c in t for c in ",;\t"):
+            return
+        parts = [p for p in re.split(r"[,;\t]+", t) if p.strip()]
+        if len(parts) != 2:
+            return
+        try:
+            lat, lon = float(parts[0].strip()), float(parts[1].strip())
+        except ValueError:
+            return
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return
+        self.lat_edit.blockSignals(True)          # avoid re-entering on setText
+        self.lat_edit.setText(f"{lat:.6f}")
+        self.lat_edit.blockSignals(False)
+        self.lon_edit.setText(f"{lon:.6f}")
+        self._append_log(f"Pasted coordinate pair split: {lat:.6f}, {lon:.6f}")
+
+
+    def _wgs84(self, point, src_crs):
+        """A canvas point in EPSG:4326, or None if it cannot be transformed."""
+        dst = QgsCoordinateReferenceSystem("EPSG:4326")
+        if not src_crs.isValid():
+            return None
+        if src_crs == dst:
+            return point
+        try:
+            tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance())
+            return tr.transform(point)
+        except Exception:
+            return None
+
+    def _toggle_pick(self, on):
+        """Arm/disarm the click-to-pick map tool."""
+        if not on:
+            self._end_pick()
+            return
+        try:
+            self._pick_tool = QgsMapToolEmitPoint(self.canvas)
+            self._pick_tool.canvasClicked.connect(self._on_map_pick)
+            self._prev_tool = self.canvas.mapTool()
+            self.canvas.setMapTool(self._pick_tool)
+            self.iface.messageBar().pushInfo(
+                "Landslide", "Click the event location on the map.")
+        except Exception as e:
+            self._append_log(f"Could not start the map picker: {e}")
+            self.pick_btn.setChecked(False)
+
+    def _end_pick(self):
+        """Put the previous map tool back, so the canvas is not left armed."""
+        tool = getattr(self, "_pick_tool", None)
+        if tool is None:
+            return
+        try:
+            tool.canvasClicked.disconnect(self._on_map_pick)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            prev = getattr(self, "_prev_tool", None)
+            if prev is not None:
+                self.canvas.setMapTool(prev)
+            else:
+                self.canvas.unsetMapTool(tool)
+        except (AttributeError, RuntimeError):
+            pass
+        self._pick_tool = None
+        self._prev_tool = None
+
+    def _on_map_pick(self, point, button):
+        """Write a clicked canvas point into the latitude/longitude fields."""
+        p = self._wgs84(point, self.canvas.mapSettings().destinationCrs())
+        if p is None:
+            self._warn("Could not convert that map position to latitude/longitude. "
+                       "Check the project's coordinate system.")
+            return
+        self._set_lat_lon(p.y(), p.x())
+        self.pick_btn.setChecked(False)          # one click, one point
+
+    def _use_map_centre(self):
+        p = self._wgs84(self.canvas.center(),
+                        self.canvas.mapSettings().destinationCrs())
+        if p is None:
+            self._warn("Could not convert the map centre to latitude/longitude. "
+                       "Check the project's coordinate system.")
+            return
+        self._set_lat_lon(p.y(), p.x())
+
+    def _set_lat_lon(self, lat, lon):
+        self.lat_edit.setText(f"{lat:.6f}")
+        self.lon_edit.setText(f"{lon:.6f}")
+        self._append_log(f"Location picked: {lat:.6f}, {lon:.6f}")
+        self.iface.messageBar().pushInfo(
+            "Landslide", f"Location set to {lat:.5f}, {lon:.5f}")
 
     # ---------- run / search ----------
     def _collect(self):
@@ -2569,6 +2698,12 @@ class LandslideDock(QgsDockWidget):
         self.settings.setValue("landslide/out", self.out_edit.text().strip())
 
     def teardown(self):
+        # hand the canvas back its previous tool: leaving the picker armed after
+        # the plugin is unloaded would swallow the user's next click
+        try:
+            self._end_pick()
+        except (AttributeError, RuntimeError):
+            pass
         # drop the project-signal connections first: they'd otherwise fire into
         # deleted widgets when the plugin is unloaded/reloaded with QGIS open
         state = getattr(self, "project_state", None)
