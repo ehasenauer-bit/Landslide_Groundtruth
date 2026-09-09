@@ -1404,6 +1404,20 @@ class PlanetTab(QWidget):
     def _preview_on_map(self):
         self._render_picks(self._preview_picks())
 
+    def _abort_tile_replies(self):
+        """Abort in-flight tile-hash POSTs and forget them. blockSignals stops their
+        finished() from decrementing the NEXT preview's _tile_pending — a row
+        double-click can re-enter _render_picks mid-request, and a late finish would
+        otherwise drive the counter negative and re-zoom/re-enable on a stale batch."""
+        for reply in list(self._tile_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tile_replies = []
+
     def _render_picks(self, picks):
         key = self._api_key()
         if not key:
@@ -1427,6 +1441,8 @@ class PlanetTab(QWidget):
         self._preview_group = lg.name("Planet", lg.date_pair(pre, post),
                                       lg.radius_tag(self.radius_spin.value()), "preview")
         self._clear_preview_layers()
+        self._abort_tile_replies()   # a re-entry (row double-click mid-request) must
+                                     # not share this batch's _tile_pending counter
         self._preview_extent = None
         self._append_log(f"Preview on map: requesting tiles for {len(picks)} scene(s)…")
         self.map_preview_btn.setEnabled(False)

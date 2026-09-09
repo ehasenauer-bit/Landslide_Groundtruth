@@ -268,6 +268,7 @@ class LandslideDock(QgsDockWidget):
         self._tif_pending = 0        # AOI downloads still outstanding this preview
         self._tif_fallbacks = []     # (label, cog_url) whose AOI render failed
         self._preview_added = []     # raster layers added by the current preview
+        self._preview_tmpfiles = []  # temp GeoTIFFs backing those layers (to unlink)
         self._preview_failed = []    # labels that failed to sign/load
         self._gdal_tuned = False     # GDAL /vsicurl options set once
         self._gallery_replies = []   # in-flight quicklook-thumbnail requests
@@ -2351,6 +2352,33 @@ class LandslideDock(QgsDockWidget):
         for lyr in self._preview_added:
             lg.remove_layer(lyr)
         self._preview_added = []
+        # Delete the temp GeoTIFFs those layers were reading — AFTER the layers are
+        # removed so the file handle is released — so previews don't leak temp files.
+        for path in self._preview_tmpfiles:
+            self._unlink_quiet(path)
+        self._preview_tmpfiles = []
+
+    @staticmethod
+    def _unlink_quiet(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _abort_tif_replies(self):
+        """Abort any in-flight AOI-GeoTIFF downloads and forget them. blockSignals
+        stops their finished() from decrementing THIS preview's _tif_pending — a
+        double-click can re-enter _render_picks while a batch is still downloading,
+        and a late finish would otherwise drive the counter negative and fire
+        _after_tif_downloads early/twice."""
+        for reply in list(self._tif_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tif_replies = []
 
     def _preview_row_on_map(self, item):
         """Double-click a row -> preview exactly that one scene (ignores ticks)."""
@@ -2410,6 +2438,8 @@ class LandslideDock(QgsDockWidget):
             self._warn(msg)
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
+        self._abort_tif_replies()      # a re-entry (double-click) must not share this
+                                       # batch's counter with a stale in-flight one
         self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
@@ -2495,9 +2525,12 @@ class LandslideDock(QgsDockWidget):
                 if lyr.isValid():
                     lg.add_to_group(lyr, "Imagery preview")
                     self._preview_added.append(lyr)
+                    self._preview_tmpfiles.append(path)   # unlinked on next clear
                     self._append_log(
                         f"  loaded {label} (AOI render, Highlight Optimized Natural Color)")
                     added = True
+                else:
+                    self._unlink_quiet(path)   # no layer owns it; don't leak the file
             except OSError:
                 pass
         if not added:

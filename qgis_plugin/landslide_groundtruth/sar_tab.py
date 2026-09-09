@@ -1456,6 +1456,21 @@ class SarTab(QWidget):
             return
         self._render_scenes(picks, mode="run")
 
+    def _abort_tif_replies(self):
+        """Abort in-flight AOI-amplitude downloads and forget them. blockSignals
+        stops their finished() from decrementing the NEXT render's _tif_pending —
+        a row double-click can re-enter _render_scenes mid-download, and a late
+        finish would otherwise drive the counter negative and fire the completion
+        handler early/twice, mixing layers from two operations."""
+        for reply in list(self._tif_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tif_replies = []
+
     def _render_scenes(self, picks, mode="preview"):
         """Download + load the AOI amplitude render for each (label, candidate).
 
@@ -1503,6 +1518,8 @@ class SarTab(QWidget):
             f"({self._render_desc()} grayscale, {res_txt}{smooth})…")
         self.map_preview_btn.setEnabled(False)
         self.run_btn.setEnabled(False)
+        self._abort_tif_replies()    # a re-entry (row double-click while a render is
+                                     # in flight) must not share this batch's counter
         self._preview_failed = []
         self._tif_pending = len(picks)
         for label, c in picks:
