@@ -11,6 +11,7 @@ the dock in response to taskCompleted/taskTerminated, which fire on the GUI thre
 """
 import json
 import os
+import re
 import subprocess
 
 from qgis.PyQt.QtCore import pyqtSignal
@@ -76,3 +77,83 @@ class PipelineTask(QgsTask):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
         super().cancel()
+# --------------------------------------------------------------------------
+# Reading a failure back to the user
+# --------------------------------------------------------------------------
+# The child's stdout and stderr are merged and streamed to the tab's log, so
+# when a run dies the real cause is almost always already on screen — the
+# problem was never that the information was missing, it was that nothing said
+# "look at the log", and nothing translated the traceback into an action.
+#
+# FAILURE_HINTS maps a signature in that output to a sentence naming the fix.
+# Ordered most-specific first; the first match wins.
+# Matched as REGEXES, not substrings. A bare "401" is not safe to look for: every
+# PlanetScope scene acquired on 1 April is called 20240401_..., and "found 1401
+# scenes" would otherwise report that the server rejected your credentials. HTTP
+# codes are therefore only recognised next to HTTP-ish context.
+# Ordered most-specific first; the first match wins.
+FAILURE_HINTS = [
+    # A Python that cannot even bootstrap. Modern CPython does not print
+    # "Failed to import encodings module" any more — it prints
+    # "init_fs_encoding: failed to get the Python codec of the filesystem
+    # encoding" followed by "ModuleNotFoundError: No module named 'encodings'",
+    # so match all three. Must stay ahead of the generic ModuleNotFoundError
+    # rule below, which would otherwise claim the imagery tools are missing when
+    # the interpreter never started at all.
+    (r"Failed to import encodings module|init_fs_encoding"
+     r"|No module named '?encodings'?",
+     "The Python you chose in Environment cannot start at all. It is probably "
+     "not the python inside the project's venv folder — pick venv/bin/python3 "
+     "(macOS/Linux) or venv\\Scripts\\python.exe (Windows)."),
+    (r"ModuleNotFoundError",
+     "The Python you chose is missing the imagery tools. Point Environment at "
+     "the python inside the project's venv folder, or re-run "
+     "'pip install -r requirements.txt' in that venv."),
+    (r"No module named",
+     "The Python you chose is missing a package the pipeline needs. Re-run "
+     "'pip install -r requirements.txt' in that venv."),
+    (r"MemoryError|Unable to allocate|_ArrayMemoryError",
+     "The run ran out of memory. Reduce the search radius and try again."),
+    (r"No space left on device|Errno 28",
+     "The disk holding the output folder is full."),
+    (r"(?:HTTP\D{0,3}401\b|\b401\s+(?:Client\s+Error|Unauthorized))",
+     "The server rejected the credentials. Check the login for that imagery "
+     "source."),
+    (r"(?:HTTP\D{0,3}403\b|\b403\s+(?:Client\s+Error|Forbidden))",
+     "The server refused access. Check the login and your quota for that "
+     "imagery source."),
+    (r"(?:HTTP\D{0,3}429\b|\b429\s+(?:Client\s+Error|Too\s+Many))",
+     "The imagery server is rate-limiting this account. Wait a minute and try "
+     "again."),
+    (r"(?:HTTP\D{0,3}5\d\d\b|\b5\d\d\s+Server\s+Error)",
+     "The imagery server had an internal error. That is on their side — try "
+     "again shortly."),
+    (r"SSLError|CERTIFICATE_VERIFY_FAILED",
+     "The secure connection to the imagery server failed. Check your network, "
+     "then try again."),
+    (r"ConnectionError|Failed to establish a new connection|NewConnectionError",
+     "Could not reach the imagery server. Check your network connection and "
+     "try again."),
+    (r"Read timed out|ReadTimeout|ConnectTimeout",
+     "The imagery server stopped responding. Try again — the search is free."),
+    (r"CPLE_OpenFailed|Cannot open|unable to open",
+     "A data file could not be opened — see the log for which one."),
+    (r"Traceback \(most recent call last\)",
+     "The imagery tools stopped with an error. The last lines of the log say "
+     "where."),
+]
+
+_HINT_RE = [(re.compile(pat, re.I), hint) for pat, hint in FAILURE_HINTS]
+
+
+def failure_hint(text):
+    """A plain-language next step for a failed run, or '' if nothing is recognised.
+
+    `text` is the tail of the run log. Returns one sentence to put in front of
+    the user; the log itself stays available for the detail."""
+    if not text:
+        return ""
+    for rx, hint in _HINT_RE:
+        if rx.search(text):
+            return hint
+    return ""

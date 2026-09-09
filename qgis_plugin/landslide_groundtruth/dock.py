@@ -220,6 +220,8 @@ class LandslideDock(QgsDockWidget):
         self.task = None
         self.settings = QgsSettings()
         self.detection = None        # the seismic record; see detection.py
+        from collections import deque
+        self._log_tail = deque(maxlen=80)   # for report_failure
         self._ed_reply = None        # in-flight Earthdata credential-check request
         self._preview_reply = None   # in-flight thumbnail request (if any)
         self._preview_pix = None     # last loaded preview, kept for rescaling
@@ -1265,7 +1267,7 @@ class LandslideDock(QgsDockWidget):
         result = getattr(self.task, "result", None)
         self.task = None
         if not result:
-            self._append_log("Search finished with no result.")
+            self.report_failure("The scene search did not finish.")
             return
         self._search_result = result
         self._fill_table(result)
@@ -2401,11 +2403,12 @@ class LandslideDock(QgsDockWidget):
         result = getattr(self.task, "result", None)
         self.task = None
         if not result:
-            self._append_log("Run finished with no result.")
+            self.report_failure("The imagery run did not finish.")
             return
         status = result.get("status")
         if status == "error":
-            self._warn(f"Pipeline error: {result.get('error')}")
+            self.report_failure("The imagery tools reported an error.",
+                                str(result.get("error") or ""))
             return
         if status == "no_imagery":
             self._warn("No usable imagery found for that location/date/window.")
@@ -2515,6 +2518,46 @@ class LandslideDock(QgsDockWidget):
     # ---------- helpers ----------
     def _append_log(self, line):
         self.log.appendPlainText(line)
+        # Keep the tail in memory too. The child's stdout and stderr are merged
+        # into this widget, so when a run dies the cause is already here — what
+        # was missing was anything that read it back to the user.
+        try:
+            self._log_tail.append(line)
+        except AttributeError:
+            from collections import deque
+            self._log_tail = deque(maxlen=80)
+            self._log_tail.append(line)
+
+    def _log_tail_text(self, n=25):
+        try:
+            return "\n".join(list(self._log_tail)[-n:])
+        except AttributeError:
+            return ""
+
+    def report_failure(self, what, extra=""):
+        """Turn a dead-end into something the user can act on.
+
+        Replaces the pattern of writing one line to a log nobody was told to
+        look at and letting the progress bar simply vanish: names what failed,
+        adds a next step when the log matches a known cause (task.failure_hint),
+        and scrolls the log to the end so the traceback is on screen."""
+        from .task import failure_hint
+        tail = self._log_tail_text()
+        hint = failure_hint(tail)
+        msg = what
+        if extra:
+            msg += " " + extra
+        if hint:
+            msg += " " + hint
+        else:
+            msg += " See the Run log below for what it printed."
+        self._warn(msg)
+        try:
+            self.log.verticalScrollBar().setValue(
+                self.log.verticalScrollBar().maximum())
+        except (AttributeError, RuntimeError):
+            pass
+        return msg
 
     def _warn(self, text):
         self.iface.messageBar().pushWarning("Landslide", text.replace("\n", " "))
