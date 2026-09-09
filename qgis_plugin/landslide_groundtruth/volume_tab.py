@@ -195,6 +195,12 @@ CSV_FIELDS = [
     ("volume_high_m3", "v_high"),
     # ∫Δh fit only: the erosion/deposition split and the change-field stats.
     ("volume_erosion_m3", "v_erosion"), ("volume_deposition_m3", "v_deposit"),
+    ("volume_net_m3", "v_net"),
+    # what the ∫Δh volume is actually worth: the per-pixel vertical noise, the
+    # volume error that follows from it, the residual bias taken off before
+    # integrating, and how much of the outline the Δh really covered.
+    ("dh_sigma_m", "sigma_dh"), ("dh_volume_sigma_m3", "v_sigma"),
+    ("dh_bias_removed_m", "dh_offset"), ("dh_coverage_frac", "dh_coverage"),
     ("dh_covered_area_m2", "covered_area"), ("dh_mean_m", "mean_dh"),
     ("dh_max_rise_m", "max_rise"), ("dh_max_drop_m", "max_drop"),
     ("dh_grid_res_m", "ddem_res"), ("dh_raster", "ddem_name"),
@@ -1687,21 +1693,59 @@ class VolumeTab(QWidget):
         bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
                   bb.xMaximum() + margin, bb.yMaximum() + margin)
         sign_pos = self.ddem_deposit_positive.isChecked()
+        area = self._measure_area(outline_feat.geometry(), outline_layer.crs())
+        # Calibrate against the ground AROUND the slide before integrating.
+        # A MOSART Δh is a shape-from-shading inversion: it constrains the shape
+        # of the change field far better than its absolute datum, and volume is
+        # LINEAR in the residual offset — half a metre over a 1 km² outline is
+        # 500,000 m³ of pure artefact reported as signal. The same pass gives the
+        # per-pixel noise, which is the only reason this estimate can carry an
+        # error bar at all. A wider box than the outline, so there IS surrounding
+        # ground to measure.
+        cal_pad = max(4.0 * res, 0.5 * max(bb.width(), bb.height()))
+        cal_bounds = (bb.xMinimum() - cal_pad, bb.yMinimum() - cal_pad,
+                      bb.xMaximum() + cal_pad, bb.yMaximum() + cal_pad)
+        try:
+            cal = dem_diff.stable_ground_stats(
+                dh_layer.source(), geom_utm.asWkt(), epsg, cal_bounds, res)
+        except Exception as e:
+            self._append_log(f"Stable-ground check failed ({e}); "
+                             "integrating without a bias correction.")
+            cal = {"offset_m": 0.0, "sigma_m": 0.0, "stable_px": 0, "ok": False}
+        dh_offset = float(cal["offset_m"]) if cal.get("ok") else 0.0
+        if cal.get("ok"):
+            self._append_log(
+                f"Stable ground around the slide: bias {cal['offset_m']:+.3f} m, "
+                f"noise {cal['sigma_m']:.3f} m ({cal['stable_px']:,} px). "
+                f"The bias is removed before integrating.")
+        else:
+            self._append_log(
+                "Not enough ground outside the outline to check the Δh for a "
+                "residual bias — the volume assumes it is unbiased, and carries "
+                "no uncertainty.")
         try:
             r = dem_diff.integrate_dh(
                 dh_layer.source(), geom_utm.asWkt(), epsg, bounds, res,
-                sign_deposit_positive=sign_pos)
+                sign_deposit_positive=sign_pos,
+                offset=dh_offset, sigma_dh_m=cal.get("sigma_m", 0.0),
+                outline_area_m2=area)
         except Exception as e:
             self._append_log(
                 f"Could not integrate “{dh_layer.name()}” over the outline: {e}")
             return
+        cover = r.get("coverage_frac")
+        if cover is not None and cover < 0.90 and r["pixel_count"]:
+            self._notify(
+                f"The elevation-change layer covers only {cover:.0%} of your "
+                f"outline, so this volume is roughly {cover:.0%} of the real "
+                f"one. Check the Δh layer's extent and nodata before using it.",
+                level=Qgis.Warning)
         if r["pixel_count"] == 0:
             self._append_log(
                 f"“{dh_layer.name()}” has no valid Δh pixels inside the outline "
                 "— does it cover this slide? Check its extent and nodata.")
             return
 
-        area = self._measure_area(outline_feat.geometry(), outline_layer.crs())
         material, material_label = self._material(), self.material_combo.currentText()
         fit_label = self.fit_combo.currentText()
         calc = (f"∫Δh · {res:g} m grid · "
@@ -1718,8 +1762,22 @@ class VolumeTab(QWidget):
             # (covered) area is carried separately in covered_area.
             "a_total": area if conv_role == "total" else None,
             "src_best": None, "src_low": None, "src_high": None,
-            "v_best": r["v_net"], "v_low": None, "v_high": None,
-            "v_erosion": r["v_erosion"], "v_deposit": r["v_deposit"],
+            # |erosion|, NOT the net. For an outline that correctly spans scar
+            # AND deposit — which is what this fit asks for — the net is a small
+            # residual of two large opposing numbers and tends to zero as the
+            # delineation improves: 2.00 Mm³ eroded against 1.99 Mm³ deposited
+            # reports 12,000 m³. A seismic inversion estimates the MOBILIZED
+            # volume, which is the erosion side.
+            "v_best": abs(r["v_erosion"]),
+            "v_low": (abs(r["v_erosion"]) - r.get("v_sigma_m3", 0.0)
+                      if r.get("v_sigma_m3") else None),
+            "v_high": (abs(r["v_erosion"]) + r.get("v_sigma_m3", 0.0)
+                       if r.get("v_sigma_m3") else None),
+            "v_net": r["v_net"],
+            "v_erosion": abs(r["v_erosion"]), "v_deposit": r["v_deposit"],
+            "sigma_dh": r.get("sigma_dh_m"), "v_sigma": r.get("v_sigma_m3"),
+            "dh_offset": r.get("offset_applied_m"),
+            "dh_coverage": cover,
             "covered_area": r["covered_area_m2"],
             "mean_dh": r["mean_dh_m"], "max_rise": r["max_rise_m"],
             "max_drop": r["max_drop_m"],
@@ -1750,9 +1808,10 @@ class VolumeTab(QWidget):
         self._append_log(
             f"∫Δh over {conv_role} “{outline_layer.name()}” "
             f"({r['covered_area_m2'] / 1e6:.3f} km² covered, "
-            f"{r['pixel_count']:,} px @ {res:g} m): net {_fmt(r['v_net'])} m³ = "
-            f"deposition {_fmt(r['v_deposit'])} + erosion {_fmt(r['v_erosion'])} "
-            f"m³. Mean Δh {r['mean_dh_m']:+.2f} m (drop {r['max_drop_m']:+.1f}, "
+            f"{r['pixel_count']:,} px @ {res:g} m): "
+            f"eroded {_fmt(abs(r['v_erosion']))} m³, deposited "
+            f"{_fmt(r['v_deposit'])} m³, net {_fmt(r['v_net'])} m³. "
+            f"Mean Δh {r['mean_dh_m']:+.2f} m (drop {r['max_drop_m']:+.1f}, "
             f"rise {r['max_rise_m']:+.1f}). Δh from “{dh_layer.name()}”; {calc}.")
         if conv_role == "source":
             self._append_log(
@@ -2009,11 +2068,26 @@ class VolumeTab(QWidget):
             self.area_range_out.setText(
                 f"mean Δh {c['mean_dh']:+.2f} m   ·   max drop "
                 f"{c['max_drop']:+.1f} m   ·   max rise {c['max_rise']:+.1f} m")
-            self.vol_best_out.setText(
-                f"net {_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
-            self.vol_range_out.setText(
-                f"erosion {_fmt(c['v_erosion'])} m³   ·   deposition "
-                f"{_fmt(c['v_deposit'])} m³")
+            # The headline is the MOBILIZED volume (|erosion|) — the quantity a
+            # seismic inversion estimates — not the net, which tends to zero as
+            # the delineation improves and once printed 12,000 m³ for a 2 Mm³
+            # slide. 3 significant figures: the ∫Δh error bar is decimetres of
+            # vertical times a whole scar, so 4 decimal places of Mm³ was
+            # precision theatre.
+            sig = c.get("v_sigma")
+            head = f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.3g} Mm³) eroded"
+            if sig:
+                head += f"   ± {_fmt(sig)} m³"
+            self.vol_best_out.setText(head)
+            bits = [f"deposited {_fmt(c['v_deposit'])} m³",
+                    f"net {_fmt(c.get('v_net'))} m³"]
+            if c.get("sigma_dh") is not None:
+                bits.append(f"Δh noise {c['sigma_dh']:.2f} m")
+            if c.get("dh_offset"):
+                bits.append(f"bias removed {c['dh_offset']:+.2f} m")
+            if c.get("dh_coverage") is not None:
+                bits.append(f"{c['dh_coverage']:.0%} of the outline covered")
+            self.vol_range_out.setText("   ·   ".join(bits))
             self.calc_out.setText(c["calc"])
         else:
             self.source_out.setText(

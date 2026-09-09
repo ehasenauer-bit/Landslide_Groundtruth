@@ -27,8 +27,9 @@ det=DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6, loc_error_km=17.
 s.dock.detection=det
 
 print("=== THE BUG: a ∫Δh measure only ===")
-print("   (v_best there is NET = +0.02 Mm3, erosion = 1.1 Mm3)")
-s._rows=[{"name":"S1","fit":"ddem","v_best":2.0e4,"v_erosion":1.1e6,"v_deposit":1.08e6}]
+print("   (rows now carry v_best=|erosion|, v_net separately)")
+s._rows=[{"name":"S1","fit":"ddem","v_best":1.1e6,"v_net":2.0e4,
+          "v_erosion":1.1e6,"v_deposit":1.08e6}]
 rec=s._refresh_verdict()
 txt=s.verdict_summary.text()
 print("  ", txt.replace("<br>","\n   ").replace("&nbsp;"," "))
@@ -46,7 +47,8 @@ assert rec["d_dh"] is None and rec["agreement"]=="agree"
 print("\n=== BOTH fits run, as two separate Measures ===")
 s._rows=[{"name":"S1","fit":"scar","material":"bedrock","v_best":1.3e6,
           "v_low":0.7e6,"v_high":2.4e6,"a_conv":4.2e5,"src_best":4.2e5},
-         {"name":"S1","fit":"ddem","v_best":2.0e4,"v_erosion":1.1e6,"v_deposit":1.08e6}]
+         {"name":"S1","fit":"ddem","v_best":1.1e6,"v_net":2.0e4,
+          "v_erosion":1.1e6,"v_deposit":1.08e6}]
 rec=s._refresh_verdict()
 print("  ", s.verdict_summary.text().replace("<br>","\n   ").replace("&nbsp;"," "))
 assert rec["d_larsen"] is not None and rec["d_dh"] is not None, "three-way must work"
@@ -63,4 +65,15 @@ assert row["vol_larsen_m3"]!=row["vol_dh_net_m3"], "must never share a column"
 assert abs(float(row["implied_depth"])-3.10)<0.01
 hdrs=[h for h,_ in VT.CSV_FIELDS]; assert len(hdrs)==len(set(hdrs))
 print("   columns:",len(VT.CSV_FIELDS),"| larsen and dh-net are separate: OK")
+print("\n=== 7. THE SIGN TRAP: dem_diff returns erosion NEGATIVE ===")
+print("   volume_tab must store abs(); a negative would make d_log10 return None")
+print("   and the dh side would vanish from the cross-check with no warning.")
+from landslide_groundtruth import verdict as V
+assert V.d_log10(-1.1e6, 1.3e6) is None, "a negative volume must not compare"
+assert V.d_log10(1.1e6, 1.3e6) is not None
+src=open(os.path.join(PLUG,"volume_tab.py")).read()
+assert '"v_erosion": abs(r["v_erosion"])' in src, "the row must store |erosion|"
+assert '"v_best": abs(r["v_erosion"])' in src, "v_best must be |erosion|, not the net"
+print("   volume_tab stores abs(erosion) for both v_best and v_erosion: OK")
+
 print("\nFIT-AWARENESS FIX VERIFIED")
