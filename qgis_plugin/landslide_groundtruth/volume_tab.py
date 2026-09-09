@@ -1504,7 +1504,7 @@ class VolumeTab(QWidget):
             return
 
         if conv_role == "source" and total_feat is not None:
-            self._warn_if_total_excludes_source(total_feat, best_layer)
+            self._warn_if_total_excludes_source(total_feat, total_layer, best_layer)
 
         used = [f"{conv_role} “{conv_layer.name()}” → volume"]
         for label, area, layer in (("total", a_total, total_layer),
@@ -1586,7 +1586,7 @@ class VolumeTab(QWidget):
                 "Range is the published fit uncertainty — one total outline "
                 "carries no area uncertainty of its own.")
 
-    def _warn_if_total_excludes_source(self, total_feat, best_layer):
+    def _warn_if_total_excludes_source(self, total_feat, total_layer, best_layer):
         """The total outline should contain the source scar. If it doesn't, the
         two are probably from different slides, or the Total area layer is
         pointing at the wrong outline. Flagged, not blocked: a source mapped from
@@ -1598,7 +1598,17 @@ class VolumeTab(QWidget):
             if not measured:
                 return
             total = total_feat.geometry()
-            if not total.contains(measured[0][1].geometry()):
+            src_geom = QgsGeometry(measured[0][1].geometry())   # copy before transform
+            # The two layers are matched by NAME and can carry DIFFERENT CRSs (e.g.
+            # total in EPSG:4326 degrees, source in UTM metres); contains() across
+            # mismatched CRSs is meaningless, so reproject the source into the total
+            # layer's CRS first.
+            if (total_layer is not None and best_layer is not None
+                    and total_layer.crs() != best_layer.crs()):
+                xform = QgsCoordinateTransform(best_layer.crs(), total_layer.crs(),
+                                               QgsProject.instance())
+                src_geom.transform(xform)
+            if not total.contains(src_geom):
                 self._append_log(
                     f"Note: the source outline in “{best_layer.name()}” is not "
                     "fully inside the total outline. Check both belong to the "
@@ -1751,6 +1761,21 @@ class VolumeTab(QWidget):
                 "capture the whole affected area.")
 
     def _difference_dems(self):
+        """Re-entry guard around the actual run: the impl calls processEvents()
+        (to flush the 'differencing…' log), which can dispatch a SECOND queued
+        click of this same button into a nested, concurrent run. Disable the
+        button and gate on a flag so the second click is ignored."""
+        if getattr(self, "_diffing", False):
+            return
+        self._diffing = True
+        self.diff_btn.setEnabled(False)
+        try:
+            self._difference_dems_impl()
+        finally:
+            self._diffing = False
+            self.diff_btn.setEnabled(True)
+
+    def _difference_dems_impl(self):
         """Warp a pre/post DEM pair to one metric grid, co-register, subtract,
         write the Δh as a GeoTIFF and load it — selected for the ∫Δh fit.
 
