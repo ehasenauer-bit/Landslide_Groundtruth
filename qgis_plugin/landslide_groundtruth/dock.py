@@ -46,7 +46,20 @@ SOURCES = [
 # Keys must match review_package.SCENE_KEYS. Only HONC (highlight_natural) is
 # ticked by default — the one layer wanted on nearly every run — so a Run stays
 # light; tick more products before running to download the rest.
-DEFAULT_SCENE = "highlight_natural"
+# What a run downloads unless the user says otherwise. It used to be
+# highlight_natural ALONE — one attractive picture and not a single piece of
+# change evidence, so the default run could not answer the question the plugin
+# exists to answer, and the layers that do answer it were an opt-in the user had
+# to know to look for.
+#
+# swir_falsecolor is in the default set because these events are rock and ice
+# avalanches: its own tooltip calls it "the highest-contrast combo for spotting
+# debris on a glacier". dndvi is kept even though vegetation change is near
+# meaningless above the treeline, because it is the one that works for the
+# vegetated coastal events and it costs nothing extra to render.
+DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
+DEFAULT_SCENES = ("highlight_natural", "swir_falsecolor",
+                  "dndvi", "dndsi", "dbright")
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
@@ -680,6 +693,34 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Days after", self._slider_row(self.post_slider, self.post_lbl))
         self._update_day_labels()
 
+        # run_single.py has accepted --seasonal since the beginning and the README
+        # calls it the fix for a winter event, but nothing in the UI could set it:
+        # the flag was reachable only from the command line. For a February event
+        # at 60 N the "before" window is dark and snow-covered, and the honest
+        # comparison is against the PREVIOUS SUMMER, not against three weeks
+        # earlier.
+        self.seasonal_check = QCheckBox(
+            "Winter event — compare against last summer instead")
+        self.seasonal_check.setToolTip(
+            "For an event in the dark, snow-covered months, use the previous "
+            "summer as the 'before' imagery so snow cover does not swamp the "
+            "change signal. Ticked automatically when the event date falls "
+            "between October and March; you can override it.")
+        self.seasonal_check.setChecked(False)
+        form.addRow("", self.seasonal_check)
+
+        # Warn as soon as the date makes the run impossible or pointless, rather
+        # than after a download that returns nothing.
+        self.window_warn = QLabel()
+        self.window_warn.setWordWrap(True)
+        self.window_warn.setStyleSheet("QLabel { color: #b3541e; }")
+        self.window_warn.setVisible(False)
+        form.addRow("", self.window_warn)
+        self.dt_edit.dateTimeChanged.connect(self._check_event_window)
+        for sl in (self.pre_slider, self.post_slider):
+            sl.valueChanged.connect(self._check_event_window)
+        self._check_event_window()
+
         self.source_combo = QComboBox()
         for label, value in SOURCES:
             self.source_combo.addItem(label, value)
@@ -732,7 +773,7 @@ class LandslideDock(QgsDockWidget):
         self.scene_checks = {}
         for key, label, tip in SCENES:
             cb = QCheckBox(label)
-            cb.setChecked(key == DEFAULT_SCENE)   # only HONC on by default
+            cb.setChecked(key in DEFAULT_SCENES)
             cb.setToolTip(tip)
             self.scene_checks[key] = cb
             sbox.addWidget(cb)
@@ -1085,6 +1126,46 @@ class LandslideDock(QgsDockWidget):
         if p:
             self.out_edit.setText(p)
 
+    def _check_event_window(self, *_):
+        """Flag a date/window that cannot return imagery, before anything is run.
+
+        Two cases actually bite. The event time defaults to NOW, so an untouched
+        form asks for imagery from the future and comes back empty with no
+        explanation. And a winter event at these latitudes needs the seasonal
+        comparison, which the analyst has no way of knowing to tick."""
+        from datetime import datetime, timedelta
+        msgs = []
+        try:
+            when = self.dt_edit.dateTime().toPyDateTime()
+        except (AttributeError, ValueError):
+            self.window_warn.setVisible(False)
+            return
+        now = datetime.utcnow()
+        post_end = when + timedelta(days=int(self.post_slider.value()))
+        if when > now + timedelta(hours=12):
+            msgs.append("The event time is in the future — no satellite has "
+                        "imaged it yet.")
+        elif post_end > now:
+            days = max(0, (post_end - now).days)
+            msgs.append(f"The 'after' window runs {days} day(s) past today, so "
+                        "part of it cannot return imagery yet.")
+        # Winter at high latitude: low sun, long nights, full snow cover.
+        try:
+            lat = abs(float(self.lat_edit.text().strip()))
+        except (ValueError, AttributeError):
+            lat = 0.0
+        if when.month in (10, 11, 12, 1, 2, 3) and lat >= 55.0:
+            msgs.append("A winter event this far north: optical imagery will be "
+                        "dark and snow-covered. Tick the winter box above, and "
+                        "consider the SAR tab, which sees through cloud and "
+                        "darkness.")
+            if not self.seasonal_check.isChecked() and not getattr(
+                    self, "_seasonal_touched", False):
+                self.seasonal_check.setChecked(True)
+                self._seasonal_touched = True
+        self.window_warn.setText("  ".join(msgs))
+        self.window_warn.setVisible(bool(msgs))
+
     # ---------- picking the epicentre off the canvas ----------
     def _split_pasted_pair(self, text):
         """Accept a whole 'lat, lon' pair pasted into the Latitude box.
@@ -1238,6 +1319,8 @@ class LandslideDock(QgsDockWidget):
         det = getattr(self, "detection", None)
         if det is not None and det.event_id:
             args += ["--event-id", det.event_id]
+        if self.seasonal_check.isChecked():
+            args += ["--seasonal"]
         return python, script, project, out, args
 
     def _busy(self, on):
