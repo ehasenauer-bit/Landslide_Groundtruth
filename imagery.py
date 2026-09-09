@@ -30,6 +30,7 @@ import threading
 import time
 import warnings
 import numpy as np
+import xarray as xr
 import pystac_client
 from pystac_client.exceptions import APIError
 from pystac_client.stac_api_io import StacApiIO
@@ -526,6 +527,20 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                 aoi_cloud_note=pre_note or post_note)
 
 
+def _s2_boa_offset(item):
+    """BOA additive offset (in DN) for one Sentinel-2 L2A scene: -1000 for processing
+    baseline >= 04.00 (≈2022-01-25 onward), which MPC serves un-harmonized, else 0.
+
+    Falls back to the acquisition date when the s2:processing_baseline property is
+    missing or unparseable — 04.00 rolled out on 2022-01-25."""
+    bl = item.properties.get("s2:processing_baseline")
+    try:
+        return -1000.0 if float(bl) >= 4.0 else 0.0
+    except (TypeError, ValueError):
+        d = item.datetime.replace(tzinfo=None) if item.datetime is not None else None
+        return -1000.0 if (d is not None and d >= dt.datetime(2022, 1, 25)) else 0.0
+
+
 def _composite(items, lat, lon, radius_km, sensor):
     """Median composite of the scenes AS ACQUIRED — no cloud removal.
 
@@ -552,7 +567,17 @@ def _composite(items, lat, lon, radius_km, sensor):
         measured = ~scl.isin(S2_NODATA_SCL)   # fill/defective only — never cloud
         # B11/B12 are natively 20 m; stackstac has resampled them to the 10 m grid
         # above, so they align with red/nir/green/blue for the SWIR products.
-        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured) / 10000.0
+        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured)
+        # Processing baseline 04.00+ (≈2022-01-25 onward) bakes BOA_ADD_OFFSET = -1000
+        # into the DN, and MPC serves L2A UN-harmonized (verified: post-04.00 dark
+        # pixels floor at ~1000 DN, pre-04.00 at ~0). So true reflectance is
+        # (DN-1000)/10000 for those scenes and DN/10000 for older ones. Apply the
+        # offset PER SCENE — matched to the stack's time order — so a window that
+        # straddles the 2022 boundary lands both sides on ONE reflectance scale
+        # instead of showing the +0.1 step as spurious change (see _s2_boa_offset).
+        boa = xr.DataArray([_s2_boa_offset(it) for it in items],
+                           coords={"time": data.time}, dims="time")
+        data = (data + boa) / 10000.0
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     else:
         qa = stack.sel(band="qa_pixel").astype("uint16")
