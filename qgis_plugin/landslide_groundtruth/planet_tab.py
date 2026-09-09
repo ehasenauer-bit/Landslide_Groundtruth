@@ -415,6 +415,31 @@ class PlanetTab(QWidget):
             lambda v: self.settings.setValue("landslide/planet_toa", v))
         form.addRow("Product", self.toa_check)
 
+        # dBrightness change layer: post − pre broadband albedo (each 0–1), styled to
+        # show ONLY where the ground DARKENED — a fresh scar exposing shadowed/wet debris,
+        # or lost bright snow/vegetation. It's derived from the raw composites (not the
+        # tone curve), so it's FREE and identical on every path; this only controls whether
+        # it's loaded onto the map. Needs BOTH a pre and a post scene rendered (it's a
+        # difference), so a one-sided render produces none.
+        self.dbright_check = QCheckBox("Load brightness-change layer (dBrightness)")
+        self.dbright_check.setChecked(self.settings.value(
+            "landslide/planet_dbright", True, type=bool))
+        self.dbright_check.setToolTip(
+            "ON (default): alongside the before/after SR detail, load a dBrightness "
+            "change layer — the pre→post change in broadband albedo (the mean of the "
+            "four SR bands), the same product the Sentinel-2/Landsat tab exports.\n"
+            "It's styled to show ONLY where brightness DECREASED (blue = strong "
+            "darkening), so a fresh scar that exposes shadowed or wet debris, or that "
+            "buries bright snow/vegetation, stands out while unchanged ground stays "
+            "transparent.\n"
+            "Derived from the raw surface-reflectance composites, so it does NOT depend "
+            "on the tone curve and costs no extra quota — toggling this and hitting "
+            "Re-tone (free) loads or drops it. Needs both a pre and a post scene "
+            "rendered; a one-sided render has nothing to difference.")
+        self.dbright_check.toggled.connect(
+            lambda v: self.settings.setValue("landslide/planet_dbright", v))
+        form.addRow("Change layer", self.dbright_check)
+
         # Hard override for the stretch, for when neither the fixed curve nor the fitted
         # one is what you want. 0 = leave it to the auto-stretch above.
         self.white_spin = QDoubleSpinBox()
@@ -1717,6 +1742,33 @@ class PlanetTab(QWidget):
                 self._append_log(f"  loaded {label}")
             else:
                 self._append_log(f"  could not open the rendered {side} layer")
+        # dBrightness change layer (post − pre albedo): only when both sides rendered
+        # (run_single writes it into render.json in that case) and the user asked for it.
+        # Same run folder as the RGB, styled to show only darkening (reuses the S2/Landsat
+        # tab's ramp). Not counted in `loaded` — it's a change raster, not an SR-detail
+        # tone layer — but tracked so the next render/preview clears it.
+        dpath = result.get("dbright")
+        if dpath and os.path.exists(dpath) and self.dbright_check.isChecked():
+            dpair = lg.date_pair(dates.get("pre"), dates.get("post"))
+            dlabel = "PlanetScope dBrightness" + (f" {dpair}" if dpair else "")
+            dlyr = QgsRasterLayer(dpath, dlabel)
+            if dlyr.isValid():
+                self.dock._style_dbright(dlyr)
+                lg.add_to_group(dlyr, group)
+                self._preview_layers.append(dlyr)
+                self._append_log(f"  loaded {dlabel} (brightness decreases only)")
+            else:
+                self._append_log("  could not open the dBrightness layer")
+        elif (self.dbright_check.isChecked() and not dpath
+              and result.get("pre") and result.get("post")):
+            # Both sides rendered and the user wanted dBrightness, but run_single refused
+            # it — the two sides aren't the same product (SR vs TOA), so their brightness
+            # difference wouldn't be comparable. Surface that rather than silently omitting
+            # the layer (the exact reason is in the notes, already logged above).
+            self.iface.messageBar().pushWarning(
+                "PlanetScope", "dBrightness skipped: the before and after scenes aren't "
+                "the same product (one SR, one TOA). Re-render both sides with the same "
+                "'Raw TOA' setting to get a comparable brightness-change layer.")
         if loaded:
             # The GeoTIFFs are clipped to the AOI box, so framing the AOI frames the
             # render exactly (no per-layer extent bookkeeping needed).

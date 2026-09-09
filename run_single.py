@@ -73,9 +73,9 @@ def _write_render_json(a, event_id, r):
     'available' lists every cached order for the event so the plugin can offer a
     picker — together they're how you can tell what this render actually cost."""
     import review_package as rp
-    out = dict(pre=None, post=None, notes=[], pending={}, tone=a.planet_tone,
-               event_id=event_id, reused=r.get("reused") or {},
-               available=r.get("available") or [])
+    out = dict(pre=None, post=None, dbright=None, notes=[], pending={},
+               tone=a.planet_tone, event_id=event_id,
+               reused=r.get("reused") or {}, available=r.get("available") or [])
     base = os.path.join(a.out, event_id)
     if a.planet_tone == "linear":
         # "None" tone mode: a plain black/white stretch with NO shaping — no rolloff,
@@ -135,6 +135,33 @@ def _write_render_json(a, event_id, r):
             out[side] = path
         except Exception as e:
             out["notes"].append(f"{side}: render failed: {e}")
+    # dBrightness change (post − pre broadband albedo), but ONLY when BOTH sides exist
+    # AND were produced with the SAME product. Differencing an SR side against a DN/TOA
+    # side compares two different radiometric scales, so the "change" would be a product
+    # artefact, not ground change — refuse it. A single render is always internally
+    # consistent (its reuse is bundle-filtered), but Recall (newest cached order per
+    # side) and Re-tone (whatever clips are on disk) can pair an SR side with a TOA one,
+    # so the guard lives here where both sides meet. Derived from the raw composites, not
+    # the tone curve, so it's identical on every path and costs only a subtraction.
+    pre_c, post_c = r.get("pre"), r.get("post")
+    prod = r.get("product") or {}
+    pre_p, post_p = prod.get("pre"), prod.get("post")
+    if pre_c is not None and post_c is not None:
+        if not (pre_p and post_p and pre_p == post_p):
+            out["notes"].append(
+                f"dbright: skipped — pre and post are not the same product "
+                f"(pre={pre_p or 'unknown'}, post={post_p or 'unknown'}). A brightness "
+                f"difference is only meaningful between matching SR (or matching TOA) "
+                f"pixels; re-render both sides the same way to get it.")
+        else:
+            import imagery as im
+            try:
+                dbright = (im._brightness(post_c) - im._brightness(pre_c)).rename("dbright")
+                dpath = f"{base}_dbright.tif"
+                dbright.rio.write_crs(pre_c.rio.crs).rio.to_raster(dpath, driver="GTiff")
+                out["dbright"] = dpath
+            except Exception as e:
+                out["notes"].append(f"dbright: render failed: {e}")
     out["notes"] += r.get("notes", [])
     out["toa"] = bool(r.get("toa"))   # DN/TOA render vs SR — the plugin labels the layer
     # scene ids actually composited per side, so the plugin can date the layers on ANY path
