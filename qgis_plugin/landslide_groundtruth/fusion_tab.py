@@ -46,9 +46,11 @@ from . import sar_change
 from .flow_layout import FlowRow
 
 # combo entries: (label, fusion_core kind key, default absolute floor)
+# First entry is the default measure and supplies the default floor. dBright
+# leads on measured reliability, not on theory — see the combo's tooltip.
 OPTICAL_KINDS = [
-    ("dNDSI — snow index change (recommended)", "dndsi", 0.10),
-    ("dBright — broadband brightness change", "dbright", 0.05),
+    ("dBright — broadband brightness change (recommended)", "dbright", 0.05),
+    ("dNDSI — snow index change", "dndsi", 0.10),
 ]
 SAR_KINDS = [
     ("Log-ratio, increase only (recommended)", "logratio", 3.0),
@@ -63,7 +65,7 @@ SAR_KINDS = [
 # SAR tab names its z-score layer "S1 change brightness z …", which contains it,
 # so a bare "bright" would preselect a SAR raster as the OPTICAL input while
 # SAR_HINTS picked the same raster as the SAR input — fusing a layer with itself.
-OPTICAL_HINTS = ("dndsi", "dbright", "ndsi")
+OPTICAL_HINTS = ("dbright", "dndsi", "ndsi")
 SAR_HINTS = ("log-ratio", "logratio", "log_ratio", "brightness z", "tsint")
 
 # markers that positively identify a raster as belonging to the OTHER sensor;
@@ -438,10 +440,20 @@ class FusionTab(QWidget):
             self.optical_kind_combo.addItem(label, key)
         self.optical_kind_combo.setToolTip(
             "Detected from the layer name — only touch it if the guess is wrong.\n\n"
-            "dNDSI is a band RATIO, so the illumination and BRDF drift that "
-            "dominates high-latitude albedo differencing largely cancels — which "
-            "matters here, because nothing in this plugin does a topographic "
-            "illumination correction. dBright is the broadband brightness change.")
+            "dBright (mean of red/green/blue/NIR) is the default because it is "
+            "the channel that keeps working. Measured over five truthed events, "
+            "background flagged at 50% recall with no SAR: dBright alone never "
+            "exceeded 7%, while dNDSI alone went blind (~100%) at Valdez and "
+            "Knik-Barry, where the deposit landed on rock and moraine rather "
+            "than snow.\n\n"
+            "dNDSI ((green - SWIR1)/(green + SWIR1)) is a band RATIO, so the "
+            "illumination and BRDF drift that dominates high-latitude albedo "
+            "differencing largely cancels — which matters here, because nothing "
+            "in this plugin does a topographic illumination correction. That "
+            "makes it the better channel WHERE THERE IS SNOW to contrast "
+            "against, and it stays worth pairing: the two together beat either "
+            "alone once SAR joins. Leave the pairing tickbox on and this choice "
+            "only decides which one leads.")
         self.optical_kind_combo.currentIndexChanged.connect(self._kind_changed)
         form.addRow(self._tag("is a", CLR_OPTICAL, bold=False),
                     self.optical_kind_combo)
@@ -1809,10 +1821,10 @@ class FusionTab(QWidget):
         score_band = names.index("score") + 1
         # same convention as the Sentinel-2 / Landsat and SAR tabs:
         #   <source> <pre>/<post> [<radius>]   e.g. "Fusion 8-7/8-19 15km"
-        # "(db)" only when the optical term is dBright; dNDSI is the default and
-        # is left unmarked, so a group name stays short unless it needs to say
-        # something. e.g. "Fusion 8-7/8-19 10km (db)"
-        tag = "(db)" if self.optical_kind_combo.currentData() == "dbright" else ""
+        # Mark only the non-default measure, so a group name stays short unless
+        # it needs to say something. dBright is the default and is left
+        # unmarked. e.g. "Fusion 8-7/8-19 10km (ndsi)"
+        tag = "(ndsi)" if self.optical_kind_combo.currentData() == "dndsi" else ""
         group_name = lg.name("Fusion", lg.date_pair(*bracket),
                              lg.radius_tag(radius_km), tag)
         group = lg.new_group(group_name)
