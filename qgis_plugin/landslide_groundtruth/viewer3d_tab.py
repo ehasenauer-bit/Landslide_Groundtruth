@@ -212,7 +212,8 @@ class Viewer3DTab(QWidget):
         form.addRow("Event time (UTC)", self.dt_edit)
         root.addLayout(form)
 
-        copy_btn = QPushButton("Copy location & date from Sentinel-2 / Landsat tab")
+        # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
+        copy_btn = QPushButton("Copy location && date from Sentinel-2 / Landsat tab")
         copy_btn.clicked.connect(self._copy_from_main)
         root.addWidget(copy_btn)
 
@@ -622,7 +623,9 @@ class Viewer3DTab(QWidget):
         out = os.path.join(base_out, "viewer3d")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")

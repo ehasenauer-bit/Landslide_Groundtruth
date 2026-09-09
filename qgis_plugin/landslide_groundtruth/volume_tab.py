@@ -208,6 +208,13 @@ CSV_FIELDS = [
     ("converted_feature_id", "conv_fid"), ("calculator", "calc"),
 ]
 
+# The ground-truthing columns: who the event was, what the analyst concluded, and
+# the three independent volumes in three separate columns so the cross-check is
+# visible in the file rather than only on screen. Appended (never interleaved) so
+# any existing reader that indexes the original columns keeps working.
+from .verdict import VERDICT_CSV_FIELDS
+CSV_FIELDS = CSV_FIELDS + VERDICT_CSV_FIELDS
+
 
 class VolumeTab(QWidget):
     def __init__(self, dock):
@@ -355,6 +362,7 @@ class VolumeTab(QWidget):
         for b in (self.write_btn, self.copy_btn, self.csv_btn, self.remove_btn):
             rbtns.addWidget(b)
         tl.addWidget(rbtns)
+        tl.addWidget(self._build_verdict_box())
         split.addWidget(tablebox)
 
         logbox = QWidget()
@@ -2193,6 +2201,192 @@ class VolumeTab(QWidget):
         QApplication.clipboard().setText("\n".join(lines))
         self._append_log(f"Copied {len(self._rows)} row(s) to the clipboard.")
 
+    # ---------- the analyst's conclusion ----------
+    def _build_verdict_box(self):
+        """Record what the analyst actually concluded.
+
+        Every other control in this plugin gathers evidence; this is the only one
+        that captures the finding, which is the thing ground-truthing exists to
+        produce. Without it a season of work leaves the conclusion in someone's
+        head and the seismic catalogue never learns whether its detections were
+        real."""
+        from . import verdict as V
+        box = QgsCollapsibleGroupBox("Verdict — what did you conclude?")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        v = QVBoxLayout(box)
+
+        self.verdict_combo = QComboBox()
+        self.verdict_combo.addItem("— not recorded —", "")
+        for key, label in V.VERDICTS:
+            self.verdict_combo.addItem(label, key)
+        self.verdict_combo.setToolTip(
+            "'Not found' and 'Cannot tell' are different answers: a slope with no "
+            "scar and a slope hidden under cloud mean opposite things to whoever "
+            "tunes the detector. Pick the one that is actually true.")
+        self.verdict_combo.currentIndexChanged.connect(self._refresh_verdict)
+        form = QFormLayout()
+        form.addRow("Call", self.verdict_combo)
+
+        self.analyst_edit = QLineEdit()
+        self.analyst_edit.setPlaceholderText("your name or initials")
+        self.analyst_edit.setToolTip("Recorded with the verdict so a reviewer "
+                                     "knows who made the call.")
+        form.addRow("Analyst", self.analyst_edit)
+        v.addLayout(form)
+
+        self.verdict_note = QPlainTextEdit()
+        self.verdict_note.setPlaceholderText(
+            "What you saw, and what convinced you — or what stopped you.")
+        self.verdict_note.setMaximumHeight(60)
+        v.addWidget(self.verdict_note)
+
+        self.verdict_summary = QLabel()
+        self.verdict_summary.setWordWrap(True)
+        self.verdict_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.verdict_summary)
+
+        row = FlowRow()
+        chk = QPushButton("Check volumes")
+        f = chk.font(); f.setBold(True); chk.setFont(f)
+        chk.setToolTip(
+            "Compare the seismic volume from the detection against the volume "
+            "measured here, and against DEM differencing if it was run.")
+        chk.clicked.connect(self._refresh_verdict)
+        row.addWidget(chk)
+        v.addWidget(row)
+        self._refresh_verdict()
+        return box
+
+    def _latest_row(self):
+        """The most recently measured slide, or {} — what the cross-check uses."""
+        try:
+            return self._rows[-1] if self._rows else {}
+        except (AttributeError, IndexError):
+            return {}
+
+    def _scar_centroid(self):
+        """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
+
+        Compared against the detection's epicentre, this is the number that says
+        whether the seismic location was any good — and it is the reason
+        'wrong_place' is a distinct verdict rather than a note."""
+        try:
+            from qgis.core import (QgsCoordinateReferenceSystem,
+                                   QgsCoordinateTransform, QgsProject)
+            # the SOURCE scar if one is assigned, else the total outline — the
+            # same polygons the volume was measured from, not the draw target.
+            lyr = None
+            for role in ("best", "total"):
+                lyr = self._role_layer(role)
+                if lyr is not None:
+                    break
+            if lyr is None:
+                return None, None
+            feats = list(lyr.getSelectedFeatures()) or list(lyr.getFeatures())
+            if not feats:
+                return None, None
+            geom = None
+            for f in feats:
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                geom = g if geom is None else geom.combine(g)
+            if geom is None:
+                return None, None
+            c = geom.centroid().asPoint()
+            src = lyr.crs()
+            dst = QgsCoordinateReferenceSystem("EPSG:4326")
+            if src.isValid() and src != dst:
+                c = QgsCoordinateTransform(
+                    src, dst, QgsProject.instance()).transform(c)
+            return c.y(), c.x()
+        except Exception:
+            return None, None
+
+    def _verdict_row(self):
+        """The event-level columns stamped onto every exported row."""
+        from . import verdict as V
+        from datetime import datetime
+        det = getattr(self.dock, "detection", None)
+        row = det.as_row() if det is not None else {}
+        row["verdict"] = self.verdict_combo.currentData() or ""
+        row["note"] = self.verdict_note.toPlainText().strip().replace("\n", " ")
+        row["analyst"] = self.analyst_edit.text().strip()
+        row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                               if row["verdict"] else "")
+        last = self._latest_row()
+        rec = V.reconcile(
+            seismic=(det.vol_best_m3 if det is not None else None),
+            larsen=_num(last.get("v_best")),
+            dh_erosion=_num(last.get("v_erosion")))
+        row["d_larsen"] = "" if rec["d_larsen"] is None else f"{rec['d_larsen']:.3f}"
+        row["d_dh"] = "" if rec["d_dh"] is None else f"{rec['d_dh']:.3f}"
+        row["agreement"] = rec["agreement"]
+        depth = V.implied_depth_m(_num(last.get("v_best")),
+                                  _num(last.get("a_conv")) or _num(last.get("src_best")))
+        row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
+        lat, lon = self._scar_centroid()
+        row["scar_lat"] = "" if lat is None else f"{lat:.6f}"
+        row["scar_lon"] = "" if lon is None else f"{lon:.6f}"
+        off = (V.haversine_km(det.lat, det.lon, lat, lon)
+               if det is not None and det.is_locatable() and lat is not None else None)
+        row["offset_km"] = "" if off is None else f"{off:.2f}"
+        row["offset_ratio"] = ("" if off is None or not (det and det.loc_error_km)
+                               else f"{off / det.loc_error_km:.2f}")
+        return row
+
+    def _refresh_verdict(self, *_):
+        """Show the three volumes side by side and say whether they agree.
+
+        The seismic estimate and the area-scaling estimate are genuinely
+        independent, so their agreement is the validation. Presenting them in one
+        block is the whole point — the tab could already compute two of them but
+        never put them next to each other."""
+        from . import verdict as V
+        det = getattr(self.dock, "detection", None)
+        last = self._latest_row()
+        larsen = _num(last.get("v_best"))
+        eros = _num(last.get("v_erosion"))
+        seis = det.vol_best_m3 if det is not None else None
+        lines = []
+        if seis is not None:
+            lines.append(f"Seismic&nbsp;&nbsp;&nbsp;&nbsp;{det.vol_str()}")
+        else:
+            lines.append('<span style="color:palette(mid);">Seismic&nbsp;&nbsp;&nbsp;&nbsp;'
+                         "— no detection loaded (paste one at the top of the panel)</span>")
+        if larsen:
+            lines.append(f"Area scaling&nbsp;&nbsp;{larsen / 1e6:.3g} ×10⁶ m³"
+                         f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
+                         f"({last.get('material') or 'material?'}, ×2 typical spread)</span>")
+        if eros:
+            lines.append(f"∫Δh erosion&nbsp;&nbsp;{eros / 1e6:.3g} ×10⁶ m³")
+        if larsen:
+            depth = V.implied_depth_m(
+                larsen, _num(last.get("a_conv")) or _num(last.get("src_best")))
+            if depth:
+                lines.append('<span style="color:palette(mid);">'
+                             f"implied mean depth {depth:.1f} m</span>")
+        rec = V.reconcile(seismic=seis, larsen=larsen, dh_erosion=eros)
+        colour = {"agree": "#1b7f37", "marginal": "#b3541e",
+                  "disagree": "#c0392b"}.get(rec["agreement"], "")
+        if colour:
+            lines.append(f'<b style="color:{colour};">→ {rec["agreement"]}</b> — {rec["text"]}')
+        elif seis is not None or larsen:
+            lines.append(f'<span style="color:palette(mid);">{rec["text"]}</span>')
+        lat, lon = self._scar_centroid()
+        if det is not None and det.is_locatable() and lat is not None:
+            off = V.haversine_km(det.lat, det.lon, lat, lon)
+            if off is not None:
+                extra = ""
+                if det.loc_error_km:
+                    inside = "inside" if off <= det.loc_error_km else "OUTSIDE"
+                    extra = (f" — {inside} the {det.loc_error_km:g} km location error")
+                lines.append(f"Scar centroid is {off:.1f} km from the reported "
+                             f"epicentre{extra}.")
+        self.verdict_summary.setText("<br>".join(lines))
+        return rec
+
     def _export_csv(self):
         if not self._rows:
             self._append_log("Nothing to export — the results table is empty.")
@@ -2209,8 +2403,16 @@ class VolumeTab(QWidget):
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow([h for h, _k in CSV_FIELDS])
+                stamp = self._verdict_row()
                 for row in self._rows:
-                    w.writerow(["" if row.get(k) is None else row.get(k)
+                    merged = dict(row)
+                    # the detection identity and the analyst's conclusion belong
+                    # to the EVENT, so every measured slide carries them; a row's
+                    # own value always wins if it has one.
+                    for k, val in stamp.items():
+                        if merged.get(k) in (None, ""):
+                            merged[k] = val
+                    w.writerow(["" if merged.get(k) is None else merged.get(k)
                                 for _h, k in CSV_FIELDS])
         except OSError as e:
             self._append_log(f"Could not write {path}: {e}")
@@ -2320,6 +2522,18 @@ def _name_tokens(name):
 
 
 # ---------- formatting ----------
+def _num(v):
+    """A row value as a float, or None. Row values are usually already numeric
+    but can arrive as formatted strings from a restored project, so parse
+    defensively rather than letting a str reach the volume arithmetic."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt(v):
     """Numbers for display: thousands-separated, and never more precision than
     the measurement carries. Areas and volumes span many orders of magnitude,

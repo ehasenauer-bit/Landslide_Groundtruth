@@ -995,7 +995,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1556,7 +1558,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1853,7 +1857,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1981,7 +1987,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -2079,7 +2087,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")

@@ -258,7 +258,8 @@ class SarTab(QWidget):
         self.dt_edit.setDateTime(self.dock.dt_edit.dateTime())
         form.addRow("Event time (UTC)", self.dt_edit)
 
-        copy_btn = QPushButton("⟵ Copy location & date from Sentinel-2 / Landsat tab")
+        # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
+        copy_btn = QPushButton("⟵ Copy location && date from Sentinel-2 / Landsat tab")
         copy_btn.setToolTip("Pull latitude, longitude, radius, event time and the "
                             "before/after windows from the other tab so you don't "
                             "re-enter the same event.")
@@ -896,7 +897,9 @@ class SarTab(QWidget):
         out = os.path.join(base_out, "sar")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")

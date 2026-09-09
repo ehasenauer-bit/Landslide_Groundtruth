@@ -262,7 +262,8 @@ _HTML_MID = """</title>
 <div id="hud">
   <button id="beforeBtn" class="btn active">◀ Before</button>
   <button id="afterBtn" class="btn">After ▶</button>
-  <button id="exportBtn" class="btn">⬇ Export figure</button>
+  <button id="exportBtn" class="btn">⬇ Export 3D figure</button>
+  <button id="exportMapBtn" class="btn">⬇ Export map figure</button>
 </div>
 <div id="tag"></div>
 <div id="help">
@@ -593,10 +594,12 @@ _VIEWER_JS = r'''
     return t;
   }
   var texes = [makeTex(), makeTex()];
+  var srcImgs = [null, null];      // the decoded HTMLImageElements, kept for the map view
   var loaded = 0;
   function load(uri, slot) {
     var img = new Image();
     img.onload = function () {
+      srcImgs[slot] = img;         // plan-view source for the 2D map figure
       gl.bindTexture(gl.TEXTURE_2D, texes[slot]);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
@@ -1347,20 +1350,244 @@ _VIEWER_JS = r'''
     g.fillText(s.cap||"", iw/2, ih+bar*0.5);
     return c;
   }
-  function buildBundle(fig, shots, status, done){
+  function buildBundle(fig, shots, status, done, opts){
+    opts = opts || {};
+    var zipName = opts.zipName || "landslide_3d_bundle.zip";
     try {
       var files=[{name:"slide.png", data:pngBytes(fig)}];
-      var nm=["before.png","after.png","after_overlays.png"];
+      var nm=opts.panelNames || ["before.png","after.png","after_overlays.png"];
       shots.forEach(function(s,i){ files.push({name:nm[i]||("panel"+(i+1)+".png"), data:pngBytes(labelledPanel(s))}); });
-      var orb=renderOrbitFrames(24, 480, 270);
-      files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 16)});   // 16cs/frame = half speed
+      if (opts.withOrbit !== false) {          // the map figure has no camera to orbit
+        var orb=renderOrbitFrames(24, 480, 270);
+        files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 16)});   // 16cs/frame = half speed
+      }
       var blob=new Blob([zipStore(files)], {type:"application/zip"});
-      var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="landslide_3d_bundle.zip";
+      var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=zipName;
       document.body.appendChild(a); a.click();
       setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
-      status.textContent="Done ✓  landslide_3d_bundle.zip";
+      status.textContent="Done ✓  "+zipName;
     } catch(e){ status.textContent="Error: "+(e&&e.message||e); }
     done();
+  }
+
+  // ---------- 2D map view: the imagery as acquired, NOT draped on terrain ----------
+  // CFG.before_uri / after_uri are already north-up QGIS renders covering exactly the
+  // scene extent, so a map panel is just that image drawn flat with the overlays
+  // projected linearly into it -- no camera, no mesh, no exaggeration. Deliberately
+  // reuses the 3D slide template (BEFORE | AFTER / AFTER+overlays | Details) so the
+  // two figures read as one document, and adds the cartographic furniture a plan view
+  // needs and a perspective view cannot carry: a true scale bar and a fixed north arrow.
+  function mapLayout(pxW, pxH) {
+    var Wm = +CFG.width_m, Hm = +CFG.height_m;
+    // margins: left for the northing labels, bottom for easting, top-right for the
+    // compass, bottom-right for the scale bar.
+    var mL = Math.round(pxW*0.120), mR = Math.round(pxW*0.030);
+    var mT = Math.round(pxH*0.045), mB = Math.round(pxH*0.115);
+    var aw = Math.max(10, pxW-mL-mR), ah = Math.max(10, pxH-mT-mB);
+    var sc = Math.min(aw/Wm, ah/Hm);                 // pixels per ground metre
+    var iw = Wm*sc, ih = Hm*sc;                      // letterboxed: aspect preserved
+    return { x0: mL+(aw-iw)/2, y0: mT+(ah-ih)/2, iw: iw, ih: ih, s: sc, Wm: Wm, Hm: Hm };
+  }
+  function mapPx(L, x, y) {          // world (east, north) metres -> panel pixels
+    return [ L.x0 + (x + L.Wm/2)*L.s, L.y0 + (L.Hm/2 - y)*L.s ];
+  }
+  // same unit rule as the 3D axes, so the two figures label distance identically
+  function mapFmt(sp) { return sp>=3000 ? {scale:0.001,dec:1,unit:"km"} : {scale:1,dec:0,unit:"m"}; }
+  function mapExtentText() {
+    // ONE unit for both dimensions, chosen from the larger: the axes may legitimately
+    // label E in km and N in m (that is the 3D figure's per-axis rule, kept for parity),
+    // but a single "6.0 km × 2400 m" extent line just reads as a mistake.
+    var Wm = +CFG.width_m, Hm = +CFG.height_m, f = mapFmt(Math.max(Wm, Hm));
+    return (Wm*f.scale).toFixed(f.dec) + " × " + (Hm*f.scale).toFixed(f.dec) + " " + f.unit;
+  }
+  function mapHalo(ctx, txt, x, y, fs, bold, align, base) {
+    ctx.textAlign = align; ctx.textBaseline = base;
+    ctx.font = (bold?"bold ":"") + fs + "px sans-serif";
+    ctx.lineWidth = Math.max(2.5, fs/4); ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    ctx.lineJoin = "round"; ctx.strokeText(txt, x, y);
+    ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
+  }
+  function drawMapAxes(ctx, L, pxW, pxH) {
+    var fs = Math.max(13, Math.round(pxW/60));
+    var fE = mapFmt(L.Wm), fN = mapFmt(L.Hm);
+    var axC = "rgba(246,249,253,0.97)", lw = Math.max(2, pxW/900), tl = Math.max(6, pxW/130);
+    ctx.save();
+    ctx.strokeStyle = axC; ctx.lineWidth = lw;
+    ctx.strokeRect(L.x0, L.y0, L.iw, L.ih);          // the map frame
+    niceTicks(0, L.Wm, 7).forEach(function (v) {     // bottom: distance east
+      if (v < -1 || v > L.Wm+1) return;
+      var px = L.x0 + v*L.s;
+      ctx.strokeStyle = axC; ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(px, L.y0+L.ih); ctx.lineTo(px, L.y0+L.ih+tl); ctx.stroke();
+      mapHalo(ctx, (v*fE.scale).toFixed(fE.dec), px, L.y0+L.ih+tl+5, fs, false, "center", "top");
+    });
+    mapHalo(ctx, "Distance E ("+fE.unit+")", L.x0+L.iw/2, L.y0+L.ih+tl+5+fs*1.9,
+            fs, true, "center", "top");
+    niceTicks(0, L.Hm, 7).forEach(function (v) {     // left: distance north, 0 at the bottom
+      if (v < -1 || v > L.Hm+1) return;
+      var py = L.y0 + L.ih - v*L.s;
+      ctx.strokeStyle = axC; ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(L.x0, py); ctx.lineTo(L.x0-tl, py); ctx.stroke();
+      mapHalo(ctx, (v*fN.scale).toFixed(fN.dec), L.x0-tl-5, py, fs, false, "right", "middle");
+    });
+    ctx.save();
+    ctx.translate(L.x0-tl-5-fs*2.6, L.y0+L.ih/2); ctx.rotate(-Math.PI/2);
+    mapHalo(ctx, "Distance N ("+fN.unit+")", 0, 0, fs, true, "center", "middle");
+    ctx.restore();
+    ctx.restore();
+  }
+  function drawMapNorthArrow(ctx, L, pxW) {
+    // pad clears the "N" glyph too: it reaches ~R + 0.34R (arrowhead) + 0.35R (half
+    // cap height) above the centre, so a 1.6R inset clipped it against the map frame.
+    var R = Math.max(16, pxW/42), pad = 1.9*R+10;
+    var cx = L.x0 + L.iw - pad, cy = L.y0 + pad, Ln = R*0.85, ah = Ln*0.4;
+    ctx.save();
+    ctx.lineWidth = Math.max(2, pxW/650);
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2*Math.PI);
+    ctx.fillStyle = "rgba(11,14,19,0.55)"; ctx.fill();     // plate: readable over snow
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.stroke();
+    ctx.strokeStyle = "rgba(240,244,250,0.95)";
+    ctx.beginPath(); ctx.moveTo(cx, cy+Ln*0.6); ctx.lineTo(cx, cy-Ln); ctx.stroke();
+    ctx.fillStyle = "rgba(240,244,250,0.95)";
+    ctx.beginPath(); ctx.moveTo(cx, cy-Ln);
+    ctx.lineTo(cx-ah*0.42, cy-Ln+ah); ctx.lineTo(cx+ah*0.42, cy-Ln+ah);
+    ctx.closePath(); ctx.fill();
+    // haloed: the "N" sits outside the compass plate, straight onto the imagery, and
+    // a plain white glyph disappears on the snow these scenes are usually full of.
+    mapHalo(ctx, "N", cx, cy-R-ah*0.5, Math.round(R*0.7), true, "center", "middle");
+    ctx.restore();
+  }
+  function drawMapScaleBar(ctx, L, pxW, pxH) {
+    // round ground distance nearest ~22% of the map width: 1/2/2.5/5/10 x 10^n
+    var target = L.Wm*0.22;
+    if (!(target > 0)) return;
+    var pw = Math.pow(10, Math.floor(Math.log(target)/Math.LN10));
+    var len = pw;
+    [1,2,2.5,5,10].forEach(function (k) { if (k*pw <= target) len = k*pw; });
+    var bw = len*L.s, h = Math.max(7, Math.round(pxH*0.013));
+    var x = L.x0 + L.iw - bw - Math.round(pxW*0.018);
+    var y = L.y0 + L.ih - h - Math.round(pxH*0.030);
+    var txt = (len >= 1000) ? (len/1000) + " km" : Math.round(len) + " m";
+    var fs = Math.max(12, Math.round(pxW/72));
+    ctx.save();
+    ctx.font = "bold "+fs+"px sans-serif";
+    var tw = ctx.measureText(txt).width;
+    var padx = Math.round(fs*0.5), pady = Math.round(fs*0.35);
+    var plw = Math.max(bw, tw) + padx*2, plh = h + fs + pady*3, cx = x + bw/2;
+    ctx.fillStyle = "rgba(11,14,19,0.62)";               // plate, so it reads on bright snow
+    ctx.fillRect(cx-plw/2, y-fs-pady*2, plw, plh);
+    ctx.fillStyle = "#f6f9ff"; ctx.fillRect(x, y, bw, h);
+    ctx.fillStyle = "#0b0e13"; ctx.fillRect(x+bw/2, y, bw/2, h);   // alternating halves
+    ctx.strokeStyle = "#f6f9ff"; ctx.lineWidth = Math.max(1, pxW/1400);
+    ctx.strokeRect(x, y, bw, h);
+    ctx.fillStyle = "#f6f9ff"; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(txt, cx, y-pady);
+    ctx.restore();
+  }
+  function drawMapOverlays(ctx, L) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(L.x0, L.y0, L.iw, L.ih); ctx.clip();
+    var lwB = Math.max(1.5, L.iw/420);
+    function trace(pts) {
+      ctx.beginPath();
+      for (var i=0;i<pts.length;i++) { var q = mapPx(L, pts[i][0], pts[i][1]);
+        if (i) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); }
+    }
+    // fills largest-first, matching the 3D draw order, so a nested source zone
+    // stays visible on top of the total-area polygon instead of under it
+    var rings = [];
+    (CFG.polys || []).forEach(function (P) {
+      if (P.name && !vis[P.name]) return;
+      var fc = P.color || [255,80,80], lc = P.line_color || fc;
+      var fa = (P.fill_alpha != null) ? P.fill_alpha : 0.55;
+      (P.rings || []).forEach(function (R) {
+        var out = R.outline || []; if (out.length < 2) return;
+        var a = 0;
+        for (var i=0;i<out.length;i++) { var u=out[i], v=out[(i+1)%out.length];
+          a += u[0]*v[1] - v[0]*u[1]; }
+        rings.push({ out: out, fc: fc, lc: lc, fa: fa, area: Math.abs(a)/2,
+                     hasFill: (P.fill !== false), hasLine: (P.outline !== false) });
+      });
+    });
+    rings.sort(function (a, b) { return b.area - a.area; });
+    rings.forEach(function (F) {
+      trace(F.out); ctx.closePath();
+      if (F.hasFill) {
+        ctx.fillStyle = "rgba("+F.fc[0]+","+F.fc[1]+","+F.fc[2]+","+F.fa+")"; ctx.fill();
+      }
+      if (F.hasLine) {
+        ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = lwB*2.4; ctx.stroke();
+        ctx.strokeStyle = "rgb("+F.lc[0]+","+F.lc[1]+","+F.lc[2]+")";
+        ctx.lineWidth = lwB*1.3; ctx.stroke();
+      }
+    });
+    (CFG.lines || []).forEach(function (LN) {          // centerline etc: white casing
+      if (LN.name && !vis[LN.name]) return;
+      var c = LN.color || [90,190,255];
+      (LN.paths || []).forEach(function (path) {
+        if (path.length < 2) return;
+        trace(path);
+        ctx.lineCap = "round"; ctx.lineJoin = "round";
+        ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = lwB*3.0; ctx.stroke();
+        ctx.strokeStyle = "rgb("+c[0]+","+c[1]+","+c[2]+")"; ctx.lineWidth = lwB*1.6; ctx.stroke();
+      });
+    });
+    var fsP = Math.max(11, Math.round(L.iw/58));
+    (CFG.points || []).forEach(function (PT) {          // crown/tip/epicentre markers
+      if (PT.name && !vis[PT.name]) return;
+      var c = PT.color || [255,220,60], co = PT.coords || [], lb = PT.labels || [];
+      co.forEach(function (pt, i) {
+        var q = mapPx(L, pt[0], pt[1]), r = Math.max(4, L.iw/150);
+        ctx.beginPath(); ctx.arc(q[0], q[1], r, 0, 2*Math.PI);
+        ctx.fillStyle = "rgb("+c[0]+","+c[1]+","+c[2]+")"; ctx.fill();
+        ctx.strokeStyle = "rgba(0,0,0,0.75)"; ctx.lineWidth = Math.max(1, lwB); ctx.stroke();
+        if (lb[i]) mapHalo(ctx, lb[i], q[0], q[1]-r-4, fsP, true, "center", "alphabetic");
+      });
+    });
+    ctx.restore();
+  }
+  function mapPanel(side, showOv, pxW, pxH) {
+    var cc = document.createElement("canvas"); cc.width = pxW; cc.height = pxH;
+    var g = cc.getContext("2d");
+    g.fillStyle = "#0b0e13"; g.fillRect(0, 0, pxW, pxH);
+    var L = mapLayout(pxW, pxH), im = srcImgs[side];
+    if (im) {
+      g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
+      g.drawImage(im, L.x0, L.y0, L.iw, L.ih);
+    }
+    if (showOv) drawMapOverlays(g, L);
+    drawMapAxes(g, L, pxW, pxH);
+    drawMapNorthArrow(g, L, pxW);
+    drawMapScaleBar(g, L, pxW, pxH);
+    return cc;
+  }
+  function exportMapFigure() {
+    if (!srcImgs[0] || !srcImgs[1]) {
+      alert("The before/after imagery is still decoding — try again in a moment.");
+      return;
+    }
+    // identical slide geometry to exportFigure(), so the 3D and map figures stack
+    var FW=1920, FH=1080, m=24, TH=54, capH=28;
+    var colW = Math.floor((FW - 3*m)/2), rowH = Math.floor((FH - TH - 3*m)/2);
+    var imgH = rowH - capH, pxW = colW*2, pxH = imgH*2;   // 2x supersample
+    var shots = [
+      { cap: "BEFORE" + (CFG.before_date ? " · " + CFG.before_date : ""), side:0, ov:false },
+      { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
+      { cap: "AFTER + overlays" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:true }
+    ].map(function (pn) { return { img: mapPanel(pn.side, pn.ov, pxW, pxH), cap: pn.cap }; });
+    composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH}, {
+      title: (CFG.title || "Landslide") + " — map view",
+      detailRows: [["Coordinate system", CFG.crs || "—"],
+                   ["View", "Map (plan view, north up)"],
+                   ["Ground extent", mapExtentText()],
+                   ["Before image", CFG.before_date || "—"],
+                   ["After image", CFG.after_date || "—"]],
+      fileName: "landslide_map_figure.png",
+      zipName: "landslide_map_bundle.zip",
+      zipLabel: "⬇ Download ZIP (slide + panels)",
+      panelNames: ["map_before.png", "map_after.png", "map_after_overlays.png"],
+      withOrbit: false
+    });
   }
   function exportFigure() {
     // 16:9 slide, 2x2 grid: Before | After / After+overlays | Details
@@ -1399,13 +1626,14 @@ _VIEWER_JS = r'''
     draw();
     composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH});
   }
-  function composeFigure(shots, L) {
+  function composeFigure(shots, L, opts) {
+    opts = opts || {};
     var fig = document.createElement("canvas"); fig.width=L.FW; fig.height=L.FH;
     var g = fig.getContext("2d");
     g.fillStyle = "#0b0e13"; g.fillRect(0,0,L.FW,L.FH);
     g.fillStyle = "#f2f5fb"; g.font = "bold 26px sans-serif";
     g.textAlign = "left"; g.textBaseline = "middle";
-    g.fillText((CFG.title||"Landslide 3D"), L.m, L.TH/2 + 4);
+    g.fillText(opts.title || (CFG.title||"Landslide 3D"), L.m, L.TH/2 + 4);
     var cells = [ [L.m, L.TH+L.m], [2*L.m+L.colW, L.TH+L.m],
                   [L.m, L.TH+2*L.m+L.rowH], [2*L.m+L.colW, L.TH+2*L.m+L.rowH] ];
     shots.forEach(function (s, i) {
@@ -1421,10 +1649,11 @@ _VIEWER_JS = r'''
     g.textAlign="left"; g.textBaseline="top";
     g.fillStyle="#f2f5fb"; g.font="bold 22px sans-serif"; g.fillText("Details", ix, yy); yy+=38;
     g.font="17px sans-serif";
-    [["Coordinate system", CFG.crs||"—"],
-     ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
-     ["Before image", CFG.before_date||"—"],
-     ["After image", CFG.after_date||"—"]].forEach(function (kv) {
+    (opts.detailRows ||
+     [["Coordinate system", CFG.crs||"—"],
+      ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
+      ["Before image", CFG.before_date||"—"],
+      ["After image", CFG.after_date||"—"]]).forEach(function (kv) {
       g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
       g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
     });
@@ -1447,16 +1676,16 @@ _VIEWER_JS = r'''
     var ov = document.createElement("div"); ov.id = "exportModal";
     var bar = document.createElement("div"); bar.className = "exp-bar";
     var zb = document.createElement("button"); zb.className = "btn";
-    zb.textContent = "⬇ Download ZIP (slide + panels + orbit GIF)";
+    zb.textContent = opts.zipLabel || "⬇ Download ZIP (slide + panels + orbit GIF)";
     var st = document.createElement("span");
     st.style.cssText = "color:#cbd5e6;font:13px sans-serif;align-self:center;margin:0 6px;";
     var dl = document.createElement("a"); dl.className = "btn"; dl.textContent = "PNG only";
-    dl.href = url; dl.download = "landslide_3d_figure.png";
+    dl.href = url; dl.download = opts.fileName || "landslide_3d_figure.png";
     var cl = document.createElement("button"); cl.className = "btn"; cl.textContent = "Close";
     cl.onclick = function () { document.body.removeChild(ov); };
     zb.onclick = function () {
       zb.disabled = true; st.textContent = "Rendering orbit + encoding GIF… (a few seconds)";
-      setTimeout(function () { buildBundle(fig, shots, st, function () { zb.disabled = false; }); }, 40);
+      setTimeout(function () { buildBundle(fig, shots, st, function () { zb.disabled = false; }, opts); }, 40);
     };
     var im = document.createElement("img"); im.src = url;
     bar.appendChild(zb); bar.appendChild(st); bar.appendChild(dl); bar.appendChild(cl);
@@ -1464,6 +1693,7 @@ _VIEWER_JS = r'''
     document.body.appendChild(ov);
   }
   document.getElementById("exportBtn").onclick = exportFigure;
+  document.getElementById("exportMapBtn").onclick = exportMapFigure;
 
   window.addEventListener("resize", draw);
   setSide(0);

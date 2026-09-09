@@ -219,6 +219,7 @@ class LandslideDock(QgsDockWidget):
         self.canvas = iface.mapCanvas()
         self.task = None
         self.settings = QgsSettings()
+        self.detection = None        # the seismic record; see detection.py
         self._ed_reply = None        # in-flight Earthdata credential-check request
         self._preview_reply = None   # in-flight thumbnail request (if any)
         self._preview_pix = None     # last loaded preview, kept for rescaling
@@ -294,6 +295,7 @@ class LandslideDock(QgsDockWidget):
         outer = QVBoxLayout(container)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._build_env_box())
+        outer.addWidget(self._build_detection_box())
 
         tabs = QTabWidget()
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
@@ -318,11 +320,16 @@ class LandslideDock(QgsDockWidget):
 
     def _build_env_box(self):
         """Shared environment settings (paths to the venv + project + output).
-        Collapsible + collapsed by default: these are set once, then forgotten.
-        Read by BOTH tabs (see _collect and PlanetTab)."""
-        env = QgsCollapsibleGroupBox("Environment")
+
+        This is a HARD GATE: eleven code paths across five tabs refuse to run
+        until these are set, and the first click a new user makes (the 3D tab's
+        pre-selected "Auto-fetch a DEM") lands on one of them. So it opens itself
+        when unconfigured, states what each path is in words the audience has,
+        shows an example of a correct value, and validates live rather than at
+        the next button press. Read by every tab (see _collect and PlanetTab)."""
+        env = QgsCollapsibleGroupBox("Environment — set these three up once")
         env.setSaveCollapsedState(False)
-        env.setCollapsed(True)
+        self.env_box = env          # tabs call env_box.setCollapsed(False) to point here
         ef = QFormLayout(env)
         self.python_edit = QLineEdit(self.settings.value(
             "landslide/python", "", type=str))
@@ -330,19 +337,258 @@ class LandslideDock(QgsDockWidget):
             "landslide/project", "", type=str))
         self.out_edit = QLineEdit(self.settings.value(
             "landslide/out", "", type=str))
-        for label, edit, picker in (
-            ("venv python", self.python_edit, self._pick_python),
-            ("project dir", self.project_edit, self._pick_project),
-            ("output dir", self.out_edit, self._pick_out),
+        for label, edit, picker, placeholder, tip in (
+            ("Python for the imagery tools", self.python_edit, self._pick_python,
+             "…/landslide_groundtruth/venv/bin/python3",
+             "The python program inside the project's venv folder — 'python3' in "
+             "venv/bin (macOS/Linux) or python.exe in venv\\Scripts (Windows). "
+             "The plugin runs the imagery tools with it, so they stay out of QGIS. "
+             "Called 'venv python' in the documentation."),
+            ("Folder with the imagery tools", self.project_edit, self._pick_project,
+             "…/landslide_groundtruth   (the folder containing run_single.py)",
+             "The folder you downloaded the pipeline into. It must contain "
+             "run_single.py."),
+            ("Where to save results", self.out_edit, self._pick_out,
+             "leave blank for <project folder>/out/interactive",
+             "Imagery, change rasters and the SAR change files the Fusion tab "
+             "reads. Leave blank to use out/interactive inside the project "
+             "folder."),
         ):
+            edit.setPlaceholderText(placeholder)
+            edit.setToolTip(tip)
+            edit.textChanged.connect(self._refresh_env_status)
             row = QHBoxLayout()
             row.addWidget(edit)
-            btn = QPushButton("…")
-            btn.setFixedWidth(28)
+            btn = QPushButton("Browse…")
+            btn.setToolTip("Choose " + label[0].lower() + label[1:])
             btn.clicked.connect(picker)
             row.addWidget(btn)
             ef.addRow(label, row)
+        # live status: says whether what is typed actually works, instead of
+        # making the user press Search to find out.
+        self.env_status = QLabel()
+        self.env_status.setWordWrap(True)
+        ef.addRow("", self.env_status)
+        self._refresh_env_status()
+        # Opens itself when unconfigured. setSaveCollapsedState(False) means the
+        # collapse state is recomputed every session, so a configured user still
+        # gets it out of the way and an unconfigured one cannot miss it.
+        env.setCollapsed(self._env_ok()[0])
         return env
+
+    def _env_ok(self):
+        """(ok, message) for the current Environment paths.
+
+        Checked in the order the user fills them in, so the message always names
+        the FIRST thing still wrong rather than the last."""
+        py = self.python_edit.text().strip()
+        proj = self.project_edit.text().strip()
+        if not py:
+            return False, "Choose the Python program that has the imagery tools installed."
+        if not os.path.exists(py):
+            return False, "There is no file at that Python path."
+        if not proj:
+            return False, "Choose the folder you downloaded the pipeline into."
+        if not os.path.exists(os.path.join(proj, "run_single.py")):
+            return False, "That folder has no run_single.py in it — pick the folder that does."
+        return True, "Ready — the imagery tools can be run."
+
+    def _refresh_env_status(self, *_):
+        """Repaint the status line, and clear any red border once a path is fixed."""
+        ok, msg = self._env_ok()
+        self.env_status.setText(("✓ " if ok else "⚠ ") + msg)
+        self.env_status.setStyleSheet(
+            "QLabel { color: %s; }" % ("#1b7f37" if ok else "#b3541e"))
+        for edit in (self.python_edit, self.project_edit, self.out_edit):
+            if edit.styleSheet() and edit.text().strip():
+                edit.setStyleSheet("")
+
+    def env_gate(self, edit=None):
+        """Refuse an action that needs the Environment, and POINT AT IT.
+
+        One shared refusal for every tab: opens the box, marks the offending
+        field, focuses it, and says what to do — instead of the old
+        "Set a valid venv python path." into a collapsed box the user has never
+        seen. Returns False so callers can `if not self.dock.env_gate(): return`."""
+        ok, msg = self._env_ok()
+        if ok:
+            return True
+        self._warn("Before searching, open the Environment box at the top of this "
+                   "panel and set it up. " + msg + " Ask whoever installed the "
+                   "plugin if you are not sure.")
+        try:
+            self.env_box.setCollapsed(False)
+            target = edit
+            if target is None:
+                target = (self.python_edit
+                          if not os.path.exists(self.python_edit.text().strip() or "\0")
+                          else self.project_edit)
+            target.setStyleSheet("QLineEdit { border: 1px solid #c0392b; }")
+            target.setFocus()
+        except (AttributeError, RuntimeError):
+            pass
+        return False
+
+    # ---------- the seismic detection record ----------
+    def _build_detection_box(self):
+        """The plugin's front door: the detection record, entered ONCE.
+
+        The analyst arrives holding a seismic detection — epicentre, origin time,
+        LOCATION ERROR, and a volume estimate. Before this box the first three had
+        to be retyped into four separate tabs and the last two had nowhere to go at
+        all, so the search radius ignored the uncertainty it was supposed to cover
+        and the seismic volume could never be compared against the digitized one.
+
+        Paste-parsing rather than eleven spin boxes because the record is already
+        on screen in another window; see detection.parse()."""
+        box = QgsCollapsibleGroupBox("Detection — paste the seismic record")
+        box.setSaveCollapsedState(False)
+        self.detection_box = box
+        v = QVBoxLayout(box)
+
+        hint = QLabel(
+            "Paste the detection record (epicentre, origin time, location error, "
+            "volume) and press <b>Read it</b>. Everything below is filled in for "
+            "you, including a search radius that actually covers the location "
+            "error.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(hint)
+
+        self.det_paste = QPlainTextEdit()
+        self.det_paste.setPlaceholderText(
+            "Detection = Y\nCoherency = 0.61\nHF / LF = 11.8\n"
+            "Org time = 08:48:37\nLatitude = 60.50\nLongitude = -140.60\n"
+            "Loc error = 17 km\nVol = 1.3 M m³\nVol range = 0.9 - 1.7 M m³")
+        self.det_paste.setMaximumHeight(96)
+        self.det_paste.setToolTip(
+            "Anything with latitude, longitude and a time in it will do — the "
+            "order does not matter and unrecognised lines are ignored. A "
+            "timestamp marked UTC is always preferred over a local one.")
+        v.addWidget(self.det_paste)
+
+        read_btn = QPushButton("Read it")
+        read_btn.setDefault(True)
+        f = read_btn.font(); f.setBold(True); read_btn.setFont(f)
+        read_btn.setToolTip("Parse the pasted record and show what was understood.")
+        read_btn.clicked.connect(self._read_detection)
+        self.det_apply_btn = QPushButton("Use it in every tab")
+        self.det_apply_btn.setEnabled(False)
+        self.det_apply_btn.setToolTip(
+            "Copy the epicentre, the event time and a radius covering the "
+            "location error into the Sentinel-2, PlanetScope, SAR and 3D tabs, "
+            "so they cannot drift apart.")
+        self.det_apply_btn.clicked.connect(self._apply_detection)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip("Forget the current detection.")
+        clear_btn.clicked.connect(self._clear_detection)
+        row = FlowRow()
+        for b in (read_btn, self.det_apply_btn, clear_btn):
+            row.addWidget(b)
+        v.addWidget(row)
+
+        self.det_summary = QLabel()
+        self.det_summary.setWordWrap(True)
+        self.det_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.det_summary)
+        self._render_detection()
+        box.setCollapsed(getattr(self, "detection", None) is not None)
+        return box
+
+    def _read_detection(self):
+        """Parse the paste box and report exactly what was understood."""
+        from . import detection as _d
+        text = self.det_paste.toPlainText().strip()
+        if not text:
+            self._warn("Paste a detection record into the box first.")
+            return
+        det, warn = _d.parse(text)
+        if not det.is_locatable() and det.origin_utc is None:
+            self.detection = None
+            self._render_detection(
+                ["Nothing recognisable in that text — no coordinates and no time."])
+            return
+        self.detection = det
+        self._render_detection(warn)
+        self._append_log("Detection read: " + " | ".join(det.summary_lines()))
+
+    def _clear_detection(self):
+        self.detection = None
+        self.det_paste.clear()
+        self._render_detection()
+
+    def _render_detection(self, warn=None):
+        """Echo the record back — above all the LOCAL time.
+
+        A record shows 08:48 UTC and 23:48 the previous day in Alaska. An analyst
+        who types the local one into a field labelled 'Event time (UTC)' shifts the
+        pre/post boundary nine hours, which silently reclassifies a bracketing
+        Sentinel-1 scene from before the failure to after it. The change map then
+        compares two pre-event scenes, finds nothing, and gives no way to find out
+        why. So the conversion is stated, every time, not left to the reader."""
+        det = getattr(self, "detection", None)
+        if det is None:
+            self.det_summary.setText(
+                "<i>No detection loaded — the tabs use whatever you type into them.</i>")
+            self.det_summary.setStyleSheet("QLabel { color: palette(mid); }")
+            if hasattr(self, "det_apply_btn"):
+                self.det_apply_btn.setEnabled(False)
+            return
+        lines = ["<b>Read:</b> " + det.summary_lines()[0]]
+        lines += det.summary_lines()[1:]
+        r = det.suggested_radius_km()
+        lines.append(f"<b>Search radius suggested: {r:g} km</b>"
+                     + ("" if det.loc_error_km else " (no location error in the record)"))
+        html = "<br>".join(lines)
+        for w in (warn or []):
+            html += f'<br><span style="color:#b3541e;">⚠ {w}</span>'
+        self.det_summary.setText(html)
+        self.det_summary.setStyleSheet("")
+        if hasattr(self, "det_apply_btn"):
+            self.det_apply_btn.setEnabled(True)
+
+    def _apply_detection(self):
+        """Push the record into every tab that has its own event fields.
+
+        The four tabs keep independent lat/lon/time widgets and nothing syncs
+        them, so this is the one place that makes them agree. The radius is set
+        from the LOCATION ERROR, not left at the 5 km default: at 17 km of error
+        a 5 km radius covers about a twelfth of the ground the scar could be on."""
+        det = getattr(self, "detection", None)
+        if det is None:
+            self._warn("Read a detection record first.")
+            return
+        if not det.is_locatable():
+            self._warn("That record has no usable latitude/longitude.")
+            return
+        radius = det.suggested_radius_km()
+        when = None
+        if det.origin_utc:
+            when = QDateTime.fromString(
+                det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
+        targets = [self]
+        for name in ("planet_tab", "sar_tab", "viewer3d_tab"):
+            t = getattr(self, name, None)
+            if t is not None:
+                targets.append(t)
+        touched = 0
+        for t in targets:
+            try:
+                if hasattr(t, "lat_edit"):
+                    t.lat_edit.setText(f"{det.lat:.6f}")
+                    t.lon_edit.setText(f"{det.lon:.6f}")
+                if hasattr(t, "radius_spin"):
+                    t.radius_spin.setValue(radius)
+                if when is not None and when.isValid() and hasattr(t, "dt_edit"):
+                    t.dt_edit.setDateTime(when)
+                touched += 1
+            except (AttributeError, RuntimeError):
+                continue
+        self.iface.messageBar().pushInfo(
+            "Detection", f"{det.event_id or 'Detection'} applied to {touched} tabs — "
+            f"search radius {radius:g} km"
+            + (f" (location error {det.loc_error_km:g} km)" if det.loc_error_km else ""))
+        self._append_log(f"Detection applied to {touched} tabs; radius {radius:g} km.")
 
     # ---------- Sentinel-2 / Landsat tab ----------
     def _build_ui(self):
@@ -828,11 +1074,9 @@ class LandslideDock(QgsDockWidget):
         project = self.project_edit.text().strip()
         out = self.out_edit.text().strip() or os.path.join(project, "out", "interactive")
         script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path.")
-            return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
+        # One shared, actionable refusal that opens the Environment box and marks
+        # the offending field, instead of two dead-end strings naming a "venv".
+        if not self.env_gate():
             return None
         self._save_settings()
         os.makedirs(out, exist_ok=True)
@@ -857,6 +1101,12 @@ class LandslideDock(QgsDockWidget):
         scenes = [k for k, cb in self.scene_checks.items() if cb.isChecked()]
         if scenes:
             args += ["--scenes", ",".join(scenes)]
+        # Stamp the catalogue key onto the outputs when a detection is loaded, so
+        # the filenames and metadata.json can be joined back to the seismic
+        # catalogue instead of carrying a datetime-derived id only this run knows.
+        det = getattr(self, "detection", None)
+        if det is not None and det.event_id:
+            args += ["--event-id", det.event_id]
         return python, script, project, out, args
 
     def _busy(self, on):
