@@ -36,6 +36,15 @@ class PipelineTask(QgsTask):
     def run(self):
         cmd = [self.python_exe, self.script] + self.cli_args
         self.logLine.emit("$ " + " ".join(cmd))
+
+        # Drop any result file left by a PREVIOUS run so a crashed/killed run this
+        # time can never be read as if it had produced fresh output (see below).
+        rp = os.path.join(self.out_dir, self.result_name)
+        try:
+            os.remove(rp)
+        except OSError:
+            pass
+
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=self.cwd, stdout=subprocess.PIPE,
@@ -48,18 +57,43 @@ class PipelineTask(QgsTask):
 
         for line in self.proc.stdout:
             if self.isCanceled():
-                self.proc.terminate()
+                self._terminate_and_reap()   # don't leave a zombie / leak the pipe
                 return False
             self.logLine.emit(line.rstrip())
         code = self.proc.wait()
-
-        rp = os.path.join(self.out_dir, self.result_name)
         try:
-            with open(rp) as f:
-                self.result = json.load(f)
-        except Exception as e:
-            self.logLine.emit(f"could not read {self.result_name}: {e}")
+            self.proc.stdout.close()
+        except Exception:
+            pass
+
+        # Only trust result.json on a clean, un-cancelled exit. A non-zero or
+        # cancelled run must NOT surface stale/partial output as this run's result
+        # (taskTerminated loads layers too, so a stale read would be shown as real).
+        if code == 0 and not self.isCanceled():
+            try:
+                with open(rp) as f:
+                    self.result = json.load(f)
+            except Exception as e:
+                self.logLine.emit(f"could not read {self.result_name}: {e}")
         return code == 0
+
+    def _terminate_and_reap(self):
+        """Terminate the child and actually WAIT for it, escalating to kill, then
+        close its stdout — so a cancel leaves no zombie and no leaked pipe FD."""
+        try:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            if self.proc.stdout is not None:
+                self.proc.stdout.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _clean_env():
@@ -77,6 +111,8 @@ class PipelineTask(QgsTask):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
         super().cancel()
+
+
 # --------------------------------------------------------------------------
 # Reading a failure back to the user
 # --------------------------------------------------------------------------
