@@ -1633,10 +1633,15 @@ class SarTab(QWidget):
                 f"    median filter skipped ({type(e).__name__}: {e})")
 
     def _raise_cd_layer(self):
-        """Keep the newest change maps above any amplitude preview layers —
-        addMapLayer stacks new layers on top, so a Preview/Run render loaded
-        after a change map would otherwise bury the overlays."""
+        """Keep the newest change maps above any amplitude preview layers.
+
+        The change overlays live in their OWN top-level group, and a later
+        Preview/Run builds a SEPARATE amplitude group that addMapLayer stacks on
+        top. Raising the individual change layers within their group would not lift
+        that group past the amplitude group, so hoist the whole top-level change
+        group (the change layer's top-level ancestor) to the top of the tree."""
         root = QgsProject.instance().layerTreeRoot()
+        moved = []
         for lyr in reversed(self._cd_last_layers):
             try:
                 node = root.findLayer(lyr.id())
@@ -1644,10 +1649,17 @@ class SarTab(QWidget):
                 continue                  # layer was removed/deleted
             if node is None:
                 continue
-            parent = node.parent() or root
-            clone = node.clone()
-            parent.insertChildNode(0, clone)
-            parent.removeChildNode(node)
+            # Walk up to the top-level node under root — the change GROUP, or the
+            # layer itself if it sits directly under root — and move THAT to index 0.
+            top = node
+            while top.parent() is not None and top.parent() != root:
+                top = top.parent()
+            if top.parent() is None or any(top == m for m in moved):
+                continue                  # detached, or this group already hoisted
+            moved.append(top)
+            clone = top.clone()
+            root.insertChildNode(0, clone)
+            root.removeChildNode(top)
 
     def _finish_map_preview(self):
         self.map_preview_btn.setEnabled(bool(self._search_result))
