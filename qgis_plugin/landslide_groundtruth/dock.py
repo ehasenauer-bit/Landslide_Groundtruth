@@ -227,6 +227,18 @@ FONT_BASE_W, FONT_BASE_H = 380, 720
 FONT_SCALE_MIN, FONT_SCALE_MAX = 0.8, 1.5
 
 
+
+def _change_kind(name):
+    """Which change product a layer filename is, or '' — drives the colour ramp.
+
+    Order matters: 'dndsi' must be tested before 'dndvi' would ever match a
+    substring of it, and both before the looser checks."""
+    n = (name or "").lower()
+    for key in ("dbright", "dndsi", "dndvi"):
+        if key in n:
+            return key
+    return ""
+
 class LandslideDock(QgsDockWidget):
     def __init__(self, iface):
         super().__init__("Landslide Ground-Truthing")
@@ -2627,7 +2639,33 @@ class LandslideDock(QgsDockWidget):
             return
         self._load_layers(result.get("layers", []), result)
 
+    # Ramp per change product. All three are signed so that a landslide makes
+    # them NEGATIVE (fusion_core.EVIDENCE_SIGN: dbright -1, dndsi -1; dNDVI is
+    # post-minus-pre, and a scar removes vegetation), so all three show only the
+    # negative side and fade to transparent at 0. The `lo` values are scaled off
+    # fusion_core.DEFAULT_FLOORS — dbright 0.05, dndsi 0.10 — and dNDVI is given
+    # the wider NDVI range a real defoliation covers.
+    #
+    # Distinct hues, not one ramp reused: the three layers are meant to be
+    # stacked and compared, and they must stay tellable apart in the legend.
+    # Blue / orange / purple survive the common red-green colour deficiencies.
+    # Break values are EXPLICIT rather than derived from `lo`, so the dBright
+    # ramp stays exactly the one that is already in use and validated (-0.30 /
+    # -0.15 / -0.05); deriving them shifted its last stop to -0.051.
+    CHANGE_RAMPS = {
+        "dbright": ((-0.30, -0.15, -0.05), ["#08306b", "#2171b5", "#6baed6"],
+                    "brightness drop (dark debris on bright snow)"),
+        "dndsi": ((-0.50, -0.25, -0.10), ["#3f007d", "#6a51a3", "#9e9ac8"],
+                  "snow-index drop (debris is not snow)"),
+        "dndvi": ((-0.60, -0.30, -0.10), ["#7f2704", "#d94801", "#fd8d3c"],
+                  "vegetation loss"),
+    }
+
     def _style_dbright(self, lyr):
+        """Backwards-compatible shim — see _style_change."""
+        return self._style_change(lyr, "dbright")
+
+    def _style_change(self, lyr, kind="dbright"):
         """Show ONLY where brightness DECREASED (dBright < 0); everything else clear.
 
         dBright = post − pre broadband albedo (each 0–1), so a negative value means
@@ -2636,12 +2674,14 @@ class LandslideDock(QgsDockWidget):
         0. The ramp isn't clipped, so any value at or above 0 (no change, or a
         brightening) clamps to that transparent 0-stop and doesn't render, while
         values below the low bound clamp to the opaque end and stay visible."""
-        lo = -0.30   # ≤ this reads as strong darkening (full opacity); 0–1 albedo scale
+        breaks, colours, what = self.CHANGE_RAMPS.get(
+            kind, self.CHANGE_RAMPS["dbright"])
+        lo, mid, near = breaks
         stops = [
-            (lo,    "#08306b", 255, "≤ −0.30 (strong darkening)"),
-            (-0.15, "#2171b5", 210, "−0.15"),
-            (-0.05, "#6baed6", 110, "−0.05"),
-            (0.0,   "#6baed6", 0,   "0 (no decrease — transparent)"),
+            (lo,   colours[0], 255, f"≤ {lo:g} (strong {what})"),
+            (mid,  colours[1], 210, f"{mid:g}"),
+            (near, colours[2], 110, f"{near:g}"),
+            (0.0,  colours[2], 0,   "0 (no change — transparent)"),
         ]
         items = []
         for value, color, alpha, text in stops:
@@ -2680,9 +2720,13 @@ class LandslideDock(QgsDockWidget):
             if lyr.isValid():
                 if run_group is None:
                     run_group = lg.new_group(lg.name(prefix, dates, radius))
-                # dBright: show only brightness DECREASES (< 0); rest transparent
-                if "dbright" in name.lower():
-                    self._style_dbright(lyr)
+                # Change rasters: show only the DECREASE that marks a scar.
+                # Previously only dBright was styled, so dNDVI and dNDSI loaded
+                # as flat grey and read as empty — the two layers the analyst is
+                # actually supposed to compare looked like failed downloads.
+                kind = _change_kind(name)
+                if kind:
+                    self._style_change(lyr, kind)
                 product = _core_product(name)
                 if product:
                     if product not in subs:
