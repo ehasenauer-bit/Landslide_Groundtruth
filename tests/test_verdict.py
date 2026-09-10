@@ -25,7 +25,7 @@ class Stub:
         self._rows = []
     def _role_layer(self, role): return None
     def _append_log(self, t): pass
-for m in ("_build_verdict_box","_latest_row","_scar_centroid","_verdict_row","_refresh_verdict"):
+for m in ("_build_verdict_box","_latest_row","_estimates","_scar_centroid","_verdict_row","_refresh_verdict"):
     setattr(Stub, m, getattr(VT.VolumeTab, m))
 
 s = Stub()

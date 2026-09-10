@@ -18,7 +18,7 @@ class Stub:
     def __init__(self): self.dock=FakeDock(); self._rows=[]
     def _role_layer(self,r): return None
     def _append_log(self,t): pass
-for m in ("_build_verdict_box","_latest_row","_scar_centroid","_verdict_row","_refresh_verdict"):
+for m in ("_build_verdict_box","_latest_row","_estimates","_scar_centroid","_verdict_row","_refresh_verdict"):
     setattr(Stub,m,getattr(VT.VolumeTab,m))
 s=Stub(); _box=s._build_verdict_box()  # keep a ref: Qt deletes children otherwise
 det=DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6, loc_error_km=17.0,

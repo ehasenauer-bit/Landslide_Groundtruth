@@ -199,6 +199,13 @@ CSV_FIELDS = [
     # what the ∫Δh volume is actually worth: the per-pixel vertical noise, the
     # volume error that follows from it, the residual bias taken off before
     # integrating, and how much of the outline the Δh really covered.
+    # both independent estimates, per row, so one exported line can show the
+    # cross-check instead of it living only on screen
+    ("vol_area_scaling_m3", "v_larsen"),
+    ("vol_area_scaling_lo_m3", "v_larsen_lo"),
+    ("vol_area_scaling_hi_m3", "v_larsen_hi"),
+    ("vol_dh_erosion_row_m3", "v_dh_erosion"),
+    ("vol_dh_net_row_m3", "v_dh_net"),
     ("dh_sigma_m", "sigma_dh"), ("dh_volume_sigma_m3", "v_sigma"),
     ("dh_bias_removed_m", "dh_offset"), ("dh_coverage_frac", "dh_coverage"),
     ("dh_covered_area_m2", "covered_area"), ("dh_mean_m", "mean_dh"),
@@ -307,11 +314,22 @@ class VolumeTab(QWidget):
         for label, _key in volume_calc.MATERIALS:
             self.material_combo.addItem(label)
         self.material_combo.setToolTip(
-            "Which material's coefficients to use. Bedrock failures are deeper "
-            "for a given area than soil failures, so this choice moves the "
-            "volume substantially — pick it from what actually failed, not the "
-            "surrounding cover.")
-        form.addRow("Hillslope material", self.material_combo)
+            "Bedrock failures are deeper for a given area than soil failures. "
+            "This is the single biggest control on the answer: at a typical "
+            "scar size the two options differ by about a factor of 5 — roughly "
+            "twenty times the ±range shown beside the volume. Pick it from what "
+            "actually failed, not from the surrounding cover.")
+        form.addRow("What failed?", self.material_combo)
+        # The case this plugin exists for is the one Larsen does not cover.
+        ice_note = QLabel(
+            "Neither option covers a rock-and-ice avalanche. If much of what "
+            "moved was ice or entrained snow, this relation is outside its "
+            "calibration — and the seismic volume is a mass divided by an "
+            "assumed density, so check both numbers assume the same thing "
+            "before comparing them.")
+        ice_note.setWordWrap(True)
+        ice_note.setStyleSheet("QLabel { color: palette(mid); }")
+        form.addRow("", ice_note)
         root.addLayout(form)
 
         # --- actions ---
@@ -969,10 +987,50 @@ class VolumeTab(QWidget):
         self.vol_best_out = self._ro()
         f.addRow("Volume (best)", self.vol_best_out)
         self.vol_range_out = self._ro()
-        f.addRow("Volume (±1σ)", self.vol_range_out)
+        self.vol_range_lbl = QLabel("Likely range")
+        self.vol_range_lbl.setToolTip(
+            "NOT a prediction interval for this landslide. It propagates the "
+            "uncertainty in WHERE THE REGRESSION LINE SITS (the published "
+            "spread on the coefficients) plus your own low/high outlines. It "
+            "contains no term for how far individual landslides scatter about "
+            "that line, which is the dominant uncertainty — roughly a factor of "
+            "2 to 3 in Larsen's own data, several times wider than the range "
+            "shown here.\n\n"
+            "Larsen's published spread is itself ambiguous: their main text "
+            "calls it a standard deviation and the supplement calls it a "
+            "standard error.\n\n"
+            "Your low/high outlines are also read as a ±2σ span, so a narrower "
+            "pair tightens this range faster than you may intend.")
+        f.addRow(self.vol_range_lbl, self.vol_range_out)
+        # V/A — the cheapest sanity check in the tab, and it was never shown even
+        # though both numbers were already in hand. 3 m is a plausible bedrock
+        # detachment; 90 m means the outline is wrong, and no other readout on
+        # this panel would have told you.
+        self.depth_out = self._ro()
+        self.depth_out.setToolTip(
+            "Volume ÷ converted area: the average thickness implied by this "
+            "estimate. Check it against the headscarp you can see — if it is "
+            "tens of metres for a shallow-looking scar, the outline or the "
+            "material is wrong.")
+        f.addRow("Implied mean depth", self.depth_out)
         self.calc_out = self._ro()
         f.addRow("Calculated by", self.calc_out)
         return box
+
+    def _show_depth(self, c):
+        """Volume ÷ area, from whichever pair actually belongs together.
+
+        Under the ∫Δh fit `a_conv` is the Δh COVERED area, not the scar, so the
+        area-scaling area is preferred when the row carries one — dividing a
+        Larsen volume by a coverage footprint would print a number that means
+        nothing."""
+        from . import verdict as V
+        vol = _num(c.get("v_larsen")) or _num(c.get("v_best"))
+        area = (_num(c.get("larsen_area_m2")) or _num(c.get("a_conv"))
+                or _num(c.get("src_best")))
+        d = V.implied_depth_m(vol, area)
+        self.depth_out.setText("" if d is None else
+                               f"{d:,.1f} m   (volume ÷ {area / 1e6:,.3g} km²)")
 
     def _build_centerline_box(self):
         """Centerline + elevation-drop tools. Collapsed by default — both are
@@ -1552,6 +1610,14 @@ class VolumeTab(QWidget):
             "used_text": ", ".join(used),
             "calc": calc,
         }
+        # The area-scaling volume also under its OWN name, so the headline field
+        # can change meaning with the fit without the cross-check losing track of
+        # which number came from where.
+        self._current["v_larsen"] = v_best
+        self._current["v_larsen_lo"] = v_low
+        self._current["v_larsen_hi"] = v_high
+        self._current["larsen_area_m2"] = conv_area
+        self._current.update(self._secondary_dh())
         self._cl_fid = None
         self._show_current()
         self.add_btn.setEnabled(True)
@@ -1652,6 +1718,87 @@ class VolumeTab(QWidget):
             self._append_log("Could not read the UTM zone's EPSG code.")
             return None, None, None
         return geom_utm, epsg, geom_utm.boundingBox()
+
+    # ---------- the other estimate, alongside the primary fit ----------
+    # The Fit combo picks ONE calibration per Measure, and it used to end there:
+    # a row was Larsen or ∫Δh, never both, and measuring the same slide twice
+    # auto-renamed it, so the two independent volumes landed in the table as
+    # "slide 1" and "slide 2" with nothing recording they were one event. The act
+    # of recording the cross-check destroyed it. These two helpers run the OTHER
+    # path opportunistically when its inputs happen to be assigned and merge the
+    # result into the SAME row under its own field names, so one row can carry
+    # the seismic, the area-scaling and the elevation-change volumes at once.
+    # The Fit still decides which one is the headline (v_best).
+
+    def _secondary_dh(self):
+        """{v_dh_*} from integrating the assigned Δh over the outline, or {}.
+
+        Silent by design: this runs beside an area-scaling Measure the user did
+        not ask to be a Δh measurement, so a missing layer or a failed warp
+        should add nothing rather than raise an error about a fit they did not
+        select."""
+        try:
+            from . import dem_diff
+            dh_layer = self._ddem_layer()
+            if dh_layer is None:
+                return {}
+            feat, layer, role = self._ddem_outline()
+            if feat is None:
+                return {}
+            geom_utm, epsg, bb = self._outline_utm(feat, layer)
+            if geom_utm is None:
+                return {}
+            res = self._ddem_grid_res()
+            margin = 2.0 * res
+            bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                      bb.xMaximum() + margin, bb.yMaximum() + margin)
+            pad = max(4.0 * res, 0.5 * max(bb.width(), bb.height()))
+            cal_bounds = (bb.xMinimum() - pad, bb.yMinimum() - pad,
+                          bb.xMaximum() + pad, bb.yMaximum() + pad)
+            cal = dem_diff.stable_ground_stats(
+                dh_layer.source(), geom_utm.asWkt(), epsg, cal_bounds, res)
+            area = self._measure_area(feat.geometry(), layer.crs())
+            r = dem_diff.integrate_dh(
+                dh_layer.source(), geom_utm.asWkt(), epsg, bounds, res,
+                sign_deposit_positive=self.ddem_deposit_positive.isChecked(),
+                offset=(cal["offset_m"] if cal.get("ok") else 0.0),
+                sigma_dh_m=cal.get("sigma_m", 0.0), outline_area_m2=area)
+            if not r.get("pixel_count"):
+                return {}
+            return {
+                "v_dh_erosion": abs(r["v_erosion"]),
+                "v_dh_deposit": r["v_deposit"],
+                "v_dh_net": r["v_net"],
+                "v_dh_sigma": r.get("v_sigma_m3"),
+                "sigma_dh": r.get("sigma_dh_m"),
+                "dh_offset": r.get("offset_applied_m"),
+                "dh_coverage": r.get("coverage_frac"),
+                "ddem_name": dh_layer.name(), "ddem_res": res,
+                "covered_area": r["covered_area_m2"],
+                "mean_dh": r["mean_dh_m"], "max_rise": r["max_rise_m"],
+                "max_drop": r["max_drop_m"],
+            }
+        except Exception as e:
+            self._append_log(f"(Δh cross-check skipped: {e})")
+            return {}
+
+    def _secondary_larsen(self):
+        """{v_larsen*} from area-scaling the source scar, or {} — the mirror of
+        _secondary_dh, run beside a ∫Δh Measure so the two can be compared."""
+        try:
+            a_best, best_feat, best_layer = self._role_area("best", "Source best")
+            if best_feat is None or not a_best:
+                return {}
+            a_low, _lf, _ll = self._role_area("low", "Source low")
+            a_high, _hf, _hl = self._role_area("high", "Source high")
+            v, vlo, vhi, calc = volume_calc.volume_source(
+                a_best, A_low=a_low, A_high=a_high, material=self._material(),
+                fit="scar", project_dir=self.dock.project_edit.text().strip())
+            return {"v_larsen": v, "v_larsen_lo": vlo, "v_larsen_hi": vhi,
+                    "larsen_area_m2": a_best, "larsen_calc": calc}
+        except Exception as e:
+            self._append_log(f"(area-scaling cross-check skipped: {e})")
+            return {}
 
     def _measure_ddem(self):
         """Volume from integrating an elevation-change raster over the outline.
@@ -1798,6 +1945,11 @@ class VolumeTab(QWidget):
                           f"“{outline_layer.name()}”  (feature {outline_feat.id()})"),
             "calc": calc,
         }
+        self._current["v_dh_erosion"] = abs(r["v_erosion"])
+        self._current["v_dh_deposit"] = r["v_deposit"]
+        self._current["v_dh_net"] = r["v_net"]
+        self._current["v_dh_sigma"] = r.get("v_sigma_m3")
+        self._current.update(self._secondary_larsen())
         self._cl_fid = None
         self._show_current()
         self.add_btn.setEnabled(True)
@@ -2089,6 +2241,7 @@ class VolumeTab(QWidget):
                 bits.append(f"{c['dh_coverage']:.0%} of the outline covered")
             self.vol_range_out.setText("   ·   ".join(bits))
             self.calc_out.setText(c["calc"])
+            self._show_depth(c)
         else:
             self.source_out.setText(
                 f"{c['used_text']}  (feature {c['conv_fid']})")
@@ -2108,11 +2261,15 @@ class VolumeTab(QWidget):
                            ("src high", c["src_high"])) if a is not None]
             self.area_range_out.setText(
                 ("  ·  ".join(others) + " m²") if others else "— (none assigned)")
+            # 3 significant figures, not 4 decimal places of Mm³: the honest
+            # spread on an area-scaling volume is a factor of 2-3, so printing
+            # 1.3021 Mm³ asserts a precision the method does not have.
             self.vol_best_out.setText(
-                f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
+                f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.3g} Mm³)")
             self.vol_range_out.setText(
                 f"{_fmt(c['v_low'])} – {_fmt(c['v_high'])} m³")
             self.calc_out.setText(c["calc"])
+            self._show_depth(c)
         if c["length"] is None:
             self.length_out.setText("— (not measured)")
         else:
@@ -2611,7 +2768,7 @@ class VolumeTab(QWidget):
         self.source_out.setText("assign the layer the fit needs, then Measure")
         for e in (self.area_best_out, self.area_range_out, self.length_out,
                   self.drop_out, self.vol_best_out, self.vol_range_out,
-                  self.calc_out):
+                  self.depth_out, self.calc_out):
             e.clear()
         self._append_log(f"Added “{row['name']}” to the results table.")
 
@@ -2725,6 +2882,27 @@ class VolumeTab(QWidget):
         self._refresh_verdict()
         return box
 
+    def _estimates(self):
+        """(larsen, dh_erosion, row) for the cross-check.
+
+        Prefers a SINGLE row carrying both — which is what a Measure now
+        produces when the inputs for the other path are also assigned. Falls
+        back to the most recent row of each kind, so rows measured before one
+        row could hold both still reconcile.
+
+        v_larsen / v_dh_erosion are read rather than v_best, because v_best
+        means whatever the row's own fit made it mean.
+        """
+        rows = list(getattr(self, "_rows", None) or [])
+        for row in reversed(rows):
+            if _num(row.get("v_larsen")) and _num(row.get("v_dh_erosion")):
+                return (_num(row["v_larsen"]), _num(row["v_dh_erosion"]), row)
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
+        larsen = _num(area.get("v_larsen")) or _num(area.get("v_best"))
+        eros = _num(dh.get("v_dh_erosion")) or _num(dh.get("v_erosion"))
+        return larsen, eros, (area or dh)
+
     def _latest_row(self, fit=None):
         """The most recent measured row, optionally restricted by fit family.
 
@@ -2800,22 +2978,28 @@ class VolumeTab(QWidget):
         row["analyst"] = self.analyst_edit.text().strip()
         row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
                                if row["verdict"] else "")
+        larsen, eros, src = self._estimates()
         area = self._latest_row("area")
         dh = self._latest_row("ddem")
         rec = V.reconcile(
             seismic=(det.vol_best_m3 if det is not None else None),
-            larsen=_num(area.get("v_best")),
-            dh_erosion=_num(dh.get("v_erosion")))
-        # split v_best by the row's own fit so the columns never lie
-        row["vol_larsen_m3"] = area.get("v_best")
-        row["vol_larsen_lo_m3"] = area.get("v_low")
-        row["vol_larsen_hi_m3"] = area.get("v_high")
-        row["vol_dh_net_m3"] = dh.get("v_best")
+            larsen=larsen, dh_erosion=eros)
+        # each volume from its OWN field, never from v_best, which means
+        # different things under different fits
+        row["vol_larsen_m3"] = larsen
+        row["vol_larsen_lo_m3"] = (src.get("v_larsen_lo")
+                                   if src.get("v_larsen_lo") is not None
+                                   else area.get("v_low"))
+        row["vol_larsen_hi_m3"] = (src.get("v_larsen_hi")
+                                   if src.get("v_larsen_hi") is not None
+                                   else area.get("v_high"))
+        row["vol_dh_net_m3"] = src.get("v_dh_net", dh.get("v_net"))
         row["d_larsen"] = "" if rec["d_larsen"] is None else f"{rec['d_larsen']:.3f}"
         row["d_dh"] = "" if rec["d_dh"] is None else f"{rec['d_dh']:.3f}"
         row["agreement"] = rec["agreement"]
-        depth = V.implied_depth_m(_num(area.get("v_best")),
-                                  _num(area.get("a_conv")) or _num(area.get("src_best")))
+        depth = V.implied_depth_m(
+            larsen, _num(src.get("larsen_area_m2")) or _num(area.get("a_conv"))
+            or _num(area.get("src_best")))
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
         lat, lon = self._scar_centroid()
         row["scar_lat"] = "" if lat is None else f"{lat:.6f}"
@@ -2836,11 +3020,10 @@ class VolumeTab(QWidget):
         never put them next to each other."""
         from . import verdict as V
         det = getattr(self.dock, "detection", None)
+        larsen, eros, src = self._estimates()
         area = self._latest_row("area")
         dh = self._latest_row("ddem")
-        larsen = _num(area.get("v_best"))
-        eros = _num(dh.get("v_erosion"))
-        net = _num(dh.get("v_best"))
+        net = _num(src.get("v_dh_net")) if src.get("v_dh_net") is not None else _num(dh.get("v_net"))
         seis = det.vol_best_m3 if det is not None else None
         lines = []
         if seis is not None:
@@ -2859,7 +3042,8 @@ class VolumeTab(QWidget):
             lines.append(f"∫Δh erosion&nbsp;&nbsp;{eros / 1e6:.3g} ×10⁶ m³{extra}")
         if larsen:
             depth = V.implied_depth_m(
-                larsen, _num(area.get("a_conv")) or _num(area.get("src_best")))
+                larsen, _num(src.get("larsen_area_m2"))
+                or _num(area.get("a_conv")) or _num(area.get("src_best")))
             if depth:
                 lines.append('<span style="color:palette(mid);">'
                              f"implied mean depth {depth:.1f} m</span>")
@@ -2870,8 +3054,13 @@ class VolumeTab(QWidget):
                          "for this slide — the Fit combo does one at a time; "
                          "measure again under a Source-scar fit to compare.</span>")
         rec = V.reconcile(seismic=seis, larsen=larsen, dh_erosion=eros)
-        colour = {"agree": "#1b7f37", "marginal": "#b3541e",
-                  "disagree": "#c0392b"}.get(rec["agreement"], "")
+        # theme.status_color, not literals: the greens and reds picked by eye
+        # here failed WCAG AA against QGIS's dark theme (2.4:1), and a verdict
+        # nobody can read is worse than no verdict.
+        from .theme import status_color
+        kind = {"agree": "success", "marginal": "warn",
+                "disagree": "error"}.get(rec["agreement"], "")
+        colour = status_color(kind) if kind else ""
         if colour:
             lines.append(f'<b style="color:{colour};">→ {rec["agreement"]}</b> — {rec["text"]}')
         elif seis is not None or larsen:
