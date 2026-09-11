@@ -204,8 +204,8 @@ def hillshade_thumb(url, max_px=256):
 # ===========================================================================
 # Elevation-change (Δh) -> volume, for the Volume tab's "∫Δh over outline" fit.
 #
-# The one thing MOSART (and any dDEM workflow) leaves to the caller: turn a map
-# of elevation change into a volume by summing dh over the ground area that
+# The one thing every dDEM workflow leaves to the caller: turn a map of
+# elevation change into a volume by summing dh over the ground area that
 # moved. Everything here is metric — the change field is warped to a UTM grid so
 # a pixel is res×res square metres regardless of whether the input arrived in
 # radar/degree/foot units, then dh·res² is summed inside the outline. Kept in
@@ -217,7 +217,7 @@ def _resolve_source(u):
 
     Distinct from `warp`, which prefixes /vsicurl onto everything non-/vsi
     because its inputs are always remote PGC COGs — here the inputs are usually
-    LOCAL rasters (a project DEM, a differenced Δh, a saved MOSART GeoTIFF).
+    LOCAL rasters (a project DEM, a differenced Δh, an imported Δh GeoTIFF).
 
     A QGIS raster layer's source() can carry provider decorations GDAL can't
     open (e.g. "…/dem.tif|band=1"); the part before the first '|' is the
@@ -352,11 +352,12 @@ def stable_ground_stats(dh_source, outline_wkt, epsg, bounds, res,
     """Residual bias and per-pixel noise of an IMPORTED Δh, from ground OUTSIDE
     the outline. Returns {"offset_m", "sigma_m", "stable_px", "ok"}.
 
-    Why this exists, specifically for MOSART. MOSART reconstructs elevation
-    change from Sentinel-1 AMPLITUDE by a least-squares shape-from-shading
-    inversion (its `sfs` / `lsquares` modules), and the notebook writes
-    `demdefs[post] - demdefs[ref]` straight to GeoTIFF. An inversion of that kind
-    constrains the SHAPE of the change field far better than its absolute datum,
+    Why this exists. The worked case is a SAR amplitude inversion of the MOSART
+    kind — elevation change reconstructed from Sentinel-1 AMPLITUDE by a
+    least-squares shape-from-shading fit, written out as `post − reference`
+    straight to GeoTIFF (that integration is parked, see parked/mosart/). An
+    inversion of that kind constrains the SHAPE of the change field far better
+    than its absolute datum,
     so the product carries a DC offset that nothing upstream removes — and volume
     is LINEAR in that offset. Half a metre of residual bias over a 1 km² outline
     integrates to 500,000 m³, which is a large fraction of a real event's whole
@@ -400,8 +401,8 @@ def integrate_dh(dh_source, outline_wkt, epsg, bounds, res,
     """Integrate an elevation-change raster over an outline -> volumes (m³).
 
     `dh_source` is any GDAL-openable Δh raster in metres. It is warped onto the
-    metric grid (bounds, epsg, res) — reprojecting a geographic (e.g. MOSART
-    lon/lat degree) product to equal-area square pixels on the way — the outline
+    metric grid (bounds, epsg, res) — reprojecting a geographic (lon/lat degree)
+    product to equal-area square pixels on the way — the outline
     (WKT, in EPSG:epsg) is rasterized to a mask, and Δh is summed over the
     covered valid pixels:
 
@@ -441,8 +442,8 @@ def integrate_dh(dh_source, outline_wkt, epsg, bounds, res,
     # the wrong one is not a detail:
     #
     #   correlated  σ_V = σ_h · A          a DC/long-wavelength bias. This is
-    #                                      the realistic case for MOSART, whose
-    #                                      shape-from-shading inversion produces
+    #                                      the realistic case for an inverted Δh,
+    #                                      whose shape-from-shading fit produces
     #                                      a smooth error field, not white noise.
     #   random      σ_V = σ_h · px · √N    independent per-pixel noise.
     #
