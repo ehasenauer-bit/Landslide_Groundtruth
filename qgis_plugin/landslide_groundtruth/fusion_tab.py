@@ -76,6 +76,12 @@ OPTICAL_EXCLUDE = ("s1 ", "log-ratio", "logratio", "int-corr", "mt-corr",
                    "brightness z")
 SAR_EXCLUDE = ("dndsi", "dbright", "dndvi", "ndvi")
 
+# How much of each other two change rasters must cover before the tab will treat
+# them as describing the same event. Measured as min(a-in-b, b-in-a), so it is
+# the SMALLER of the two containments — see _footprint_match for why the
+# one-directional version of this test was worse than no test at all.
+FOOTPRINT_MATCH_MIN = 0.60
+
 # score ramp: transparent below 0.2 so a quiet AOI renders as nothing at all
 SCORE_RAMP = [(0.0, "#ffffff", 0), (0.20, "#ffffcc", 0), (0.40, "#fed976", 140),
               (0.60, "#fd8d3c", 200), (0.80, "#e31a1c", 230),
@@ -126,6 +132,7 @@ class FusionTab(QWidget):
         # without a button press. Debounced: loading a project adds layers one
         # at a time and would otherwise re-scan (and re-log) once per layer.
         self._bbox_cache = {}
+        self._browsed = {"optical": {}, "sar": {}}   # path -> name, per side
         self._sar_user_choice = False  # True once the user picks SAR by hand
         self._refreshing = False
         self._applying_preset = False
@@ -185,7 +192,7 @@ class FusionTab(QWidget):
         A newcomer should be able to tell what to do next without reading a
         manual, and an expert should be able to see at a glance that the tab is
         about to fuse the pair they think it is — which is why step 2 shows the
-        footprint overlap and not just a tick."""
+        footprint match and not just a tick."""
         box = QFrame()
         box.setFrameShape(QFrame.StyledPanel)
         grid = QGridLayout(box)
@@ -250,19 +257,19 @@ class FusionTab(QWidget):
             n = 1 + (len(self._sar_siblings(sar))
                      if self.pair_sar_check.isChecked() else 0)
             ov = self._pair_overlap
-            detail = (f"{ov:.0%} footprint overlap with the optical raster"
+            detail = (f"{ov:.0%} footprint match with the optical raster"
                       if ov is not None else "")
             self._set_step(1, f"✓ {n} detector{'s' if n != 1 else ''}",
-                           CLR_OK if (ov is None or ov >= 0.5) else CLR_WARN,
+                           CLR_OK if (ov is None or ov >= 0.80) else CLR_WARN,
                            detail)
         elif not self.out_fused_check.isChecked():
             self._set_step(1, "Not needed", CLR_MUTED,
                            "'Fused score' is unticked — this is an optical-only run")
         else:
             ov = self._pair_overlap
-            if ov is not None and ov < 0.30:
+            if ov is not None and ov < FOOTPRINT_MATCH_MIN:
                 self._set_step(1, "No SAR raster covers this area", CLR_BAD,
-                               f"best overlap {ov:.0%} — pick one, or run SAR "
+                               f"best match {ov:.0%} — pick one, or run SAR "
                                "change detection for this event")
             else:
                 self._set_step(1, "Choose a SAR raster", CLR_BAD,
@@ -536,9 +543,8 @@ class FusionTab(QWidget):
         self._optical_browse = QPushButton("…")
         self._optical_browse.setMaximumWidth(32)
         self._optical_browse.clicked.connect(
-            lambda: self._browse_into(self._optical_combo, "optical change raster"))
-        self._optical_combo.currentIndexChanged.connect(
-            lambda _i: self._autodetect_measure("optical"))
+            lambda: self._browse_into("optical", "optical change raster"))
+        self._optical_combo.currentIndexChanged.connect(self._optical_chosen)
         form.addRow(self._tag("Optical change raster", CLR_OPTICAL),
                     self._row(self._optical_combo, self._optical_browse))
         self.optical_kind_combo = QComboBox()
@@ -567,7 +573,10 @@ class FusionTab(QWidget):
         self._sar_combo = QComboBox()
         self._sar_combo.setToolTip(
             "The change map from the SAR tab — chosen automatically as the one "
-            "whose footprint overlaps the optical raster above.\n\nThe SAR tab "
+            "whose footprint MATCHES the optical raster above. A raster covering "
+            "noticeably different ground is listed greyed out with how far off "
+            "it is, rather than offered as a pair; the … button forces any file "
+            "you like past that.\n\nThe SAR tab "
             "saves a float32 copy under the layer's own name in "
             "<output>/sar/change. Older runs left only a temporary file, and a "
             "temp file that has since been cleaned up shows here greyed out as "
@@ -575,7 +584,7 @@ class FusionTab(QWidget):
         self._sar_browse = QPushButton("…")
         self._sar_browse.setMaximumWidth(32)
         self._sar_browse.clicked.connect(
-            lambda: self._browse_into(self._sar_combo, "SAR change raster"))
+            lambda: self._browse_into("sar", "SAR change raster"))
         self._sar_combo.currentIndexChanged.connect(self._sar_chosen)
         form.addRow(self._tag("SAR change raster", CLR_SAR),
                     self._row(self._sar_combo, self._sar_browse))
@@ -1053,42 +1062,40 @@ class FusionTab(QWidget):
         survey = self._survey_layers()
         rasters = sorted([(n, p) for n, p, r in survey if p],
                          key=lambda t: t[0].lower())
+        # One row per FILE, not per layer. Adding a package to the project twice
+        # gives two QgsRasterLayers over one raster, and they render as two rows
+        # identical in every visible respect — same name, same footprint, same
+        # folder — which reads as "there are two different rasters here" and
+        # sends you looking for a difference that does not exist.
+        unique, seen_paths = [], set()
+        for nm, src in rasters:
+            if src not in seen_paths:
+                seen_paths.add(src)
+                unique.append((nm, src))
+        rasters = unique
         rejected = sorted([(n, r) for n, p, r in survey if not p],
                           key=lambda t: t[0].lower())
 
-        for combo, hints, exclude in (
-                (self._optical_combo, OPTICAL_HINTS, OPTICAL_EXCLUDE),
-                (self._sar_combo, SAR_HINTS, SAR_EXCLUDE)):
-            keep = combo.currentData()
-            known = {p for _n, p in rasters}
-            # keep files the user browsed to, but only while they still exist:
-            # a stale entry would otherwise stay selected after its file is gone
-            extras = [(combo.itemText(i), combo.itemData(i))
-                      for i in range(combo.count())
-                      if combo.itemData(i) and combo.itemData(i) not in known
-                      and os.path.exists(combo.itemData(i))]
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("— choose a layer —", None)
-            for nm, src in rasters:
-                combo.addItem(nm, src)
-            for nm, src in extras:                   # browsed-in files
-                combo.addItem(nm, src)
-            first_bad = combo.count()
-            for nm, why in rejected:
-                combo.addItem(f"{nm}  —  {why}", None)
-            model = combo.model()
-            for i in range(first_bad, combo.count()):
-                item = model.item(i) if hasattr(model, "item") else None
-                if item is not None:
-                    item.setEnabled(False)
-            idx = combo.findData(keep) if keep else -1
-            if idx < 0:
-                idx = self._best_match(combo, hints, exclude)
-            if idx > 0 and not combo.itemData(idx):
-                idx = 0                              # never land on a greyed row
-            combo.setCurrentIndex(max(0, idx))
-            combo.blockSignals(False)
+        # Optical first: it is the ANCHOR. Every SAR candidate is measured
+        # against the optical footprint, so the SAR list cannot be built until
+        # the optical choice has settled.
+        self._fill_combo("optical", rasters, rejected, OPTICAL_HINTS,
+                         OPTICAL_EXCLUDE)
+        opt_path = self._optical_combo.currentData()
+        anchor = self._bbox4326(opt_path) if opt_path else None
+        lost = self._fill_combo("sar", rasters, rejected, SAR_HINTS,
+                                SAR_EXCLUDE, anchor=anchor)
+        if lost and self._sar_user_choice:
+            # the hand-picked SAR raster does not cover the optical raster now
+            # selected; hand the pairing back to geography rather than leave a
+            # dead choice sitting in the box looking authoritative
+            self._sar_user_choice = False
+            if not quiet:
+                self._warn(
+                    "The SAR raster you had picked does not cover the same "
+                    "ground as the optical raster now selected, so it was "
+                    "released. It is still listed, greyed out, with how far off "
+                    "it is.")
 
         # Pair the SAR input to the OPTICAL one by geography, not by name order.
         # Alphabetical order pairs whichever event happens to spell earliest: with
@@ -1096,25 +1103,46 @@ class FusionTab(QWidget):
         # overlap. Only re-pick when the user has not chosen the SAR layer
         # themselves.
         self._pair_overlap = None
-        opt_path = self._optical_combo.currentData()
         if opt_path and not self._sar_user_choice:
-            anchor = self._bbox4326(opt_path)
-            idx, ov = self._best_overlapping(self._sar_combo, SAR_HINTS, anchor,
-                                             SAR_EXCLUDE)
-            self._pair_overlap = ov
+            idx, ov = self._best_footprint_match(self._sar_combo, SAR_HINTS,
+                                                 anchor, SAR_EXCLUDE)
             self._sar_combo.blockSignals(True)
-            if idx > 0 and ov >= 0.30:
+            if idx > 0 and ov >= FOOTPRINT_MATCH_MIN:
                 self._sar_combo.setCurrentIndex(idx)
             else:
                 self._sar_combo.setCurrentIndex(0)   # no honest pair — ask
             self._sar_combo.blockSignals(False)
             self._autodetect_measure("sar")
-            if idx > 0 and ov < 0.30 and not quiet:
-                self._warn(
-                    "No SAR change raster overlaps the selected optical raster "
-                    f"(best overlap {ov:.0%}). They would describe different "
-                    "places. Pick the SAR layer for THIS event, or run SAR change "
-                    "detection for it.")
+            if idx > 0:
+                self._pair_overlap = ov
+            else:
+                # The search above only sees rows the filter left selectable, so
+                # when it finds nothing it returns 0.0 — and reporting "best 0%"
+                # for a raster that missed by a whisker would send the user
+                # looking for the wrong problem. Score every SAR-looking raster,
+                # greyed or not, and report the real near-miss.
+                near = [self._footprint_match(anchor, self._bbox4326(src))
+                        for nm, src in rasters
+                        if any(h in nm.lower() for h in SAR_HINTS)
+                        and not any(x in nm.lower() for x in SAR_EXCLUDE)]
+                self._pair_overlap = max(near) if near else None
+                if near and not quiet:
+                    self._warn(
+                        "No SAR change raster covers the same ground as the "
+                        f"selected optical raster (a pair needs a "
+                        f"{FOOTPRINT_MATCH_MIN:.0%} footprint match; the "
+                        f"closest of {len(near)} manages {max(near):.0%}). "
+                        "Every one is listed greyed out with how far off it is "
+                        "— the usual cause is an optical raster left over from "
+                        "a run at a different radius. Run SAR change detection "
+                        "over the same AOI, or use the … button to force a file.")
+        elif opt_path:
+            # user-chosen SAR: still report the match, so the step panel says
+            # what this pair actually is instead of going silent
+            sar_path = self._sar_combo.currentData()
+            if sar_path:
+                self._pair_overlap = self._footprint_match(
+                    anchor, self._bbox4326(sar_path))
 
         # blockSignals above suppressed currentIndexChanged, so the measure
         # auto-detect never ran for a selection made BY the refresh — which is
@@ -1135,25 +1163,144 @@ class FusionTab(QWidget):
                        "project is listed greyed-out in the dropdowns with the "
                        "reason; the log pane has the same list.")
 
+    def _fill_combo(self, role, rasters, rejected, hints, exclude, anchor=None):
+        """Repopulate one side's combo. Returns True if a selection was dropped.
+
+        Every row is labelled with its ground footprint, because a layer NAME
+        does not identify a raster here: re-running an event writes a second
+        raster under the same event id, and two dbright layers whose names differ
+        only in an end date are indistinguishable in a dropdown 160 px wide. The
+        size is the thing that tells them apart, so the size is on every row.
+
+        `anchor` is the optical footprint each SAR candidate is measured against.
+        A raster covering different ground is LISTED, with how far off it is, and
+        disabled — the tab's standing rule is that a layer which silently fails
+        to appear is unexplainable from the UI, so nothing is ever dropped."""
+        combo = self._optical_combo if role == "optical" else self._sar_combo
+        keep = combo.currentData()
+        known = {p for _n, p in rasters}
+        # browsed-in files survive a rescan, but only while they still exist: a
+        # stale entry would otherwise stay selected after its file was gone
+        rows = list(rasters) + sorted(
+            (nm, src) for src, nm in self._browsed[role].items()
+            if src not in known and os.path.exists(src))
+        seen = {}
+        for nm, _src in rows:
+            seen[nm] = seen.get(nm, 0) + 1
+        dup = {nm for nm, c in seen.items() if c > 1}
+
+        good, mismatched = [], []
+        for nm, src in rows:
+            why = self._footprint_reason(src, anchor)
+            label = self._row_label(nm, src, dup)
+            if why:
+                mismatched.append((f"{label}  —  {why}", None))
+            else:
+                good.append((label, src))
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("— choose a layer —", None)
+        for label, src in good:
+            combo.addItem(label, src)
+        first_bad = combo.count()
+        for label, _none in mismatched:              # wrong ground for this pair
+            combo.addItem(label, None)
+        for nm, why in rejected:                     # not fusable at all
+            combo.addItem(f"{nm}  —  {why}", None)
+        model = combo.model()
+        for i in range(first_bad, combo.count()):
+            item = model.item(i) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(False)
+        idx = combo.findData(keep) if keep else -1
+        lost = bool(keep) and idx < 0
+        if idx < 0:
+            idx = self._best_match(combo, hints, exclude)
+        if idx > 0 and not combo.itemData(idx):
+            idx = 0                                  # never land on a greyed row
+        combo.setCurrentIndex(max(0, idx))
+        combo.blockSignals(False)
+        return lost
+
     def _bbox4326(self, path):
-        """Lon/lat bounding box of a raster, cached by (path, mtime).
+        """Lon/lat bounding box of a raster, cached by (path, mtime)."""
+        return self._geom(path).get("bbox")
+
+    def _footprint_km(self, path):
+        """(width, height) of a raster's ground footprint in km, or None."""
+        return self._geom(path).get("km")
+
+    def _geom(self, path):
+        """Footprint of a raster — lon/lat bbox and ground size — by (path, mtime).
 
         Only the geotransform is read — no pixel access — so this stays cheap
         enough to run for every candidate layer on every refresh."""
         try:
             key = (path, os.path.getmtime(path))
         except OSError:
-            return None
+            return {}
         hit = self._bbox_cache.get(key)
         if hit is not None:
             return hit
+        out = {}
         try:
             gt, shape, proj = fusion_grid.reference_grid(path)
-            bb = fusion_cloud.bbox_4326(gt, shape, proj)
+            out["bbox"] = fusion_cloud.bbox_4326(gt, shape, proj)
+            out["km"] = fusion_grid.extent_km(gt, shape)
         except Exception:                            # noqa: BLE001
-            bb = None
-        self._bbox_cache[key] = bb
-        return bb
+            pass
+        self._bbox_cache[key] = out
+        return out
+
+    def _row_label(self, name, path, dup_names):
+        """A combo row that identifies its raster: name, footprint, and — only
+        when another layer shares the name — the folder that separates them."""
+        bits = []
+        km = self._footprint_km(path)
+        if km:
+            bits.append(f"{km[0]:.0f}×{km[1]:.0f} km")
+        if name in dup_names:
+            folder = os.path.basename(os.path.dirname(path))
+            if folder:
+                bits.append(folder)
+        return f"{name}  ·  {'  ·  '.join(bits)}" if bits else name
+
+    @staticmethod
+    def _footprint_match(a, b):
+        """How far two lon/lat boxes agree about WHICH GROUND they cover, 0-1.
+
+        min(intersection/area(a), intersection/area(b)) — symmetric, so a box
+        swallowed whole by a much larger one scores LOW rather than perfectly.
+        That asymmetry was the bug this replaces: intersection/area(optical)
+        alone returns 1.00 for a 20 km optical tile sitting inside a 90 km SAR
+        scene. A flawless score, for a pair that shares 5% of its ground — so the
+        tab auto-paired them, said "100% footprint overlap" in the step panel,
+        and fused a 90 km raster carrying optical evidence over a twentieth of
+        itself."""
+        if not a or not b:
+            return 0.0
+        return min(FusionTab._overlap_fraction(a, b),
+                   FusionTab._overlap_fraction(b, a))
+
+    def _footprint_reason(self, path, anchor):
+        """Why this raster cannot pair with the anchor footprint, or None.
+
+        None whenever the footprint is unknown or there is no anchor yet: this
+        filter exists to stop an accident, and it must never block on ignorance."""
+        if not anchor or not path:
+            return None
+        bb = self._bbox4326(path)
+        if not bb:
+            return None
+        m = self._footprint_match(anchor, bb)
+        if m >= FOOTPRINT_MATCH_MIN:
+            return None
+        # Kept short on purpose: the dock can be 360 px wide and a combo elides
+        # from the right, so the number has to arrive before the explanation does
+        if m <= 0.0:
+            return "no overlap with the optical raster"
+        return f"{m:.0%} of the optical footprint, needs {FOOTPRINT_MATCH_MIN:.0%}"
 
     @staticmethod
     def _overlap_fraction(a, b):
@@ -1165,8 +1312,8 @@ class FusionTab(QWidget):
         area = (a[2] - a[0]) * (a[3] - a[1])
         return (ox * oy / area) if area > 0 else 0.0
 
-    def _best_overlapping(self, combo, hints, anchor_bbox, exclude=()):
-        """Index of the hint-matching entry that overlaps `anchor_bbox` most.
+    def _best_footprint_match(self, combo, hints, anchor_bbox, exclude=()):
+        """Index of the hint-matching entry whose footprint best matches `anchor_bbox`.
 
         Name order is NOT a safe way to pair the two inputs. Sorting is
         alphabetical, so which event lands first depends on how its dates happen
@@ -1175,8 +1322,12 @@ class FusionTab(QWidget):
         earlier character. Geography is the only thing that actually says two
         rasters describe the same place, so pair on it.
 
-        Returns (index, overlap) with index -1 when nothing matches."""
-        best, best_ov = -1, 0.0
+        Rows the footprint filter greyed out carry no path and are skipped here
+        too, so this only ever ranks candidates that already cover the same
+        ground; the score it returns is what the step panel reports.
+
+        Returns (index, match) with index -1 when nothing matches."""
+        best, best_m = -1, 0.0
         for i in range(1, combo.count()):
             path = combo.itemData(i)
             if not path:
@@ -1186,10 +1337,10 @@ class FusionTab(QWidget):
                 continue
             if any(x in text for x in exclude):
                 continue
-            ov = self._overlap_fraction(anchor_bbox, self._bbox4326(path))
-            if ov > best_ov:
-                best, best_ov = i, ov
-        return best, best_ov
+            m = self._footprint_match(anchor_bbox, self._bbox4326(path))
+            if m > best_m:
+                best, best_m = i, m
+        return best, best_m
 
     @staticmethod
     def _best_match(combo, hints, exclude=()):
@@ -1207,13 +1358,20 @@ class FusionTab(QWidget):
                     return i
         return -1
 
-    def _browse_into(self, combo, what):
+    def _browse_into(self, role, what):
+        """Browse to a raster by hand — the escape hatch past every filter.
+
+        A file chosen here is remembered for that side and re-offered on each
+        rescan even when the footprint filter would have greyed it out: the
+        filter is there to stop an accident, not to overrule a decision."""
+        combo = self._optical_combo if role == "optical" else self._sar_combo
         start = self._out_dir()
         path, _ = QFileDialog.getOpenFileName(
             self, f"Select the {what}", start if os.path.isdir(start) else "",
             "GeoTIFF (*.tif *.tiff);;All files (*)")
         if not path:
             return
+        self._browsed[role][path] = os.path.basename(path)
         combo.addItem(os.path.basename(path), path)
         combo.setCurrentIndex(combo.count() - 1)
 
@@ -1244,6 +1402,18 @@ class FusionTab(QWidget):
         if not self._refreshing:
             self._sar_user_choice = True
         self._autodetect_measure("sar")
+
+    def _optical_chosen(self, _idx):
+        """A new optical raster re-anchors everything downstream.
+
+        The SAR list is filtered and paired against the OPTICAL footprint, so
+        leaving it alone when the anchor moves is what let a 45 km-radius dBright
+        sit next to a SAR tile from an earlier, much smaller run — the selection
+        changed and nothing else did. Re-running the scan is cheap: the
+        footprints are cached by (path, mtime)."""
+        self._autodetect_measure("optical")
+        if not self._refreshing:
+            self._refresh_layers()
 
     def _autodetect_measure(self, side):
         """Set the measure combo from the chosen layer's name.
@@ -1413,7 +1583,23 @@ class FusionTab(QWidget):
         for g in ginfo:
             self._step(f"  {os.path.basename(g['path'])}: {g['shape'][1]}×"
                        f"{g['shape'][0]} px, ~{g['ground_m']:.1f} m ground"
-                       + ("  ← fusion grid" if g["path"] == ref_path else ""))
+                       + ("  ← sets the resolution" if g["path"] == ref_path
+                          else ""))
+
+        # 1b. …but NOT the extent. The reference is whichever input is coarser,
+        # and letting its footprint through as the output footprint is how a
+        # 20 km optical tile against a 90 km SAR scene produced a 90 km raster
+        # that was blind over 95% of itself. Reach and detail are separate
+        # questions; the honest reach is the ground both inputs describe.
+        gt, shape, xinfo = fusion_grid.crop_to_common(gt, shape, proj, inputs)
+        w_km, h_km = fusion_grid.extent_km(gt, shape)
+        if xinfo["cropped"]:
+            self._step(f"  extent: cropped to the ground BOTH inputs cover — "
+                       f"{shape[1]}×{shape[0]} px, {w_km:.1f}×{h_km:.1f} km "
+                       f"({xinfo['kept']:.0%} of the reference raster)")
+        else:
+            self._step(f"  extent: {w_km:.1f}×{h_km:.1f} km — both inputs cover "
+                       f"all of it")
 
         # 2. warp both onto it. 'average' is a genuine aggregation when going
         # fine→coarse; nearest/bilinear would throw away most of the measurements
@@ -1457,6 +1643,20 @@ class FusionTab(QWidget):
                     log=self._step)
                 self._step("  " + note)
                 if cloud is not None:
+                    # A mask that removes nearly everything is far more likely to
+                    # be a broken mask than a cloudy scene, and it is invisible in
+                    # the output: the optical band just quietly turns to NaN and
+                    # the score falls back to SAR. It must shout. (Mt Logan,
+                    # 45 km: 99.5% masked, optical surviving on a 10 km square.)
+                    masked = float(np.mean(cloud))
+                    if masked > 0.80:
+                        self._warn(
+                            f"The cloud mask removed {masked:.0%} of the AOI, so "
+                            "the optical channel is blank over almost all of it "
+                            "and the score is effectively SAR-only. Check the "
+                            "scene list in the <event>_metadata.json beside the "
+                            "optical raster, or untick 'mask clouds' to see the "
+                            "optical evidence unmasked.")
                     opt = np.where(cloud, np.nan, opt).astype(np.float32)
 
         # 5. detrend, then rank above an ABSOLUTE floor.

@@ -348,6 +348,65 @@ if _HAVE_GDAL:
     check("qa cloud/shadow flagged", qbad[0, 0] and qbad[0, 1])
     check("qa snow/clear not flagged", not qbad[0, 2] and not qbad[0, 3])
 
+    print("a scene only votes on pixels it SAW (MGRS tiling)")
+    # Mt Logan, 45 km radius: the Run composited FOUR MGRS tiles a side, each
+    # covering roughly a quadrant. Outside its own footprint a tile renders as
+    # SCL 0, which _decode calls unusable — correct for one scene alone, fatal
+    # as a vote. Every pixel then collected three "cloudy" votes out of four,
+    # 0.75 cleared the 0.5 threshold, and 99.5% of a cloud-free AOI was masked.
+    # The survivor was the small square at the centre where all four overlap.
+    obs = fcl._observed(np.array([[0, np.nan, 4, 9, 11]], dtype=np.float32), "s2")
+    check("fill and NaN are 'not observed'", obs.tolist() == [[False, False, True, True, True]], obs)
+    check("a cloud class IS observed", bool(obs[0, 3]))
+
+    _G = 40
+    def _quadrant_tile(ix, iy, cloudy=False):
+        """One tile: SCL 4 (clear) over its own quadrant + overlap, 0 elsewhere."""
+        a = np.zeros((_G, _G), dtype=np.float32)
+        r0, r1 = (0, _G * 3 // 5) if iy == 0 else (_G * 2 // 5, _G)
+        c0, c1 = (0, _G * 3 // 5) if ix == 0 else (_G * 2 // 5, _G)
+        a[r0:r1, c0:c1] = 9.0 if cloudy else 4.0
+        return a
+
+    def _fake_fetch(_coll, item_id, _asset, _bbox, _w, _h, timeout=180):
+        ix, iy, cloudy = _TILES[item_id]
+        fd, path = tempfile.mkstemp(suffix=".tif", prefix="t_scl_")
+        os.close(fd)
+        d = gdal.GetDriverByName("GTiff").Create(path, _G, _G, 1, gdal.GDT_Float32)
+        d.SetGeoTransform(_gt_s); d.SetProjection(g4.ExportToWkt())
+        bnd = d.GetRasterBand(1); bnd.SetNoDataValue(-9999.0)
+        bnd.WriteArray(_quadrant_tile(ix, iy, cloudy)); bnd.FlushCache()
+        bnd = None; d = None
+        return path
+
+    _gt_s = (-141.7, (1.6 / _G), 0.0, 60.70, 0.0, -(0.8 / _G))
+    _TILES = {"A": (0, 0, False), "B": (1, 0, False),
+              "C": (0, 1, False), "D": (1, 1, False)}
+    _meta4 = {"sensor": "s2", "pre_scenes": list(_TILES), "post_scenes": list(_TILES)}
+    _real_fetch = fcl._fetch_class_band
+    try:
+        fcl._fetch_class_band = _fake_fetch
+        m4, note4 = fcl.cloud_mask_on_grid(_meta4, _gt_s, (_G, _G),
+                                           g4.ExportToWkt(), frac_thresh=0.5)
+        check("four clear tiles mask almost nothing", m4.mean() < 0.02,
+              f"{m4.mean():.1%} masked — {note4}")
+        # the old rule: every scene votes on every pixel, len(ids) denominator
+        _old = np.zeros((_G, _G), dtype=np.float32)
+        for _k in _TILES:
+            _old += fcl._decode(_quadrant_tile(*_TILES[_k][:2]), "s2").astype(np.float32)
+        check("the old rule really did mask ~everything", ((_old / 4.0) >= 0.5).mean() > 0.95,
+              f"{((_old / 4.0) >= 0.5).mean():.1%}")
+
+        # and a tile that IS cloudy must still mask its own quadrant
+        _TILES["A"] = (0, 0, True)
+        m5, _n5 = fcl.cloud_mask_on_grid(_meta4, _gt_s, (_G, _G),
+                                         g4.ExportToWkt(), frac_thresh=0.5)
+        check("a genuinely cloudy tile still masks its own ground",
+              m5[2, 2] and m5.mean() > 0.20, f"{m5.mean():.1%} masked")
+        check("and leaves the far corner alone", not m5[_G - 2, _G - 2])
+    finally:
+        fcl._fetch_class_band = _real_fetch
+
     print("glacier rasterize across CRS")
     shp = os.path.join(tmp, "glaciers.shp")
     drv = ogr.GetDriverByName("ESRI Shapefile"); vds = drv.CreateDataSource(shp)
