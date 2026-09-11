@@ -285,9 +285,29 @@ def sieve_small_blobs(values, mask, min_area, fill=0.0, connectivity=8):
     m = np.asarray(mask) & np.isfinite(out)
     if min_area <= 1 or not m.any():
         return out
+    ys, xs, roots = label_blobs(m, connectivity)
+    counts = np.bincount(roots, minlength=ys.size)
+    small = counts[roots] < min_area
+    out[ys[small], xs[small]] = fill
+    return out
+
+
+def label_blobs(mask, connectivity=8):
+    """Connected components of `mask` -> (ys, xs, roots).
+
+    `ys`/`xs` are the mask pixels and `roots[i]` is the component id of pixel i
+    (an arbitrary but stable member index, so np.bincount(roots) gives component
+    sizes directly). Same pure-numpy union-find sieve_small_blobs has always
+    used — lifted out so callers that need the components themselves, not just
+    a size filter, do not reimplement it. QGIS ships no scipy.
+
+    Only mask pixels are unioned, so cost scales with the mask, not the image."""
+    m = np.asarray(mask, dtype=bool)
     h, w = m.shape
     ys, xs = np.nonzero(m)
     n = ys.size
+    if n == 0:
+        return ys, xs, np.zeros(0, dtype=np.int64)
     idx = -np.ones((h, w), dtype=np.int64)
     idx[ys, xs] = np.arange(n)
     parent = np.arange(n, dtype=np.int64)
@@ -312,10 +332,7 @@ def sieve_small_blobs(values, mask, min_area, fill=0.0, connectivity=8):
         for a, b in zip(np.nonzero(nb >= 0)[0].tolist(), nb[nb >= 0].tolist()):
             union(a, b)
     roots = np.array([find(i) for i in range(n)], dtype=np.int64)
-    counts = np.bincount(roots, minlength=n)
-    small = counts[roots] < min_area
-    out[ys[small], xs[small]] = fill
-    return out
+    return ys, xs, roots
 
 
 # ---------- detectors ----------

@@ -27,10 +27,12 @@ from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
-    QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 from qgis.core import (
-    QgsColorRampShader, QgsProject, QgsRasterLayer, QgsRasterShader,
+    QgsColorRampShader, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsProject, QgsRasterLayer, QgsRasterShader, QgsRectangle,
     QgsSingleBandPseudoColorRenderer,
 )
 from qgis.gui import QgsCollapsibleGroupBox
@@ -161,6 +163,7 @@ class FusionTab(QWidget):
         root.addWidget(self.pages)
 
         root.addWidget(self._action_row())
+        root.addWidget(self._candidates_box())
         root.addWidget(self._log_pane(), 1)
 
     # ---------- header ----------
@@ -403,6 +406,109 @@ class FusionTab(QWidget):
         self.run_btn.clicked.connect(self._run)
         btn_row.addWidget(self.run_btn)
         return btn_row
+
+    def _candidates_box(self):
+        """Ranked shortlist of the scoring blobs. Click a row to zoom to it.
+
+        The score raster alone is hard to read: measured over six truthed
+        events it puts the real scar in the top 2% of pixels, but a handful of
+        isolated background pixels still score higher, so the scar is rarely the
+        brightest thing on screen. As BLOBS it is: ranked by peak score the scar
+        came 1st on four of six events and never below 15th of ~120-190, so a
+        short list finds it where the heatmap buries it."""
+        box = QgsCollapsibleGroupBox("Candidates")
+        box.setToolTip(
+            "The scoring blobs that survived the area sieve, strongest first.\n\n"
+            "Ranked by PEAK score, not area: the largest blob is usually a broad "
+            "terrain or illumination artefact, while the slide is the one with "
+            "the strongest core. Area is shown so a one-pixel spike is obvious.\n\n"
+            "Click a row to zoom the map to that blob.")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(8, 4, 8, 8)
+        self.cand_table = QTableWidget(0, 3)
+        self.cand_table.setHorizontalHeaderLabels(["#", "Area km\u00b2", "Score"])
+        self.cand_table.verticalHeader().setVisible(False)
+        self.cand_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.cand_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.cand_table.setMaximumHeight(180)
+        hh = self.cand_table.horizontalHeader()
+        hh.setStretchLastSection(True)
+        self.cand_table.setColumnWidth(0, 40)
+        self.cand_table.setColumnWidth(1, 90)
+        self.cand_table.itemSelectionChanged.connect(self._zoom_to_candidate)
+        v.addWidget(self.cand_table)
+        self.cand_note = QLabel("Run the fusion to list candidates.")
+        self.cand_note.setStyleSheet(f"color:{CLR_MUTED}; font-size:10px;")
+        v.addWidget(self.cand_note)
+        self._cand_rows = []
+        self._cand_geo = None
+        return box
+
+    def _fill_candidates(self, score, gt, shape, proj, min_px):
+        """Populate the shortlist from the FINAL score — the same pixels the map
+        shows, so a row always corresponds to something visible."""
+        import numpy as np
+        self.cand_table.blockSignals(True)
+        self.cand_table.setRowCount(0)
+        self._cand_rows, self._cand_geo = [], (gt, shape, proj)
+        try:
+            mask = np.isfinite(score) & (score >= SIEVE_THRESHOLD)
+            ys, xs, roots = sar_change.label_blobs(mask)
+            dxm, dym = layover_dim.metric_pixel_size(gt, shape[0])
+            rows = fusion_core.candidates(score, ys, xs, roots, dxm, dym,
+                                          min_px=max(1, int(min_px)), limit=20)
+        except Exception as e:                       # noqa: BLE001 — never block a run
+            self.cand_table.blockSignals(False)
+            self.cand_note.setText(f"candidates unavailable: {type(e).__name__}: {e}")
+            return
+        for i, c in enumerate(rows, 1):
+            r = self.cand_table.rowCount()
+            self.cand_table.insertRow(r)
+            for col, txt in enumerate((str(i), f"{c['area_km2']:.2f}",
+                                       f"{c['peak']:.3f}")):
+                self.cand_table.setItem(r, col, QTableWidgetItem(txt))
+        self._cand_rows = rows
+        self.cand_table.blockSignals(False)
+        if rows:
+            self.cand_note.setText(
+                f"{len(rows)} strongest of the blobs above {SIEVE_THRESHOLD:g} "
+                f"\u2014 click a row to zoom. The scar is usually in the top few.")
+        else:
+            self.cand_note.setText(
+                f"nothing scored above {SIEVE_THRESHOLD:g} over the minimum area "
+                f"\u2014 no candidate to list.")
+
+    def _zoom_to_candidate(self):
+        """Zoom the canvas to the selected blob, padded so it has context."""
+        rows = self.cand_table.selectionModel().selectedRows() \
+            if self.cand_table.selectionModel() else []
+        if not rows or self._cand_geo is None:
+            return
+        i = rows[0].row()
+        if i >= len(self._cand_rows):
+            return
+        c = self._cand_rows[i]
+        gt, _shape, proj = self._cand_geo
+        x0 = gt[0] + gt[1] * c["col0"]
+        x1 = gt[0] + gt[1] * (c["col1"] + 1)
+        y0 = gt[3] + gt[5] * c["row0"]
+        y1 = gt[3] + gt[5] * (c["row1"] + 1)
+        rect = QgsRectangle(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        pad = max(rect.width(), rect.height()) * 0.6 or 1e-4
+        rect.grow(pad)
+        try:
+            canvas = self.iface.mapCanvas()
+            dst = canvas.mapSettings().destinationCrs()
+            src = QgsCoordinateReferenceSystem()
+            src.createFromWkt(proj)
+            if src.isValid() and dst.isValid() and src.authid() != dst.authid():
+                rect = QgsCoordinateTransform(
+                    src, dst, QgsProject.instance()).transformBoundingBox(rect)
+            canvas.setExtent(rect)
+            canvas.refresh()
+        except Exception as e:                       # noqa: BLE001
+            self._append_log(f"  could not zoom to candidate {i + 1}: "
+                             f"{type(e).__name__}: {e}")
 
     def _log_pane(self):
         self.log = QTextEdit()
@@ -1508,9 +1614,11 @@ class FusionTab(QWidget):
         # the final score only — the ingredient bands stay untouched so you can
         # still see WHY something scored before it was cleared.
         min_km2 = float(self.min_area_spin.value())
+        cand_min_px = 1
         if min_km2 > 0:
             dxm, dym = layover_dim.metric_pixel_size(gt, shape[0])
             min_px = max(1, int(round(min_km2 * 1e6 / (dxm * dym))))
+            cand_min_px = min_px
             sig = np.isfinite(bands["score"]) & (bands["score"] >= SIEVE_THRESHOLD)
             before = int(sig.sum())
             bands["score"] = sar_change.sieve_small_blobs(
@@ -1520,6 +1628,10 @@ class FusionTab(QWidget):
             self._step(f"  area sieve ≥{min_km2:g} km² ({min_px} px): cleared "
                        f"{before - after} of {before} scoring pixel(s) in blobs "
                        "too small to be a slide")
+
+        # shortlist the surviving blobs: the scar is rarely the brightest PIXEL
+        # but is almost always one of the strongest BLOBS (see _candidates_box)
+        self._fill_candidates(bands["score"], gt, shape, proj, cand_min_px)
 
         for line in fusion_core.summarize(bands, meta, [o_info, s_info]):
             self._step(line)

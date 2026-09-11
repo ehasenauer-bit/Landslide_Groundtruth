@@ -642,6 +642,48 @@ def fuse(optical_rank, sar_rank, slope_w=None, glacier_w=None,
     return bands, meta
 
 
+def candidates(score, ys, xs, roots, dx_m, dy_m, min_px=1, limit=20):
+    """Ranked scoring blobs of the fused score. Pure numpy; no GDAL, no scipy.
+
+    `ys`/`xs`/`roots` come from sar_change.label_blobs on the mask of pixels at
+    or above the display threshold — the same components the area sieve already
+    works in, so what the table lists is exactly what survived on the map.
+
+    Ranked by PEAK score, not area. The biggest blob is usually a broad terrain
+    or illumination artefact; the slide is the one with the strongest core. Area
+    is reported so a one-pixel spike is obvious, not used to sort.
+
+    Returns at most `limit` dicts: area_km2, peak, mean, n_px, the peak pixel
+    (peak_row/peak_col) to centre a zoom on, and the blob's pixel bounding box
+    (row0/row1/col0/col1) to frame it."""
+    out = []
+    if ys.size == 0:
+        return out
+    sc = np.asarray(score, dtype=np.float32)
+    vals = sc[ys, xs]
+    px_km2 = (float(dx_m) * float(dy_m)) / 1e6
+    order = np.argsort(roots, kind="mergesort")
+    r_sorted = roots[order]
+    # one pass over runs of equal root, so cost is the blob pixels, not the image
+    starts = np.flatnonzero(np.r_[True, r_sorted[1:] != r_sorted[:-1]])
+    ends = np.r_[starts[1:], r_sorted.size]
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        sel = order[a:b]
+        n = sel.size
+        if n < min_px:
+            continue
+        v = vals[sel]
+        k = int(np.argmax(v))
+        yy, xx = ys[sel], xs[sel]
+        out.append({"n_px": int(n), "area_km2": float(n * px_km2),
+                    "peak": float(v[k]), "mean": float(v.mean()),
+                    "peak_row": int(yy[k]), "peak_col": int(xx[k]),
+                    "row0": int(yy.min()), "row1": int(yy.max()),
+                    "col0": int(xx.min()), "col1": int(xx.max())})
+    out.sort(key=lambda c: (-c["peak"], -c["area_km2"]))
+    return out[:limit] if limit else out
+
+
 def summarize(bands, meta, floors_info=None):
     """Human-readable lines for the tab's log pane. Says plainly when nothing
     cleared the floors, rather than letting a noise map imply a detection."""
