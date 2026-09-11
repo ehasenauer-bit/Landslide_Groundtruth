@@ -44,6 +44,66 @@ ITEM_TYPE = "PSScene"
 BUNDLE = "analytic_sr_udm2"          # 4-band surface reflectance + usable-data mask
 FALLBACK_BUNDLE = "analytic_udm2"    # non-SR (DN) if SR not licensed on the account
 PS_SR_SCALE = 1e-4                   # PlanetScope SR DN -> reflectance
+
+# TOA path (--planet-toa): order the DN ('analytic') product instead of SR and do our own
+# top-of-atmosphere conversion, rather than take Planet's SR atmospheric correction — which
+# over-corrects bright snow/ice (impossible >1.0 reflectance, cyan/pink cast). TOA can't
+# over-correct because it applies NO correction: DN * per-band reflectanceCoefficient (from
+# the scene metadata; see _toa_from_dn). The render side auto-detects a DN file by name, so
+# only ORDERING needs the switch below.
+#
+# TOA does carry the atmosphere, though, and at a LOW sun angle develops a strong MAGENTA
+# cast: heavy blue path radiance plus red-weighted reflectance coefficients squeeze green.
+# It is a multiplicative colour imbalance, which a dark-object subtraction can't fix (and
+# DOS also crushes a snow scene, whose darkest pixel isn't a true dark object). Instead
+# _balance_cast white-balances it: clouds/snow are physically neutral, so scale the visible
+# bands to make the brightest pixels grey. It only scales bands UP (never darkens), is
+# clamped, and is skipped when there's no bright neutral anchor. The dark end / contrast is
+# left to the tone curve's auto-stretch, which already fits it per scene.
+TOA_BUNDLE = "analytic_udm2"         # DN + UDM2 (no atmospheric correction)
+TOA_BALANCE = True                   # white-balance a TOA scene's atmospheric cast (False = skip)
+TOA_BRIGHT_PCT = 85.0                # brightest (100-this)% of visible pixels = the neutral target
+TOA_MIN_ANCHOR = 0.50                # ... but only balance when that target is this bright (snow/cloud)
+TOA_MAX_GAIN = 1.8                   # clamp per-band gain so a noisy estimate can't blow a channel up
+_order_bundle = BUNDLE               # what _create_order orders; set_toa_ordering flips it
+
+
+def set_toa_ordering(toa):
+    """Order the DN ('analytic') product (TOA_BUNDLE) instead of SR. Call once at startup
+    (run_single --planet-toa). Subprocess-scoped module state — run_single is a fresh
+    process per run — and only the order path reads it; the render path auto-detects DN."""
+    global _order_bundle
+    _order_bundle = TOA_BUNDLE if toa else BUNDLE
+
+
+def _pairs_toa(pairs):
+    """True if the analytic clips in `pairs` are the DN ('analytic') product — i.e. this
+    render came through the TOA path — rather than surface reflectance (whose files carry
+    the _SR marker). Used to label a render TOA regardless of how it was triggered."""
+    return bool(pairs) and all(sr and "_sr" not in os.path.basename(sr).lower()
+                               for sr, _ in pairs)
+
+
+def _scene_ids(pairs):
+    """Scene ids of the analytic clips in `pairs`, parsed from their filenames (e.g.
+    '20240131_210809_72_2479_3B_AnalyticMS_clip.tif' -> '20240131_210809_72_2479'). Lets a
+    render report exactly which scenes it composited, so the plugin can date the layers."""
+    out = []
+    for sr, _ in pairs or []:
+        if sr:
+            out.append(os.path.basename(sr).split("_3B_")[0])
+    return out
+
+
+def _bundle_reusable(bundle):
+    """Can an order delivered under ledger `bundle` serve the product being requested now?
+    A TOA (DN) request may reuse only DN orders; an SR request reuses SR orders and legacy
+    entries with no bundle recorded (SR was the only product before the TOA path). Without
+    this, reuse matches on scene id alone and a TOA render loads a cached SR order (or an
+    SR render loads a DN order) — the wrong pixels under the requested label."""
+    if _order_bundle == TOA_BUNDLE:
+        return bundle == TOA_BUNDLE
+    return bundle in (BUNDLE, None)
 PS_RES = 3.0                         # PlanetScope native ground sample distance (~3 m)
 DOWNLOAD_TRIES = 4                   # passes at an order's files before giving up
 
@@ -66,7 +126,20 @@ def _resolve_cloud_frac(max_cloud_pct, auto_window):
 
 
 def _client():
+    """Planet client authenticated with the key the caller published via PL_API_KEY.
+
+    A bare `planet.Planet()` does NOT honour PL_API_KEY in SDK v3: its default
+    auth resolves an on-disk profile (PL_AUTH_PROFILE in ~/.planet.json ->
+    ~/.planet/<profile>/) BEFORE it ever consults the PL_API_KEY env var, so a
+    stale key saved to disk by a past `planet auth`/API-key session silently wins
+    over the fresh key the plugin sets — surfacing as InvalidAPIKey. Build the auth
+    explicitly from PL_API_KEY so the caller-supplied key always wins; fall back to
+    the SDK default (on-disk profile / `planet auth login`) only when it's unset."""
+    import os
     import planet
+    key = os.environ.get("PL_API_KEY", "").strip()
+    if key:
+        return planet.Planet(session=planet.Session(auth=planet.Auth.from_key(key)))
     return planet.Planet()
 
 
@@ -169,20 +242,33 @@ def _geom_bbox(geom):
     return [min(xs), min(ys), max(xs), max(ys)] if xs else None
 
 
-def _candidate(item, event_time):
+def _candidate(item, event_time, aoi_cloud_pct=None):
     """One PSScene item -> a JSON-able candidate row for the dry-run preview.
 
     cloud_pct is normalized to 0-100 (Planet reports cloud_cover as 0-1, unlike
     STAC's eo:cloud_cover). thumb_url is the free browse PNG link (no order).
     geometry/bbox are the scene footprint, so the plugin can draw it on the map
-    and you can see whether the strip actually covers the AOI."""
+    and you can see whether the strip actually covers the AOI.
+
+    aoi_cloud_pct is the honest per-pixel cloud fraction over just the AOI box —
+    the counterpart to imagery.py's _stac_candidate, and what the plugin's "Cloud"
+    column really wants. But Planet's per-pixel cloud lives in the UDM2 mask, which
+    is delivered ONLY by a paid Orders API order (see _create_order / BUNDLE), not a
+    free windowed COG the way Sentinel-2's SCL is on the Planetary Computer. So the
+    free dry-run can't measure it without spending quota, and leaves it None; the
+    plugin then falls back to the whole-scene cloud_pct (marked with a leading "~"
+    and a grey dot). The argument is here so a caller that already holds the
+    AOI-clipped UDM2 on disk — the paid render/order path — can supply the real
+    number through this same contract without a preview ever paying for it. See
+    search_event for the full rationale."""
     d = _acquired(item)
     cloud = item["properties"].get("cloud_cover")
     thumb = (item.get("_links") or {}).get("thumbnail")
     geom = item.get("geometry")
     return dict(id=item["id"], date=d.isoformat(),
                 cloud_pct=round(cloud * 100, 1) if cloud is not None else None,
-                gap_days=abs((d - event_time).days),
+                aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0),
                 source="PlanetScope", thumb_url=thumb,
                 geometry=geom, bbox=_geom_bbox(geom))
 
@@ -198,7 +284,22 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     caller (the dry-run dispatcher), which records them as a per-source note.
 
     max_cloud_pct / require_point / allow_test_quality: see fetch_event — kept
-    identical here so the preview shows exactly the scenes a Run would consider."""
+    identical here so the preview shows exactly the scenes a Run would consider.
+
+    Each candidate carries aoi_cloud_pct — the honest cloud-over-your-AOI number
+    the whole-scene cloud_cover can't give — but here it is always None, on
+    purpose. Unlike Sentinel-2's SCL (a free windowed COG on the Planetary
+    Computer, read per-AOI at effectively no cost in imagery._aoi_cloud_fractions),
+    Planet's per-pixel cloud is the UDM2 mask, delivered only by a paid, minutes-
+    long Orders API order (see _create_order). Measuring it for the ~12-24 preview
+    candidates per side would mean ordering every one of them — the exact quota the
+    free dry-run exists to avoid spending before you've chosen scenes by eye. The
+    Data API item metadata is no help either: its cloud stats (cloud_cover and the
+    UDM2-derived percentages) are all WHOLE-scene over the full strip, never AOI-
+    scoped. So the preview keeps aoi_cloud_pct None and the plugin shows the whole-
+    scene cloud_pct with a grey dot and a leading "~", and the real per-AOI number
+    is left to the render/order path, which already has the AOI-clipped UDM2 in
+    hand (see _candidate)."""
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
@@ -226,10 +327,14 @@ def _create_order(pl, item_ids, aoi):
     them concurrently server-side, instead of waiting out the first order (~1-5
     min) before the second is even queued."""
     from planet import order_request as orq
+    # Don't list the primary bundle as its own fallback: a TOA order's primary already IS
+    # FALLBACK_BUNDLE (analytic_udm2), and Planet rejects the duplicate ("Duplicate in
+    # fallback list: analytic_udm2"). The SR->DN fallback only applies when SR is primary.
+    fallback = FALLBACK_BUNDLE if _order_bundle != FALLBACK_BUNDLE else None
     req = orq.build_request(
         name=f"landslide_{dt.datetime.now():%Y%m%d_%H%M%S}",
-        products=[orq.product(item_ids, BUNDLE, ITEM_TYPE,
-                              fallback_bundle=FALLBACK_BUNDLE)],
+        products=[orq.product(item_ids, _order_bundle, ITEM_TYPE,
+                              fallback_bundle=fallback)],
         tools=[orq.clip_tool(aoi)],
     )
     return pl.orders.create_order(req)["id"]
@@ -399,7 +504,23 @@ def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=18
     aoi = pc.aoi_from_disk(dest)
     if aoi:
         meta.update(lat=aoi["lat"], lon=aoi["lon"], bbox=aoi["bbox"])
-    pc.record(order_id, dest, bundle=BUNDLE,
+    # A re-download of an order ALREADY in the ledger (its clips were cleaned up, so
+    # they're re-fetched for free) must NOT overwrite how it was originally PLACED:
+    # radius_km (the requested AOI the cache-size gate checks), bundle (SR vs TOA),
+    # created_utc and source. `meta`/_order_bundle here describe the CURRENT
+    # recall/render context — a possibly narrower AOI or different mode — and writing
+    # them would corrupt the double-charge guard (record() replaces, not merges).
+    # Preserve the prior values; only backfill fields the old record lacked.
+    prev = next((r for r in pc.load() if r.get("order_id") == str(order_id)), None)
+    bundle, created_utc, source = _order_bundle, None, "order"
+    if prev is not None:
+        if prev.get("radius_km") is not None:
+            meta["radius_km"] = prev["radius_km"]
+        if prev.get("bundle") is not None:
+            bundle = prev["bundle"]
+        created_utc = prev.get("created_utc")
+        source = prev.get("source") or "order"
+    pc.record(order_id, dest, bundle=bundle, created_utc=created_utc, source=source,
               scene_ids=pc.scene_ids_on_disk(dest), **meta)
     return pairs
 
@@ -450,6 +571,79 @@ def _target_grid(lat, lon, radius_km, epsg, res=PS_RES):
     return from_origin(minx, maxy, res, res), (height, width)
 
 
+def _reflectance_coeffs(scene_path):
+    """{band_number: reflectanceCoefficient} from the scene's *_AnalyticMS_metadata*.xml,
+    the per-band DN->TOA-reflectance factors Planet ships with an analytic (DN) scene.
+    Empty dict if the sidecar or the fields aren't there (older delivery / SR-only)."""
+    d = os.path.dirname(scene_path)
+    prefix = os.path.basename(scene_path).split("_3B_")[0]
+    meta = None
+    try:
+        for f in os.listdir(d):
+            low = f.lower()
+            if low.endswith(".xml") and "analyticms_metadata" in low \
+                    and f.split("_3B_")[0] == prefix:
+                meta = os.path.join(d, f)
+                break
+    except OSError:
+        return {}
+    if not meta:
+        return {}
+    import re
+    with open(meta, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    # each <ps:bandSpecificMetadata> holds a bandNumber then its reflectanceCoefficient
+    pairs = re.findall(
+        r"bandNumber>\s*(\d+)\s*<.*?reflectanceCoefficient>\s*([\deE.+-]+)\s*<", text, re.S)
+    return {int(b): float(c) for b, c in pairs}
+
+
+def _toa_from_dn(da, scene_path):
+    """Analytic DN scene -> TOA reflectance: DN * per-band reflectanceCoefficient. `da`
+    still carries rasterio's integer band coords 1..4 (= blue, green, red, nir)."""
+    coeffs = _reflectance_coeffs(scene_path)
+    # Check that EVERY band we hold has a coefficient, not just the count: a metadata
+    # gap (e.g. bands {1,2,3,5} for data bands {1,2,3,4}) satisfies a count test yet
+    # KeyErrors on the lookup below. Membership catches that and gives the guidance.
+    if not all(int(b) in coeffs for b in da.band.values):
+        raise IncompleteDownload(
+            f"{os.path.basename(scene_path)}: the scene metadata is missing a per-band "
+            f"reflectanceCoefficient, so the DN ('analytic') product can't be converted "
+            f"to TOA reflectance — re-order it, or use the SR bundle")
+    factors = xr.DataArray([coeffs[int(b)] for b in da.band.values],
+                           coords={"band": da.band}, dims="band")
+    return da * factors
+
+
+def _balance_cast(da):
+    """White-balance a TOA scene's atmospheric cast (see the TOA_* block above). Clouds and
+    snow are physically neutral, so scale the visible bands (1,2,3 = blue,green,red) to make
+    the brightest pixels grey — removing the magenta cast low-sun TOA develops. `da` still
+    carries rasterio's integer band coords 1..4.
+
+    Only scales bands UP (gain >= 1), so it neutralises without darkening; each gain is
+    clamped to TOA_MAX_GAIN against a noisy estimate; and the whole step is skipped when the
+    brightest pixels are below TOA_MIN_ANCHOR — i.e. there's no snow/cloud to trust as a
+    neutral reference, so a colourful terrain-only scene is left alone. The dark end and
+    contrast are the tone curve's auto-stretch's job, not this."""
+    vis = [b for b in da.band.values if b in (1, 2, 3)]
+    if not vis:
+        return da
+    vmax = da.sel(band=vis).max("band").values
+    fin = np.isfinite(vmax)
+    if not fin.any():
+        return da
+    thr = float(np.percentile(vmax[fin], TOA_BRIGHT_PCT))
+    if thr < TOA_MIN_ANCHOR:            # no bright neutral anchor -> don't guess a balance
+        return da
+    m = fin & (vmax >= thr)
+    means = {b: float(np.nanmean(da.sel(band=b).values[m])) for b in vis}
+    tgt = max(means.values())
+    gains = [min(max(tgt / means[b] if (b in vis and means[b] > 1e-6) else 1.0, 1.0),
+                 TOA_MAX_GAIN) for b in da.band.values]
+    return da * xr.DataArray(gains, coords={"band": da.band}, dims="band")
+
+
 def _open_scene(sr_path, udm_path, epsg, transform, shape, mask_clouds=True):
     """One clipped PSScene -> reflectance DataArray (bands blue/green/red/nir),
     reprojected onto the shared (transform, shape) target grid.
@@ -461,7 +655,14 @@ def _open_scene(sr_path, udm_path, epsg, transform, shape, mask_clouds=True):
     preview exists to reveal. Clouds, if any, are then just visible in the render."""
     da = rioxarray.open_rasterio(sr_path, masked=True).astype("float32")
     if "_sr" in os.path.basename(sr_path).lower():
-        da = da * PS_SR_SCALE            # SR DN -> reflectance; DN bundle left as-is
+        da = da * PS_SR_SCALE            # SR DN -> surface reflectance
+    else:
+        # analytic (DN) product = the --planet-toa path: convert to TOA reflectance
+        # ourselves and white-balance its atmospheric cast, instead of Planet's SR
+        # correction (which over-corrects bright snow). See _toa_from_dn / _balance_cast.
+        da = _toa_from_dn(da, sr_path)
+        if TOA_BALANCE:
+            da = _balance_cast(da)
     da = da.assign_coords(band=["blue", "green", "red", "nir"])
     if mask_clouds and udm_path and os.path.exists(udm_path):
         udm = rioxarray.open_rasterio(udm_path)
@@ -639,8 +840,10 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
 
     Shared by render_preview (orders it just created) and resume_preview (orders an
     earlier render placed but didn't finish waiting on). Returns
-    (comps, notes, pending): comps is {'pre': comp|None, 'post': comp|None}; pending
-    is {side: order_id} for orders that didn't finish but are worth coming back to —
+    (comps, notes, pending, products): comps is {'pre': comp|None, 'post': comp|None};
+    products is {side: 'sr'|'toa'|None} (the product the downloaded clips actually are,
+    from _pairs_toa) so the caller can refuse to difference an SR side against a TOA one;
+    pending is {side: order_id} for orders that didn't finish but are worth coming back to —
     still processing after the wait budget, or finished and downloading when the
     network cut out. Either way the order is already placed and paid for, so the
     caller persists the id and can hand it back here later WITHOUT re-ordering (no
@@ -656,11 +859,15 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
     event_id + AOI, which is what makes it recallable for free later
     (recall_preview) instead of ordered a second time."""
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}
     notes, pending = [], {}
     meta = dict(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
     for side, order_id in orders.items():
         try:
             pairs = _wait_download(pl, order_id, dict(meta, side=side))
+            # what this side actually is (DN/TOA vs SR), from the clips on disk — so a
+            # caller differencing pre against post can tell they're the same product.
+            products[side] = "toa" if _pairs_toa(pairs) else "sr"
             # mask_clouds=False: a visual detail preview should show every real pixel
             # (esp. bright snow UDM2 may misflag), not punch cloud-masked holes.
             comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
@@ -685,9 +892,18 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
                     f"the files that did arrive are kept — resume it (don't re-order) "
                     f"to pull the rest without spending quota again.")
             else:
+                # Unrecognised failure. The order was already PLACED AND PAID FOR,
+                # so always surface its id (and keep it in `pending` so recall can
+                # find it) — dropping it here would leave the user paying again for
+                # scenes they can't locate. Resuming a truly-failed order is a no-op,
+                # but a recoverable one (transient API/state error) then succeeds.
+                pending[side] = order_id
                 notes.append(
-                    f"{side}: order/download failed: {type(e).__name__}: {e}")
-    return comps, notes, pending
+                    f"{side}: order/download failed for order {order_id} "
+                    f"({type(e).__name__}: {e}). The order is placed in your Planet "
+                    f"account — try resuming it (don't re-order) before spending quota "
+                    f"again.")
+    return comps, notes, pending, products
 
 
 class _LazyClient:
@@ -721,6 +937,10 @@ def _cached_side(side, ids, event_id, lat, lon, radius_km):
     if not recs:
         recs = [r for r in pc.find(side=side, scene_ids=ids)
                 if not r.get("bbox") and r.get("radius_km") is None]
+    # Only reuse an order whose product matches what's being requested now, so a TOA
+    # (DN) render doesn't silently serve a cached SR order for the same scene id — that
+    # would put SR pixels on the canvas under a TOA label. See _bundle_reusable.
+    recs = [r for r in recs if _bundle_reusable(r.get("bundle"))]
     on_disk = [r for r in recs if pc.has_files(r)]
     return (on_disk or recs or [None])[0]
 
@@ -787,6 +1007,7 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
     """
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
     notes, reused = [], {}
     client = _LazyClient()
     recs = pc.find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
@@ -817,6 +1038,7 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
             notes.append(note)
         if comp is not None:
             comps[side] = comp
+            products[side] = "toa" if rec.get("bundle") == TOA_BUNDLE else "sr"
             reused[side] = rec["order_id"]
             pc.stamp_footprint(rec["order_id"], event_id=event_id)
 
@@ -827,7 +1049,11 @@ def recall_preview(lat, lon, radius_km, event_id=None, orders=None):
             + f". The ledger lives in {pc.cache_root()}; 'Render detail' places the "
             f"first order, and every order after that is recallable for free.")
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending={}, reused=reused, available=available)
+                pending={}, reused=reused, available=available, product=products,
+                toa=any((picked.get(s) or {}).get("bundle") == TOA_BUNDLE
+                        for s in ("pre", "post")),
+                scenes={s: list((picked.get(s) or {}).get("scene_ids") or [])
+                        for s in ("pre", "post")})
 
 
 def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
@@ -861,6 +1087,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
     the other side load."""
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
     notes, reused, to_order = [], {}, {}
     client = _LazyClient()
     for side, ids in (("pre", pre_ids), ("post", post_ids)):
@@ -880,6 +1107,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
             to_order[side] = ids
             continue
         comps[side] = comp
+        products[side] = "toa" if rec.get("bundle") == TOA_BUNDLE else "sr"
         reused[side] = rec["order_id"]
         pc.stamp_footprint(rec["order_id"], event_id=event_id)
 
@@ -896,14 +1124,17 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
                 orders[side] = _create_order(pl, ids, aoi)
             except Exception as e:
                 notes.append(f"{side}: order create failed: {type(e).__name__}: {e}")
-        fresh, dl_notes, pending = _finish_orders(pl, orders, lat, lon, radius_km,
-                                                  epsg, event_id=event_id)
+        fresh, dl_notes, pending, fresh_products = _finish_orders(
+            pl, orders, lat, lon, radius_km, epsg, event_id=event_id)
         notes += dl_notes
         for side in ("pre", "post"):
             if fresh[side] is not None:
                 comps[side] = fresh[side]
+                products[side] = fresh_products[side]
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending=pending, reused=reused)
+                pending=pending, reused=reused, toa=(_order_bundle == TOA_BUNDLE),
+                product=products,
+                scenes={"pre": list(pre_ids or []), "post": list(post_ids or [])})
 
 
 def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
@@ -927,7 +1158,9 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
     None with a note rather than raising, so one downloaded side still re-tones."""
     epsg = im._utm_epsg(lat, lon)
     comps = {"pre": None, "post": None}
-    notes, reused = [], {}
+    products = {"pre": None, "post": None}   # 'sr'|'toa' per side, so dbright can refuse a mix
+    notes, reused, toa = [], {}, False
+    scenes = {"pre": [], "post": []}
     cached = pc.newest_by_side(pc.find(event_id=event_id, lat=lat, lon=lon,
                                        radius_km=radius_km, require_files=True))
     for side in ("pre", "post"):
@@ -940,6 +1173,10 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
                 reused[side] = rec["order_id"]
         if not pairs:
             continue
+        side_toa = _pairs_toa(pairs)     # DN clips on disk -> this side came via the TOA path
+        toa = toa or side_toa            # label the whole re-tone TOA if either side is
+        products[side] = "toa" if side_toa else "sr"
+        scenes[side] = _scene_ids(pairs)
         try:
             # mask_clouds=False mirrors _finish_orders: same pixels in, so only the
             # tone curve differs between modes (see docstring).
@@ -958,7 +1195,7 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
                      f"'Render detail' once, or 'Recall order' if you've ordered it "
                      f"before.")
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending={}, reused=reused)
+                pending={}, reused=reused, toa=toa, product=products, scenes=scenes)
 
 
 def resume_preview(lat, lon, radius_km, orders, event_id=None):
@@ -975,7 +1212,8 @@ def resume_preview(lat, lon, radius_km, orders, event_id=None):
     pl = _client()
     epsg = im._utm_epsg(lat, lon)
     orders = {s: o for s, o in (orders or {}).items() if o and s in ("pre", "post")}
-    comps, notes, pending = _finish_orders(pl, orders, lat, lon, radius_km, epsg,
-                                           event_id=event_id)
+    comps, notes, pending, products = _finish_orders(pl, orders, lat, lon, radius_km,
+                                                     epsg, event_id=event_id)
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
-                pending=pending, reused={})
+                pending=pending, reused={}, toa=(_order_bundle == TOA_BUNDLE),
+                product=products)

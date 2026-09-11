@@ -30,6 +30,7 @@ import threading
 import time
 import warnings
 import numpy as np
+import xarray as xr
 import pystac_client
 from pystac_client.exceptions import APIError
 from pystac_client.stac_api_io import StacApiIO
@@ -102,6 +103,25 @@ LS_BANDS = ["red", "nir08", "green", "blue", "swir16", "swir22", "qa_pixel"]
 # (3 shadow, 8/9 cloud medium/high, 10 cirrus) and 11 snow/ice are deliberately
 # kept, so a run downloads the scene as acquired rather than a cloud-masked one.
 S2_NODATA_SCL = [0, 1]
+
+# Scene-classification values that count as cloud contamination when measuring
+# cloud OVER THE AOI (see _aoi_cloud_fractions): 3 cloud shadow, 8/9 cloud
+# medium/high, 10 thin cirrus. Snow/ice (11) is deliberately NOT counted — over
+# glaciated Alaska terrain it is the ground, not weather, and would swamp the
+# number. This is the per-pixel counterpart to the whole-tile eo:cloud_cover.
+S2_CLOUD_SCL = [3, 8, 9, 10]
+# Landsat C2 QA_PIXEL cloud-contamination bits: 1 dilated cloud, 2 cirrus,
+# 3 cloud, 4 cloud shadow. Bit 0 (fill) and bit 5 (snow) are not counted; fill
+# marks the non-measured pixels instead (the AOI-cloud denominator).
+LS_CLOUD_BITS = 0b11110
+# Snow/ice classes, measured ALONGSIDE cloud (not as cloud) so the plugin can
+# warn when the AOI is snow-dominated: over bright glaciers Sen2Cor/Fmask
+# routinely misclassify cloud tops AS snow, and since snow is excluded from the
+# cloud count above, a cloud-choked scene can then report a falsely-clear
+# AOI-cloud %. The snow fraction lets the caller flag the cloud number as only a
+# lower bound there — see _aoi_cloud_fractions.
+S2_SNOW_SCL = [11]           # SCL 11 = snow / ice
+LS_SNOW_BIT = 0b100000       # QA_PIXEL bit 5 = snow / ice
 
 # Dry-run (search_event) candidate cap per side, mirroring sar_imagery: the
 # preview's job is to show what was actually acquired near the event so the
@@ -231,7 +251,197 @@ def _ids_collection(prefer, ids):
 _STAC_SOURCE = {"sentinel-2-l2a": "Sentinel-2", "landsat-c2-l2": "Landsat"}
 
 
-def _stac_candidate(item, event_time, source):
+_OCM_STATE = {}   # process-level lazy cache of the OmniCloudMask ensemble
+
+# Every touch of that ensemble — the lazy load AND each predict — is serialised
+# on this lock, because torch's MPS backend is NOT thread-safe: it caches its
+# compiled Metal kernels in a plain hash map that it mutates without any lock of
+# its own, so two threads dispatching at once tear the map and segfault the
+# interpreter (EXC_BAD_ACCESS inside MetalShaderLibrary::exec_unary_kernel — a
+# hard crash, not a Python exception, so no try/except can catch it).
+# run_single._search_candidates fans the Sentinel-2 and Landsat previews out
+# across threads and BOTH land here, which is exactly that race. The lock covers
+# only the torch work: the STAC searches and the stackstac reads — the slow,
+# network-bound part the fan-out exists for — still overlap freely.
+_OCM_LOCK = threading.Lock()
+
+
+def _ocm_models():
+    """Load the OmniCloudMask ensemble ONCE per process, cached in _OCM_STATE.
+
+    Returns (device, models). The first call downloads ~58 MB of model weights
+    from HuggingFace (cached offline after) and picks the inference device (MPS
+    on Apple Silicon, else CUDA/CPU). Raises on import/download failure — the
+    caller catches it and falls back to the SCL/QA cloud count. Cached so a
+    search's pre + post sides (same subprocess) load the net just once, not once
+    per candidate; the cache is filled under _OCM_LOCK so the parallel preview's
+    two threads can't both download and build the ensemble."""
+    with _OCM_LOCK:
+        if "models" not in _OCM_STATE:
+            import torch
+            from omnicloudmask.cloud_mask import collect_models
+            from omnicloudmask.model_utils import default_device
+            dev = default_device()
+            _OCM_STATE["device"] = dev
+            _OCM_STATE["models"] = collect_models(
+                custom_models=None, inference_device=dev,
+                inference_dtype=torch.float32, source="hugging_face")
+        return _OCM_STATE["device"], _OCM_STATE["models"]
+
+
+# _aoi_cloud_fractions fans the per-scene AOI reads across this many threads. The
+# reads are network-bound and independent; measured throughput plateaus by ~8, so
+# more workers don't help. The plugin already threads the S2 and Landsat previews,
+# so this nests under that.
+_AOI_READ_WORKERS = 8
+
+
+def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
+    """Per-item (cloud%, snow%, source) over the AOI box, keyed by item id.
+
+    cloud_pct is the honest "cloud over your point" number the whole-tile
+    eo:cloud_cover cannot give. With method='ocm' (default) it is measured by
+    OmniCloudMask — a neural cloud+shadow mask that judges cloud by LOCAL
+    contrast, not absolute brightness, so over glaciers it does NOT dump bright
+    cloud tops into the snow bin the way the SCL/QA thresholds do; 'source' is
+    'ocm'. On any OCM unavailability/failure it falls back to a windowed count of
+    the classification band (Sentinel-2 SCL / Landsat QA_PIXEL) cloud classes,
+    'source' 'scl' — a conservative LOWER BOUND over snow. snow_pct is always the
+    classification-band snow share (drives the ❄ snow-swamped flag; OCM has no
+    snow class). All three are None where the AOI has no measured pixels (the
+    footprint misses the box) so the caller can fall back to the tile metric.
+
+    Returns (fractions, note): fractions is {item.id: (cloud%, snow%, source)};
+    note is None, or a one-line reason when method='ocm' was asked but OCM fell
+    back to SCL for the batch (so the plugin can say WHY, not fail silently).
+
+    Each scene is read on its own thread (network-bound, so fanning out is ~2x
+    faster than one big read); OCM inference then runs serially under _OCM_LOCK.
+    Per scene the classification and R/G/NIR reads share ONE grid (same
+    epsg/bounds/resolution, run coarse — ~100 m / ~200 px; see the res comment
+    below), so the OCM mask and the SCL 'valid'/'snow' masks align
+    pixel-for-pixel. Single-item reads also make the old stackstac-sorts-by-time
+    mislabeling impossible. Never raises: any read/inference error downgrades to
+    None/fallback so the preview still lists its scenes."""
+    if not items:
+        return {}, None
+    native = 20 if sensor == "s2" else 30
+    # Coarse read (~100 m / ~200 px): OmniCloudMask is nominally trained for
+    # 10-50 m, but measured on these glaciated Alaska scenes its cloud% is
+    # unchanged from 50 m to 100 m (a 73%-cloud scene stays 73%, a clear one stays
+    # 0%) — the thick-cloud-over-snow signal is coarse, so fewer pixels cuts the
+    # read without moving the number. Coarsening can soften only THIN cirrus, where
+    # the ❄ flag already says "check the thumbnail". 200 px is well above OCM's
+    # ~96 px context knee. Floor at the sensor's native GSD so a tiny AOI is never
+    # upsampled.
+    res = min(100.0, max(float(native), (2 * radius_km * 1000.0) / 200.0))
+    epsg = _utm_epsg(lat, lon)
+    bounds = _bbox(lat, lon, radius_km)
+    cls_band = "SCL" if sensor == "s2" else "qa_pixel"
+    # fill_value marks off-footprint pixels as this sensor's own "no measurement"
+    # code, so they drop out of the denominator: SCL 0 = nodata, QA_PIXEL bit 0 = fill.
+    cls_fill = 0 if sensor == "s2" else 1
+    rgn_bands = ["B04", "B03", "B08"] if sensor == "s2" else ["red", "green", "nir08"]
+
+    def _read(item):
+        """(id, classification 2-D, R/G/NIR 3-D or None). Never raises — a failed
+        read returns None so that scene falls back (SCL) or drops out entirely.
+        One stackstac read per band-group per scene: single-item reads mean
+        `isel(time=0)` is unambiguous, so the stackstac-sorts-by-datetime
+        mislabeling simply cannot happen here."""
+        try:
+            c = stackstac.stack(
+                [item], assets=[cls_band], epsg=epsg, resolution=res,
+                bounds_latlon=bounds, chunksize=2048, rescale=False,
+                fill_value=cls_fill).squeeze("band", drop=True).compute(
+                    scheduler="synchronous")
+            cls_arr = np.asarray(c.isel(time=0).values)
+        except Exception as e:
+            print(f"    [aoi-cloud] {sensor} {getattr(item, 'id', '?')} read failed "
+                  f"({type(e).__name__}: {e})")
+            return item.id, None, None
+        rgn_arr = None
+        if method == "ocm":
+            try:
+                # Raw DN, fill=0: OCM z-score-normalises each band over its NONZERO
+                # pixels, so DN scaling is irrelevant but 0 must mean no-data.
+                r = stackstac.stack(
+                    [item], assets=rgn_bands, epsg=epsg, resolution=res,
+                    bounds_latlon=bounds, chunksize=2048, rescale=False,
+                    fill_value=0).compute(scheduler="synchronous")
+                rgn_arr = np.asarray(r.isel(time=0).values, dtype="float32")  # (3,H,W)
+            except Exception as e:
+                print(f"    [aoi-cloud] {sensor} {item.id} R/G/NIR read failed "
+                      f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
+        return item.id, cls_arr, rgn_arr
+
+    # The reads are network-bound and independent, so fan the scenes across a small
+    # thread pool — ~2x faster than one big stackstac read. Throughput plateaus at
+    # ~8 workers (measured), and the plugin already runs the S2 and Landsat previews
+    # on their own threads, so this nests under that.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(_AOI_READ_WORKERS, len(items))) as ex:
+        reads = list(ex.map(_read, items))
+
+    # OmniCloudMask inference, run SERIALLY under _OCM_LOCK (torch's MPS backend is
+    # not thread-safe). Cheap next to the reads. ocm_note is set only when OCM
+    # can't load AT ALL (the actionable "wrong venv" case) so the plugin can shout
+    # it; a per-scene read/inference miss just falls that one scene back to SCL.
+    ocm_masks, ocm_note = {}, None
+    if method == "ocm":
+        predict_from_array = None
+        try:
+            dev, models = _ocm_models()
+            from omnicloudmask import predict_from_array
+        except Exception as e:
+            ocm_note = (f"OmniCloudMask could not load ({type(e).__name__}: {e}) — "
+                        f"cloud % is the SCL/QA lower bound. Check that the plugin's "
+                        f"venv python has omnicloudmask installed.")
+            print(f"    [aoi-cloud] !! {ocm_note}")
+        if predict_from_array is not None:
+            for iid, _cls, rgn_arr in reads:
+                if rgn_arr is None:
+                    continue
+                try:
+                    with _OCM_LOCK:   # concurrent MPS dispatch segfaults; see _OCM_LOCK
+                        mask = predict_from_array(rgn_arr, custom_models=models,
+                                                  inference_device=dev)
+                    m = np.asarray(mask).squeeze()   # (H,W): 0 clear, 1/2/3 cloud/shadow
+                    ocm_masks[iid] = np.isin(m, (1, 2, 3))
+                except Exception as e:
+                    print(f"    [aoi-cloud] OCM inference failed for {iid} "
+                          f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
+
+    out = {}
+    for iid, cls_arr, _rgn in reads:
+        if cls_arr is None:
+            out[iid] = (None, None, None)
+            continue
+        if sensor == "s2":
+            a = cls_arr.astype("int16")
+            valid = ~np.isin(a, S2_NODATA_SCL)
+            cloudy = np.isin(a, S2_CLOUD_SCL)
+            snowy = np.isin(a, S2_SNOW_SCL)
+        else:
+            a = cls_arr.astype("uint16")
+            valid = (a & 1) == 0                       # bit 0 = fill
+            cloudy = (a & LS_CLOUD_BITS) > 0
+            snowy = (a & LS_SNOW_BIT) > 0
+        n = int(valid.sum())
+        if not n:
+            out[iid] = (None, None, None)
+            continue
+        snow_pct = 100.0 * float((snowy & valid).sum()) / n
+        m = ocm_masks.get(iid)
+        if m is not None and m.shape == valid.shape:
+            out[iid] = (100.0 * float((m & valid).sum()) / n, snow_pct, "ocm")
+        else:
+            out[iid] = (100.0 * float((cloudy & valid).sum()) / n, snow_pct, "scl")
+    return out, ocm_note
+
+
+def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=None,
+                    aoi_cloud_method=None):
     """One STAC item -> a JSON-able candidate row for the dry-run preview.
 
     thumb_url is the item's free rendered preview / browse PNG (no download or
@@ -256,7 +466,10 @@ def _stac_candidate(item, event_time, source):
     cog = visual.href.split("?")[0] if visual is not None else None
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=round(cloud, 1) if cloud is not None else None,
-                gap_days=abs((d - event_time).days) if d else None,
+                aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
+                aoi_snow_pct=round(aoi_snow_pct, 1) if aoi_snow_pct is not None else None,
+                aoi_cloud_method=aoi_cloud_method,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=source, thumb_url=thumb, cog_url=cog,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
 
@@ -282,9 +495,13 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     returned rows with that same blend to mark the run's pick (★) among them.
 
     max_cloud_pct: whole-tile cloud cap (0-100); None or >= 100 -> no cap, every
-    acquisition in the window is listed. Tile-wide metric, and the only cloud
-    handling there is: a Run composites the scenes as acquired, with no per-pixel
-    cloud masking (see _composite), so what you see listed is what you get."""
+    acquisition in the window is listed. Tile-wide metric (the STAC filter), and
+    the only cloud handling on a Run is: it composites the scenes as acquired,
+    with no per-pixel cloud masking (see _composite), so what you see listed is
+    what you get. Each listed candidate also carries aoi_cloud_pct — the fraction
+    of the AOI box that is cloud/cirrus/shadow, read per-pixel from the
+    classification band (see _aoi_cloud_fractions) — the honest cloud-over-point
+    number the tile-wide cap can't give."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
     pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
@@ -298,9 +515,30 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                               max_cloud=cloud, limit=pre_lim, cloud_weight=None)
     post_items = search_scenes(lat, lon, radius_km, post0, post1, coll, event_time,
                                max_cloud=cloud, limit=post_lim, cloud_weight=None)
+    pre_aoi, pre_note = _aoi_cloud_fractions(pre_items, lat, lon, radius_km, sensor)
+    post_aoi, post_note = _aoi_cloud_fractions(post_items, lat, lon, radius_km, sensor)
     return dict(source=src,
-                pre=[_stac_candidate(i, event_time, src) for i in pre_items],
-                post=[_stac_candidate(i, event_time, src) for i in post_items])
+                pre=[_stac_candidate(i, event_time, src,
+                                     *(pre_aoi.get(i.id) or (None, None, None)))
+                     for i in pre_items],
+                post=[_stac_candidate(i, event_time, src,
+                                      *(post_aoi.get(i.id) or (None, None, None)))
+                      for i in post_items],
+                aoi_cloud_note=pre_note or post_note)
+
+
+def _s2_boa_offset(item):
+    """BOA additive offset (in DN) for one Sentinel-2 L2A scene: -1000 for processing
+    baseline >= 04.00 (≈2022-01-25 onward), which MPC serves un-harmonized, else 0.
+
+    Falls back to the acquisition date when the s2:processing_baseline property is
+    missing or unparseable — 04.00 rolled out on 2022-01-25."""
+    bl = item.properties.get("s2:processing_baseline")
+    try:
+        return -1000.0 if float(bl) >= 4.0 else 0.0
+    except (TypeError, ValueError):
+        d = item.datetime.replace(tzinfo=None) if item.datetime is not None else None
+        return -1000.0 if (d is not None and d >= dt.datetime(2022, 1, 25)) else 0.0
 
 
 def _composite(items, lat, lon, radius_km, sensor):
@@ -329,7 +567,17 @@ def _composite(items, lat, lon, radius_km, sensor):
         measured = ~scl.isin(S2_NODATA_SCL)   # fill/defective only — never cloud
         # B11/B12 are natively 20 m; stackstac has resampled them to the 10 m grid
         # above, so they align with red/nir/green/blue for the SWIR products.
-        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured) / 10000.0
+        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured)
+        # Processing baseline 04.00+ (≈2022-01-25 onward) bakes BOA_ADD_OFFSET = -1000
+        # into the DN, and MPC serves L2A UN-harmonized (verified: post-04.00 dark
+        # pixels floor at ~1000 DN, pre-04.00 at ~0). So true reflectance is
+        # (DN-1000)/10000 for those scenes and DN/10000 for older ones. Apply the
+        # offset PER SCENE — matched to the stack's time order — so a window that
+        # straddles the 2022 boundary lands both sides on ONE reflectance scale
+        # instead of showing the +0.1 step as spurious change (see _s2_boa_offset).
+        boa = xr.DataArray([_s2_boa_offset(it) for it in items],
+                           coords={"time": data.time}, dims="time")
+        data = (data + boa) / 10000.0
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     else:
         qa = stack.sel(band="qa_pixel").astype("uint16")

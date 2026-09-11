@@ -53,6 +53,8 @@ SCENE_KEYS = ["true_color", "highlight_natural", "false_color", "swir_falsecolor
 TONE_MODES = {
     "knee": "Highlight rolloff — untouched midtones, tamed highlights",
     "natural": "Highlight Optimized Natural Color — even detail, softer contrast",
+    "linear": "None — plain linear stretch, no tone shaping",
+    "hdr": "HDR (exposure fusion) — shadow AND snow detail in one image",
 }
 
 # Gentle S-curve strength applied to BOTH tone modes by the PlanetScope render path
@@ -97,6 +99,43 @@ KNEE = 0.55
 # BY colour, fresh debris against vegetation.
 DESAT = 1.0
 DESAT_ONSET = 0.5
+
+# Cyan-selective de-blue: a SECOND desaturation pass keyed to HUE, not brightness.
+# The DESAT pass above only fires above DESAT_ONSET (0.5 reflectance), so the skylit
+# blue cast on shadowed snow and glacier ice — ~0.2-0.4 reflectance, only ~8% more
+# blue than red at the source but stretched loud as the knee brightens it toward white
+# — passes straight through. (The DESAT block above notes that skylit blue shadow was
+# deliberately left bit-identical; this pass is where we walk that back on purpose.)
+# It fades a pixel toward its own neutral value (`sh`) in proportion to how far BLUE
+# sits above the warm red/green channels, so warm scar/debris colour (red >= blue) is
+# bit-identical BY CONSTRUCTION — only a blue/cyan excess is pulled to grey. Neutralises
+# to GREY, unlike cutting the blue channel (which leaves green on top and greens the
+# snow). It trades the blue of skylit shadow/ice — real, but not the diagnostic signal —
+# for cleaner snow while leaving untouched the warm colour scars are actually read by.
+# BLUE_DESAT=0 restores the old output exactly.
+BLUE_DESAT = 0.6          # strength: 0 = off, 1.0 ~ fully neutral blue shadows
+BLUE_DESAT_K = 0.18       # post-gain (blue - max(red,green)) that earns full weight
+BLUE_DESAT_LO = 0.08      # reflectance gate: below this (deep-noise shadow) no fade ...
+BLUE_DESAT_HI = 0.22      # ... rising to full weight by here (shadowed-snow reflectance)
+
+# Cast-strip: a final pass on the RENDERED rgb that fades a colour cast toward each
+# pixel's own luminance. Because the fade target IS the luminance, it removes a cast
+# WITHOUT changing brightness — the whole point, vs the 'natural' cube-root mode which
+# de-fringes by darkening the scene. Two casts are handled:
+#   CYAN_STRIP fades a COOL cast (blue > red — the cyan AND blue that Planet SR's
+#     atmospheric over-correction paints on bright snow/ice) at every brightness. It
+#     catches true cyan the BLUE_DESAT pass above misses (that one keys on blue over the
+#     MAX of red/green, so a cyan pixel with high green slips through).
+#   PINK_STRIP fades a WARM cast (red > blue — the pink/salmon on bright snow) but ONLY
+#     through a luminance gate, so the warm colour of scars/debris on darker terrain —
+#     the diagnostic signal — is left untouched.
+# CAST_STRIP_K is the channel-difference (0-255 DN) that earns full strength. Either
+# strength at 0 disables that strip.
+CYAN_STRIP = 1.0          # cool (cyan/blue) cast removal strength; 0 = off
+PINK_STRIP = 1.0          # warm (pink/salmon) cast removal strength on snow; 0 = off
+CAST_STRIP_K = 30.0       # DN of |blue-red| that earns full-strength fade
+PINK_GATE_LO = 175.0      # luminance (0-255) below which PINK_STRIP does nothing ...
+PINK_GATE_HI = 210.0      # ... rising to full strength here (snow-bright pixels only)
 
 # --- auto-stretch: fitting the knee curve to a scene that has no dark end ----------
 # WHITE/KNEE above assume the frame CONTAINS terrain: the linear, arithmetically-untouched
@@ -295,9 +334,157 @@ def auto_stretch(comps, white=WHITE, knee=KNEE, onset=DESAT_ONSET):
         + f"; scene p{AUTO_BLACK_PCT:g}-p{AUTO_WHITE_PCT:g} = {lo:.3f}-{hi:.3f}")
 
 
-def _highlight_rolloff(comp, path, src_crs, white=WHITE, knee=KNEE, contrast=1.0,
-                       desat=DESAT, black=0.0, onset=DESAT_ONSET):
-    """Write the "highlight rolloff" rendering of the true-colour bands.
+def _strip_cast(rgb, strength, cool, gate_lo=None, gate_hi=None):
+    """Fade a colour cast toward luminance on the FINAL 0-255 rgb (band red/green/blue).
+
+    The fade target is each pixel's own luminance, so the cast is neutralised with NO
+    change in brightness (see CYAN_STRIP/PINK_STRIP). cool=True targets a COOL cast
+    (blue>red: cyan and blue); cool=False a WARM cast (red>blue: pink/salmon). Weight
+    scales with the blue/red difference over CAST_STRIP_K. A gate_lo/gate_hi luminance
+    window, when given, limits the fade to bright pixels (snow), so warm scar/debris
+    colour on darker terrain is untouched. strength<=0 is an exact no-op."""
+    if strength <= 0:
+        return rgb
+    r = rgb.sel(band="red").drop_vars("band")
+    g = rgb.sel(band="green").drop_vars("band")
+    b = rgb.sel(band="blue").drop_vars("band")
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    excess = (b - r) if cool else (r - b)
+    w = (excess / CAST_STRIP_K).clip(0.0, 1.0) * strength
+    if gate_lo is not None:
+        u = ((y - gate_lo) / max(gate_hi - gate_lo, 1e-6)).clip(0.0, 1.0)
+        w = w * (u * u * (3.0 - 2.0 * u))
+    return rgb + (y - rgb) * w
+
+
+# HDR tone mode: fuse several exposures of the rolloff curve so shadowed terrain AND bright
+# snow/ice both keep detail in one image — the local tone-map answer to a scene whose dynamic
+# range a single white point can't hold. The exposures are the SAME reflectance rendered at
+# these white points (low = bright, lifts shadow/terrain; high = dark, recovers snow texture),
+# fused by Mertens-Kautz-Van Reeth exposure fusion (2007): a Laplacian-pyramid blend weighted
+# by per-pixel contrast x saturation x well-exposedness, so the best-exposed region of each
+# exposure wins with no halos. See _highlight_hdr / _exposure_fusion.
+# The exposure spread is derived PER SCENE from its own reflectance distribution (see
+# _hdr_whites): the white point that best-exposes a region at reflectance R is ~R, so taking
+# these percentiles of the channel-max reflectance places a bright/mid/dark exposure across
+# whatever range the scene actually spans — a bright all-ice frame, a dark terrain scene and
+# a low-contrast cloudy one each auto-bracket themselves, no fixed tuning. HDR_WHITES is only
+# the fallback when the frame is too small to estimate.
+HDR_EXPOSURE_PCTS = (30.0, 62.0, 94.0)   # scene reflectance percentiles -> bright/mid/dark exposures
+HDR_WHITES = (0.16, 0.35, 0.75)      # fallback exposure white points if percentiles can't be taken
+HDR_WELLEXP_SIGMA = 0.2              # width of the well-exposedness (mid-tone) Gaussian weight
+# Exposure fusion compresses a scene into the mid-tones — punchy locally, but flat globally.
+# _hdr_finish restores contrast to a CONSISTENT TARGET rather than maximising it: it scales
+# luminance contrast toward HDR_TARGET_STD, so a flat cloudy scene is boosted while an already
+# high-contrast one (bright snow + deep shadow) is eased BACK instead of crushed to black and
+# white. Targeting a fixed std — not stretching each scene to full black/white — is what makes
+# the result look the same across every scene. The scale is one gain around the mean applied to
+# all of R/G/B, so hue/saturation are preserved; the gain is clamped so noise isn't amplified.
+HDR_TARGET_STD = 0.16              # luminance contrast every scene is normalised toward
+HDR_GAIN_MIN = 0.6                 # ... easing an over-contrasty scene back down (gain < 1)
+HDR_GAIN_MAX = 3.0                 # ... or boosting a flat one, clamped so noise isn't amplified
+# HDR keeps a BIT of colour by easing the chroma neutralizers (highlight desat, cyan de-blue,
+# cyan/pink cast-strips) by this factor — otherwise a mostly-bright scene (snow/cloud) is
+# neutralised almost to greyscale, which reads as lifeless. The neutralizers only touch chroma,
+# never luminance, so this cannot darken the image or flatten the snow's contrast. HDR-ONLY: the
+# knee mode still neutralises fully (its casts are cleaned as before). 1.0 = fully neutral (old
+# HDR look); lower keeps more colour (but lets more of the atmospheric cast/edge fringe through).
+HDR_SATURATION = 0.7
+
+_PYR_K = np.array([1.0, 4.0, 6.0, 4.0, 1.0])
+_PYR_K = _PYR_K / _PYR_K.sum()
+
+
+def _pyr_blur(a):
+    """Separable binomial (Gaussian) blur over the first two axes, reflect-padded."""
+    def conv(x, ax):
+        pad = [(0, 0)] * x.ndim
+        pad[ax] = (2, 2)
+        xp = np.pad(x, pad, mode="reflect")
+        o = np.zeros_like(x)
+        for i, k in enumerate(_PYR_K):
+            sl = [slice(None)] * x.ndim
+            sl[ax] = slice(i, i + x.shape[ax])
+            o = o + k * xp[tuple(sl)]
+        return o
+    return conv(conv(a, 0), 1)
+
+
+def _pyr_up(a, shape):
+    """Upsample `a` to (shape[0], shape[1], ...) by zero-insertion + blur*4."""
+    o = np.zeros((shape[0], shape[1]) + a.shape[2:], float)
+    o[::2, ::2] = a[:(shape[0] + 1) // 2, :(shape[1] + 1) // 2]
+    return 4.0 * _pyr_blur(o)
+
+
+def _gauss_pyr(a, n):
+    p = [a]
+    for _ in range(n - 1):
+        a = _pyr_blur(a)[::2, ::2]
+        p.append(a)
+    return p
+
+
+def _lap_pyr(a, n):
+    g = _gauss_pyr(a, n)
+    return [g[i] - _pyr_up(g[i + 1], g[i].shape) for i in range(n - 1)] + [g[-1]]
+
+
+def _pyr_collapse(lp):
+    a = lp[-1]
+    for i in range(len(lp) - 2, -1, -1):
+        a = _pyr_up(a, lp[i].shape) + lp[i]
+    return a
+
+
+def _exposure_fusion(imgs):
+    """Mertens exposure fusion: blend LDR exposures `imgs` (each (H, W, 3) in 0-1) by a
+    per-pixel weight of contrast * saturation * well-exposedness, combined through a Laplacian
+    pyramid (Gaussian pyramid of the weights x Laplacian pyramid of the images) so the seams
+    between exposures are halo-free. Returns the fused (H, W, 3) image in 0-1."""
+    h, w, _ = imgs[0].shape
+    levels = max(3, int(np.log2(min(h, w))) - 2)
+    weights = []
+    for im in imgs:
+        g = im.mean(2)
+        gp = np.pad(g, 1, mode="reflect")
+        contrast = np.abs(4 * g - gp[:-2, 1:-1] - gp[2:, 1:-1]
+                          - gp[1:-1, :-2] - gp[1:-1, 2:])          # Laplacian magnitude
+        saturation = im.std(2)
+        wellexp = np.prod(np.exp(-0.5 * ((im - 0.5) / HDR_WELLEXP_SIGMA) ** 2), axis=2)
+        weights.append(contrast * saturation * wellexp + 1e-12)
+    total = np.sum(weights, axis=0) + 1e-12
+    weights = [wt / total for wt in weights]
+    out = None
+    for im, wt in zip(imgs, weights):
+        gw = _gauss_pyr(wt, levels)
+        li = _lap_pyr(im, levels)
+        blended = [gw[lv][..., None] * li[lv] for lv in range(levels)]
+        out = blended if out is None else [o + b for o, b in zip(out, blended)]
+    return _pyr_collapse(out).clip(0.0, 1.0)
+
+
+def _hdr_finish(img, valid):
+    """Normalise the fused image to a CONSISTENT contrast (HDR_TARGET_STD) instead of maximising
+    it, so every scene lands at the same punch: a flat cloudy scene is boosted, a high-contrast
+    one (bright snow + deep shadow) is eased back rather than crushed to black and white. Scales
+    luminance contrast around the fused mean by target/current std (clamped HDR_GAIN_MIN..MAX),
+    applied as one gain to all channels so colour is preserved. `valid` (H, W bool) excludes
+    nodata; `img` is (H, W, 3) in 0-1."""
+    yv = img.mean(2)[valid]
+    if yv.size == 0:
+        return img
+    mean, std = float(yv.mean()), float(yv.std())
+    gain = float(np.clip(HDR_TARGET_STD / max(std, 1e-3), HDR_GAIN_MIN, HDR_GAIN_MAX))
+    return (mean + (img - mean) * gain).clip(0.0, 1.0)
+
+
+def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
+                 desat=DESAT, black=0.0, onset=DESAT_ONSET,
+                 blue_desat=BLUE_DESAT, cyan_strip=CYAN_STRIP,
+                 pink_strip=PINK_STRIP):
+    """The "highlight rolloff" render as a 0-255 float rgb DataArray (NaN = nodata);
+    _highlight_rolloff writes it and _highlight_hdr fuses several exposures of it.
 
     The alternative to _highlight_natural's global power law: below the knee this
     is the SAME linear 0..white stretch _rgb uses, so midtones and shadows come
@@ -329,6 +516,12 @@ def _highlight_rolloff(comp, path, src_crs, white=WHITE, knee=KNEE, contrast=1.0
     which leaves every surface that carries diagnostic colour untouched; it is well
     above the knee, so the "midtones arithmetically untouched" guarantee above holds a
     fortiori. desat=0 restores the old purely ratio-preserving output.
+
+    Finally, two cast-strips run on the rendered rgb (see _strip_cast, CYAN_STRIP/
+    PINK_STRIP): they fade Planet SR's cyan/blue and pink casts on snow toward luminance,
+    removing the colour without darkening — the reason to reach for this over the
+    cube-root mode when the goal is to read detail under a fringe. cyan_strip/pink_strip
+    at 0 skip them and restore the pre-cast-strip output.
     """
     refl = comp.sel(band=["red", "green", "blue"]).clip(0, None)
     rgb = (refl - black) / max(white - black, 1e-6)
@@ -342,15 +535,98 @@ def _highlight_rolloff(comp, path, src_crs, white=WHITE, knee=KNEE, contrast=1.0
     # Fade toward `sh` — the max channel's own post-gain value — so a compressed
     # highlight walks to WHITE at its own brightness rather than to grey.
     rgb = rgb + (sh - rgb) * _desat_weight(rmax, onset, desat)
+    # Cyan-selective de-blue (see BLUE_DESAT): a second fade toward `sh`, but weighted
+    # by how far BLUE sits above the warm channels rather than by brightness — so it
+    # neutralises the skylit blue of snow-shadow/ice (which the reflectance-gated pass
+    # above leaves alone below its onset) while warm scar/debris colour, where blue is
+    # not the excess channel, is bit-identical.
+    if blue_desat > 0:
+        warm = rgb.sel(band=["red", "green"]).max(dim="band")
+        cyan = ((rgb.sel(band="blue") - warm) / BLUE_DESAT_K).clip(0.0, 1.0)
+        u = ((rmax - BLUE_DESAT_LO)
+             / max(BLUE_DESAT_HI - BLUE_DESAT_LO, 1e-6)).clip(0.0, 1.0)
+        # A manual black point over-stretches a blue shadow: subtracting it drives the
+        # shadow's blue far past the warm channels, so a fixed-strength fade leaves a
+        # larger blue tint than the fixed/auto curve does (measurably ~2.4x at black
+        # 0.15). Raise the EFFECTIVE strength by that same amplification, rmax/(rmax -
+        # black), so the leftover tint is the fraction a black=0 stretch would leave —
+        # i.e. invariant to where the black point sits. At black=0 (ratio 1) this is
+        # exactly blue_desat, so the fixed curve and every auto-stretch (which use a
+        # near-zero black) render bit-for-bit as before.
+        ratio = ((rmax - black) / rmax.where(rmax > 1e-6, 1e-6)).clip(0.0, 1.0)
+        s_eff = 1.0 - (1.0 - blue_desat) * ratio
+        rgb = rgb + (sh - rgb) * (s_eff * cyan
+                                  * (u * u * (3.0 - 2.0 * u))).clip(0.0, 1.0)
     rgb = _contrast(rgb.clip(0, 1), contrast) * 255
+    # Cast-strip on the final rgb, fading toward luminance so it CANNOT darken (unlike
+    # the cube-root mode): clear the cyan/blue cast Planet SR paints on snow/ice, then
+    # the pink/salmon warm cast on bright snow (luminance-gated, so warm scar/debris
+    # colour on darker terrain is untouched). See CYAN_STRIP/PINK_STRIP.
+    rgb = _strip_cast(rgb, cyan_strip, cool=True)
+    rgb = _strip_cast(rgb, pink_strip, cool=False,
+                      gate_lo=PINK_GATE_LO, gate_hi=PINK_GATE_HI)
     if black > 0:
         # nodata is 0, so a valid pixel driven to DN 0 by the black point would punch a
         # transparent HOLE in the layer exactly where a dark scar is. Floor the valid
         # pixels at 1; NaN passes through np.clip untouched and still becomes nodata.
         rgb = rgb.clip(1.0, 255.0)
+    return rgb
+
+
+def _write_rgb(rgb, path, src_crs):
+    """Write a 0-255 float rgb DataArray (NaN = nodata) as the 3-band uint8 GeoTIFF."""
     rgb = rgb.fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
     rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+
+
+def _highlight_rolloff(comp, path, src_crs, **kw):
+    """Write the highlight-rolloff render (the curve itself is _rolloff_rgb)."""
+    _write_rgb(_rolloff_rgb(comp, **kw), path, src_crs)
+
+
+def _hdr_whites(comp):
+    """Per-scene exposure white points, auto-bracketed from the reflectance distribution (see
+    HDR_EXPOSURE_PCTS) so the HDR spread fits each scene with no fixed tuning. A white point
+    ~R best-exposes a region at reflectance R, so the chosen percentiles of the channel-max
+    reflectance give a bright, a mid and a dark exposure across the scene's own range. Clamped
+    and kept distinct so a degenerate/flat scene still brackets; falls back to HDR_WHITES when
+    the frame is too small to estimate."""
+    rmax = comp.sel(band=["red", "green", "blue"]).max(dim="band").values
+    v = rmax[np.isfinite(rmax)]
+    if v.size < 5000:
+        return HDR_WHITES
+    q = np.clip(np.percentile(v, HDR_EXPOSURE_PCTS).astype(float), 0.05, 1.3)
+    q[1] = max(q[1], q[0] * 1.25)        # keep the three exposures distinct on a flat scene
+    q[2] = max(q[2], q[1] * 1.25)
+    return tuple(float(x) for x in q)
+
+
+def _highlight_hdr(comp, path, src_crs, knee=KNEE, contrast=1.0, desat=DESAT,
+                   black=0.0, onset=DESAT_ONSET, blue_desat=BLUE_DESAT,
+                   cyan_strip=CYAN_STRIP, pink_strip=PINK_STRIP):
+    """HDR render: Mertens exposure fusion of the rolloff curve at HDR_WHITES, so a scene with
+    both deep shadow and blown snow keeps detail at BOTH ends in one image — the local
+    tone-map a single white point can't give. Same knee/contrast/desat/cast-strip treatment
+    per exposure; only the white point (exposure) varies, then _exposure_fusion picks the
+    best-exposed region of each. No auto-stretch: the fusion IS the dynamic-range fit."""
+    # Keep a bit of colour: ease the chroma neutralizers by HDR_SATURATION. They touch only
+    # chroma (fade toward the pixel's own luminance/neutral), never brightness, so this cannot
+    # darken the image or reduce the snow's contrast — it only lets some colour survive.
+    s = HDR_SATURATION
+    exps = [_rolloff_rgb(comp, white=w, knee=knee, contrast=contrast, desat=desat * s,
+                         black=black, onset=onset, blue_desat=blue_desat * s,
+                         cyan_strip=cyan_strip * s, pink_strip=pink_strip * s).transpose(
+                             "band", "y", "x")
+            for w in _hdr_whites(comp)]
+    stack = [e.values for e in exps]                       # each (3, H, W), 0-255, NaN=nodata
+    nod = np.isnan(stack[0]).all(axis=0)                   # (H, W) nodata mask
+    imgs = [np.moveaxis(np.nan_to_num(s, nan=0.0), 0, 2) / 255.0 for s in stack]  # (H,W,3) 0-1
+    fused = _exposure_fusion(imgs)                         # (H, W, 3) in 0-1 (flat/muddy)
+    fused = _hdr_finish(fused, ~nod)                       # reclaim shadow depth + midtones
+    arr = np.moveaxis(fused, 2, 0) * 255.0                 # (3, H, W)
+    arr[:, nod] = np.nan                                   # restore nodata -> transparent
+    _write_rgb(exps[0].copy(data=arr), path, src_crs)
 
 
 def _highlight_natural(comp, path, src_crs, contrast=1.0):
@@ -376,6 +652,33 @@ def _highlight_natural(comp, path, src_crs, contrast=1.0):
     rgb = np.cbrt(0.6 * rgb).clip(0, 1)
     rgb = _contrast(rgb, contrast)
     rgb = (rgb * 255).fillna(0).astype("uint8")
+    rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
+    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+
+
+def _linear(comp, path, src_crs, white=WHITE, black=0.0):
+    """Write a plain linear black/white stretch of the true-colour bands — the "None"
+    tone mode, with every shaping the other two curves add switched OFF.
+
+    No highlight rolloff, no cube-root, no highlight desaturation, no S-curve contrast:
+    just (black..white) reflectance mapped to (0..255) per channel and hard-clipped, the
+    same maths as _rgb but with the endpoints exposed. Bright ice therefore CLIPS to flat
+    white exactly as a naive stretch would — that is the point. It is the un-toned
+    reference for reading what the surface reflectance itself looks like, without the
+    render making a highlight/contrast decision on your behalf.
+
+    `white`/`black` default to WHITE (0.30) and 0.0 — the same window _rgb uses — and are
+    the only knobs: the plugin's Manual-stretch spin boxes drive them. The auto-stretch is
+    deliberately NOT wired in here (a scene-fitted stretch is itself a processing choice
+    this mode exists to turn off), and `contrast` is not a parameter at all.
+    """
+    refl = comp.sel(band=["red", "green", "blue"]).clip(0, None)
+    rgb = ((refl - black) / max(white - black, 1e-6)).clip(0, 1) * 255
+    if black > 0:
+        # nodata is 0, so floor valid pixels at 1 lest a black-clipped scar punch a
+        # transparent hole in the layer (see _highlight_rolloff). NaN stays nodata.
+        rgb = rgb.clip(1.0, 255.0)
+    rgb = rgb.fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
     rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
 

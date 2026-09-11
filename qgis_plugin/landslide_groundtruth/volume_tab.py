@@ -3,26 +3,30 @@
 Where this sits in the workflow: the other tabs get you imagery and elevation
 change; this one turns the polygons you digitize over that imagery into numbers.
 
-WHICH OUTLINE THE VOLUME COMES FROM: the TOTAL landslide outline — the whole
-affected area, source through runout to deposit. A mapped slide usually carries
-several outlines: one total extent plus two or three interpretations of the
-source scar inside it. Only the total is converted. The source outlines are
-measured and reported beside it, never run through the relation, because the
-relation answers a question about whatever area it is handed and the source scar
-is a fraction of what failed — feeding it a source outline silently answers a
-different question and reads low.
+WHICH OUTLINE THE VOLUME COMES FROM: it follows the Fit, because the Larsen
+coefficients are calibrated per outline definition. The source-scar fit (Larsen
+Table S1, the default) converts the BEST SOURCE outline and widens the volume
+range with the low/high source outlines when they are assigned. The total-area
+fit converts the TOTAL outline instead, once its coefficients are filled in (see
+LARSEN_TOTAL in volume_calc). Whichever outline is NOT the fit's calibrated input
+is still measured and reported alongside, never run through the relation, because
+the relation answers a question about whatever area it is handed — feeding the
+scar fit a total outline reads high, and feeding a total fit a source outline
+reads low.
 
 How the pieces fit:
 
-  Roles     Four layer pickers: one TOTAL (drives the volume) and three optional
-            SOURCE roles (best/low/high, reported only). Assigning by layer
-            rather than by map selection means the input is explicit and
-            re-measurable, and layers named for their role — "Total Area",
-            "Source Area (low)" — are recognised automatically, so a project that
-            already holds the outlines comes up ready to measure. A role layer
-            holding several polygons contributes its largest; the rest are
-            reported, not combined, since they are alternative attempts at one
-            outline rather than parts of it.
+  Roles     Four layer pickers: one TOTAL and three SOURCE roles (best/low/high).
+            Under the source-scar fit the SOURCE best drives the volume and
+            source low/high set its range; the total is reported alongside. Under
+            the total-area fit the TOTAL drives it and the source roles are
+            reported. Assigning by layer rather than by map selection means the
+            input is explicit and re-measurable, and layers named for their role
+            — "Total Area", "Source Area (low)" — are recognised automatically,
+            so a project that already holds the outlines comes up ready to
+            measure. A role layer holding several polygons contributes its
+            largest; the rest are reported, not combined, since they are
+            alternative attempts at one outline rather than parts of it.
 
   Area      Ellipsoidal plan-view area (QgsDistanceArea + the project
             ellipsoid) — the same thing $area gives, and the same quantity
@@ -35,19 +39,30 @@ How the pieces fit:
             outline instruction on the tab follows this choice, so the polygon
             and the calibration can't silently disagree.
 
-  Length    A medial-axis centerline of the total outline (see centerline.py),
-            dropped into an editable scratch layer so you can trim the ends or
-            nudge it and re-measure. Reported for reference only — the volume
-            comes from area alone.
+  Length    A medial-axis centerline of the total landslide outline (see
+            centerline.py) — a whole-slide runout length, taken from the total
+            even under the scar fit; with no total assigned it spines the
+            converted outline instead. Which outline it spines can be overridden
+            with the "Centerline from" picker. Dropped into an editable scratch
+            layer so you can trim the ends or nudge it and re-measure. Reported
+            for reference only — the volume comes from area alone.
+
+  Relief    With an elevation raster assigned ("Elevation (DEM)"), the fall
+            height is read ALONG that centerline — its highest reading is the
+            source crown, its lowest the toe — giving the drop H and the travel
+            angle atan(H/L). A HILLSHADE is shading (0-255), not elevation, so a
+            byte raster is refused rather than reported as metres. Reference
+            only, like the length; the 3D viewer tab can fetch a DEM to sample.
 
   Results   One row per slide, accumulating across slides so a session's work
             exports as one CSV, plus a write-back that stamps the numbers onto
-            the total outline's own feature so they travel with the geometry.
+            the converted outline's own feature so they travel with the geometry.
 
 The volume arithmetic itself lives in volume_calc, which prefers the project's
 canonical larsen_BR_volume.py and names whichever implementation ran.
 """
 import csv
+import math
 import os
 import re
 from functools import partial
@@ -56,17 +71,20 @@ from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QPlainTextEdit, QTableWidget, QTableWidgetItem,
-    QSplitter, QFileDialog, QApplication, QHeaderView, QToolButton,
+    QSplitter, QFileDialog, QApplication, QHeaderView, QToolButton, QCheckBox,
 )
 from qgis.core import (
-    QgsProject, QgsVectorLayer, QgsWkbTypes, QgsDistanceArea, QgsUnitTypes,
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
+    Qgis, QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes,
+    QgsDistanceArea, QgsUnitTypes, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform, QgsGeometry, QgsPointXY,
     QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol, QgsVectorDataProvider,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import centerline as centerline_mod
 from . import volume_calc
+from . import layer_group as lg
+from .flow_layout import FlowRow
 
 
 def _utm_epsg(lat, lon):
@@ -120,19 +138,29 @@ SOURCE_ROLES = (("best", "best"), ("low", "low"), ("high", "high"))
 
 # Attribute fields the write-back adds to the scar layer. (name, type, source
 # key in a results row.) Kept short and lower-case so they survive a Shapefile
-# round-trip (10-character field-name limit) as well as GeoPackage.
+# round-trip (10-character field-name limit) as well as GeoPackage. area_m2 is
+# the area that PRODUCED the volume (source best under the scar fit, total under
+# the total fit); area_lo/hi_m2 are the low/high areas that set the range;
+# total_m2 records the total outline for context when it wasn't the converted one.
 WRITEBACK_FIELDS = [
     ("slide", QVariant.String, "name"),
     ("fit", QVariant.String, "fit_label"),
     ("material", QVariant.String, "material_label"),
-    ("area_m2", QVariant.Double, "a_total"),
-    ("src_m2", QVariant.Double, "src_best"),
-    ("src_lo_m2", QVariant.Double, "src_low"),
-    ("src_hi_m2", QVariant.Double, "src_high"),
+    ("area_m2", QVariant.Double, "a_conv"),
+    ("area_lo_m2", QVariant.Double, "a_conv_low"),
+    ("area_hi_m2", QVariant.Double, "a_conv_high"),
+    ("total_m2", QVariant.Double, "a_total"),
     ("length_m", QVariant.Double, "length"),
+    ("z_top_m", QVariant.Double, "z_top"),
+    ("z_bot_m", QVariant.Double, "z_bottom"),
+    ("drop_m", QVariant.Double, "drop"),
+    ("reach_deg", QVariant.Double, "reach_angle"),
     ("vol_m3", QVariant.Double, "v_best"),
     ("vol_lo_m3", QVariant.Double, "v_low"),
     ("vol_hi_m3", QVariant.Double, "v_high"),
+    # Elevation-change (∫Δh) fit only; None under the area-scaling fits.
+    ("vol_ero_m3", QVariant.Double, "v_erosion"),
+    ("vol_dep_m3", QVariant.Double, "v_deposit"),
 ]
 
 # Measurement units we refuse to convert from. Square degrees because QGIS only
@@ -145,24 +173,60 @@ UNUSABLE_LENGTH_UNITS = (QgsUnitTypes.DistanceDegrees,
                          QgsUnitTypes.DistanceUnknownUnit)
 
 TABLE_COLS = ["Slide", "Fit", "Material", "Total area (m²)", "V best (m³)",
-              "V low (m³)", "V high (m³)", "Src best (m²)", "Src low (m²)",
-              "Src high (m²)", "Length (m)", "Layers"]
+              "V low (m³)", "V high (m³)", "V ero (m³)", "V dep (m³)",
+              "Src best (m²)", "Src low (m²)", "Src high (m²)",
+              "Length (m)", "Drop (m)", "Layers"]
 
 # CSV header + the row keys behind it, so the export carries raw numbers rather
-# than the table's thousands-separated display strings. total_area_m2 is the one
-# the volume came from; the source areas are recorded but were not converted.
+# than the table's thousands-separated display strings. converted_area_m2 is the
+# one the volume came from (source best under the scar fit, total under the total
+# fit); converted_from names which role that was. The other areas are recorded
+# but were not converted.
 CSV_FIELDS = [
     ("slide", "name"), ("fit", "fit"), ("material", "material"),
-    ("total_area_m2", "a_total"),
+    ("converted_from", "conv_role"),
+    ("converted_area_m2", "a_conv"),
+    ("converted_area_low_m2", "a_conv_low"),
+    ("converted_area_high_m2", "a_conv_high"),
     ("volume_best_m3", "v_best"), ("volume_low_m3", "v_low"),
     ("volume_high_m3", "v_high"),
+    # ∫Δh fit only: the erosion/deposition split and the change-field stats.
+    ("volume_erosion_m3", "v_erosion"), ("volume_deposition_m3", "v_deposit"),
+    ("volume_net_m3", "v_net"),
+    # what the ∫Δh volume is actually worth: the per-pixel vertical noise, the
+    # volume error that follows from it, the residual bias taken off before
+    # integrating, and how much of the outline the Δh really covered.
+    # both independent estimates, per row, so one exported line can show the
+    # cross-check instead of it living only on screen
+    ("vol_area_scaling_m3", "v_larsen"),
+    ("vol_area_scaling_lo_m3", "v_larsen_lo"),
+    ("vol_area_scaling_hi_m3", "v_larsen_hi"),
+    ("vol_dh_erosion_row_m3", "v_dh_erosion"),
+    ("vol_dh_net_row_m3", "v_dh_net"),
+    ("dh_sigma_m", "sigma_dh"), ("dh_volume_sigma_m3", "v_sigma"),
+    ("dh_bias_removed_m", "dh_offset"), ("dh_coverage_frac", "dh_coverage"),
+    ("dh_covered_area_m2", "covered_area"), ("dh_mean_m", "mean_dh"),
+    ("dh_max_rise_m", "max_rise"), ("dh_max_drop_m", "max_drop"),
+    ("dh_grid_res_m", "ddem_res"), ("dh_raster", "ddem_name"),
+    ("total_area_m2", "a_total"),
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
     ("centerline_m", "length"), ("centerline_method", "length_method"),
-    ("total_layer", "layer_name"), ("source_best_layer", "best_layer"),
+    ("elev_top_m", "z_top"), ("elev_bottom_m", "z_bottom"),
+    ("drop_m", "drop"), ("reach_angle_deg", "reach_angle"),
+    ("hl_ratio", "hl_ratio"), ("elevation_layer", "dem_name"),
+    ("converted_layer", "layer_name"), ("total_layer", "total_layer"),
+    ("source_best_layer", "best_layer"),
     ("source_low_layer", "low_layer"), ("source_high_layer", "high_layer"),
-    ("total_feature_id", "best_fid"), ("calculator", "calc"),
+    ("converted_feature_id", "conv_fid"), ("calculator", "calc"),
 ]
+
+# The ground-truthing columns: who the event was, what the analyst concluded, and
+# the three independent volumes in three separate columns so the cross-check is
+# visible in the file rather than only on screen. Appended (never interleaved) so
+# any existing reader that indexes the original columns keeps working.
+from .verdict import VERDICT_CSV_FIELDS
+CSV_FIELDS = CSV_FIELDS + VERDICT_CSV_FIELDS
 
 
 class VolumeTab(QWidget):
@@ -194,9 +258,11 @@ class VolumeTab(QWidget):
 
         intro = QLabel(
             "Volume from landslide area — Larsen et al. (2010) area–volume "
-            "scaling. The volume is computed from the TOTAL landslide outline; "
-            "the source-area outlines are measured and reported alongside it, "
-            "not converted. Assign the layers below and press Measure.")
+            "scaling. The area converted to a volume follows the Fit below: the "
+            "source-scar fit converts the BEST SOURCE outline (and widens the ± "
+            "range with the low/high source outlines); the total-area fit "
+            "converts the TOTAL outline. The outline not used is measured and "
+            "reported alongside. Assign the layers below and press Measure.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         root.addWidget(intro)
@@ -236,33 +302,57 @@ class VolumeTab(QWidget):
         for label, _key in volume_calc.MATERIALS:
             self.material_combo.addItem(label)
         self.material_combo.setToolTip(
-            "Which material's coefficients to use. Bedrock failures are deeper "
-            "for a given area than soil failures, so this choice moves the "
-            "volume substantially — pick it from what actually failed, not the "
-            "surrounding cover.")
-        form.addRow("Hillslope material", self.material_combo)
+            "Bedrock failures are deeper for a given area than soil failures. "
+            "This is the single biggest control on the answer: at a typical "
+            "scar size the two options differ by about a factor of 5 — roughly "
+            "twenty times the ±range shown beside the volume. Pick it from what "
+            "actually failed, not from the surrounding cover.")
+        form.addRow("What failed?", self.material_combo)
+        # The case this plugin exists for is the one Larsen does not cover.
+        ice_note = QLabel(
+            "Neither option covers a rock-and-ice avalanche. If much of what "
+            "moved was ice or entrained snow, this relation is outside its "
+            "calibration — and the seismic volume is a mass divided by an "
+            "assumed density, so check both numbers assume the same thing "
+            "before comparing them.")
+        ice_note.setWordWrap(True)
+        ice_note.setStyleSheet("QLabel { color: palette(mid); }")
+        form.addRow("", ice_note)
         root.addLayout(form)
 
         # --- actions ---
-        btns = QHBoxLayout()
+        btns = FlowRow()
         self.measure_btn = QPushButton("Measure")
         self.measure_btn.setToolTip(
-            "Measure the assigned layers and convert the TOTAL area to a "
-            "volume. The source-area layers are optional; they are measured "
-            "and recorded but never converted.")
+            "Measure the assigned layers and convert the area the selected Fit "
+            "is calibrated on — the best SOURCE area for the scar fit (source "
+            "low/high widen the range), the TOTAL area for the total fit. The "
+            "outline not converted is measured and recorded alongside.")
         self.measure_btn.clicked.connect(self._measure)
+        f = self.measure_btn.font()
+        f.setBold(True)
+        self.measure_btn.setFont(f)
+        self.measure_btn.setDefault(True)
         self.add_btn = QPushButton("Add to results ↓")
         self.add_btn.setToolTip(
             "Append the measurement below to the results table and move on to "
-            "the next slide.")
+            "the next slide. Enabled after a successful Measure.")
         self.add_btn.setEnabled(False)
         self.add_btn.clicked.connect(self._add_row)
-        for b in (self.measure_btn, self.add_btn):
+        self.refresh_btn = QPushButton("↻ Refresh layers")
+        self.refresh_btn.setToolTip(
+            "Re-sync every layer picker on this tab — so a layer you just added "
+            "to the project shows up without reloading the plugin. A Δh raster "
+            "from elsewhere has to be added to QGIS first (Layer ▸ Add Raster "
+            "Layer); this tab only lists what the project already holds.")
+        self.refresh_btn.clicked.connect(self._refresh_layers)
+        for b in (self.measure_btn, self.add_btn, self.refresh_btn):
             btns.addWidget(b)
-        root.addLayout(btns)
+        root.addWidget(btns)
 
         root.addWidget(self._build_current_box())
         root.addWidget(self._build_centerline_box())
+        root.addWidget(self._build_ddem_box())
 
         # --- results ---
         split = QSplitter(Qt.Vertical)
@@ -282,10 +372,10 @@ class VolumeTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         tl.addWidget(self.table)
 
-        rbtns = QHBoxLayout()
+        rbtns = FlowRow()
         self.write_btn = QPushButton("Write to layer")
         self.write_btn.setToolTip(
-            "Stamp the numbers onto the BEST outline's own feature as "
+            "Stamp the numbers onto the CONVERTED outline's own feature as "
             "attributes (fields are added if missing), so they travel with the "
             "geometry. Applies to the selected rows, or all rows if none are "
             "selected. Needs a layer that accepts attribute edits.")
@@ -302,7 +392,8 @@ class VolumeTab(QWidget):
         self.remove_btn.clicked.connect(self._remove_rows)
         for b in (self.write_btn, self.copy_btn, self.csv_btn, self.remove_btn):
             rbtns.addWidget(b)
-        tl.addLayout(rbtns)
+        tl.addWidget(rbtns)
+        tl.addWidget(self._build_verdict_box())
         split.addWidget(tablebox)
 
         logbox = QWidget()
@@ -351,7 +442,7 @@ class VolumeTab(QWidget):
         row.addWidget(refresh)
         v.addLayout(row)
 
-        btns = QHBoxLayout()
+        btns = FlowRow()
         self.new_layer_btn = QPushButton("New scar layer")
         self.new_layer_btn.setToolTip(
             f"Create an empty polygon layer (“{SCAR_LAYER}”), make it active, "
@@ -368,7 +459,7 @@ class VolumeTab(QWidget):
         self.draw_btn.clicked.connect(self._draw_outline)
         for b in (self.new_layer_btn, self.draw_btn):
             btns.addWidget(b)
-        v.addLayout(btns)
+        v.addWidget(btns)
 
         self.sel_lbl = QLabel()
         self.sel_lbl.setWordWrap(True)
@@ -457,7 +548,73 @@ class VolumeTab(QWidget):
                     f"A_{role} drop-down to override.")
 
         self._on_layer_changed()
+        self._refresh_relief_combos(layers)
         self._update_role_label()
+
+    def _project_rasters(self):
+        """Raster layers in layer-tree drawing order — the DEM candidates."""
+        project = QgsProject.instance()
+        try:
+            ordered = project.layerTreeRoot().layerOrder()
+        except Exception:
+            ordered = list(project.mapLayers().values())
+        return [l for l in ordered if isinstance(l, QgsRasterLayer)]
+
+    def _refresh_relief_combos(self, layers=None):
+        """Repopulate the "Centerline from" and "Elevation (DEM)" pickers,
+        each keeping its current selection so a layer add never reassigns them.
+
+        The centerline picker offers Auto (data None — follow the measurement)
+        plus every polygon layer; the DEM picker offers "— none —" plus every
+        single-band raster, the same DEM filter the 3D viewer tab uses."""
+        if not hasattr(self, "_cl_source_combo"):
+            return                        # still constructing
+        if layers is None:
+            layers = self._polygon_layers()
+
+        combo = self._cl_source_combo
+        keep = combo.currentData() if combo.count() else None
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Auto — total area (else converted)", None)
+        for layer in layers:
+            combo.addItem(layer.name(), layer.id())
+        idx = combo.findData(keep)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+        dem = self._dem_combo
+        keep_dem = dem.currentData() if dem.count() else None
+        dem.blockSignals(True)
+        dem.clear()
+        dem.addItem("— none —", None)
+        for lyr in self._project_rasters():
+            # single-band rasters are the elevation candidates; a hillshade is
+            # single-band too and is caught later, at sample time (_is_hillshade)
+            if lyr.bandCount() == 1:
+                dem.addItem(lyr.name(), lyr.id())
+        idx = dem.findData(keep_dem)
+        dem.setCurrentIndex(idx if idx >= 0 else 0)
+        dem.blockSignals(False)
+
+        # The elevation-change fit's three raster pickers — the Δh input and the
+        # pre/post pair — share the single-band-raster filter with the DEM combo.
+        # Guarded with getattr because they're built after this may first run.
+        for combo in (getattr(self, "_ddem_combo", None),
+                      getattr(self, "_pre_dem_combo", None),
+                      getattr(self, "_post_dem_combo", None)):
+            if combo is None:
+                continue
+            keep = combo.currentData() if combo.count() else None
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— none —", None)
+            for lyr in self._project_rasters():
+                if lyr.bandCount() == 1:
+                    combo.addItem(lyr.name(), lyr.id())
+            idx = combo.findData(keep)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
 
     def _match_role_layers(self, layers):
         """{role: layer} for layers whose NAME identifies their role.
@@ -608,16 +765,36 @@ class VolumeTab(QWidget):
             extra = f" of {len(measured)}, largest" if len(measured) > 1 else ""
             parts.append(f"{label} {_fmt(measured[0][0])} m²{extra}")
         if not parts:
-            self.role_lbl.setText(
-                "Assign the total landslide outline to “Total area layer” — that "
-                "is what the volume is computed from. The source-area layers are "
-                "optional and are reported alongside it.")
+            fit = self._fit()
+            if fit == "ddem":
+                self.role_lbl.setText(
+                    "Assign the total landslide outline to “Total area layer” — "
+                    "the elevation-change fit sums Δh over it. A source outline "
+                    "is used instead if no total is assigned.")
+            elif fit == "total":
+                self.role_lbl.setText(
+                    "Assign the total landslide outline to “Total area layer” — "
+                    "the total-area fit computes the volume from it. The "
+                    "source-area layers are optional and reported alongside.")
+            else:
+                self.role_lbl.setText(
+                    "Assign the best source outline to “Source area (best)” — "
+                    "the source-scar fit computes the volume from it. Source "
+                    "low/high widen the range; the total is reported alongside.")
             self.role_lbl.setStyleSheet("QLabel { color: palette(mid); }")
             return
         problem = self._role_order_problem(areas)
-        if not problem and "total" not in areas:
-            problem = ("No total area layer assigned — the volume needs the "
-                       "total outline, not the source areas.")
+        if not problem:
+            fit = self._fit()
+            if fit == "total" and "total" not in areas:
+                problem = ("No total area layer assigned — the total-area fit "
+                           "converts the total outline.")
+            elif fit == "ddem" and "total" not in areas and "best" not in areas:
+                problem = ("No outline assigned — the elevation-change fit sums "
+                           "Δh over the total (or source) outline.")
+            elif fit == "scar" and "best" not in areas:
+                problem = ("No source-best layer assigned — the source-scar fit "
+                           "converts the best source outline.")
         self.role_lbl.setText("  ·  ".join(parts) + (f"\n⚠ {problem}" if problem else ""))
         self.role_lbl.setStyleSheet(
             "QLabel { color: #c62828; }" if problem
@@ -683,7 +860,7 @@ class VolumeTab(QWidget):
             "outline_width": "0.6"})
         if symbol is not None and layer.renderer() is not None:
             layer.renderer().setSymbol(symbol)
-        QgsProject.instance().addMapLayer(layer)
+        lg.add_to_group(layer, "Volume")
         self._refresh_layers()
         idx = self._layer_combo.findData(layer.id())
         if idx >= 0:
@@ -725,13 +902,14 @@ class VolumeTab(QWidget):
     def _build_current_box(self):
         """Which layers are measured, and what came out.
 
-        The drop-downs are the input. "Total area layer" is the whole landslide
-        outline and is the ONLY one converted to a volume; the three source-area
-        roles are measured and reported beside it, because the relation answers
-        a question about the area you give it and the source scar is a fraction
-        of what failed. Everything below them is read-only computed output,
-        which is also why the per-project state save skips it (see
-        project_state._persistable)."""
+        The drop-downs are the input. Which one is converted to a volume follows
+        the Fit: the source-scar fit converts "Source area (best)" and widens the
+        range with the low/high source outlines; the total-area fit converts
+        "Total area layer". The outline the fit doesn't use is measured and
+        reported beside the result, never fed to the relation, because the
+        relation answers a question about the area you give it. Everything below
+        the drop-downs is read-only computed output, which is also why the
+        per-project state save skips it (see project_state._persistable)."""
         box = QgsCollapsibleGroupBox("Current measurement")
         box.setSaveCollapsedState(False)
         f = QFormLayout(box)
@@ -742,8 +920,9 @@ class VolumeTab(QWidget):
         self._total_combo = QComboBox()
         self._total_combo.setToolTip(
             "Layer holding the TOTAL landslide outline — the whole affected "
-            "area, source through runout to deposit. THIS is the area converted "
-            "to a volume.\n\n"
+            "area, source through runout to deposit. Converted to a volume only "
+            "under the total-area fit; under the source-scar fit it is measured "
+            "and reported alongside, not converted.\n\n"
             "Filled in automatically from a layer named “Total Area”, “Total "
             "Landslide Area” or “Landslide Area”. Capitalisation and punctuation "
             "don't matter.")
@@ -751,21 +930,22 @@ class VolumeTab(QWidget):
 
         self._best_combo = QComboBox()
         self._best_combo.setToolTip(
-            "Optional. Layer holding the BEST source-scar interpretation. "
-            "Measured and reported alongside the volume, but NOT converted — the "
-            "volume comes from the total area.\n\n"
+            "Layer holding the BEST source-scar interpretation. Under the "
+            "source-scar fit THIS is the area converted to a volume.\n\n"
             "Filled in automatically from “Source Area (best)”, or a plain "
             "“Source Area”.")
         f.addRow("Source area (best)", self._best_combo)
         self._low_combo = QComboBox()
         self._low_combo.setToolTip(
             "Optional. Layer holding the CONSERVATIVE (smaller) source-scar "
-            "interpretation, from “Source Area (low)”. Reported, not converted.")
+            "interpretation, from “Source Area (low)”. Under the source-scar fit "
+            "it lowers the volume range (paired with source high).")
         f.addRow("Source area (low)", self._low_combo)
         self._high_combo = QComboBox()
         self._high_combo.setToolTip(
             "Optional. Layer holding the GENEROUS (larger) source-scar "
-            "interpretation, from “Source Area (high)”. Reported, not converted.")
+            "interpretation, from “Source Area (high)”. Under the source-scar fit "
+            "it raises the volume range (paired with source low).")
         f.addRow("Source area (high)", self._high_combo)
         for role, combo in (("total", self._total_combo),
                             ("best", self._best_combo), ("low", self._low_combo),
@@ -780,50 +960,240 @@ class VolumeTab(QWidget):
         self.role_lbl.setStyleSheet("QLabel { color: palette(mid); }")
         f.addRow(self.role_lbl)
 
-        self.source_out = self._ro("assign the total area layer, then Measure")
+        self.source_out = self._ro("assign the layer the fit needs, then Measure")
         f.addRow("Measured", self.source_out)
         self.area_best_out = self._ro()
-        f.addRow("Total area → volume", self.area_best_out)
+        f.addRow("Area → volume", self.area_best_out)
         self.area_range_out = self._ro()
-        f.addRow("Source areas (reported)", self.area_range_out)
+        f.addRow("Other areas (reported)", self.area_range_out)
         self.length_out = self._ro()
         f.addRow("Centerline length", self.length_out)
+        self.drop_out = self._ro()
+        f.addRow("Elevation drop", self.drop_out)
         self.vol_best_out = self._ro()
         f.addRow("Volume (best)", self.vol_best_out)
         self.vol_range_out = self._ro()
-        f.addRow("Volume (±1σ)", self.vol_range_out)
+        self.vol_range_lbl = QLabel("Likely range")
+        self.vol_range_lbl.setToolTip(
+            "NOT a prediction interval for this landslide. It propagates the "
+            "uncertainty in WHERE THE REGRESSION LINE SITS (the published "
+            "spread on the coefficients) plus your own low/high outlines. It "
+            "contains no term for how far individual landslides scatter about "
+            "that line, which is the dominant uncertainty — roughly a factor of "
+            "2 to 3 in Larsen's own data, several times wider than the range "
+            "shown here.\n\n"
+            "Larsen's published spread is itself ambiguous: their main text "
+            "calls it a standard deviation and the supplement calls it a "
+            "standard error.\n\n"
+            "Your low/high outlines are also read as a ±2σ span, so a narrower "
+            "pair tightens this range faster than you may intend.")
+        f.addRow(self.vol_range_lbl, self.vol_range_out)
+        # V/A — the cheapest sanity check in the tab, and it was never shown even
+        # though both numbers were already in hand. 3 m is a plausible bedrock
+        # detachment; 90 m means the outline is wrong, and no other readout on
+        # this panel would have told you.
+        self.depth_out = self._ro()
+        self.depth_out.setToolTip(
+            "Volume ÷ converted area: the average thickness implied by this "
+            "estimate. Check it against the headscarp you can see — if it is "
+            "tens of metres for a shallow-looking scar, the outline or the "
+            "material is wrong.")
+        f.addRow("Implied mean depth", self.depth_out)
         self.calc_out = self._ro()
         f.addRow("Calculated by", self.calc_out)
         return box
 
+    def _show_depth(self, c):
+        """Volume ÷ area, from whichever pair actually belongs together.
+
+        Under the ∫Δh fit `a_conv` is the Δh COVERED area, not the scar, so the
+        area-scaling area is preferred when the row carries one — dividing a
+        Larsen volume by a coverage footprint would print a number that means
+        nothing."""
+        from . import verdict as V
+        vol = _num(c.get("v_larsen")) or _num(c.get("v_best"))
+        area = (_num(c.get("larsen_area_m2")) or _num(c.get("a_conv"))
+                or _num(c.get("src_best")))
+        d = V.implied_depth_m(vol, area)
+        self.depth_out.setText("" if d is None else
+                               f"{d:,.1f} m   (volume ÷ {area / 1e6:,.3g} km²)")
+
     def _build_centerline_box(self):
-        """Centerline tools. Collapsed by default — length is a reference
-        number, not an input to the volume, so it stays out of the way until
-        it's wanted."""
-        box = QgsCollapsibleGroupBox("Centerline (length, optional)")
+        """Centerline + elevation-drop tools. Collapsed by default — both are
+        reference numbers, not inputs to the volume, so they stay out of the way
+        until wanted.
+
+        Two optional inputs live here. "Centerline from" chooses which outline
+        the medial-axis spine is taken from; left on Auto it follows _measure's
+        choice (the total outline, or the converted one when no total is
+        assigned). "Elevation (DEM)" names a single-band elevation raster to
+        read the slide's fall height from — sampled along the centerline, so its
+        highest reading is the source crown and its lowest the toe. A HILLSHADE
+        is 0-255 shading, not elevation, so a byte raster is refused rather than
+        reported as metres (see _is_hillshade)."""
+        box = QgsCollapsibleGroupBox("Centerline & elevation drop (optional)")
         box.setSaveCollapsedState(False)
         box.setCollapsed(True)
         v = QVBoxLayout(box)
 
         note = QLabel(
-            "Derives the medial-axis spine of the best outline — it follows the "
-            f"slide's bends instead of cutting across them — into “{CENTERLINE_LAYER}”, "
-            "left in edit mode so you can trim the ends with the Vertex Tool. "
-            "Re-measure afterwards to pick up your edits. Reported for "
-            "reference; the volume comes from area alone.")
+            "Derives the medial-axis spine of the chosen outline (the total "
+            "landslide outline by default) — it follows the slide's bends "
+            f"instead of cutting across them — into “{CENTERLINE_LAYER}”, left "
+            "in edit mode so you can trim the ends with the Vertex Tool. "
+            "Re-measure afterwards to pick up your edits. With an elevation "
+            "raster assigned it also reads the crown-to-toe fall height along "
+            "that spine. Reported for reference; the volume comes from area "
+            "alone.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(note)
 
-        row = QHBoxLayout()
+        form = QFormLayout()
+        # underscore-prefixed like the role combos: rebuilt from the project on
+        # every refresh, so persisting them would only mark the project dirty.
+        self._cl_source_combo = QComboBox()
+        self._cl_source_combo.setToolTip(
+            "Which outline the centerline is spined from. Auto follows the "
+            "measurement: the TOTAL outline when one is assigned, otherwise the "
+            "converted outline. Pick a specific polygon layer to override — e.g. "
+            "the total-area layer even under the source-scar fit.")
+        form.addRow("Centerline from", self._cl_source_combo)
+
+        self._dem_combo = QComboBox()
+        self._dem_combo.setToolTip(
+            "Optional. A single-band ELEVATION raster (DEM/DSM) to read the "
+            "slide's fall height from — sampled along the centerline, crown to "
+            "toe. Gives the drop H and the travel angle atan(H/L).\n\n"
+            "A hillshade is shading (0-255), NOT elevation, and is refused. Load "
+            "a DEM/DSM, or let the 3D viewer tab fetch ArcticDEM, then pick it "
+            "here.")
+        self._dem_combo.currentIndexChanged.connect(self._on_dem_changed)
+        form.addRow("Elevation (DEM)", self._dem_combo)
+        v.addLayout(form)
+
+        row = FlowRow()
         self.centerline_btn = QPushButton("Draw centerline")
         self.centerline_btn.setEnabled(False)
+        self.centerline_btn.setToolTip(
+            "Digitize a runout centerline for the measured slide, spined from the "
+            "outline the measurement used. Enabled after a successful Measure.")
         self.centerline_btn.clicked.connect(self._draw_centerline)
         self.remeasure_btn = QPushButton("Re-measure (after editing)")
         self.remeasure_btn.setEnabled(False)
+        self.remeasure_btn.setToolTip(
+            "Recompute the centerline length and elevation drop after you edit the "
+            "drawn line's vertices. Enabled once a centerline has been drawn.")
         self.remeasure_btn.clicked.connect(self._remeasure_centerline)
-        for b in (self.centerline_btn, self.remeasure_btn):
+        self.sample_btn = QPushButton("Sample elevation")
+        self.sample_btn.setEnabled(False)
+        self.sample_btn.setToolTip(
+            "Read the fall height from the assigned DEM along the centerline "
+            "drawn above. Runs automatically when a DEM is set; use this after "
+            "picking a DEM, or after editing the line.")
+        self.sample_btn.clicked.connect(self._sample_elevation_current)
+        for b in (self.centerline_btn, self.remeasure_btn, self.sample_btn):
             row.addWidget(b)
+        v.addWidget(row)
+        return box
+
+    def _build_ddem_box(self):
+        """Elevation-change (∫Δh) inputs — used only by the "Elevation change"
+        fit. Collapsed by default; that fit's outline instruction points here.
+
+        Two ways to feed it. Assign a Δh raster you already have (a
+        lidar/photogrammetry dDEM, a SAR elevation-change product — anything in
+        metres of surface change), OR build one here by differencing a pre/post
+        DEM pair. Either
+        way the volume is Δh summed over the TOTAL outline, split into erosion
+        (loss) and deposition (gain). The differencing math lives in dem_diff so
+        this tab stays free of numpy/GDAL until the fit is actually used."""
+        box = QgsCollapsibleGroupBox("Elevation change → volume (∫Δh)")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        v = QVBoxLayout(box)
+
+        note = QLabel(
+            "For the “Elevation change (∫Δh over outline)” fit. Assign an "
+            "elevation-change raster (Δh, in metres) and press Measure: the "
+            "volume is Δh summed over the TOTAL outline (or the source outline "
+            "if no total is assigned), reported as net, erosion and deposition. "
+            "No Δh raster yet? Difference a pre/post DEM pair below to make one.")
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(note)
+
+        form = QFormLayout()
+        # underscore-prefixed like the other layer pickers: rebuilt from the
+        # project each refresh, so persisting them would only mark it dirty.
+        self._ddem_combo = QComboBox()
+        self._ddem_combo.setToolTip(
+            "The elevation-change raster (Δh) to integrate — single-band, in "
+            "METRES of surface change. Positive = the surface rose (deposition), "
+            "negative = it dropped (erosion), unless you flip the sign below. A "
+            "geographic (lon/lat) raster is reprojected to a metric grid before "
+            "summing, so equal-area pixels are used.")
+        form.addRow("Elevation change (Δh)", self._ddem_combo)
+
+        self.ddem_grid_edit = QLineEdit("2")
+        self.ddem_grid_edit.setToolTip(
+            "Grid resolution in metres for the integration (and for the "
+            "differencing below). The raster is warped to this square grid, so a "
+            "pixel is exactly this on a side. Finer captures more detail but "
+            "costs memory; coarser than the input's own resolution just smooths "
+            "it. Defaults to 2 m.")
+        form.addRow("Grid (m)", self.ddem_grid_edit)
+
+        self.ddem_deposit_positive = QCheckBox(
+            "Positive Δh is deposition (post − pre)")
+        self.ddem_deposit_positive.setChecked(True)
+        self.ddem_deposit_positive.setToolTip(
+            "Which way the Δh raster is signed. Checked (post − pre): a positive "
+            "value means the surface ROSE — deposition. Uncheck for a pre − post "
+            "product, where positive means loss; the sign is flipped so erosion "
+            "and deposition still come out labelled correctly.")
+        form.addRow("Sign", self.ddem_deposit_positive)
+        v.addLayout(form)
+
+        sub = QLabel("Make a Δh raster by differencing two DEMs:")
+        sub.setStyleSheet("QLabel { color: palette(mid); font-style: italic; }")
+        v.addWidget(sub)
+
+        dform = QFormLayout()
+        self._pre_dem_combo = QComboBox()
+        self._pre_dem_combo.setToolTip(
+            "The BEFORE (pre-event) elevation surface — e.g. a pre-event lidar "
+            "DSM. A tiled DEM must be loaded as a single layer (a VRT) to be "
+            "picked here.")
+        dform.addRow("Pre-event DEM", self._pre_dem_combo)
+        self._post_dem_combo = QComboBox()
+        self._post_dem_combo.setToolTip(
+            "The AFTER (post-event) elevation surface. Δh = post − pre.")
+        dform.addRow("Post-event DEM", self._post_dem_combo)
+        v.addLayout(dform)
+
+        self.ddem_coregister = QCheckBox("Vertical co-register on stable ground")
+        self.ddem_coregister.setChecked(True)
+        self.ddem_coregister.setToolTip(
+            "Remove the DC vertical bias between the two DEMs — a sigma-clipped "
+            "median of the difference, so the slide and other real change fall "
+            "out and only quasi-stable ground sets the offset. Leave on unless "
+            "the DEMs already share a vertical datum with no geolocation bias.\n\n"
+            "Caveat: where the surrounding ground is itself changing (a glacier "
+            "between epochs), the offset is drawn from moving ground — check the "
+            "stable-pixel count reported in the log.")
+        v.addWidget(self.ddem_coregister)
+
+        row = QHBoxLayout()
+        self.diff_btn = QPushButton("Difference DEMs → Δh layer")
+        self.diff_btn.setToolTip(
+            "Warp the pre and post DEMs to a shared metric grid over the "
+            "outline, co-register, subtract, and load the result as a Δh raster "
+            "— then selected above, ready to Measure. Runs in this window; a "
+            "large AOI at a fine grid can take a few seconds.")
+        self.diff_btn.clicked.connect(self._difference_dems)
+        row.addWidget(self.diff_btn)
+        row.addStretch(1)
         v.addLayout(row)
         return box
 
@@ -835,6 +1205,18 @@ class VolumeTab(QWidget):
     def _append_log(self, msg):
         self.log.appendPlainText(msg)
 
+    def _notify(self, msg, level=None):
+        """Log to the tab AND flash the QGIS message bar, so an action button
+        never looks like it did nothing when the Log panel is scrolled out of
+        view. The first line goes to the bar; the full message to the log."""
+        self._append_log(msg)
+        try:
+            self.iface.messageBar().pushMessage(
+                "Volume", msg.split("\n")[0].strip(),
+                level=Qgis.Info if level is None else level, duration=7)
+        except Exception:
+            pass
+
     def _on_fit_changed(self, *_args):
         """Keep the outline instruction honest about the selected calibration,
         and say up front when a fit has no coefficients yet — better than
@@ -845,6 +1227,9 @@ class VolumeTab(QWidget):
             text += ("  Not configured yet: add LARSEN_TOTAL to "
                      "larsen_BR_volume.py (or volume_calc.py) — see the log.")
         self.outline_lbl.setText("⚠ " + text if text else "")
+        # The role readout names which layer the fit needs, so keep it in step.
+        if hasattr(self, "role_lbl"):
+            self._update_role_label()
 
     def _fit(self):
         return dict(volume_calc.FITS).get(self.fit_combo.currentText(), "scar")
@@ -881,32 +1266,31 @@ class VolumeTab(QWidget):
         return area, feature, layer
 
     def _measure(self):
-        """Volume from the TOTAL landslide outline.
+        """Volume from the outline the selected Fit is calibrated on.
 
-        The source-area outlines are measured and reported alongside it but are
-        never converted: the source scar is a fraction of what failed, so running
-        the relation on it answers a different question than the one being asked.
-        Source low/high therefore no longer widen the volume range either — with
-        one total outline the range is the published fit uncertainty, and it takes
-        a low/high pair of TOTAL outlines to add area uncertainty to it."""
+        The Larsen coefficients are per outline definition, so which outline is
+        converted follows the Fit: the source-scar fit converts the BEST SOURCE
+        outline and widens the range with the source low/high outlines when they
+        are assigned; the total-area fit converts the TOTAL outline. Whichever
+        outline is not the fit's input is measured and reported alongside but
+        never fed to the relation — running it on the wrong outline silently
+        answers a different question (a total outline through the scar fit reads
+        high; a source outline through a total fit reads low)."""
         if not self._polygon_layers():
             self._append_log(
                 "This project has no polygon layer. Press New scar layer to "
                 "make one and start drawing the outline.")
             return
 
+        fit = self._fit()
+        # The elevation-change fit integrates a Δh raster over the outline rather
+        # than scaling an area — a wholly different path, handled on its own.
+        if fit == "ddem":
+            return self._measure_ddem()
+        # Every role is measured up front; the Fit decides which one is converted
+        # to a volume and which are reported alongside.
         a_total, total_feat, total_layer = self._role_area("total", "Total area")
-        if a_total is None:
-            if total_layer is None:
-                self._append_log(
-                    "No layer is assigned to “Total area layer”. The volume is "
-                    "computed from the TOTAL landslide outline — the whole "
-                    "affected area — so pick that layer. The source-area "
-                    "drop-downs are reported alongside it, not converted.")
-            return
-
-        # measured for the record; deliberately not fed to the relation
-        a_best, _bf, best_layer = self._role_area("best", "Source best")
+        a_best, best_feat, best_layer = self._role_area("best", "Source best")
         a_low, _lf, low_layer = self._role_area("low", "Source low")
         a_high, _hf, high_layer = self._role_area("high", "Source high")
 
@@ -918,12 +1302,39 @@ class VolumeTab(QWidget):
                 "rather than reporting a number from the wrong outline.")
             return
 
-        fit = self._fit()
+        if fit == "total":
+            conv_role, conv_area = "total", a_total
+            conv_feat, conv_layer = total_feat, total_layer
+            conv_low = conv_high = None
+        else:  # scar: the calibrated input is the source scar
+            conv_role, conv_area = "source", a_best
+            conv_feat, conv_layer = best_feat, best_layer
+            conv_low, conv_high = a_low, a_high
+
+        if conv_area is None:
+            # A layer that is assigned but empty/unmeasurable already produced a
+            # specific message in _role_area; only the truly-unassigned case
+            # needs the "pick a layer" guidance here.
+            if conv_layer is None and fit == "total":
+                self._append_log(
+                    "No layer is assigned to “Total area layer”. The total-area "
+                    "fit converts the TOTAL landslide outline, so assign that "
+                    "layer — or switch Fit to “Source scar” to convert the "
+                    "source outline instead.")
+            elif conv_layer is None:
+                self._append_log(
+                    "No layer is assigned to “Source area (best)”. The "
+                    "source-scar fit converts the BEST SOURCE outline, so assign "
+                    "that layer. The total and low/high layers are optional — "
+                    "low/high widen the range, the total is reported alongside.")
+            return
+
         material, material_label = self._material(), self.material_combo.currentText()
         fit_label = self.fit_combo.currentText()
         try:
             v_best, v_low, v_high, calc = volume_calc.volume_source(
-                a_total, material=material, fit=fit,
+                conv_area, A_low=conv_low, A_high=conv_high,
+                material=material, fit=fit,
                 project_dir=self.dock.project_edit.text().strip())
         except volume_calc.NotConfigured as e:
             self._append_log(str(e))
@@ -933,54 +1344,98 @@ class VolumeTab(QWidget):
             self._append_log(f"Volume calculation failed: {e}")
             return
 
-        self._warn_if_total_excludes_source(total_feat, best_layer)
+        if conv_role == "source" and total_feat is not None:
+            self._warn_if_total_excludes_source(total_feat, total_layer, best_layer)
 
-        used = [f"total “{total_layer.name()}”"]
-        for label, area, layer in (("src best", a_best, best_layer),
+        used = [f"{conv_role} “{conv_layer.name()}” → volume"]
+        for label, area, layer in (("total", a_total, total_layer),
+                                   ("src best", a_best, best_layer),
                                    ("src low", a_low, low_layer),
                                    ("src high", a_high, high_layer)):
-            if area is not None:
+            if area is not None and layer is not conv_layer:
                 used.append(f"{label} “{layer.name()}”")
+        # The centerline is a whole-slide runout length, so it is taken from the
+        # TOTAL outline whenever one is assigned — even under the scar fit, where
+        # the volume itself comes from the source scar. With no total outline
+        # there is nothing else to spine but the converted one.
+        if total_feat is not None:
+            len_layer_id, len_fid = total_layer.id(), total_feat.id()
+            len_from = "total"
+        else:
+            len_layer_id, len_fid = conv_layer.id(), conv_feat.id()
+            len_from = conv_role
         self._current = {
             "name": self.name_edit.text().strip() or "slide",
             "material": material, "material_label": material_label,
             "fit": fit, "fit_label": fit_label,
-            "a_best": a_total, "a_low": None, "a_high": None,
+            "conv_role": conv_role,
+            "a_conv": conv_area, "a_conv_low": conv_low, "a_conv_high": conv_high,
             "a_total": a_total,
             "src_best": a_best, "src_low": a_low, "src_high": a_high,
             "v_best": v_best, "v_low": v_low, "v_high": v_high,
             "length": None, "length_method": "",
-            "layer_id": total_layer.id(), "layer_name": total_layer.name(),
+            "z_top": None, "z_bottom": None, "drop": None,
+            "reach_angle": None, "hl_ratio": None, "dem_name": "",
+            "layer_id": conv_layer.id(), "layer_name": conv_layer.name(),
+            "conv_fid": conv_feat.id(),
+            "len_layer_id": len_layer_id, "len_fid": len_fid, "len_from": len_from,
+            "total_layer": total_layer.name() if a_total is not None else "",
+            "best_layer": best_layer.name() if a_best is not None else "",
             "low_layer": low_layer.name() if a_low is not None else "",
             "high_layer": high_layer.name() if a_high is not None else "",
-            "best_layer": best_layer.name() if a_best is not None else "",
-            "best_fid": total_feat.id(),
-            "fids_text": str(total_feat.id()),
+            "fids_text": str(conv_feat.id()),
             "used_text": ", ".join(used),
             "calc": calc,
         }
+        # The area-scaling volume also under its OWN name, so the headline field
+        # can change meaning with the fit without the cross-check losing track of
+        # which number came from where.
+        self._current["v_larsen"] = v_best
+        self._current["v_larsen_lo"] = v_low
+        self._current["v_larsen_hi"] = v_high
+        self._current["larsen_area_m2"] = conv_area
+        self._current.update(self._secondary_dh())
         self._cl_fid = None
         self._show_current()
         self.add_btn.setEnabled(True)
         self.centerline_btn.setEnabled(True)
         self.remeasure_btn.setEnabled(False)
+        self.sample_btn.setEnabled(False)
 
+        conv_name = "Source best" if conv_role == "source" else "Total"
         self._append_log(
-            f"Total area = {_fmt(a_total)} m² from “{total_layer.name()}” — "
-            f"V = {_fmt(v_best)} m³ ({_fmt(v_low)} – {_fmt(v_high)}). "
-            f"{fit_label}, {material_label.lower()}; via {calc}.")
-        srcs = [f"{lbl} {_fmt(a)} m²" for lbl, a in
-                (("low", a_low), ("best", a_best), ("high", a_high))
-                if a is not None]
-        if srcs:
+            f"{conv_name} area = {_fmt(conv_area)} m² from "
+            f"“{conv_layer.name()}” — V = {_fmt(v_best)} m³ "
+            f"({_fmt(v_low)} – {_fmt(v_high)}). {fit_label}, "
+            f"{material_label.lower()}; via {calc}.")
+        # Report the areas that were measured but not converted.
+        if conv_role == "source":
+            others = [f"total {_fmt(a_total)} m²"] if a_total is not None else []
+        else:
+            others = [f"{lbl} {_fmt(a)} m²" for lbl, a in
+                      (("src low", a_low), ("src best", a_best),
+                       ("src high", a_high)) if a is not None]
+        if others:
             self._append_log(
-                "Source areas measured for the record (not converted): "
-                + ", ".join(srcs) + ".")
-        self._append_log(
-            "Range is the published fit uncertainty — one total outline carries "
-            "no area uncertainty of its own.")
+                "Also measured (not converted): " + ", ".join(others) + ".")
+        # Say where the ± range came from.
+        if conv_role == "source" and conv_low is not None and conv_high is not None:
+            self._append_log(
+                "Range combines the published fit uncertainty with the source "
+                "low/high area spread.")
+        elif conv_role == "source":
+            missing = ("both source low and high outlines"
+                       if conv_low is None and conv_high is None
+                       else "the other source outline")
+            self._append_log(
+                f"Range is the published fit uncertainty — assign {missing} to "
+                "add area uncertainty to it.")
+        else:
+            self._append_log(
+                "Range is the published fit uncertainty — one total outline "
+                "carries no area uncertainty of its own.")
 
-    def _warn_if_total_excludes_source(self, total_feat, best_layer):
+    def _warn_if_total_excludes_source(self, total_feat, total_layer, best_layer):
         """The total outline should contain the source scar. If it doesn't, the
         two are probably from different slides, or the Total area layer is
         pointing at the wrong outline. Flagged, not blocked: a source mapped from
@@ -992,7 +1447,17 @@ class VolumeTab(QWidget):
             if not measured:
                 return
             total = total_feat.geometry()
-            if not total.contains(measured[0][1].geometry()):
+            src_geom = QgsGeometry(measured[0][1].geometry())   # copy before transform
+            # The two layers are matched by NAME and can carry DIFFERENT CRSs (e.g.
+            # total in EPSG:4326 degrees, source in UTM metres); contains() across
+            # mismatched CRSs is meaningless, so reproject the source into the total
+            # layer's CRS first.
+            if (total_layer is not None and best_layer is not None
+                    and total_layer.crs() != best_layer.crs()):
+                xform = QgsCoordinateTransform(best_layer.crs(), total_layer.crs(),
+                                               QgsProject.instance())
+                src_geom.transform(xform)
+            if not total.contains(src_geom):
                 self._append_log(
                     f"Note: the source outline in “{best_layer.name()}” is not "
                     "fully inside the total outline. Check both belong to the "
@@ -1000,29 +1465,490 @@ class VolumeTab(QWidget):
         except Exception:
             pass
 
+    # ---------- elevation-change (∫Δh) fit ----------
+    def _ddem_outline(self):
+        """(feature, layer, role) for the outline the ∫Δh fit integrates over.
+
+        The TOTAL outline when assigned — both erosion and deposition live inside
+        it — else the best source outline. (None, None, None) with a logged
+        reason when neither is available."""
+        _a_total, total_feat, total_layer = self._role_area("total", "Total area")
+        _a_best, best_feat, best_layer = self._role_area("best", "Source best")
+        if total_feat is not None:
+            return total_feat, total_layer, "total"
+        if best_feat is not None:
+            return best_feat, best_layer, "source"
+        return None, None, None
+
+    def _outline_utm(self, feat, layer):
+        """(geom_in_utm, epsg_int, bounds_tuple) for a feature, or (None, ...).
+
+        The metric frame the differencing and integration share — a UTM zone
+        chosen from the outline's own centroid, and its bounding box (both in
+        metres). Logging of any CRS failure is done by _to_utm."""
+        geom_utm, utm_crs = self._to_utm(feat.geometry(), layer.crs())
+        if geom_utm is None:
+            return None, None, None
+        try:
+            epsg = int(utm_crs.authid().split(":")[1])
+        except (AttributeError, IndexError, ValueError):
+            self._append_log("Could not read the UTM zone's EPSG code.")
+            return None, None, None
+        return geom_utm, epsg, geom_utm.boundingBox()
+
+    # ---------- the other estimate, alongside the primary fit ----------
+    # The Fit combo picks ONE calibration per Measure, and it used to end there:
+    # a row was Larsen or ∫Δh, never both, and measuring the same slide twice
+    # auto-renamed it, so the two independent volumes landed in the table as
+    # "slide 1" and "slide 2" with nothing recording they were one event. The act
+    # of recording the cross-check destroyed it. These two helpers run the OTHER
+    # path opportunistically when its inputs happen to be assigned and merge the
+    # result into the SAME row under its own field names, so one row can carry
+    # the seismic, the area-scaling and the elevation-change volumes at once.
+    # The Fit still decides which one is the headline (v_best).
+
+    def _secondary_dh(self):
+        """{v_dh_*} from integrating the assigned Δh over the outline, or {}.
+
+        Silent by design: this runs beside an area-scaling Measure the user did
+        not ask to be a Δh measurement, so a missing layer or a failed warp
+        should add nothing rather than raise an error about a fit they did not
+        select."""
+        try:
+            from . import dem_diff
+            dh_layer = self._ddem_layer()
+            if dh_layer is None:
+                return {}
+            feat, layer, role = self._ddem_outline()
+            if feat is None:
+                return {}
+            geom_utm, epsg, bb = self._outline_utm(feat, layer)
+            if geom_utm is None:
+                return {}
+            res = self._ddem_grid_res()
+            margin = 2.0 * res
+            bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                      bb.xMaximum() + margin, bb.yMaximum() + margin)
+            pad = max(4.0 * res, 0.5 * max(bb.width(), bb.height()))
+            cal_bounds = (bb.xMinimum() - pad, bb.yMinimum() - pad,
+                          bb.xMaximum() + pad, bb.yMaximum() + pad)
+            cal = dem_diff.stable_ground_stats(
+                dh_layer.source(), geom_utm.asWkt(), epsg, cal_bounds, res)
+            area = self._measure_area(feat.geometry(), layer.crs())
+            r = dem_diff.integrate_dh(
+                dh_layer.source(), geom_utm.asWkt(), epsg, bounds, res,
+                sign_deposit_positive=self.ddem_deposit_positive.isChecked(),
+                offset=(cal["offset_m"] if cal.get("ok") else 0.0),
+                sigma_dh_m=cal.get("sigma_m", 0.0), outline_area_m2=area)
+            if not r.get("pixel_count"):
+                return {}
+            return {
+                "v_dh_erosion": abs(r["v_erosion"]),
+                "v_dh_deposit": r["v_deposit"],
+                "v_dh_net": r["v_net"],
+                "v_dh_sigma": r.get("v_sigma_m3"),
+                "sigma_dh": r.get("sigma_dh_m"),
+                "dh_offset": r.get("offset_applied_m"),
+                "dh_coverage": r.get("coverage_frac"),
+                "ddem_name": dh_layer.name(), "ddem_res": res,
+                "covered_area": r["covered_area_m2"],
+                "mean_dh": r["mean_dh_m"], "max_rise": r["max_rise_m"],
+                "max_drop": r["max_drop_m"],
+            }
+        except Exception as e:
+            self._append_log(f"(Δh cross-check skipped: {e})")
+            return {}
+
+    def _secondary_larsen(self):
+        """{v_larsen*} from area-scaling the source scar, or {} — the mirror of
+        _secondary_dh, run beside a ∫Δh Measure so the two can be compared."""
+        try:
+            a_best, best_feat, best_layer = self._role_area("best", "Source best")
+            if best_feat is None or not a_best:
+                return {}
+            a_low, _lf, _ll = self._role_area("low", "Source low")
+            a_high, _hf, _hl = self._role_area("high", "Source high")
+            v, vlo, vhi, calc = volume_calc.volume_source(
+                a_best, A_low=a_low, A_high=a_high, material=self._material(),
+                fit="scar", project_dir=self.dock.project_edit.text().strip())
+            return {"v_larsen": v, "v_larsen_lo": vlo, "v_larsen_hi": vhi,
+                    "larsen_area_m2": a_best, "larsen_calc": calc}
+        except Exception as e:
+            self._append_log(f"(area-scaling cross-check skipped: {e})")
+            return {}
+
+    def _measure_ddem(self):
+        """Volume from integrating an elevation-change raster over the outline.
+
+        The Δh raster (a lidar/photogrammetry dDEM, an externally produced SAR
+        elevation-change product, or one built by the differencing tool) is summed over the TOTAL outline — the
+        whole affected area, since both erosion and deposition count — or the
+        source outline when no total is assigned. dem_diff does the numpy/GDAL
+        work; this resolves the outline to metres, hands it over, and drops the
+        result into the same _current/results spine the area-scaling fits use."""
+        try:
+            from . import dem_diff
+        except Exception as e:
+            self._append_log(
+                "The elevation-change fit needs the DEM tools (numpy + GDAL), "
+                f"which failed to load: {e}. They ship with QGIS — if this "
+                "persists the install's Python is incomplete.")
+            return
+
+        outline_feat, outline_layer, conv_role = self._ddem_outline()
+        if outline_feat is None:
+            self._append_log(
+                "The elevation-change fit sums Δh over the TOTAL landslide "
+                "outline — assign that layer (or a source outline) first.")
+            return
+        dh_layer = self._ddem_layer()
+        if dh_layer is None:
+            self._append_log(
+                "No elevation-change raster assigned. Pick one under “Elevation "
+                "change (Δh)” — a Δh product in metres — or build one with "
+                "“Difference DEMs → Δh layer”.")
+            return
+
+        geom_utm, epsg, bb = self._outline_utm(outline_feat, outline_layer)
+        if geom_utm is None:
+            return
+        res = self._ddem_grid_res()
+        margin = 2.0 * res
+        bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                  bb.xMaximum() + margin, bb.yMaximum() + margin)
+        sign_pos = self.ddem_deposit_positive.isChecked()
+        area = self._measure_area(outline_feat.geometry(), outline_layer.crs())
+        # Calibrate against the ground AROUND the slide before integrating.
+        # An inverted Δh (shape-from-shading and friends) constrains the shape
+        # of the change field far better than its absolute datum, and volume is
+        # LINEAR in the residual offset — half a metre over a 1 km² outline is
+        # 500,000 m³ of pure artefact reported as signal. The same pass gives the
+        # per-pixel noise, which is the only reason this estimate can carry an
+        # error bar at all. A wider box than the outline, so there IS surrounding
+        # ground to measure.
+        cal_pad = max(4.0 * res, 0.5 * max(bb.width(), bb.height()))
+        cal_bounds = (bb.xMinimum() - cal_pad, bb.yMinimum() - cal_pad,
+                      bb.xMaximum() + cal_pad, bb.yMaximum() + cal_pad)
+        try:
+            cal = dem_diff.stable_ground_stats(
+                dh_layer.source(), geom_utm.asWkt(), epsg, cal_bounds, res)
+        except Exception as e:
+            self._append_log(f"Stable-ground check failed ({e}); "
+                             "integrating without a bias correction.")
+            cal = {"offset_m": 0.0, "sigma_m": 0.0, "stable_px": 0, "ok": False}
+        dh_offset = float(cal["offset_m"]) if cal.get("ok") else 0.0
+        if cal.get("ok"):
+            self._append_log(
+                f"Stable ground around the slide: bias {cal['offset_m']:+.3f} m, "
+                f"noise {cal['sigma_m']:.3f} m ({cal['stable_px']:,} px). "
+                f"The bias is removed before integrating.")
+        else:
+            self._append_log(
+                "Not enough ground outside the outline to check the Δh for a "
+                "residual bias — the volume assumes it is unbiased, and carries "
+                "no uncertainty.")
+        try:
+            r = dem_diff.integrate_dh(
+                dh_layer.source(), geom_utm.asWkt(), epsg, bounds, res,
+                sign_deposit_positive=sign_pos,
+                offset=dh_offset, sigma_dh_m=cal.get("sigma_m", 0.0),
+                outline_area_m2=area)
+        except Exception as e:
+            self._append_log(
+                f"Could not integrate “{dh_layer.name()}” over the outline: {e}")
+            return
+        cover = r.get("coverage_frac")
+        if cover is not None and cover < 0.90 and r["pixel_count"]:
+            self._notify(
+                f"The elevation-change layer covers only {cover:.0%} of your "
+                f"outline, so this volume is roughly {cover:.0%} of the real "
+                f"one. Check the Δh layer's extent and nodata before using it.",
+                level=Qgis.Warning)
+        if r["pixel_count"] == 0:
+            self._append_log(
+                f"“{dh_layer.name()}” has no valid Δh pixels inside the outline "
+                "— does it cover this slide? Check its extent and nodata.")
+            return
+
+        material, material_label = self._material(), self.material_combo.currentText()
+        fit_label = self.fit_combo.currentText()
+        calc = (f"∫Δh · {res:g} m grid · "
+                f"{'post−pre' if sign_pos else 'pre−post'} (dem_diff)")
+        self._current = {
+            "name": self.name_edit.text().strip() or "slide",
+            "material": material, "material_label": material_label,
+            "fit": "ddem", "fit_label": fit_label,
+            "conv_role": "ddem",
+            "a_conv": r["covered_area_m2"], "a_conv_low": None, "a_conv_high": None,
+            # a_total is the TOTAL outline's plan area — recorded only when a
+            # total outline actually drove the integration, mirroring the
+            # area-scaling path (which leaves it None otherwise). The integrated
+            # (covered) area is carried separately in covered_area.
+            "a_total": area if conv_role == "total" else None,
+            "src_best": None, "src_low": None, "src_high": None,
+            # |erosion|, NOT the net. For an outline that correctly spans scar
+            # AND deposit — which is what this fit asks for — the net is a small
+            # residual of two large opposing numbers and tends to zero as the
+            # delineation improves: 2.00 Mm³ eroded against 1.99 Mm³ deposited
+            # reports 12,000 m³. A seismic inversion estimates the MOBILIZED
+            # volume, which is the erosion side.
+            "v_best": abs(r["v_erosion"]),
+            "v_low": (abs(r["v_erosion"]) - r.get("v_sigma_m3", 0.0)
+                      if r.get("v_sigma_m3") else None),
+            "v_high": (abs(r["v_erosion"]) + r.get("v_sigma_m3", 0.0)
+                       if r.get("v_sigma_m3") else None),
+            "v_net": r["v_net"],
+            "v_erosion": abs(r["v_erosion"]), "v_deposit": r["v_deposit"],
+            "sigma_dh": r.get("sigma_dh_m"), "v_sigma": r.get("v_sigma_m3"),
+            "dh_offset": r.get("offset_applied_m"),
+            "dh_coverage": cover,
+            "covered_area": r["covered_area_m2"],
+            "mean_dh": r["mean_dh_m"], "max_rise": r["max_rise_m"],
+            "max_drop": r["max_drop_m"],
+            "ddem_name": dh_layer.name(), "ddem_res": res,
+            "length": None, "length_method": "",
+            "z_top": None, "z_bottom": None, "drop": None,
+            "reach_angle": None, "hl_ratio": None, "dem_name": "",
+            "layer_id": outline_layer.id(), "layer_name": outline_layer.name(),
+            "conv_fid": outline_feat.id(),
+            "len_layer_id": outline_layer.id(), "len_fid": outline_feat.id(),
+            "len_from": conv_role,
+            "total_layer": outline_layer.name() if conv_role == "total" else "",
+            # the outline is already named by layer_name/used_text; don't also
+            # claim it as the source-best layer (which has no area under ddem).
+            "best_layer": "", "low_layer": "", "high_layer": "",
+            "fids_text": str(outline_feat.id()),
+            "used_text": (f"∫Δh “{dh_layer.name()}” over {conv_role} "
+                          f"“{outline_layer.name()}”  (feature {outline_feat.id()})"),
+            "calc": calc,
+        }
+        self._current["v_dh_erosion"] = abs(r["v_erosion"])
+        self._current["v_dh_deposit"] = r["v_deposit"]
+        self._current["v_dh_net"] = r["v_net"]
+        self._current["v_dh_sigma"] = r.get("v_sigma_m3")
+        self._current.update(self._secondary_larsen())
+        self._cl_fid = None
+        self._show_current()
+        self.add_btn.setEnabled(True)
+        self.centerline_btn.setEnabled(True)
+        self.remeasure_btn.setEnabled(False)
+        self.sample_btn.setEnabled(False)
+
+        self._append_log(
+            f"∫Δh over {conv_role} “{outline_layer.name()}” "
+            f"({r['covered_area_m2'] / 1e6:.3f} km² covered, "
+            f"{r['pixel_count']:,} px @ {res:g} m): "
+            f"eroded {_fmt(abs(r['v_erosion']))} m³, deposited "
+            f"{_fmt(r['v_deposit'])} m³, net {_fmt(r['v_net'])} m³. "
+            f"Mean Δh {r['mean_dh_m']:+.2f} m (drop {r['max_drop_m']:+.1f}, "
+            f"rise {r['max_rise_m']:+.1f}). Δh from “{dh_layer.name()}”; {calc}.")
+        if conv_role == "source":
+            self._append_log(
+                "No total outline assigned — integrated over the SOURCE outline, "
+                "so the runout deposit is excluded. Assign a total outline to "
+                "capture the whole affected area.")
+
+    def _difference_dems(self):
+        """Re-entry guard around the actual run: the impl calls processEvents()
+        (to flush the 'differencing…' log), which can dispatch a SECOND queued
+        click of this same button into a nested, concurrent run. Disable the
+        button and gate on a flag so the second click is ignored."""
+        if getattr(self, "_diffing", False):
+            return
+        self._diffing = True
+        self.diff_btn.setEnabled(False)
+        try:
+            self._difference_dems_impl()
+        finally:
+            self._diffing = False
+            self.diff_btn.setEnabled(True)
+
+    def _difference_dems_impl(self):
+        """Warp a pre/post DEM pair to one metric grid, co-register, subtract,
+        write the Δh as a GeoTIFF and load it — selected for the ∫Δh fit.
+
+        Runs synchronously: a manual button on a bounded AOI, so a few seconds of
+        blocking is acceptable and simpler than a background task."""
+        try:
+            from . import dem_diff
+        except Exception as e:
+            self._append_log(f"DEM tools (numpy + GDAL) failed to load: {e}.")
+            return
+        pre = self._raster_from(self._pre_dem_combo)
+        post = self._raster_from(self._post_dem_combo)
+        if pre is None or post is None:
+            self._append_log(
+                "Pick both a pre-event and a post-event DEM to difference.")
+            return
+        if pre.id() == post.id():
+            self._append_log("Pre and post DEM are the same layer — pick two.")
+            return
+
+        outline_feat, outline_layer, _role = self._ddem_outline()
+        if outline_feat is None:
+            self._append_log(
+                "Assign a total (or source) outline first — it sets the area to "
+                "difference over.")
+            return
+        geom_utm, epsg, bb = self._outline_utm(outline_feat, outline_layer)
+        if geom_utm is None:
+            return
+        res = self._ddem_grid_res()
+        # a generous margin so stable ground surrounds the slide for co-registration
+        margin = max(300.0, 0.25 * max(bb.width(), bb.height()))
+        bounds = (bb.xMinimum() - margin, bb.yMinimum() - margin,
+                  bb.xMaximum() + margin, bb.yMaximum() + margin)
+        coreg = self.ddem_coregister.isChecked()
+
+        # The outline size and the grid resolution are set independently, and
+        # this path holds several arrays of the same shape at once (pre, post,
+        # difference, mask). Refuse a grid that cannot finish rather than warping
+        # into a hang the user cannot tell from a slow run.
+        from . import limits
+        ok, lmsg = limits.check_grid(bounds[2] - bounds[0], bounds[3] - bounds[1],
+                                     res, what="difference grid")
+        if not ok:
+            self._notify(lmsg, level=Qgis.Warning)
+            return
+        if lmsg:
+            self._append_log(lmsg)
+
+        self._append_log(
+            f"Differencing “{post.name()}” − “{pre.name()}” over "
+            f"{bb.width() + 2 * margin:.0f}×{bb.height() + 2 * margin:.0f} m @ "
+            f"{res:g} m … runs here, may take a few seconds.")
+        QApplication.processEvents()
+        try:
+            dh, gt, proj, stats = dem_diff.difference_dems(
+                pre.source(), post.source(), bounds, epsg, res, coregister=coreg)
+        except Exception as e:
+            self._append_log(f"Differencing failed: {e}")
+            return
+
+        out_dir = (self.dock.out_edit.text().strip()
+                   or self.dock.project_edit.text().strip())
+        if not out_dir or not os.path.isdir(out_dir):
+            import tempfile
+            out_dir = tempfile.gettempdir()
+        name = self.name_edit.text().strip() or "slide"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "slide"
+        path = os.path.join(out_dir, f"{safe}_dh.tif")
+        # Drop any layer already reading this exact file so a re-difference
+        # updates ONE Δh layer instead of stacking duplicates — and so the file
+        # handle is released first (on Windows an open layer locks the GeoTIFF
+        # and the rewrite below would fail with a confusing "could not write").
+        for lyr in list(self._project_rasters()):
+            try:
+                if (os.path.normpath(lyr.source().split("|", 1)[0])
+                        == os.path.normpath(path)):
+                    lg.remove_layer(lyr)
+            except (RuntimeError, AttributeError):
+                pass
+        try:
+            dem_diff.write_gtiff(path, dh, gt, proj)
+        except Exception as e:
+            self._append_log(f"Could not write {path}: {e}")
+            return
+        layer = QgsRasterLayer(path, f"Δh {name} (post−pre)")
+        if not layer.isValid():
+            self._append_log(f"Wrote {path} but QGIS could not load it back.")
+            return
+        lg.add_to_group(layer, "Volume")   # registers the layer AND folders it
+        self._refresh_relief_combos()
+        idx = self._ddem_combo.findData(layer.id())
+        if idx >= 0:
+            self._ddem_combo.setCurrentIndex(idx)
+
+        warn = ""
+        if stats["valid_px"] and stats["stable_px"] < 0.05 * stats["valid_px"]:
+            warn = (f" ⚠ the offset rested on a thin slice of ground "
+                    f"({stats['stable_px']:,} px) — treat it as unreliable.")
+        self._append_log(
+            f"Δh written to {path} and loaded as “{layer.name()}”, selected "
+            f"above. Vertical offset removed: {stats['offset_m']:+.2f} m (from "
+            f"{stats['stable_px']:,} stable of {stats['valid_px']:,} valid px)."
+            f"{warn} Now press Measure with the elevation-change fit selected.")
+
     def _show_current(self):
         c = self._current
         if c is None:
             return
-        self.source_out.setText(
-            f"{c['used_text']}  (feature {c['best_fid']})")
-        self.area_best_out.setText(
-            f"{_fmt(c['a_total'])} m²   ({c['a_total'] / 1e6:,.4f} km²)")
-        srcs = [f"{lbl} {_fmt(a)}" for lbl, a in
-                (("low", c["src_low"]), ("best", c["src_best"]),
-                 ("high", c["src_high"])) if a is not None]
-        self.area_range_out.setText(
-            ("  ·  ".join(srcs) + " m²") if srcs else "— (none assigned)")
-        self.vol_best_out.setText(
-            f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.4f} Mm³)")
-        self.vol_range_out.setText(
-            f"{_fmt(c['v_low'])} – {_fmt(c['v_high'])} m³")
-        self.calc_out.setText(c["calc"])
+        if c.get("conv_role") == "ddem":
+            # The ∫Δh fit reports a covered area (not a converted one), the
+            # change-field statistics, and an erosion/deposition split in place
+            # of the area fit's ±1σ range.
+            self.source_out.setText(c["used_text"])
+            self.area_best_out.setText(
+                f"{_fmt(c['covered_area'])} m² covered  "
+                f"({c['covered_area'] / 1e6:,.4f} km² @ "
+                f"{_fmt(c.get('ddem_res'))} m grid)")
+            self.area_range_out.setText(
+                f"mean Δh {c['mean_dh']:+.2f} m   ·   max drop "
+                f"{c['max_drop']:+.1f} m   ·   max rise {c['max_rise']:+.1f} m")
+            # The headline is the MOBILIZED volume (|erosion|) — the quantity a
+            # seismic inversion estimates — not the net, which tends to zero as
+            # the delineation improves and once printed 12,000 m³ for a 2 Mm³
+            # slide. 3 significant figures: the ∫Δh error bar is decimetres of
+            # vertical times a whole scar, so 4 decimal places of Mm³ was
+            # precision theatre.
+            sig = c.get("v_sigma")
+            head = f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.3g} Mm³) eroded"
+            if sig:
+                head += f"   ± {_fmt(sig)} m³"
+            self.vol_best_out.setText(head)
+            bits = [f"deposited {_fmt(c['v_deposit'])} m³",
+                    f"net {_fmt(c.get('v_net'))} m³"]
+            if c.get("sigma_dh") is not None:
+                bits.append(f"Δh noise {c['sigma_dh']:.2f} m")
+            if c.get("dh_offset"):
+                bits.append(f"bias removed {c['dh_offset']:+.2f} m")
+            if c.get("dh_coverage") is not None:
+                bits.append(f"{c['dh_coverage']:.0%} of the outline covered")
+            self.vol_range_out.setText("   ·   ".join(bits))
+            self.calc_out.setText(c["calc"])
+            self._show_depth(c)
+        else:
+            self.source_out.setText(
+                f"{c['used_text']}  (feature {c['conv_fid']})")
+            # The area that produced the volume, with its low/high range if any.
+            conv_txt = f"{_fmt(c['a_conv'])} m²   ({c['a_conv'] / 1e6:,.4f} km²)"
+            if c.get("a_conv_low") is not None and c.get("a_conv_high") is not None:
+                conv_txt += (f"   [range {_fmt(c['a_conv_low'])} – "
+                             f"{_fmt(c['a_conv_high'])} m²]")
+            self.area_best_out.setText(conv_txt)
+            # The areas measured but not converted, for context.
+            if c["conv_role"] == "source":
+                others = ([f"total {_fmt(c['a_total'])}"]
+                          if c["a_total"] is not None else [])
+            else:
+                others = [f"{lbl} {_fmt(a)}" for lbl, a in
+                          (("src low", c["src_low"]), ("src best", c["src_best"]),
+                           ("src high", c["src_high"])) if a is not None]
+            self.area_range_out.setText(
+                ("  ·  ".join(others) + " m²") if others else "— (none assigned)")
+            # 3 significant figures, not 4 decimal places of Mm³: the honest
+            # spread on an area-scaling volume is a factor of 2-3, so printing
+            # 1.3021 Mm³ asserts a precision the method does not have.
+            self.vol_best_out.setText(
+                f"{_fmt(c['v_best'])} m³   ({c['v_best'] / 1e6:,.3g} Mm³)")
+            self.vol_range_out.setText(
+                f"{_fmt(c['v_low'])} – {_fmt(c['v_high'])} m³")
+            self.calc_out.setText(c["calc"])
+            self._show_depth(c)
         if c["length"] is None:
             self.length_out.setText("— (not measured)")
         else:
             self.length_out.setText(
                 f"{_fmt(c['length'])} m   ({c['length_method']})")
+        if c.get("drop") is None:
+            self.drop_out.setText("— (no elevation raster sampled)")
+        else:
+            txt = (f"crown {_fmt(c['z_top'])} m → toe {_fmt(c['z_bottom'])} m  "
+                   f"=  {_fmt(c['drop'])} m fall")
+            if c.get("reach_angle") is not None:
+                txt += (f"   (H/L {c['hl_ratio']:.3f}, "
+                        f"{c['reach_angle']:.1f}° travel angle)")
+            self.drop_out.setText(txt)
 
     def _distance_area(self, crs):
         """Ellipsoidal measurement in the given CRS.
@@ -1089,14 +2015,8 @@ class VolumeTab(QWidget):
         c = self._current
         if c is None:
             return
-        layer = QgsProject.instance().mapLayer(c["layer_id"])
+        layer, geom = self._centerline_source(c)
         if layer is None:
-            self._append_log("The measured layer is no longer in the project.")
-            return
-        feat = layer.getFeature(c["best_fid"])
-        geom = feat.geometry() if feat is not None else None
-        if geom is None or geom.isEmpty():
-            self._append_log("Could not re-read the best outline's geometry.")
             return
 
         # the skeleton is metric: work in the local UTM zone, then hand the
@@ -1141,6 +2061,7 @@ class VolumeTab(QWidget):
         c["length_method"] = method
         self._show_current()
         self.remeasure_btn.setEnabled(True)
+        self.sample_btn.setEnabled(True)
 
         self.iface.setActiveLayer(cl_layer)
         cl_layer.removeSelection()
@@ -1155,6 +2076,43 @@ class VolumeTab(QWidget):
                 "The medial-axis skeleton degenerated (very narrow or very "
                 "simple outline), so this is the longest straight chord — it "
                 "cuts corners on a curving slide.")
+        # read the fall height straight away when a DEM is assigned, so the drop
+        # appears with the length rather than needing a second click
+        if self._dem_layer() is not None:
+            self._sample_elevation_current(auto=True)
+
+    def _centerline_source(self, c):
+        """(layer, geometry) of the outline to spine, or (None, None) with a log.
+
+        An explicit "Centerline from" choice wins; on Auto it is the outline
+        _measure recorded — the TOTAL when one was assigned, otherwise the
+        converted one — so a scar-fit volume still gets a whole-slide length."""
+        chosen = self._layer_from(self._cl_source_combo)
+        if chosen is not None:
+            _area, feat, _measured = self._layer_total(chosen)
+            if feat is None:
+                self._append_log(
+                    f"“{chosen.name()}” has no measurable polygon to spine — "
+                    "pick another layer under “Centerline from”.")
+                return None, None
+            return chosen, feat.geometry()
+
+        layer = QgsProject.instance().mapLayer(c["len_layer_id"])
+        if layer is None:
+            self._append_log("The outline to spine is no longer in the project.")
+            return None, None
+        feat = layer.getFeature(c["len_fid"])
+        geom = feat.geometry() if feat is not None else None
+        if geom is None or geom.isEmpty():
+            self._append_log("Could not re-read the outline's geometry.")
+            return None, None
+        if c.get("len_from") != "total":
+            self._append_log(
+                "No total outline assigned — spining the "
+                f"{c.get('len_from', 'converted')} outline instead. Assign the "
+                "total landslide outline (or pick one under “Centerline from”) "
+                "for a whole-slide runout length.")
+        return layer, geom
 
     def _remeasure_centerline(self):
         c = self._current
@@ -1179,6 +2137,189 @@ class VolumeTab(QWidget):
                     self._cl_fid, idx, float(length))
         self._show_current()
         self._append_log(f"Centerline re-measured: {_fmt(length)} m.")
+        # the edit moved the ends and changed L, so the drop and travel angle
+        # go stale — re-read them when a DEM is assigned
+        if self._dem_layer() is not None:
+            self._sample_elevation_current(auto=True)
+
+    # ---------- elevation drop ----------
+    def _dem_layer(self):
+        """The raster assigned to "Elevation (DEM)", or None."""
+        if not hasattr(self, "_dem_combo"):
+            return None
+        lyr = QgsProject.instance().mapLayer(self._dem_combo.currentData() or "")
+        return lyr if isinstance(lyr, QgsRasterLayer) else None
+
+    def _raster_from(self, combo):
+        """The raster layer a combo points at, or None."""
+        lyr = QgsProject.instance().mapLayer(combo.currentData() or "")
+        return lyr if isinstance(lyr, QgsRasterLayer) else None
+
+    def _ddem_layer(self):
+        """The raster assigned to "Elevation change (Δh)", or None."""
+        if not hasattr(self, "_ddem_combo"):
+            return None
+        return self._raster_from(self._ddem_combo)
+
+    def _ddem_grid_res(self):
+        """Integration/differencing grid resolution (m); 2 m on empty/bad input."""
+        try:
+            r = float(self.ddem_grid_edit.text().strip())
+            if r > 0:
+                return r
+        except (ValueError, AttributeError):
+            pass
+        return 2.0
+
+    def _on_dem_changed(self, *_args):
+        """Sample as soon as a DEM is picked, if a centerline already exists —
+        so choosing the raster after drawing shows the drop without another
+        click. A genuine user change only; the repopulate blocks signals."""
+        if (self._current is not None and self._cl_fid is not None
+                and self._dem_layer() is not None):
+            self._sample_elevation_current(auto=True)
+
+    def _is_hillshade(self, dem):
+        """True when a raster is shading, not elevation.
+
+        A hillshade / shaded-relief layer is a Byte raster of 0-255 illumination
+        values; sampling it and calling the result a fall height would be a
+        confident wrong answer in the wrong units. The data type is the reliable
+        tell (an elevation DEM is Int16/Float32); the name is a backstop."""
+        try:
+            if dem.dataProvider().dataType(1) == Qgis.Byte:
+                return True
+        except Exception:
+            pass
+        return "hillshade" in _name_tokens(dem.name())
+
+    def _sample_elevation_current(self, auto=False):
+        """Read the slide's fall height from the assigned DEM along the current
+        centerline: crown (highest), toe (lowest), drop H and travel angle.
+
+        Auto=True is the call made straight after drawing/editing/picking, so it
+        stays quiet when there is simply nothing to do; a button press (auto=
+        False) explains what is missing instead."""
+        c = self._current
+        if c is None:
+            if not auto:
+                self._append_log("Measure a slide first.")
+            return
+        dem = self._dem_layer()
+        if dem is None:
+            if not auto:
+                self._append_log(
+                    "Assign a single-band elevation raster to “Elevation "
+                    "(DEM)” first.")
+            return
+        cl_layer = self._existing_centerline_layer()
+        if cl_layer is None or self._cl_fid is None:
+            if not auto:
+                self._append_log(
+                    "Draw a centerline first — the fall height is read along "
+                    "it.")
+            return
+        feat = cl_layer.getFeature(self._cl_fid)
+        geom = feat.geometry() if feat is not None else None
+        if geom is None or geom.isEmpty():
+            self._append_log("The centerline feature is gone — draw it again.")
+            return
+        if self._is_hillshade(dem):
+            self._append_log(
+                f"“{dem.name()}” looks like a hillshade (a byte, 0-255 shading "
+                "raster), not an elevation model — its values are not metres, "
+                "so no fall height was read. Load a DEM/DSM, or let the 3D "
+                "viewer tab fetch ArcticDEM, then pick that under “Elevation "
+                "(DEM)”.")
+            return
+        if not hasattr(dem.dataProvider(), "sample"):
+            self._append_log(
+                "This QGIS build can't sample raster values (needs 3.4+).")
+            return
+
+        result = self._elevation_drop(geom, cl_layer.crs(), dem)
+        if result is None:
+            self._append_log(
+                f"Could not read elevations from “{dem.name()}” under the "
+                "centerline — the DEM may not cover this slide, or every sample "
+                "fell on nodata.")
+            return
+        z_top, z_bottom, n = result
+        drop = z_top - z_bottom
+        length = c.get("length")
+        hl = reach = None
+        if length and length > 0:
+            hl = drop / length
+            reach = math.degrees(math.atan2(drop, length))
+        c.update(z_top=z_top, z_bottom=z_bottom, drop=drop,
+                 hl_ratio=hl, reach_angle=reach, dem_name=dem.name())
+        self._show_current()
+        self._write_centerline_relief(cl_layer, z_top, z_bottom, drop, reach)
+
+        msg = (f"Elevation from “{dem.name()}”: crown {_fmt(z_top)} m → toe "
+               f"{_fmt(z_bottom)} m = {_fmt(drop)} m fall ({n} samples).")
+        if reach is not None:
+            msg += (f" Over {_fmt(length)} m of centerline that is H/L "
+                    f"{hl:.3f} — a {reach:.1f}° travel angle.")
+        self._append_log(msg)
+
+    def _elevation_drop(self, line_geom, line_crs, dem):
+        """(z_top, z_bottom, n_samples) sampled along a line from a DEM, or None.
+
+        The line is reprojected to local UTM and densified so the crown and toe
+        aren't skipped between sparse medial-axis vertices; every densified
+        vertex is read from the DEM (transformed into the DEM's own CRS), and
+        the highest and lowest finite readings are the crown and toe."""
+        work, work_crs = self._to_utm(line_geom, line_crs)
+        if work is None:
+            return None
+        length = work.length()
+        step = max(length / 300.0, 1.0) if length > 0 else 1.0
+        dense = work.densifyByDistance(step) or work
+        provider = dem.dataProvider()
+        dem_crs = dem.crs()
+        xform = None
+        if work_crs != dem_crs:
+            xform = QgsCoordinateTransform(
+                work_crs, dem_crs, QgsProject.instance())
+        z_top = z_bottom = None
+        n = 0
+        for v in dense.vertices():
+            p = QgsPointXY(v.x(), v.y())
+            if xform is not None:
+                try:
+                    p = xform.transform(p)
+                except Exception:
+                    continue
+            try:
+                val, ok = provider.sample(p, 1)
+            except Exception:
+                return None
+            if not ok or val is None or math.isnan(val):
+                continue
+            n += 1
+            if z_top is None or val > z_top:
+                z_top = val
+            if z_bottom is None or val < z_bottom:
+                z_bottom = val
+        if n == 0 or z_top is None:
+            return None
+        return z_top, z_bottom, n
+
+    def _write_centerline_relief(self, cl_layer, z_top, z_bottom, drop, reach):
+        """Stamp the fall height onto the centerline feature, so the derived
+        layer carries the relief alongside its length. Silently skips fields a
+        pre-existing centerline layer (older schema) doesn't have."""
+        started = not cl_layer.isEditable()
+        if started and not cl_layer.startEditing():
+            return
+        for name, value in (("z_top_m", z_top), ("z_bot_m", z_bottom),
+                            ("drop_m", drop), ("reach_deg", reach)):
+            idx = cl_layer.fields().indexOf(name)
+            if idx >= 0 and value is not None:
+                cl_layer.changeAttributeValue(self._cl_fid, idx, float(value))
+        if started:
+            cl_layer.commitChanges()
 
     def _to_utm(self, geom, layer_crs):
         """(geometry in local UTM metres, that UTM CRS) — or (None, None).
@@ -1260,12 +2401,16 @@ class VolumeTab(QWidget):
             QgsField("slide", QVariant.String),
             QgsField("length_m", QVariant.Double),
             QgsField("method", QVariant.String),
+            QgsField("z_top_m", QVariant.Double),
+            QgsField("z_bot_m", QVariant.Double),
+            QgsField("drop_m", QVariant.Double),
+            QgsField("reach_deg", QVariant.Double),
         ])
         layer.updateFields()
         symbol = QgsLineSymbol.createSimple({"color": "255,32,32", "width": "0.7"})
         if symbol is not None and layer.renderer() is not None:
             layer.renderer().setSymbol(symbol)
-        QgsProject.instance().addMapLayer(layer)
+        lg.add_to_group(layer, "Volume")
         self._cl_layer_id = layer.id()
         self._append_log(f"Created scratch layer “{CENTERLINE_LAYER}”.")
         return layer
@@ -1284,29 +2429,34 @@ class VolumeTab(QWidget):
         self.add_btn.setEnabled(False)
         self.centerline_btn.setEnabled(False)
         self.remeasure_btn.setEnabled(False)
-        self.source_out.setText("assign A_best and press Measure")
+        self.sample_btn.setEnabled(False)
+        self.source_out.setText("assign the layer the fit needs, then Measure")
         for e in (self.area_best_out, self.area_range_out, self.length_out,
-                  self.vol_best_out, self.vol_range_out, self.calc_out):
+                  self.drop_out, self.vol_best_out, self.vol_range_out,
+                  self.depth_out, self.calc_out):
             e.clear()
         self._append_log(f"Added “{row['name']}” to the results table.")
 
     def _refresh_table(self):
         self.table.setRowCount(len(self._rows))
         for r, row in enumerate(self._rows):
-            srcs = [n for n in (row["best_layer"], row["low_layer"],
-                                row["high_layer"]) if n]
-            layers = row["layer_name"] + (f"  +src: {', '.join(srcs)}" if srcs else "")
+            others = [n for n in (row.get("total_layer", ""), row["best_layer"],
+                                  row["low_layer"], row["high_layer"])
+                      if n and n != row["layer_name"]]
+            layers = row["layer_name"] + (f"  + {', '.join(others)}" if others else "")
             values = [
                 row["name"], row["fit_label"], row["material_label"],
                 _fmt(row["a_total"]),
                 _fmt(row["v_best"]), _fmt(row["v_low"]), _fmt(row["v_high"]),
+                _fmt(row.get("v_erosion")), _fmt(row.get("v_deposit")),
                 _fmt(row["src_best"]), _fmt(row["src_low"]), _fmt(row["src_high"]),
                 _fmt(row["length"]),
+                _fmt(row.get("drop")),
                 layers,
             ]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if 3 <= c <= 10:
+                if 3 <= c <= 13:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(r, c, item)
 
@@ -1340,6 +2490,259 @@ class VolumeTab(QWidget):
         QApplication.clipboard().setText("\n".join(lines))
         self._append_log(f"Copied {len(self._rows)} row(s) to the clipboard.")
 
+    # ---------- the analyst's conclusion ----------
+    def _build_verdict_box(self):
+        """Record what the analyst actually concluded.
+
+        Every other control in this plugin gathers evidence; this is the only one
+        that captures the finding, which is the thing ground-truthing exists to
+        produce. Without it a season of work leaves the conclusion in someone's
+        head and the seismic catalogue never learns whether its detections were
+        real."""
+        from . import verdict as V
+        box = QgsCollapsibleGroupBox("Verdict — what did you conclude?")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        v = QVBoxLayout(box)
+
+        self.verdict_combo = QComboBox()
+        self.verdict_combo.addItem("— not recorded —", "")
+        for key, label in V.VERDICTS:
+            self.verdict_combo.addItem(label, key)
+        self.verdict_combo.setToolTip(
+            "'Not found' and 'Cannot tell' are different answers: a slope with no "
+            "scar and a slope hidden under cloud mean opposite things to whoever "
+            "tunes the detector. Pick the one that is actually true.")
+        self.verdict_combo.currentIndexChanged.connect(self._refresh_verdict)
+        form = QFormLayout()
+        form.addRow("Call", self.verdict_combo)
+
+        self.analyst_edit = QLineEdit()
+        self.analyst_edit.setPlaceholderText("your name or initials")
+        self.analyst_edit.setToolTip("Recorded with the verdict so a reviewer "
+                                     "knows who made the call.")
+        form.addRow("Analyst", self.analyst_edit)
+        v.addLayout(form)
+
+        self.verdict_note = QPlainTextEdit()
+        self.verdict_note.setPlaceholderText(
+            "What you saw, and what convinced you — or what stopped you.")
+        self.verdict_note.setMaximumHeight(60)
+        v.addWidget(self.verdict_note)
+
+        self.verdict_summary = QLabel()
+        self.verdict_summary.setWordWrap(True)
+        self.verdict_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.verdict_summary)
+
+        row = FlowRow()
+        chk = QPushButton("Check volumes")
+        f = chk.font(); f.setBold(True); chk.setFont(f)
+        chk.setToolTip(
+            "Compare the seismic volume from the detection against the volume "
+            "measured here, and against DEM differencing if it was run.")
+        chk.clicked.connect(self._refresh_verdict)
+        row.addWidget(chk)
+        v.addWidget(row)
+        self._refresh_verdict()
+        return box
+
+    def _estimates(self):
+        """(larsen, dh_erosion, row) for the cross-check.
+
+        Prefers a SINGLE row carrying both — which is what a Measure now
+        produces when the inputs for the other path are also assigned. Falls
+        back to the most recent row of each kind, so rows measured before one
+        row could hold both still reconcile.
+
+        v_larsen / v_dh_erosion are read rather than v_best, because v_best
+        means whatever the row's own fit made it mean.
+        """
+        rows = list(getattr(self, "_rows", None) or [])
+        for row in reversed(rows):
+            if _num(row.get("v_larsen")) and _num(row.get("v_dh_erosion")):
+                return (_num(row["v_larsen"]), _num(row["v_dh_erosion"]), row)
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
+        larsen = _num(area.get("v_larsen")) or _num(area.get("v_best"))
+        eros = _num(dh.get("v_dh_erosion")) or _num(dh.get("v_erosion"))
+        return larsen, eros, (area or dh)
+
+    def _latest_row(self, fit=None):
+        """The most recent measured row, optionally restricted by fit family.
+
+        The Fit combo makes area scaling and ∫Δh MUTUALLY EXCLUSIVE per Measure,
+        so no single row ever holds both volumes: under "ddem" v_best is the NET
+        change, not a Larsen estimate. Reading v_best blindly would therefore
+        compare a seismic inversion against a near-zero difference of two large
+        numbers and label it "area scaling". So the cross-check reaches back for
+        the most recent row of EACH kind instead — which is also what lets the
+        three-way comparison work at all across two separate Measure runs.
+
+        fit=None  -> the most recent row, whatever it was
+        fit="area"-> the most recent area-scaling row (scar / total)
+        fit="ddem"-> the most recent elevation-change row
+        """
+        try:
+            rows = list(self._rows or [])
+        except AttributeError:
+            return {}
+        if fit == "area":
+            rows = [r for r in rows if r.get("fit") not in ("ddem",)]
+        elif fit == "ddem":
+            rows = [r for r in rows if r.get("fit") == "ddem"]
+        return rows[-1] if rows else {}
+
+    def _scar_centroid(self):
+        """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
+
+        Compared against the detection's epicentre, this is the number that says
+        whether the seismic location was any good — and it is the reason
+        'wrong_place' is a distinct verdict rather than a note."""
+        try:
+            from qgis.core import (QgsCoordinateReferenceSystem,
+                                   QgsCoordinateTransform, QgsProject)
+            # the SOURCE scar if one is assigned, else the total outline — the
+            # same polygons the volume was measured from, not the draw target.
+            lyr = None
+            for role in ("best", "total"):
+                lyr = self._role_layer(role)
+                if lyr is not None:
+                    break
+            if lyr is None:
+                return None, None
+            feats = list(lyr.getSelectedFeatures()) or list(lyr.getFeatures())
+            if not feats:
+                return None, None
+            geom = None
+            for f in feats:
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                geom = g if geom is None else geom.combine(g)
+            if geom is None:
+                return None, None
+            c = geom.centroid().asPoint()
+            src = lyr.crs()
+            dst = QgsCoordinateReferenceSystem("EPSG:4326")
+            if src.isValid() and src != dst:
+                c = QgsCoordinateTransform(
+                    src, dst, QgsProject.instance()).transform(c)
+            return c.y(), c.x()
+        except Exception:
+            return None, None
+
+    def _verdict_row(self):
+        """The event-level columns stamped onto every exported row."""
+        from . import verdict as V
+        from datetime import datetime
+        det = getattr(self.dock, "detection", None)
+        row = det.as_row() if det is not None else {}
+        row["verdict"] = self.verdict_combo.currentData() or ""
+        row["note"] = self.verdict_note.toPlainText().strip().replace("\n", " ")
+        row["analyst"] = self.analyst_edit.text().strip()
+        row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                               if row["verdict"] else "")
+        larsen, eros, src = self._estimates()
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
+        rec = V.reconcile(
+            seismic=(det.vol_best_m3 if det is not None else None),
+            larsen=larsen, dh_erosion=eros)
+        # each volume from its OWN field, never from v_best, which means
+        # different things under different fits
+        row["vol_larsen_m3"] = larsen
+        row["vol_larsen_lo_m3"] = (src.get("v_larsen_lo")
+                                   if src.get("v_larsen_lo") is not None
+                                   else area.get("v_low"))
+        row["vol_larsen_hi_m3"] = (src.get("v_larsen_hi")
+                                   if src.get("v_larsen_hi") is not None
+                                   else area.get("v_high"))
+        row["vol_dh_net_m3"] = src.get("v_dh_net", dh.get("v_net"))
+        row["d_larsen"] = "" if rec["d_larsen"] is None else f"{rec['d_larsen']:.3f}"
+        row["d_dh"] = "" if rec["d_dh"] is None else f"{rec['d_dh']:.3f}"
+        row["agreement"] = rec["agreement"]
+        depth = V.implied_depth_m(
+            larsen, _num(src.get("larsen_area_m2")) or _num(area.get("a_conv"))
+            or _num(area.get("src_best")))
+        row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
+        lat, lon = self._scar_centroid()
+        row["scar_lat"] = "" if lat is None else f"{lat:.6f}"
+        row["scar_lon"] = "" if lon is None else f"{lon:.6f}"
+        off = (V.haversine_km(det.lat, det.lon, lat, lon)
+               if det is not None and det.is_locatable() and lat is not None else None)
+        row["offset_km"] = "" if off is None else f"{off:.2f}"
+        row["offset_ratio"] = ("" if off is None or not (det and det.loc_error_km)
+                               else f"{off / det.loc_error_km:.2f}")
+        return row
+
+    def _refresh_verdict(self, *_):
+        """Show the three volumes side by side and say whether they agree.
+
+        The seismic estimate and the area-scaling estimate are genuinely
+        independent, so their agreement is the validation. Presenting them in one
+        block is the whole point — the tab could already compute two of them but
+        never put them next to each other."""
+        from . import verdict as V
+        det = getattr(self.dock, "detection", None)
+        larsen, eros, src = self._estimates()
+        area = self._latest_row("area")
+        dh = self._latest_row("ddem")
+        net = _num(src.get("v_dh_net")) if src.get("v_dh_net") is not None else _num(dh.get("v_net"))
+        seis = det.vol_best_m3 if det is not None else None
+        lines = []
+        if seis is not None:
+            lines.append(f"Seismic&nbsp;&nbsp;&nbsp;&nbsp;{det.vol_str()}")
+        else:
+            lines.append('<span style="color:palette(mid);">Seismic&nbsp;&nbsp;&nbsp;&nbsp;'
+                         "— no detection loaded (paste one at the top of the panel)</span>")
+        if larsen:
+            lines.append(f"Area scaling&nbsp;&nbsp;{larsen / 1e6:.3g} ×10⁶ m³"
+                         f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
+                         f"({area.get('material') or 'material?'}, ×2 typical spread)</span>")
+        if eros:
+            extra = ("" if net is None else
+                     f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
+                     f"(net {net / 1e6:+.2g})</span>")
+            lines.append(f"∫Δh erosion&nbsp;&nbsp;{eros / 1e6:.3g} ×10⁶ m³{extra}")
+        if larsen:
+            depth = V.implied_depth_m(
+                larsen, _num(src.get("larsen_area_m2"))
+                or _num(area.get("a_conv")) or _num(area.get("src_best")))
+            if depth:
+                lines.append('<span style="color:palette(mid);">'
+                             f"implied mean depth {depth:.1f} m</span>")
+        if larsen and not eros and dh:
+            pass
+        elif not larsen and eros:
+            lines.append('<span style="color:palette(mid);">Area scaling not run '
+                         "for this slide — the Fit combo does one at a time; "
+                         "measure again under a Source-scar fit to compare.</span>")
+        rec = V.reconcile(seismic=seis, larsen=larsen, dh_erosion=eros)
+        # theme.status_color, not literals: the greens and reds picked by eye
+        # here failed WCAG AA against QGIS's dark theme (2.4:1), and a verdict
+        # nobody can read is worse than no verdict.
+        from .theme import status_color
+        kind = {"agree": "success", "marginal": "warn",
+                "disagree": "error"}.get(rec["agreement"], "")
+        colour = status_color(kind) if kind else ""
+        if colour:
+            lines.append(f'<b style="color:{colour};">→ {rec["agreement"]}</b> — {rec["text"]}')
+        elif seis is not None or larsen:
+            lines.append(f'<span style="color:palette(mid);">{rec["text"]}</span>')
+        lat, lon = self._scar_centroid()
+        if det is not None and det.is_locatable() and lat is not None:
+            off = V.haversine_km(det.lat, det.lon, lat, lon)
+            if off is not None:
+                extra = ""
+                if det.loc_error_km:
+                    inside = "inside" if off <= det.loc_error_km else "OUTSIDE"
+                    extra = (f" — {inside} the {det.loc_error_km:g} km location error")
+                lines.append(f"Scar centroid is {off:.1f} km from the reported "
+                             f"epicentre{extra}.")
+        self.verdict_summary.setText("<br>".join(lines))
+        return rec
+
     def _export_csv(self):
         if not self._rows:
             self._append_log("Nothing to export — the results table is empty.")
@@ -1356,8 +2759,16 @@ class VolumeTab(QWidget):
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow([h for h, _k in CSV_FIELDS])
+                stamp = self._verdict_row()
                 for row in self._rows:
-                    w.writerow(["" if row.get(k) is None else row.get(k)
+                    merged = dict(row)
+                    # the detection identity and the analyst's conclusion belong
+                    # to the EVENT, so every measured slide carries them; a row's
+                    # own value always wins if it has one.
+                    for k, val in stamp.items():
+                        if merged.get(k) in (None, ""):
+                            merged[k] = val
+                    w.writerow(["" if merged.get(k) is None else merged.get(k)
                                 for _h, k in CSV_FIELDS])
         except OSError as e:
             self._append_log(f"Could not write {path}: {e}")
@@ -1367,8 +2778,28 @@ class VolumeTab(QWidget):
     # ---------- write-back ----------
     def _write_to_layer(self):
         if not self._rows:
-            self._append_log("Nothing to write — add a measurement first.")
+            self._notify("Nothing to write — measure a slide first.")
             return
+        # _selected_rows() falls back to EVERY row when nothing is clicked, which
+        # is the right default for Copy and Export CSV — they only read. This one
+        # writes attributes onto the outline features and COMMITS the edit, so
+        # doing that to a whole table because the user had not clicked a row is a
+        # data-loss trap. Ask first, and say how many.
+        explicit = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not explicit and len(self._rows) > 1:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            names = ", ".join(str(r.get("name") or "?") for r in self._rows[:4])
+            if len(self._rows) > 4:
+                names += f", … ({len(self._rows)} in total)"
+            ok = QMessageBox.question(
+                self, "Write to layer",
+                f"No rows are selected, so this will stamp attributes onto ALL "
+                f"{len(self._rows)} measured slides and commit the edit:\n\n"
+                f"{names}\n\nSelect rows first to write just those. Continue?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if ok != QMessageBox.Yes:
+                self._append_log("Write to layer cancelled.")
+                return
         project = QgsProject.instance()
         written = 0
         for r in self._selected_rows():
@@ -1382,9 +2813,12 @@ class VolumeTab(QWidget):
             if self._write_one(layer, row):
                 written += 1
         if written:
-            self._append_log(
+            self._notify(
                 f"Wrote attributes for {written} slide(s). The layer's edits "
                 "are committed — save the project/layer as usual.")
+        else:
+            self._notify("Nothing was written — see the log for why.",
+                         level=Qgis.Warning)
 
     def _write_one(self, layer, row):
         caps = layer.dataProvider().capabilities()
@@ -1394,9 +2828,9 @@ class VolumeTab(QWidget):
                 "edits (read-only source).")
             return False
 
-        if not layer.getFeature(row["best_fid"]).isValid():
+        if not layer.getFeature(row["conv_fid"]).isValid():
             self._append_log(
-                f"“{row['name']}”: feature {row['best_fid']} is no longer in "
+                f"“{row['name']}”: feature {row['conv_fid']} is no longer in "
                 f"{layer.name()} — saving a layer renumbers features that were "
                 "still unsaved when they were measured. Measure it again, then "
                 "write.")
@@ -1441,7 +2875,7 @@ class VolumeTab(QWidget):
                 continue
             value = row.get(key)
             if not layer.changeAttributeValue(
-                    row["best_fid"], idx,
+                    row["conv_fid"], idx,
                     QVariant() if value is None else value):
                 ok = False
         if started and not layer.commitChanges():
@@ -1452,7 +2886,7 @@ class VolumeTab(QWidget):
         if not ok:
             self._append_log(
                 f"“{row['name']}”: some attributes could not be set on "
-                f"feature {row['best_fid']}.")
+                f"feature {row['conv_fid']}.")
         return ok
 
 
@@ -1467,6 +2901,18 @@ def _name_tokens(name):
 
 
 # ---------- formatting ----------
+def _num(v):
+    """A row value as a float, or None. Row values are usually already numeric
+    but can arrive as formatted strings from a restored project, so parse
+    defensively rather than letting a str reach the volume arithmetic."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt(v):
     """Numbers for display: thousands-separated, and never more precision than
     the measurement carries. Areas and volumes span many orders of magnitude,

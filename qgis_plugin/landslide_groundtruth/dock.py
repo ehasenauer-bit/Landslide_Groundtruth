@@ -1,6 +1,7 @@
 """The dock panel: location pick, date, pre/post sliders, source preference, run."""
 import base64
 import json
+import re
 import math
 import os
 import platform
@@ -23,10 +24,14 @@ from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsField, QgsFeature, QgsGeometry, QgsPointXY, QgsFillSymbol,
     QgsMarkerSymbol,
+    QgsSingleBandPseudoColorRenderer, QgsColorRampShader, QgsRasterShader,
 )
-from qgis.gui import QgsDockWidget, QgsCollapsibleGroupBox
+from qgis.gui import (QgsDockWidget, QgsCollapsibleGroupBox,
+                      QgsMapToolEmitPoint)
 
 from .task import PipelineTask
+from . import layer_group as lg
+from .flow_layout import FlowRow
 
 # label -> --prefer value. PlanetScope lives in its own tab now (separate
 # Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
@@ -38,8 +43,29 @@ SOURCES = [
 ]
 
 # Downloadable review "scenes": (--scenes token, checkbox label, tooltip).
-# Keys must match review_package.SCENE_KEYS. All checked by default = the full
-# review package (the historical behaviour); uncheck to download fewer products.
+# Keys must match review_package.SCENE_KEYS. Only HONC (highlight_natural) is
+# ticked by default — the one layer wanted on nearly every run — so a Run stays
+# light; tick more products before running to download the rest.
+# What a run downloads unless the user says otherwise. It used to be
+# highlight_natural ALONE — one attractive picture and not a single piece of
+# change evidence, so the default run could not answer the question the plugin
+# exists to answer, and the layers that do answer it were an opt-in the user had
+# to know to look for.
+#
+# The set is the three CHANGE rasters plus one context image. dNDSI and
+# dBright are the validated detectors — fusion_core scores an event as
+# mean(dNDSI, dBright, SAR), benchmarked across Iliamna/Hubbard/Valdez, and
+# carries a floor for each (0.10, 0.05). dNDVI is the weakest of the three
+# above the treeline but is the one that works for the vegetated coastal
+# events, and it is a rendering of bands already fetched.
+#
+# swir_falsecolor is deliberately NOT here despite being excellent to look at.
+# It is a single-date 3-band composite, not a change detector: Fusion never
+# reads it, it cannot be differenced, and PlanetScope — the primary source —
+# has no SWIR bands at all, so defaulting it on does nothing on a Planet run.
+# It stays one tick away for interpreting a scene by eye.
+DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
+DEFAULT_SCENES = ("highlight_natural", "dndvi", "dndsi", "dbright")
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
@@ -76,11 +102,58 @@ SENSOR_LABEL = {
     "landsat": "Landsat (~30 m)",
 }
 
-# table row tints: pre = blue, post = green; explicit dark text so the pastel
-# backgrounds stay readable under both the light and dark QGIS themes.
-PRE_BG = QColor(220, 235, 252)
-POST_BG = QColor(224, 244, 226)
-ROW_FG = QColor(20, 20, 20)
+# Short sensor tag for the layer-tree folder name (SENSOR_LABEL is too long there).
+SENSOR_TAG = {"planet": "PlanetScope", "s2": "S2", "landsat": "Landsat"}
+
+# Which product each run-output file is, keyed off the `kind` token review_package
+# bakes into the filename. Ordered most-specific first so "dndvi" wins over "ndvi".
+# The value becomes the folder's product suffix, e.g. "S2 7-20/7-21 NDVI".
+CORE_PRODUCTS = [
+    ("dndvi", "dNDVI"), ("dndsi", "dNDSI"), ("dbright", "dBright"),
+    ("highlight", "HONC"), ("falsecolor", "False-color"),
+    ("swir", "SWIR"), ("ndvi", "NDVI"), ("rgb", "TC"),
+]
+
+
+def _core_product(basename):
+    """Product tag for a run-output filename, or '' if none matches (e.g. the
+    predicted-epicentre point.gpkg, which then sits at the top level of the run's
+    own folder rather than in a product subfolder)."""
+    low = basename.lower()
+    for token, tag in CORE_PRODUCTS:
+        if f"_{token}_" in low or low.endswith("_" + token):
+            return tag
+    return ""
+
+
+def _first_date(dates):
+    """Earliest acquisition date in a side's list, for the folder name; '' if none."""
+    uniq = sorted({d for d in (dates or []) if d})
+    return uniq[0] if uniq else ""
+
+# Every colour the plugin uses now lives in theme.py, named for what it means
+# and with its contrast against both QGIS themes recorded. Re-exported here so
+# sar_tab and planet_tab keep importing them from .dock unchanged.
+from . import theme as _theme
+from .theme import (            # noqa: F401  (re-exported for the other tabs)
+    PRE_BG, POST_BG, ROW_FG, MUTED_FG,
+    CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
+    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX, CLOUD_SNOW_MARK,
+    STATUS_COLORS,
+    status_css, status_text, status_html, invalid_field_css,
+)
+
+# Colour of the number in the "Cloud" column, by cloud over the AOI box: green
+# clear / amber some / red heavy, grey when the per-pixel number couldn't be
+# measured (footprint misses the box, or the read failed and we fell back to the
+# whole-scene value shown with a ~). Darkened a touch from pure web hues so the
+# text stays legible on the pale pre/post row backgrounds.
+# Above this share of the AOI classed snow/ice, the SCL/QA_PIXEL cloud test can't
+# be trusted: over bright glaciers the classifier routinely bins cloud tops AS
+# snow (SCL 11 / QA bit 5), which the AOI-cloud count excludes, so a cloud-choked
+# scene can read a falsely-clear few percent. We keep the number but mark it (❄,
+# greyed) so it reads as "judge by the thumbnail", not a confident clear signal.
+SNOW_UNRELIABLE_PCT = 50.0
 
 # Planetary Computer's public asset-signing endpoint. Given a blob href it
 # returns {"href": "<href>?<SAS>", "msft:expiry": ...}; the SAS token is short-
@@ -159,6 +232,18 @@ FONT_BASE_W, FONT_BASE_H = 380, 720
 FONT_SCALE_MIN, FONT_SCALE_MAX = 0.8, 1.5
 
 
+
+def _change_kind(name):
+    """Which change product a layer filename is, or '' — drives the colour ramp.
+
+    Order matters: 'dndsi' must be tested before 'dndvi' would ever match a
+    substring of it, and both before the looser checks."""
+    n = (name or "").lower()
+    for key in ("dbright", "dndsi", "dndvi"):
+        if key in n:
+            return key
+    return ""
+
 class LandslideDock(QgsDockWidget):
     def __init__(self, iface):
         super().__init__("Landslide Ground-Truthing")
@@ -166,17 +251,23 @@ class LandslideDock(QgsDockWidget):
         self.canvas = iface.mapCanvas()
         self.task = None
         self.settings = QgsSettings()
+        self.detection = None        # the seismic record; see detection.py
+        from collections import deque
+        self._log_tail = deque(maxlen=80)   # for report_failure
         self._ed_reply = None        # in-flight Earthdata credential-check request
         self._preview_reply = None   # in-flight thumbnail request (if any)
         self._preview_pix = None     # last loaded preview, kept for rescaling
         self._preview_fallback = None  # baked thumb to retry if a render URL fails
         self._search_result = None   # last Search/Preview result (for map preview)
+        self._search_sig = None      # inputs the current table was searched under
+        self._run_radius = None      # search radius the in-flight Run used (group name)
         self._sign_replies = []      # in-flight COG-signing requests
         self._sign_pending = 0       # signs still outstanding this preview
         self._tif_replies = []       # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0        # AOI downloads still outstanding this preview
         self._tif_fallbacks = []     # (label, cog_url) whose AOI render failed
         self._preview_added = []     # raster layers added by the current preview
+        self._preview_tmpfiles = []  # temp GeoTIFFs backing those layers (to unlink)
         self._preview_failed = []    # labels that failed to sign/load
         self._gdal_tuned = False     # GDAL /vsicurl options set once
         self._gallery_replies = []   # in-flight quicklook-thumbnail requests
@@ -230,6 +321,7 @@ class LandslideDock(QgsDockWidget):
         (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
         Data/Orders/Tiles system). Environment (venv/project/out) is shared because
         both tabs launch the SAME venv subprocess."""
+        from .fusion_tab import FusionTab
         from .planet_tab import PlanetTab
         from .sar_tab import SarTab
         from .viewer3d_tab import Viewer3DTab
@@ -238,6 +330,7 @@ class LandslideDock(QgsDockWidget):
         outer = QVBoxLayout(container)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._build_env_box())
+        outer.addWidget(self._build_detection_box())
 
         tabs = QTabWidget()
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
@@ -245,6 +338,11 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self.planet_tab, "PlanetScope")
         self.sar_tab = SarTab(self)
         tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
+        # Consumes the two tabs above rather than searching for imagery itself:
+        # one optical change raster AND one SAR change raster into a single
+        # landslide score. Sits after them because that is the workflow order.
+        self.fusion_tab = FusionTab(self)
+        tabs.addTab(self.fusion_tab, "Fusion")
         self.viewer3d_tab = Viewer3DTab(self)
         tabs.addTab(self.viewer3d_tab, "3D viewer")
         # The one tab that consumes the review step's output rather than
@@ -257,11 +355,16 @@ class LandslideDock(QgsDockWidget):
 
     def _build_env_box(self):
         """Shared environment settings (paths to the venv + project + output).
-        Collapsible + collapsed by default: these are set once, then forgotten.
-        Read by BOTH tabs (see _collect and PlanetTab)."""
-        env = QgsCollapsibleGroupBox("Environment")
+
+        This is a HARD GATE: eleven code paths across five tabs refuse to run
+        until these are set, and the first click a new user makes (the 3D tab's
+        pre-selected "Auto-fetch a DEM") lands on one of them. So it opens itself
+        when unconfigured, states what each path is in words the audience has,
+        shows an example of a correct value, and validates live rather than at
+        the next button press. Read by every tab (see _collect and PlanetTab)."""
+        env = QgsCollapsibleGroupBox("Environment — set these three up once")
         env.setSaveCollapsedState(False)
-        env.setCollapsed(True)
+        self.env_box = env          # tabs call env_box.setCollapsed(False) to point here
         ef = QFormLayout(env)
         self.python_edit = QLineEdit(self.settings.value(
             "landslide/python", "", type=str))
@@ -269,19 +372,341 @@ class LandslideDock(QgsDockWidget):
             "landslide/project", "", type=str))
         self.out_edit = QLineEdit(self.settings.value(
             "landslide/out", "", type=str))
-        for label, edit, picker in (
-            ("venv python", self.python_edit, self._pick_python),
-            ("project dir", self.project_edit, self._pick_project),
-            ("output dir", self.out_edit, self._pick_out),
+        for label, edit, picker, placeholder, tip in (
+            ("Python for the imagery tools", self.python_edit, self._pick_python,
+             "…/landslide_groundtruth/venv/bin/python3",
+             "The python program inside the project's venv folder — 'python3' in "
+             "venv/bin (macOS/Linux) or python.exe in venv\\Scripts (Windows). "
+             "The plugin runs the imagery tools with it, so they stay out of QGIS. "
+             "Called 'venv python' in the documentation."),
+            ("Folder with the imagery tools", self.project_edit, self._pick_project,
+             "…/landslide_groundtruth   (the folder containing run_single.py)",
+             "The folder you downloaded the pipeline into. It must contain "
+             "run_single.py."),
+            ("Where to save results", self.out_edit, self._pick_out,
+             "leave blank for <project folder>/out/interactive",
+             "Imagery, change rasters and the SAR change files the Fusion tab "
+             "reads. Leave blank to use out/interactive inside the project "
+             "folder."),
         ):
+            edit.setPlaceholderText(placeholder)
+            edit.setToolTip(tip)
+            edit.textChanged.connect(self._refresh_env_status)
             row = QHBoxLayout()
             row.addWidget(edit)
-            btn = QPushButton("…")
-            btn.setFixedWidth(28)
+            btn = QPushButton("Browse…")
+            btn.setToolTip("Choose " + label[0].lower() + label[1:])
             btn.clicked.connect(picker)
             row.addWidget(btn)
             ef.addRow(label, row)
+        # live status: says whether what is typed actually works, instead of
+        # making the user press Search to find out.
+        self.env_status = QLabel()
+        self.env_status.setWordWrap(True)
+        ef.addRow("", self.env_status)
+        self._refresh_env_status()
+        # Opens itself when unconfigured. setSaveCollapsedState(False) means the
+        # collapse state is recomputed every session, so a configured user still
+        # gets it out of the way and an unconfigured one cannot miss it.
+        env.setCollapsed(self._env_ok()[0])
         return env
+
+    def _env_ok(self):
+        """(ok, message) for the current Environment paths.
+
+        Checked in the order the user fills them in, so the message always names
+        the FIRST thing still wrong rather than the last."""
+        py = self.python_edit.text().strip()
+        proj = self.project_edit.text().strip()
+        if not py:
+            return False, "Choose the Python program that has the imagery tools installed."
+        if not os.path.exists(py):
+            return False, "There is no file at that Python path."
+        if not proj:
+            return False, "Choose the folder you downloaded the pipeline into."
+        if not os.path.exists(os.path.join(proj, "run_single.py")):
+            return False, "That folder has no run_single.py in it — pick the folder that does."
+        return True, "Ready — the imagery tools can be run."
+
+    def _refresh_env_status(self, *_):
+        """Repaint the status line, and clear any red border once a path is fixed."""
+        ok, msg = self._env_ok()
+        kind = "success" if ok else "warn"
+        self.env_status.setText(status_text(kind, msg))
+        self.env_status.setStyleSheet(status_css(kind))
+        for edit in (self.python_edit, self.project_edit, self.out_edit):
+            if edit.styleSheet() and edit.text().strip():
+                edit.setStyleSheet("")
+
+    def env_gate(self, edit=None):
+        """Refuse an action that needs the Environment, and POINT AT IT.
+
+        One shared refusal for every tab: opens the box, marks the offending
+        field, focuses it, and says what to do — instead of the old
+        "Set a valid venv python path." into a collapsed box the user has never
+        seen. Returns False so callers can `if not self.dock.env_gate(): return`."""
+        ok, msg = self._env_ok()
+        if ok:
+            return True
+        self._warn("Before searching, open the Environment box at the top of this "
+                   "panel and set it up. " + msg + " Ask whoever installed the "
+                   "plugin if you are not sure.")
+        try:
+            self.env_box.setCollapsed(False)
+            target = edit
+            if target is None:
+                target = (self.python_edit
+                          if not os.path.exists(self.python_edit.text().strip() or "\0")
+                          else self.project_edit)
+            target.setStyleSheet(invalid_field_css())
+            target.setFocus()
+        except (AttributeError, RuntimeError):
+            pass
+        return False
+
+    # ---------- the seismic detection record ----------
+    def _build_detection_box(self):
+        """The plugin's front door: the detection record, entered ONCE.
+
+        The analyst arrives holding a seismic detection — epicentre, origin time,
+        LOCATION ERROR, and a volume estimate. Before this box the first three had
+        to be retyped into four separate tabs and the last two had nowhere to go at
+        all, so the search radius ignored the uncertainty it was supposed to cover
+        and the seismic volume could never be compared against the digitized one.
+
+        Typed fields rather than a paste box: the record arrives as a FIGURE (a
+        station map with the numbers printed in the corner), so there is no text
+        to paste. Reading them off an image is the analyst's job — but doing it
+        ONCE here, instead of four times across four tabs, is the point."""
+        box = QgsCollapsibleGroupBox("Detection — the seismic record")
+        box.setSaveCollapsedState(False)
+        self.detection_box = box
+        v = QVBoxLayout(box)
+
+        hint = QLabel(
+            "Copy the numbers off the detection figure once. They fill in every "
+            "tab below, set a search radius that actually covers the location "
+            "error, and give the Volume tab something to check its own answer "
+            "against.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(hint)
+
+        form = QFormLayout()
+        self.det_id_edit = QLineEdit()
+        self.det_id_edit.setPlaceholderText("AK2026-0204   (filled in from the date if left blank)")
+        self.det_id_edit.setToolTip(
+            "The catalogue key for this event. It is stamped onto the output "
+            "filenames and the exported CSV so the results can be joined back "
+            "to the detection catalogue.")
+        form.addRow("Event ID", self.det_id_edit)
+
+        self.det_time_edit = QDateTimeEdit(QDateTime.currentDateTimeUtc())
+        self.det_time_edit.setCalendarPopup(True)
+        self.det_time_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.det_time_edit.setToolTip(
+            "The origin time, in UTC. Read the UTC line off the figure, not the "
+            "Alaska one — they are often a different calendar day, and the local "
+            "one shifts the before/after boundary by nine hours.")
+        form.addRow("Origin time (UTC)", self.det_time_edit)
+
+        self.det_lat_edit = QLineEdit()
+        self.det_lat_edit.setPlaceholderText("60.50")
+        self.det_lon_edit = QLineEdit()
+        self.det_lon_edit.setPlaceholderText("-140.60   (negative in Alaska/Yukon)")
+        form.addRow("Latitude", self.det_lat_edit)
+        form.addRow("Longitude", self.det_lon_edit)
+
+        self.det_err_spin = QDoubleSpinBox()
+        self.det_err_spin.setRange(0.0, 200.0)
+        self.det_err_spin.setDecimals(1)
+        self.det_err_spin.setSingleStep(1.0)
+        self.det_err_spin.setSuffix(" km")
+        self.det_err_spin.setSpecialValueText("not given")
+        self.det_err_spin.setToolTip(
+            "The 'Loc error' on the figure — the radius the scar is somewhere "
+            "inside. This drives the search radius: at 17 km of error, the old "
+            "5 km default covered about a twelfth of the ground the slide could "
+            "be on, so an empty result meant 'never looked there'.")
+        form.addRow("Location error", self.det_err_spin)
+
+        self.det_vol_edit = QLineEdit()
+        self.det_vol_edit.setPlaceholderText("1.3        million m³")
+        self.det_vol_edit.setToolTip(
+            "The seismic volume estimate, in millions of m³ — the 'Vol' line. "
+            "The Volume tab compares its own area-derived volume against this.")
+        self.det_vol_lo_edit = QLineEdit()
+        self.det_vol_lo_edit.setPlaceholderText("0.9")
+        self.det_vol_hi_edit = QLineEdit()
+        self.det_vol_hi_edit.setPlaceholderText("1.7")
+        form.addRow("Volume (M m³)", self.det_vol_edit)
+        rng = QHBoxLayout()
+        rng.addWidget(self.det_vol_lo_edit)
+        rng.addWidget(QLabel("to"))
+        rng.addWidget(self.det_vol_hi_edit)
+        form.addRow("Volume range", rng)
+        v.addLayout(form)
+
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
+                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+            w.textChanged.connect(self._read_detection)
+        self.det_time_edit.dateTimeChanged.connect(self._read_detection)
+        self.det_err_spin.valueChanged.connect(self._read_detection)
+
+        self.det_apply_btn = QPushButton("Use it in every tab")
+        self.det_apply_btn.setEnabled(False)
+        f = self.det_apply_btn.font(); f.setBold(True); self.det_apply_btn.setFont(f)
+        self.det_apply_btn.setToolTip(
+            "Copy the epicentre, the event time and a radius covering the "
+            "location error into the Sentinel-2, PlanetScope, SAR and 3D tabs, "
+            "so they cannot drift apart.")
+        self.det_apply_btn.clicked.connect(self._apply_detection)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip("Forget the current detection.")
+        clear_btn.clicked.connect(self._clear_detection)
+        row = FlowRow()
+        row.addWidget(self.det_apply_btn)
+        row.addWidget(clear_btn)
+        v.addWidget(row)
+
+        self.det_summary = QLabel()
+        self.det_summary.setWordWrap(True)
+        self.det_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.det_summary)
+        self._read_detection()
+        box.setCollapsed(False)
+        return box
+
+    def _num_or_none(self, edit, scale=1.0):
+        """A line edit's contents as a float (times `scale`), or None if blank
+        or not a number — so a half-typed field never reaches the arithmetic."""
+        try:
+            t = edit.text().strip()
+            return float(t) * scale if t else None
+        except (ValueError, AttributeError):
+            return None
+
+    def _read_detection(self, *_):
+        """Rebuild the Detection from the fields, and echo it back."""
+        from .detection import Detection
+        lat = self._num_or_none(self.det_lat_edit)
+        lon = self._num_or_none(self.det_lon_edit)
+        warn = []
+        if lat is not None and not (-90.0 <= lat <= 90.0):
+            warn.append(f"Latitude {lat:g} is out of range."); lat = None
+        if lon is not None and not (-180.0 <= lon <= 180.0):
+            warn.append(f"Longitude {lon:g} is out of range."); lon = None
+        # The classic error, and in Alaska/Yukon it lands the AOI in Siberia
+        # without failing loudly anywhere.
+        if lat is not None and lon is not None and lon > 0 and lat > 50:
+            warn.append(f"Longitude {lon:+g} is POSITIVE (eastern hemisphere). "
+                        "Alaska and the Yukon are negative — check for a dropped "
+                        "minus sign.")
+        det = Detection(
+            event_id=self.det_id_edit.text().strip(),
+            origin_utc=self.det_time_edit.dateTime().toPyDateTime(),
+            lat=lat, lon=lon,
+            loc_error_km=(self.det_err_spin.value() or None),
+            vol_best_m3=self._num_or_none(self.det_vol_edit, 1e6),
+            vol_low_m3=self._num_or_none(self.det_vol_lo_edit, 1e6),
+            vol_high_m3=self._num_or_none(self.det_vol_hi_edit, 1e6))
+        if not det.event_id and det.origin_utc:
+            det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
+        self.detection = det if det.is_locatable() else None
+        self._render_detection(warn)
+
+    def _clear_detection(self):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
+                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+            w.clear()
+        self.det_err_spin.setValue(0.0)
+        self.detection = None
+        self._render_detection()
+
+    def _render_detection(self, warn=None):
+        """Echo the record back — above all the LOCAL time.
+
+        A record shows 08:48 UTC and 23:48 the previous day in Alaska. An analyst
+        reading the local one off the figure and typing it into a field labelled
+        UTC shifts the pre/post boundary nine hours, which silently reclassifies
+        a bracketing Sentinel-1 scene from before the failure to after it. The
+        change map then compares two pre-event scenes, finds nothing, and gives
+        no way to find out why. So the conversion is stated, every time."""
+        det = getattr(self, "detection", None)
+        if det is None:
+            self.det_summary.setText(
+                "<i>Enter at least a latitude and longitude — the tabs otherwise "
+                "use whatever you type into them individually.</i>")
+            self.det_summary.setStyleSheet("QLabel { color: palette(mid); }")
+            if hasattr(self, "det_apply_btn"):
+                self.det_apply_btn.setEnabled(False)
+            for w in (warn or []):
+                self.det_summary.setText(
+                    self.det_summary.text() + "<br>" + status_html("warn", w))
+            return
+        lines = ["<b>" + (det.event_id or "Detection") + "</b>"]
+        if det.origin_utc:
+            lines.append(f"{det.origin_utc:%Y-%m-%d %H:%M:%S} UTC   =   {det.local_str()}")
+        pos = f"{det.lat:.4f}, {det.lon:.4f}"
+        if det.loc_error_km:
+            pos += f"  ± {det.loc_error_km:g} km"
+        lines.append(pos)
+        v = det.vol_str()
+        if v:
+            lines.append(f"Seismic volume {v}")
+        r = det.suggested_radius_km()
+        lines.append(f"<b>Search radius suggested: {r:g} km</b>"
+                     + ("" if det.loc_error_km else " (no location error entered)"))
+        html = "<br>".join(lines)
+        for w in (warn or []):
+            html += "<br>" + status_html("warn", w)
+        self.det_summary.setText(html)
+        self.det_summary.setStyleSheet("")
+        if hasattr(self, "det_apply_btn"):
+            self.det_apply_btn.setEnabled(True)
+
+    def _apply_detection(self):
+        """Push the record into every tab that has its own event fields.
+
+        The four tabs keep independent lat/lon/time widgets and nothing syncs
+        them, so this is the one place that makes them agree. The radius is set
+        from the LOCATION ERROR, not left at the 5 km default: at 17 km of error
+        a 5 km radius covers about a twelfth of the ground the scar could be on."""
+        det = getattr(self, "detection", None)
+        if det is None:
+            self._warn("Read a detection record first.")
+            return
+        if not det.is_locatable():
+            self._warn("That record has no usable latitude/longitude.")
+            return
+        radius = det.suggested_radius_km()
+        when = None
+        if det.origin_utc:
+            when = QDateTime.fromString(
+                det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
+        targets = [self]
+        for name in ("planet_tab", "sar_tab", "viewer3d_tab"):
+            t = getattr(self, name, None)
+            if t is not None:
+                targets.append(t)
+        touched = 0
+        for t in targets:
+            try:
+                if hasattr(t, "lat_edit"):
+                    t.lat_edit.setText(f"{det.lat:.6f}")
+                    t.lon_edit.setText(f"{det.lon:.6f}")
+                if hasattr(t, "radius_spin"):
+                    t.radius_spin.setValue(radius)
+                if when is not None and when.isValid() and hasattr(t, "dt_edit"):
+                    t.dt_edit.setDateTime(when)
+                touched += 1
+            except (AttributeError, RuntimeError):
+                continue
+        self.iface.messageBar().pushInfo(
+            "Detection", f"{det.event_id or 'Detection'} applied to {touched} tabs — "
+            f"search radius {radius:g} km"
+            + (f" (location error {det.loc_error_km:g} km)" if det.loc_error_km else ""))
+        self._append_log(f"Detection applied to {touched} tabs; radius {radius:g} km.")
 
     # ---------- Sentinel-2 / Landsat tab ----------
     def _build_ui(self):
@@ -294,14 +719,40 @@ class LandslideDock(QgsDockWidget):
         # --- event inputs ---
         form = QFormLayout()
         self.lat_edit = QLineEdit()
-        self.lat_edit.setPlaceholderText("e.g. 59.906992")
-        self.lat_edit.setValidator(QDoubleValidator(-90.0, 90.0, 8))
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
+        # No QDoubleValidator here on purpose. It rejected any string containing a
+        # separator, and Qt drops a rejected paste SILENTLY — so pasting a
+        # "lat, lon" pair from a detection record, a spreadsheet or a map site
+        # left the box empty with no message at all. The pair is split below and
+        # the value is validated in _collect, which can explain what is wrong.
+        self.lat_edit.textChanged.connect(self._split_pasted_pair)
         form.addRow("Latitude", self.lat_edit)
 
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
-        self.lon_edit.setValidator(QDoubleValidator(-180.0, 180.0, 8))
         form.addRow("Longitude", self.lon_edit)
+
+        # Pick the epicentre off the canvas. The docs have promised this since
+        # the first release (metadata.txt, both READMEs) and it was never
+        # implemented; typing was the only way in. It matters more than it
+        # sounds: the detection's location error is often 10-20 km, so the
+        # analyst hunts around inside that disc rather than knowing one point,
+        # and README.md calls clicking the defence against the classic dropped
+        # minus sign on longitude.
+        self.pick_btn = QPushButton("Pick on map")
+        self.pick_btn.setCheckable(True)
+        self.pick_btn.setToolTip(
+            "Click a point on the QGIS map to fill in the latitude and "
+            "longitude. Click this button again (or press Esc) to stop.")
+        self.pick_btn.toggled.connect(self._toggle_pick)
+        centre_btn = QPushButton("Use map centre")
+        centre_btn.setToolTip(
+            "Fill in the latitude and longitude of the middle of the map view.")
+        centre_btn.clicked.connect(self._use_map_centre)
+        pick_row = FlowRow()
+        pick_row.addWidget(self.pick_btn)
+        pick_row.addWidget(centre_btn)
+        form.addRow("", pick_row)
 
         self.radius_spin = QDoubleSpinBox()
         self.radius_spin.setRange(0.2, 50.0)
@@ -335,42 +786,61 @@ class LandslideDock(QgsDockWidget):
         pa_row.addWidget(add_pa_btn)
         form.addRow("Point and area", pa_row)
 
-        self.auto_check = QCheckBox("Auto: tightest window (nearest clear scene each side)")
-        self.auto_check.setToolTip(
-            "Use only the clear scene nearest the event date on each side, for the "
-            "smallest before/after gap. The sliders below then set the MAXIMUM days "
-            "to search each side.")
-        self.auto_check.toggled.connect(self._update_day_labels)
-
         self.pre_slider, self.pre_lbl = self._day_slider(60)
         self.post_slider, self.post_lbl = self._day_slider(90)
         for s in (self.pre_slider, self.post_slider):
             s.valueChanged.connect(self._update_day_labels)
-        form.addRow(self.auto_check)
         form.addRow("Days before", self._slider_row(self.pre_slider, self.pre_lbl))
         form.addRow("Days after", self._slider_row(self.post_slider, self.post_lbl))
         self._update_day_labels()
+
+        # run_single.py has accepted --seasonal since the beginning and the README
+        # calls it the fix for a winter event, but nothing in the UI could set it:
+        # the flag was reachable only from the command line. For a February event
+        # at 60 N the "before" window is dark and snow-covered, and the honest
+        # comparison is against the PREVIOUS SUMMER, not against three weeks
+        # earlier.
+        self.seasonal_check = QCheckBox(
+            "Winter event — compare against last summer instead")
+        self.seasonal_check.setToolTip(
+            "For an event in the dark, snow-covered months, use the previous "
+            "summer as the 'before' imagery so snow cover does not swamp the "
+            "change signal. Ticked automatically when the event date falls "
+            "between October and March; you can override it.")
+        self.seasonal_check.setChecked(False)
+        form.addRow("", self.seasonal_check)
+
+        # Warn as soon as the date makes the run impossible or pointless, rather
+        # than after a download that returns nothing.
+        self.window_warn = QLabel()
+        self.window_warn.setWordWrap(True)
+        self.window_warn.setStyleSheet(status_css("warn"))
+        self.window_warn.setVisible(False)
+        form.addRow("", self.window_warn)
+        self.dt_edit.dateTimeChanged.connect(self._check_event_window)
+        for sl in (self.pre_slider, self.post_slider):
+            sl.valueChanged.connect(self._check_event_window)
+        self._check_event_window()
 
         self.source_combo = QComboBox()
         for label, value in SOURCES:
             self.source_combo.addItem(label, value)
         form.addRow("Imagery source", self.source_combo)
 
-        # Cloud filtering is OFF by default: eo:cloud_cover is a whole-scene metric
-        # over a 110 km granule, so it says nothing about your few-km AOI, and
-        # filtering on it hides the cloudy-scene-wide acquisitions that are often
-        # perfectly clear over the point — plus every scene you'd need in order to
-        # judge that call yourself. Search lists them all; you look at the
-        # thumbnails and tick what's usable. Tick the box to cap it anyway.
+        # Cloud filtering is ON by default at 50%: eo:cloud_cover is a whole-scene
+        # metric over a 110 km granule, so it says nothing about your few-km AOI,
+        # but a 50% cap trims the mostly-clouded acquisitions that swamp a long
+        # list while still keeping most of the scenes worth eyeballing. Untick the
+        # box to see every scene, clouds and all, and pick purely by thumbnail.
         self.cloud_filter_check = QCheckBox("Hide scenes cloudier than")
-        self.cloud_filter_check.setChecked(False)
+        self.cloud_filter_check.setChecked(True)
         self.cloud_filter_check.setToolTip(
-            "Off (default): NO cloud filtering — every scene in the window is "
-            "listed, clouds and all, so you can see the clouds and pick by eye.\n"
-            "On: drop scenes whose WHOLE-SCENE cloud cover exceeds the value on "
-            "the right. That is a scene-wide metric, not your AOI — a scene can be "
-            "90% cloudy overall and still clear over your point, so this filter "
-            "throws away usable scenes. Use it only to thin a very long list.\n"
+            "On (default): drop scenes whose WHOLE-SCENE cloud cover exceeds the "
+            "value on the right. That is a scene-wide metric, not your AOI — a "
+            "scene can be 60% cloudy overall and still clear over your point, so "
+            "raise the cap or untick this if the list looks too thin.\n"
+            "Off: NO cloud filtering — every scene in the window is listed, clouds "
+            "and all, so you can see the clouds and pick by eye.\n"
             "Either way this only chooses WHICH scenes are listed: a Run downloads "
             "the scenes as acquired, with the cloud left in. No pixels are masked "
             "out for cloud, so you never get holes in the imagery.")
@@ -378,9 +848,9 @@ class LandslideDock(QgsDockWidget):
         self.cloud_spin.setRange(0.0, 100.0)
         self.cloud_spin.setDecimals(0)
         self.cloud_spin.setSingleStep(5.0)
-        self.cloud_spin.setValue(80.0)
+        self.cloud_spin.setValue(50.0)
         self.cloud_spin.setSuffix(" %")
-        self.cloud_spin.setEnabled(False)
+        self.cloud_spin.setEnabled(True)
         self.cloud_spin.setToolTip(self.cloud_filter_check.toolTip())
         self.cloud_filter_check.toggled.connect(self.cloud_spin.setEnabled)
         cloud_row = QHBoxLayout()
@@ -390,18 +860,21 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Cloud filter", cloud_row)
         root.addLayout(form)
 
-        # --- which review "scenes" to download ---
-        # Each checked product is written by the run; uncheck what you won't use to
-        # download less. The predicted-epicentre point layer is always included.
-        # Expanded by default so the choice is visible (it's a primary control).
-        scenes_box = QgsCollapsibleGroupBox("Scenes to download")
+        # --- which review layers to export ---
+        # These are OUTPUT products (renderings), not satellite acquisitions — the
+        # "scene" word is reserved for the Candidate scenes table below. Each checked
+        # product is written by the run; only HONC is ticked by default, so tick the
+        # extra products you want before running. The predicted-epicentre point layer
+        # is always included. Expanded by default so the choice is visible (a primary
+        # control).
+        scenes_box = QgsCollapsibleGroupBox("Layers to export")
         scenes_box.setSaveCollapsedState(False)
         scenes_box.setCollapsed(False)
         sbox = QVBoxLayout(scenes_box)
         self.scene_checks = {}
         for key, label, tip in SCENES:
             cb = QCheckBox(label)
-            cb.setChecked(True)
+            cb.setChecked(key in DEFAULT_SCENES)
             cb.setToolTip(tip)
             self.scene_checks[key] = cb
             sbox.addWidget(cb)
@@ -410,14 +883,14 @@ class LandslideDock(QgsDockWidget):
         # (PlanetScope coverage/quality toggles moved to the PlanetScope tab.)
 
         # --- search (free dry-run) / run / cancel ---
-        btn_row = QHBoxLayout()
+        btn_row = FlowRow()
         self.search_btn = QPushButton("Search / Preview")
         self.search_btn.setToolTip(
             "Free dry-run: list the candidate before/after scenes per source, "
             "nearest the event date first, and show them below with their browse "
             "images. Nothing is downloaded and no order is placed — use it to check "
-            "coverage and pick the scenes before a full Run. Cloudy scenes are "
-            "listed too unless you turn the cloud filter on.")
+            "coverage and pick the scenes before a full Run. Scenes over the cloud "
+            "cap are hidden by default; untick the cloud filter to list them too.")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
@@ -438,6 +911,7 @@ class LandslideDock(QgsDockWidget):
             "on its own, minus the change rasters that need both. With the table "
             "empty (no Search yet) the run falls back to picking scenes itself.")
         self.run_btn.clicked.connect(self._run)
+        f = self.run_btn.font(); f.setBold(True); self.run_btn.setFont(f); self.run_btn.setDefault(True)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
@@ -445,7 +919,7 @@ class LandslideDock(QgsDockWidget):
         btn_row.addWidget(self.map_preview_btn)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.cancel_btn)
-        root.addLayout(btn_row)
+        root.addWidget(btn_row)
 
         # draw each candidate scene's footprint on the map (off by default)
         self.footprint_check = QCheckBox("Show scene footprints on map")
@@ -489,9 +963,9 @@ class LandslideDock(QgsDockWidget):
             "Hand-picking works for Sentinel-2 / Landsat; PlanetScope has its own "
             "tab.")
         scenes_box.addWidget(scenes_lbl)
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Source", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Source", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -507,11 +981,14 @@ class LandslideDock(QgsDockWidget):
         # quicklook gallery: every candidate's browse thumbnail at once (before +
         # after) so you can scan for the cloud-free scene over the AOI in one
         # glance, instead of clicking the table row by row. Click a tile to select
-        # its scene (drives the big preview + Preview on map).
-        gallerybox = QWidget()
+        # its scene (drives the big preview + Preview on map). Collapsible and
+        # collapsed by default: the Cloud column is the primary signal now, so the
+        # thumbnails stay tucked away until you want to eyeball a scene.
+        gallerybox = QgsCollapsibleGroupBox(
+            "Quicklook gallery (click a thumbnail to select its scene)")
+        gallerybox.setSaveCollapsedState(False)
+        gallerybox.setCollapsed(True)
         g_layout = QVBoxLayout(gallerybox)
-        g_layout.setContentsMargins(0, 0, 0, 0)
-        g_layout.addWidget(QLabel("Quicklook gallery (click a thumbnail to select its scene)"))
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
@@ -521,11 +998,13 @@ class LandslideDock(QgsDockWidget):
         g_layout.addWidget(self.gallery_scroll, 1)
         out_split.addWidget(gallerybox)
 
-        # preview pane: free browse image of the selected scene (no order placed)
-        previewbox = QWidget()
+        # preview pane: free browse image of the selected scene (no order placed).
+        # Same deal — collapsible, collapsed by default; expand it when you want
+        # to check a scene by eye rather than by the Cloud number.
+        previewbox = QgsCollapsibleGroupBox("Scene preview")
+        previewbox.setSaveCollapsedState(False)
+        previewbox.setCollapsed(True)
         pv_layout = QVBoxLayout(previewbox)
-        pv_layout.setContentsMargins(0, 0, 0, 0)
-        pv_layout.addWidget(QLabel("Scene preview"))
         self.preview = QLabel("Select a scene to preview its browse image.")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setWordWrap(True)
@@ -543,13 +1022,16 @@ class LandslideDock(QgsDockWidget):
         log_layout.addWidget(self.log)
         out_split.addWidget(logbox)
 
-        out_split.setStretchFactor(0, 3)   # table
-        out_split.setStretchFactor(1, 3)   # gallery
-        out_split.setStretchFactor(2, 2)   # preview
+        # gallery + preview are collapsible and collapsed by default, so give them
+        # no stretch: they sit as thin title bars until expanded (then drag the
+        # handle to size them). The table is the primary signal, so it dominates.
+        out_split.setStretchFactor(0, 5)   # table
+        out_split.setStretchFactor(1, 0)   # gallery (collapsible, sizes on demand)
+        out_split.setStretchFactor(2, 0)   # preview (collapsible, sizes on demand)
         out_split.setStretchFactor(3, 2)   # log
         scenes.setMinimumHeight(120)
-        gallerybox.setMinimumHeight(0)     # drag closed when you don't need it
-        previewbox.setMinimumHeight(0)     # drag closed when you don't need it
+        gallerybox.setMinimumHeight(0)     # collapsed to its title bar by default
+        previewbox.setMinimumHeight(0)     # collapsed to its title bar by default
         logbox.setMinimumHeight(80)
         root.addWidget(out_split, 1)
         return w
@@ -571,8 +1053,8 @@ class LandslideDock(QgsDockWidget):
 
         info = QLabel(
             'Optional: store NASA Earthdata credentials for NASA-hosted imagery '
-            'downloads. The Sentinel-2 / Landsat search above uses the Planetary '
-            'Computer and needs no login. Register at '
+            'downloads. The Sentinel-2 / Landsat search above uses the Microsoft '
+            'Planetary Computer and needs no login. Register at '
             f'<a href="{EARTHDATA_REGISTER_URL}">urs.earthdata.nasa.gov</a>.')
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
@@ -590,9 +1072,7 @@ class LandslideDock(QgsDockWidget):
         self.ed_pass_edit.returnPressed.connect(self._earthdata_login)
         form.addRow("Password", self.ed_pass_edit)
 
-        row = QWidget()
-        btns = QHBoxLayout(row)
-        btns.setContentsMargins(0, 0, 0, 0)
+        row = FlowRow()
         self.ed_login_btn = QPushButton("Test && save credentials")
         self.ed_login_btn.setToolTip(
             "Check the username/password against NASA URS. If valid, save them to "
@@ -602,8 +1082,8 @@ class LandslideDock(QgsDockWidget):
         self.ed_check_btn.setToolTip(
             "Report whether ~/.netrc already holds a NASA Earthdata entry.")
         self.ed_check_btn.clicked.connect(self._earthdata_check_netrc)
-        btns.addWidget(self.ed_login_btn)
-        btns.addWidget(self.ed_check_btn)
+        row.addWidget(self.ed_login_btn)
+        row.addWidget(self.ed_check_btn)
         form.addRow(row)
 
         self.ed_status = QLabel()
@@ -678,12 +1158,20 @@ class LandslideDock(QgsDockWidget):
                 existing = netrc_path.read_text()
             except OSError:
                 existing = ""
-        # keep every line except the old urs.earthdata.nasa.gov machine block
+        # Keep every line except the old urs.earthdata.nasa.gov machine block.
+        # A .netrc top-level entry is 'machine <host>', 'default', or 'macdef
+        # <name>'; skipping must END at the NEXT top-level entry of ANY kind, not
+        # only the next 'machine' — otherwise a 'default' (or 'macdef') block that
+        # happens to follow the URS entry gets swallowed with it, silently dropping
+        # other services' credentials/macros. Match the host as a whole token, not
+        # a substring, so 'machine noturs.earthdata.nasa.gov.example' is preserved.
         kept = []
         skip = False
         for line in (existing.splitlines() if existing.strip() else []):
-            if line.strip().startswith("machine"):
-                skip = EARTHDATA_HOST in line
+            tokens = line.split()
+            keyword = tokens[0] if tokens else ""
+            if keyword in ("machine", "default", "macdef"):
+                skip = keyword == "machine" and EARTHDATA_HOST in tokens[1:2]
             if not skip:
                 kept.append(line)
         entry = (f"machine {EARTHDATA_HOST}\n"
@@ -720,9 +1208,8 @@ class LandslideDock(QgsDockWidget):
         return s, QLabel()
 
     def _update_day_labels(self, *_):
-        suffix = " (max)" if self.auto_check.isChecked() else ""
-        self.pre_lbl.setText(f"{self.pre_slider.value()} d{suffix}")
-        self.post_lbl.setText(f"{self.post_slider.value()} d{suffix}")
+        self.pre_lbl.setText(f"{self.pre_slider.value()} d")
+        self.post_lbl.setText(f"{self.post_slider.value()} d")
 
     def _slider_row(self, slider, lbl):
         row = QWidget()
@@ -748,6 +1235,147 @@ class LandslideDock(QgsDockWidget):
         if p:
             self.out_edit.setText(p)
 
+    def _check_event_window(self, *_):
+        """Flag a date/window that cannot return imagery, before anything is run.
+
+        Two cases actually bite. The event time defaults to NOW, so an untouched
+        form asks for imagery from the future and comes back empty with no
+        explanation. And a winter event at these latitudes needs the seasonal
+        comparison, which the analyst has no way of knowing to tick."""
+        from datetime import datetime, timedelta
+        msgs = []
+        try:
+            when = self.dt_edit.dateTime().toPyDateTime()
+        except (AttributeError, ValueError):
+            self.window_warn.setVisible(False)
+            return
+        now = datetime.utcnow()
+        post_end = when + timedelta(days=int(self.post_slider.value()))
+        if when > now + timedelta(hours=12):
+            msgs.append("The event time is in the future — no satellite has "
+                        "imaged it yet.")
+        elif post_end > now:
+            days = max(0, (post_end - now).days)
+            msgs.append(f"The 'after' window runs {days} day(s) past today, so "
+                        "part of it cannot return imagery yet.")
+        # Winter at high latitude: low sun, long nights, full snow cover.
+        try:
+            lat = abs(float(self.lat_edit.text().strip()))
+        except (ValueError, AttributeError):
+            lat = 0.0
+        if when.month in (10, 11, 12, 1, 2, 3) and lat >= 55.0:
+            msgs.append("A winter event this far north: optical imagery will be "
+                        "dark and snow-covered. Tick the winter box above, and "
+                        "consider the SAR tab, which sees through cloud and "
+                        "darkness.")
+            if not self.seasonal_check.isChecked() and not getattr(
+                    self, "_seasonal_touched", False):
+                self.seasonal_check.setChecked(True)
+                self._seasonal_touched = True
+        self.window_warn.setText("  ".join(msgs))
+        self.window_warn.setVisible(bool(msgs))
+
+    # ---------- picking the epicentre off the canvas ----------
+    def _split_pasted_pair(self, text):
+        """Accept a whole 'lat, lon' pair pasted into the Latitude box.
+
+        Coordinates travel as a pair everywhere the analyst gets them, so
+        requiring two separate paste actions (and silently discarding the pair if
+        they try one) is friction for nothing."""
+        t = (text or "").strip()
+        if not t or not any(c in t for c in ",;\t"):
+            return
+        parts = [p for p in re.split(r"[,;\t]+", t) if p.strip()]
+        if len(parts) != 2:
+            return
+        try:
+            lat, lon = float(parts[0].strip()), float(parts[1].strip())
+        except ValueError:
+            return
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return
+        self.lat_edit.blockSignals(True)          # avoid re-entering on setText
+        self.lat_edit.setText(f"{lat:.6f}")
+        self.lat_edit.blockSignals(False)
+        self.lon_edit.setText(f"{lon:.6f}")
+        self._append_log(f"Pasted coordinate pair split: {lat:.6f}, {lon:.6f}")
+
+
+    def _wgs84(self, point, src_crs):
+        """A canvas point in EPSG:4326, or None if it cannot be transformed."""
+        dst = QgsCoordinateReferenceSystem("EPSG:4326")
+        if not src_crs.isValid():
+            return None
+        if src_crs == dst:
+            return point
+        try:
+            tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance())
+            return tr.transform(point)
+        except Exception:
+            return None
+
+    def _toggle_pick(self, on):
+        """Arm/disarm the click-to-pick map tool."""
+        if not on:
+            self._end_pick()
+            return
+        try:
+            self._pick_tool = QgsMapToolEmitPoint(self.canvas)
+            self._pick_tool.canvasClicked.connect(self._on_map_pick)
+            self._prev_tool = self.canvas.mapTool()
+            self.canvas.setMapTool(self._pick_tool)
+            self.iface.messageBar().pushInfo(
+                "Landslide", "Click the event location on the map.")
+        except Exception as e:
+            self._append_log(f"Could not start the map picker: {e}")
+            self.pick_btn.setChecked(False)
+
+    def _end_pick(self):
+        """Put the previous map tool back, so the canvas is not left armed."""
+        tool = getattr(self, "_pick_tool", None)
+        if tool is None:
+            return
+        try:
+            tool.canvasClicked.disconnect(self._on_map_pick)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            prev = getattr(self, "_prev_tool", None)
+            if prev is not None:
+                self.canvas.setMapTool(prev)
+            else:
+                self.canvas.unsetMapTool(tool)
+        except (AttributeError, RuntimeError):
+            pass
+        self._pick_tool = None
+        self._prev_tool = None
+
+    def _on_map_pick(self, point, button):
+        """Write a clicked canvas point into the latitude/longitude fields."""
+        p = self._wgs84(point, self.canvas.mapSettings().destinationCrs())
+        if p is None:
+            self._warn("Could not convert that map position to latitude/longitude. "
+                       "Check the project's coordinate system.")
+            return
+        self._set_lat_lon(p.y(), p.x())
+        self.pick_btn.setChecked(False)          # one click, one point
+
+    def _use_map_centre(self):
+        p = self._wgs84(self.canvas.center(),
+                        self.canvas.mapSettings().destinationCrs())
+        if p is None:
+            self._warn("Could not convert the map centre to latitude/longitude. "
+                       "Check the project's coordinate system.")
+            return
+        self._set_lat_lon(p.y(), p.x())
+
+    def _set_lat_lon(self, lat, lon):
+        self.lat_edit.setText(f"{lat:.6f}")
+        self.lon_edit.setText(f"{lon:.6f}")
+        self._append_log(f"Location picked: {lat:.6f}, {lon:.6f}")
+        self.iface.messageBar().pushInfo(
+            "Landslide", f"Location set to {lat:.5f}, {lon:.5f}")
+
     # ---------- run / search ----------
     def _collect(self):
         """Validate inputs and build the shared CLI args, or return None.
@@ -767,11 +1395,9 @@ class LandslideDock(QgsDockWidget):
         project = self.project_edit.text().strip()
         out = self.out_edit.text().strip() or os.path.join(project, "out", "interactive")
         script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path.")
-            return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
+        # One shared, actionable refusal that opens the Environment box and marks
+        # the offending field, instead of two dead-end strings naming a "venv".
+        if not self.env_gate():
             return None
         self._save_settings()
         os.makedirs(out, exist_ok=True)
@@ -791,13 +1417,19 @@ class LandslideDock(QgsDockWidget):
             "--max-cloud", f"{max_cloud:.0f}",
             "--out", out,
         ]
-        if self.auto_check.isChecked():
-            args.append("--auto-window")
         # which review layers to download (ignored by the Search dry-run). Always
         # pass the explicit list so "all checked" and "none checked" stay distinct.
         scenes = [k for k, cb in self.scene_checks.items() if cb.isChecked()]
         if scenes:
             args += ["--scenes", ",".join(scenes)]
+        # Stamp the catalogue key onto the outputs when a detection is loaded, so
+        # the filenames and metadata.json can be joined back to the seismic
+        # catalogue instead of carrying a datetime-derived id only this run knows.
+        det = getattr(self, "detection", None)
+        if det is not None and det.event_id:
+            args += ["--event-id", det.event_id]
+        if self.seasonal_check.isChecked():
+            args += ["--seasonal"]
         return python, script, project, out, args
 
     def _busy(self, on):
@@ -843,9 +1475,36 @@ class LandslideDock(QgsDockWidget):
                     "Landsat. They can't be composited together.")
         return dict(source=next(iter(sources)), pre=picked["pre"], post=picked["post"])
 
+    def _search_signature(self):
+        """The inputs that define WHICH candidate scenes a Search lists and how
+        they're labelled: location, event date, AOI radius, and the pre/post
+        window. The table's rows (and their ticked scene IDs) are only meaningful
+        for these exact values, so _run compares this against the signature
+        captured at Search time to reject a stale table — see _run."""
+        return (
+            self.lat_edit.text().strip(),
+            self.lon_edit.text().strip(),
+            self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm"),
+            f"{self.radius_spin.value():.2f}",
+            self.pre_slider.value(),
+            self.post_slider.value(),
+        )
+
     def _run(self):
         if not any(cb.isChecked() for cb in self.scene_checks.values()):
-            self._warn("Select at least one scene to download.")
+            self._warn("Select at least one layer to export.")
+            return
+        # The listed scenes belong to the last Search / Preview. If the location or
+        # event date has changed since then, the table is stale: a Run rebuilds its
+        # --datetime and output folder from the CURRENT inputs, so it would download
+        # those old scenes under the new date (mislabelling them). Force a fresh
+        # Search rather than guess. An empty table is the automatic path — nothing
+        # ticked to protect — and is left alone.
+        if self.table.rowCount() > 0 and self._search_signature() != self._search_sig:
+            self._warn("Location / event date changed since the last Search / "
+                       "Preview, so the listed scenes are from the old search. Run "
+                       "Search / Preview again so the candidates match the current "
+                       "inputs before downloading.")
             return
         sel = self._checked_scene_selection()
         if isinstance(sel, str):
@@ -864,6 +1523,9 @@ class LandslideDock(QgsDockWidget):
         if c is None:
             return
         python, script, project, out, args = c
+        # radius the run is actually launching with, so _load_layers can name the
+        # run folder for it even if the spinner is nudged while the run executes.
+        self._run_radius = self.radius_spin.value()
         if sel:
             # only pass the sides that were actually ticked — a missing side means
             # "don't fetch that side", not "fall back to the automatic search"
@@ -896,6 +1558,9 @@ class LandslideDock(QgsDockWidget):
             return
         python, script, project, out, args = c
         args = args + ["--search-only"]
+        # remember what this search was run under; _run rejects the table once any
+        # of these change (so old scenes can't download under a new date/location).
+        self._search_sig = self._search_signature()
         self.log.clear()
         # drop the old result BEFORE emptying the table: clearing rows fires a
         # selection change, and the footprint refresh that hangs off it would
@@ -923,48 +1588,80 @@ class LandslideDock(QgsDockWidget):
         result = getattr(self.task, "result", None)
         self.task = None
         if not result:
-            self._append_log("Search finished with no result.")
+            self.report_failure("The scene search did not finish.")
             return
         self._search_result = result
         self._fill_table(result)
         self._load_gallery(result)
         if self.footprint_check.isChecked():
             self._draw_footprints(log=True)
+        ocm_warn = None
         for note in result.get("notes", []):
             self._append_log("note: " + note)
+            if note.lstrip().startswith("⚠") and "OmniCloudMask" in note:
+                ocm_warn = note.lstrip("⚠ ").strip()
         # the map preview renders via the data API (Sentinel-2 or Landsat); enable
         # it only when there's a streamable scene on at least one side.
         has_streamable = bool(self._best_streamable("pre") or self._best_streamable("post"))
         self.map_preview_btn.setEnabled(has_streamable)
         npre, npost = len(result.get("pre", [])), len(result.get("post", []))
-        self.iface.messageBar().pushInfo(
-            "Landslide", f"Found {npre} pre / {npost} post candidate scenes "
-                         f"(no orders placed).")
+        # A quiet fall-back to the SCL/QA lower bound is exactly what looked like
+        # "the cloud % is inaccurate", so shout it in the message bar (not just the
+        # log) with the reason and the fix.
+        if ocm_warn:
+            self.iface.messageBar().pushWarning("Landslide — cloud %", ocm_warn)
+        else:
+            self.iface.messageBar().pushInfo(
+                "Landslide", f"Found {npre} pre / {npost} post candidate scenes "
+                             f"(no orders placed).")
 
     def _fill_table(self, result):
         pre = result.get("pre", [])
         post = result.get("post", [])
-        # The dry-run lists every acquisition near the event, nearest-first (clouds
-        # included — see imagery.search_event), but an AUTOMATIC Run does not pick
-        # the nearest scene: it ranks by the cloud-weighted blend fetch_event uses
-        # (gap_days + cloud_weight*cloud_pct) and median-composites the top N. So
-        # replicate that selection here: ★ = the scene that ranking leads with, ✓ =
-        # also in its composite, plain/greyed = below its cutoff. Those marks are a
-        # SUGGESTION — the ticks decide, and a greyed row is often the right pick
-        # once you've looked at where the cloud actually sits.
+        # The dry-run lists every acquisition near the event (clouds included — see
+        # imagery.search_event). We mark the best review scene per side by what a
+        # usable before/after actually needs (see _rank_like_run): ★ = covers the
+        # event point, fills the most of the AOI box, and is least cloudy; ✓ = also
+        # among the best-covering low-cloud scenes; plain/greyed = less coverage,
+        # cloudier, or off-point entirely. The marks are a SUGGESTION — the ticks
+        # decide, and a 'cloudy' (whole-scene) row is often clear over the point.
         sel = self._run_selection(pre, post, result.get("params", {}))
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
+        off_point = 0                    # scenes whose footprint misses the epicentre
         for r, (side, c) in enumerate(rows):
             info = sel[side]
             cid = c.get("id")
+            covers_pt = self._covers_event(c)
+            if not covers_pt:
+                off_point += 1
+            cover_frac = self._aoi_coverage(c)          # 0..1 of the AOI box filled
             is_top = cid is not None and cid == info["top"]
             in_comp = cid in info["used"]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
-            cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
+            # "Cloud" column = cloud over YOUR AOI (per-pixel). A leading "~"
+            # marks the fallback to the whole-scene eo:cloud_cover when the AOI
+            # number couldn't be measured, so the two are never confused. A
+            # leading ❄ marks a snow-swamped AOI, where the number is only a
+            # lower bound (cloud over snow reads as snow — see SNOW_UNRELIABLE_PCT).
+            aoi_cloud = c.get("aoi_cloud_pct")
+            aoi_snow = c.get("aoi_snow_pct")
+            aoi_method = c.get("aoi_cloud_method")   # 'ocm' | 'scl' | None
+            scene_cloud = c.get("cloud_pct")
+            snow_swamped = (aoi_cloud is not None and aoi_snow is not None
+                            and aoi_snow >= SNOW_UNRELIABLE_PCT)
+            if aoi_cloud is not None:
+                cloud = f"{aoi_cloud:.0f}%"
+                if snow_swamped:
+                    cloud = f"{CLOUD_SNOW_MARK} " + cloud
+            elif scene_cloud is not None:
+                cloud = f"~{scene_cloud:.0f}%"
+            else:
+                cloud = ""
+            cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else ("✓ " if in_comp else "  ")
-            cells = [marker + side, date, gap, cloud,
+            cells = [marker + side, date, gap, cloud, cover,
                      c.get("source", ""), c.get("id", "")]
             base = PRE_BG if side == "pre" else POST_BG
             bg = base.darker(112) if is_top else base   # the run's pick a touch darker
@@ -993,56 +1690,161 @@ class LandslideDock(QgsDockWidget):
             side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
             side_item.setCheckState(Qt.Unchecked)
             if c.get("thumb_url"):
-                self.table.item(r, 5).setToolTip(c["thumb_url"])
+                self.table.item(r, 6).setToolTip(c["thumb_url"])
+            # colour the Cloud number itself: green/amber/red by AOI cloud, grey
+            # when we only have the whole-scene value. Set here (before the
+            # off-point muting below), so a scene that misses the point still
+            # greys out wholesale — its cloud colour is moot there anyway.
+            cloud_item = self.table.item(r, 3)
+            # Grey the number only when it is genuinely untrustworthy: a snow-swamped
+            # AOI with a reassuring green/amber reading that came from the SCL/QA
+            # FALLBACK (a lower bound over snow). OmniCloudMask accounts for
+            # cloud-over-snow — that is the whole reason we switched — so an 'ocm'
+            # number keeps its true green/amber/red colour even when snow-swamped.
+            mask_color = (snow_swamped and aoi_cloud <= CLOUD_AMBER_MAX
+                          and aoi_method != "ocm")
+            cloud_item.setForeground(QBrush(
+                CLOUD_UNKNOWN if mask_color else self._cloud_color(aoi_cloud)))
+            if aoi_cloud is not None:
+                tip = (f"Cloud, cirrus & shadow over your AOI: {aoi_cloud:.0f}%.\n"
+                       f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       f"· red above.")
+                if aoi_method == "ocm":
+                    tip += ("\nMeasured by OmniCloudMask (neural cloud+shadow "
+                            "mask that judges cloud by local contrast, so it is "
+                            "not fooled by bright snow).")
+                elif aoi_method == "scl":
+                    tip += ("\nOmniCloudMask unavailable — from the SCL/QA "
+                            "classification band, a LOWER BOUND over snow.")
+                if scene_cloud is not None:
+                    tip += f"\nWhole scene (eo:cloud_cover): {scene_cloud:.0f}%."
+                if snow_swamped and aoi_method == "ocm":
+                    # OCM already handles cloud-over-snow, so this is a residual-risk
+                    # note, not a "don't trust the number" warning.
+                    tip += (f"\n\n{CLOUD_SNOW_MARK} Snow-dominated AOI "
+                            f"({aoi_snow:.0f}% snow/ice). This number is usable — "
+                            f"but thin cirrus over bright ice is the residual blind "
+                            f"spot of every optical mask, so give the thumbnail a "
+                            f"glance here.")
+                elif snow_swamped:
+                    tip += (f"\n\n{CLOUD_SNOW_MARK} Snow-swamped AOI: "
+                            f"{aoi_snow:.0f}% of the measured pixels are classed "
+                            f"snow/ice. Over glaciers the classifier often labels "
+                            f"cloud AS snow, which this count excludes — so the "
+                            f"cloud % is only a LOWER BOUND and may look clear when "
+                            f"it isn't. Judge this scene by its thumbnail, not the "
+                            f"number.")
+            else:
+                tip = ("AOI cloud unavailable — the footprint may miss your AOI box, "
+                       "or the classification read failed, so this is the WHOLE-scene "
+                       "value (shown with a ~).\n")
+                tip += (f"Whole scene (eo:cloud_cover): {scene_cloud:.0f}%."
+                        if scene_cloud is not None else "No cloud metric reported.")
+            cloud_item.setToolTip(tip)
+            self.table.item(r, 4).setToolTip(
+                f"Footprint covers {cover}% of the AOI box — how much of the area "
+                f"has pixels, NOT how cloudy it is (that's the Cloud column)."
+                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             if is_top:
                 side_item.setToolTip(
-                    "★ Best-ranked scene on this side (gap_days + cloud weighting) "
-                    "— a suggestion, not a selection. It is NOT ticked for you.")
+                    f"★ Best scene on this side: covers the event point and the most "
+                    f"of the AOI ({cover}%) with the least cloud. A suggestion, not a "
+                    f"selection — it is NOT ticked for you.")
             elif in_comp:
                 side_item.setToolTip(
-                    "✓ Also inside that ranking's top few on this side, so it's "
-                    "another reasonable pick.")
+                    "✓ Also among the best-covering, low-cloud scenes on this side, "
+                    "so it's another reasonable pick.")
             else:
                 side_item.setToolTip(
-                    "Ranked below where that suggestion stops (gap_days + cloud "
-                    "weighting). The ranking knows nothing about WHERE the cloud "
-                    "sits, so check the thumbnail — a 'cloudy' scene is often clear "
-                    "over the AOI and the right pick.")
+                    "Ranked below the suggestion (less AOI coverage, or cloudier "
+                    "over the AOI). The Cloud column is measured over your AOI now, "
+                    "not the whole scene — but still check the thumbnail, since a "
+                    "few percent can sit right on the point.")
             side_item.setToolTip(
                 side_item.toolTip() + "\n\nTick the checkbox to use this scene: a "
                 "Run downloads EXACTLY the ticked rows (and 'Preview on map' "
                 "renders them). Nothing else is added. Sentinel-2 / Landsat only — "
                 "PlanetScope has its own tab.")
+            if not covers_pt:
+                # muted text flags it visually; the tooltip says why it's demoted
+                for col in range(self.table.columnCount()):
+                    it = self.table.item(r, col)
+                    if it is not None:
+                        it.setForeground(QBrush(MUTED_FG))
+                side_item.setToolTip(
+                    side_item.toolTip() + "\n\n⚠ This scene's footprint does NOT "
+                    "cover the epicentre — its acquisition leaves the event point "
+                    "in a nodata gap, so it is ranked last and won't be the "
+                    "Preview-on-map default. It still lists in case you want the "
+                    "surrounding area.")
+        if off_point:
+            self._append_log(
+                f"note: {off_point} of {len(rows)} candidate scene(s) do not cover "
+                f"the epicentre (footprint clips the AOI but misses the point); "
+                f"they are ranked last so the ★ and Preview-on-map favour scenes "
+                f"that actually cover the event point.")
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
-    def _rank_like_run(self, cands, cloud_weight, auto_window):
-        """Order candidates exactly as imagery.search_scenes would for a Run.
+    def _cloud_color(self, pct):
+        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
 
-        auto_window: nearest day first, then clearest among same-day (cloud_weight
-        ignored). Otherwise the blend cost gap_days + cloud_weight*cloud_pct, so a
-        clearer scene a little further from the event can outrank a cloudy near one."""
+        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when
+        pct is None (no AOI measurement — the cell shows the whole-scene value
+        with a ~, so it must not read as a confident clear/cloudy signal)."""
+        if pct is None:
+            return CLOUD_UNKNOWN
+        if pct <= CLOUD_GREEN_MAX:
+            return CLOUD_CLEAR
+        if pct <= CLOUD_AMBER_MAX:
+            return CLOUD_SOME
+        return CLOUD_HEAVY
+
+    def _rank_like_run(self, cands, cloud_weight, auto_window):
+        """Order candidates for the ★ / Preview-on-map: the scene that best covers
+        the point AND the AOI, with the least cloud.
+
+        Keys, in order:
+          1. covers the epicentre (a scene that leaves the point in a nodata gap is
+             useless for a before/after there, so it sinks below every one that
+             covers it, whatever else it has going for it);
+          2. AOI coverage, bucketed to 5% (the scene filling the most of the search
+             box — fewest nodata gaps over the area);
+          3. cloud cover over the AOI, least first (falls back to the whole-scene
+             metric when the AOI number is missing; only breaks ties between
+             similarly-covering scenes — which is why coverage is bucketed);
+          4. gap_days, nearest the event last, as a final tiebreaker.
+        cloud_weight / auto_window no longer reshuffle this: coverage of the point
+        and the area is what makes a review scene usable, so it leads regardless of
+        which Run mode produced the candidates."""
+        def covers(c):
+            return 0 if self._covers_event(c) else 1        # point-covering first
+
+        def cov_bucket(c):
+            return -round(self._aoi_coverage(c) * 20)       # 5% bins, most first
+
+        def cloud(c):
+            v = c.get("aoi_cloud_pct")          # cloud over the AOI, when measured
+            if v is None:
+                v = c.get("cloud_pct")          # else the whole-scene metric
+            return 100.0 if v is None else v
+
         def gap(c):
             g = c.get("gap_days")
             return 1e9 if g is None else g
 
-        def cloud(c):
-            v = c.get("cloud_pct")
-            return 100.0 if v is None else v
-
-        if auto_window:
-            return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
-        return sorted(cands, key=lambda c: gap(c) + cloud_weight * cloud(c))
+        return sorted(cands, key=lambda c: (covers(c), cov_bucket(c), cloud(c), gap(c)))
 
     def _run_selection(self, pre, post, params):
-        """Which scenes a Run would composite per side: {'pre'/'post': {top, used}}.
+        """Which scenes to mark per side: {'pre'/'post': {top, used}}.
 
-        Mirrors fetch_event: pick the source it would use (explicit --prefer, else
-        the first of Planet→Sentinel-2→Landsat with scenes on both sides), then take
-        the top 1 (auto-window) or top 6 (default, median-composited) by the run's
-        ranking. `top` is the scene the preview should show; `used` is the full
-        composite set."""
+        Picks the source a Run would use (explicit --prefer, else the first of
+        Planet→Sentinel-2→Landsat with scenes on both sides), then ranks that
+        source's scenes by point+AOI coverage and cloud (see `_rank_like_run`).
+        `top` (the ★) is the scene the preview should show — best coverage of the
+        point and the box, least cloud; `used` (the ✓ set) is the top 1
+        (auto-window) or top 6 of that ranking."""
         cw = params.get("cloud_weight", 0.5)
         cw = 0.5 if cw is None else cw
         auto = bool(params.get("auto_window"))
@@ -1227,7 +2029,23 @@ class LandslideDock(QgsDockWidget):
 
     def _make_gallery_tile(self, c):
         date = (c.get("date") or "")[:10]
-        cloud = "—" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}%"
+        # cloud over the AOI where measured; a leading "~" falls back to the
+        # whole-scene metric and a leading ❄ marks a snow-dominated AOI — matching
+        # the table's Cloud column.
+        aoi_cloud = c.get("aoi_cloud_pct")
+        aoi_snow = c.get("aoi_snow_pct")
+        aoi_method = c.get("aoi_cloud_method")   # 'ocm' | 'scl' | None
+        scene_cloud = c.get("cloud_pct")
+        snow_swamped = (aoi_cloud is not None and aoi_snow is not None
+                        and aoi_snow >= SNOW_UNRELIABLE_PCT)
+        if aoi_cloud is not None:
+            cloud = f"{aoi_cloud:.0f}%"
+            if snow_swamped:
+                cloud = f"{CLOUD_SNOW_MARK} " + cloud
+        elif scene_cloud is not None:
+            cloud = f"~{scene_cloud:.0f}%"
+        else:
+            cloud = "—"
         gap = "" if c.get("gap_days") is None else f"{c['gap_days']}d"
         src = c.get("source", "")
         cid = c.get("id")
@@ -1237,7 +2055,17 @@ class LandslideDock(QgsDockWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\n{src}\ncloud {cloud} · {gap}")
-        tile.setToolTip(f"{src}\n{cid}\n{date}   cloud {cloud}   gap {gap}")
+        cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
+                     else f"whole-scene cloud {cloud}")
+        tip = f"{src}\n{cid}\n{date}   {cloud_tip}   gap {gap}"
+        if snow_swamped and aoi_method == "ocm":
+            tip += (f"\n{CLOUD_SNOW_MARK} snow-dominated AOI ({aoi_snow:.0f}% "
+                    f"snow/ice) — number is usable; glance at the thumbnail for "
+                    f"thin cirrus.")
+        elif snow_swamped:
+            tip += (f"\n{CLOUD_SNOW_MARK} snow-swamped AOI ({aoi_snow:.0f}% "
+                    f"snow/ice) — cloud % is a lower bound; judge by the thumbnail.")
+        tile.setToolTip(tip)
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)
         if url:
@@ -1322,6 +2150,60 @@ class LandslideDock(QgsDockWidget):
         except (TypeError, IndexError):
             return None
         return None
+
+    def _event_point(self):
+        """QgsPointXY of the event epicentre from the last search, or None.
+
+        The same lon/lat the search box is centred on (see `_aoi_bbox`)."""
+        result = self._search_result or {}
+        try:
+            return QgsPointXY(float(result.get("lon")), float(result.get("lat")))
+        except (TypeError, ValueError):
+            return None
+
+    def _covers_event(self, candidate):
+        """True if the scene's footprint actually contains the event point.
+
+        The STAC search returns every scene whose TILE footprint intersects the
+        AOI box, so a scene can clip a corner of the box yet leave the epicentre
+        in that acquisition's diagonal nodata gap — a Preview-on-map then paints
+        imagery off to one side of the point (covering the AOI, not the point).
+        This tests real coverage of the point so the ranking can sink those
+        scenes. Absent/unparseable geometry -> True (never demote a scene we
+        cannot test)."""
+        pt = self._event_point()
+        if pt is None:
+            return True
+        g = self._qgs_geom(candidate.get("geometry"))
+        if g is None or g.isEmpty():
+            return True
+        return g.contains(pt)
+
+    def _aoi_coverage(self, candidate):
+        """Fraction (0..1) of the search-AOI box the scene footprint fills.
+
+        area(footprint ∩ AOI) / area(AOI). Drives the ★/preview toward the scene
+        that fills the MOST of the box (fewest nodata gaps over the area), which
+        is the other half of 'covers the point AND the AOI'. The ratio is taken in
+        the AOI's own lon/lat space, so the box's degree anisotropy cancels top
+        and bottom. 0.0 when geometry or AOI is missing, so an untestable scene
+        never wins on coverage."""
+        bbox = self._aoi_bbox()
+        g = self._qgs_geom(candidate.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy, _ = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
 
     def _selected_ids(self):
         """Scene ids of the currently selected table rows."""
@@ -1475,11 +2357,35 @@ class LandslideDock(QgsDockWidget):
         """Remove the rasters a previous Preview-on-map added, so each preview
         shows just the current pick instead of piling up."""
         for lyr in self._preview_added:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_added = []
+        # Delete the temp GeoTIFFs those layers were reading — AFTER the layers are
+        # removed so the file handle is released — so previews don't leak temp files.
+        for path in self._preview_tmpfiles:
+            self._unlink_quiet(path)
+        self._preview_tmpfiles = []
+
+    @staticmethod
+    def _unlink_quiet(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _abort_tif_replies(self):
+        """Abort any in-flight AOI-GeoTIFF downloads and forget them. blockSignals
+        stops their finished() from decrementing THIS preview's _tif_pending — a
+        double-click can re-enter _render_picks while a batch is still downloading,
+        and a late finish would otherwise drive the counter negative and fire
+        _after_tif_downloads early/twice."""
+        for reply in list(self._tif_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tif_replies = []
 
     def _preview_row_on_map(self, item):
         """Double-click a row -> preview exactly that one scene (ignores ticks)."""
@@ -1514,16 +2420,33 @@ class LandslideDock(QgsDockWidget):
                        "tick the scene(s) you want in the table.")
             return
         scenes = []
+        off_point = 0
         for side, c, why in picks:
             date = (c.get("date") or "")[:10]
             short = "S2" if c.get("source") == "Sentinel-2" else "Landsat"
+            if not self._covers_event(c):
+                off_point += 1
             scenes.append((f"{short} {side} {date}".strip(), c["id"],
                            c.get("cog_url"), c.get("source"), why))
         self._append_log(
             f"Preview on map: rendering Highlight Optimized Natural Color over the "
             f"AOI for {len(scenes)} scene(s)…")
+        if off_point:
+            # the render still covers the AOI box, but this scene has no pixels at
+            # the epicentre — say so rather than leave the user reading a nodata gap
+            if off_point == len(scenes):
+                msg = (f"None of the {len(scenes)} scene(s) being previewed cover the "
+                       f"event point — their imagery sits to one side of the epicentre, "
+                       f"which falls in the scene's nodata gap. No Sentinel-2 / Landsat "
+                       f"scene in this window covers the point on that side.")
+            else:
+                msg = (f"{off_point} of {len(scenes)} previewed scene(s) do not cover the "
+                       f"event point (epicentre in a nodata gap); the others do.")
+            self._warn(msg)
         self._ensure_network_timeout()
         self.map_preview_btn.setEnabled(False)
+        self._abort_tif_replies()      # a re-entry (double-click) must not share this
+                                       # batch's counter with a stale in-flight one
         self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
@@ -1607,11 +2530,14 @@ class LandslideDock(QgsDockWidget):
                     f.write(data)
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
-                    QgsProject.instance().addMapLayer(lyr)
+                    lg.add_to_group(lyr, "Imagery preview")
                     self._preview_added.append(lyr)
+                    self._preview_tmpfiles.append(path)   # unlinked on next clear
                     self._append_log(
                         f"  loaded {label} (AOI render, Highlight Optimized Natural Color)")
                     added = True
+                else:
+                    self._unlink_quiet(path)   # no layer owns it; don't leak the file
             except OSError:
                 pass
         if not added:
@@ -1671,7 +2597,7 @@ class LandslideDock(QgsDockWidget):
             self._preview_failed.append(label)
             self._append_log(f"  layer would not open for {label}")
             return
-        QgsProject.instance().addMapLayer(lyr)
+        lg.add_to_group(lyr, "Imagery preview")
         self._preview_added.append(lyr)
         self._append_log(f"  loaded {label} (streamed)")
 
@@ -1790,23 +2716,120 @@ class LandslideDock(QgsDockWidget):
         self.canvas.setExtent(rect)
         self.canvas.refresh()
 
+    def _zoom_to_layers(self, layers):
+        """Frame the canvas on the combined extent of the just-created layers.
+
+        Reprojects each layer's extent into the canvas CRS and unions them, so a
+        Run lands on the imagery it produced — centred on the event AOI — instead
+        of on the first layer's raw extent (which, for the lone epicentre point,
+        collapses the zoom to a single coordinate). Zero-area layers are skipped;
+        falls back to the search AOI if nothing usable remains."""
+        dst = self.canvas.mapSettings().destinationCrs()
+        union = None
+        for lyr in layers:
+            try:
+                ext = lyr.extent()
+            except (RuntimeError, AttributeError):
+                continue
+            if ext is None or ext.isEmpty() or ext.width() <= 0 or ext.height() <= 0:
+                continue                       # skip the epicentre point (no area)
+            src = lyr.crs()
+            if dst.isValid() and src.isValid() and src != dst:
+                try:
+                    ext = QgsCoordinateTransform(
+                        src, dst, QgsProject.instance()).transformBoundingBox(ext)
+                except Exception:
+                    continue
+            if union is None:
+                union = QgsRectangle(ext)
+            else:
+                union.combineExtentWith(ext)
+        if union is None or union.isEmpty():
+            self._zoom_to_aoi()                # nothing framable -> the search box
+            return
+        union.scale(1.05)                      # a little breathing room around it
+        self.canvas.setExtent(union)
+        self.canvas.refresh()
+
     def _on_done(self):
         self._busy(False)
         result = getattr(self.task, "result", None)
         self.task = None
         if not result:
-            self._append_log("Run finished with no result.")
+            self.report_failure("The imagery run did not finish.")
             return
         status = result.get("status")
         if status == "error":
-            self._warn(f"Pipeline error: {result.get('error')}")
+            self.report_failure("The imagery tools reported an error.",
+                                str(result.get("error") or ""))
             return
         if status == "no_imagery":
             self._warn("No usable imagery found for that location/date/window.")
             return
         self._load_layers(result.get("layers", []), result)
 
+    # Ramp per change product. All three are signed so that a landslide makes
+    # them NEGATIVE (fusion_core.EVIDENCE_SIGN: dbright -1, dndsi -1; dNDVI is
+    # post-minus-pre, and a scar removes vegetation), so all three show only the
+    # negative side and fade to transparent at 0. The `lo` values are scaled off
+    # fusion_core.DEFAULT_FLOORS — dbright 0.05, dndsi 0.10 — and dNDVI is given
+    # the wider NDVI range a real defoliation covers.
+    #
+    # Distinct hues, not one ramp reused: the three layers are meant to be
+    # stacked and compared, and they must stay tellable apart in the legend.
+    # Blue / orange / purple survive the common red-green colour deficiencies.
+    # Break values are EXPLICIT rather than derived from `lo`, so the dBright
+    # ramp stays exactly the one that is already in use and validated (-0.30 /
+    # -0.15 / -0.05); deriving them shifted its last stop to -0.051.
+    CHANGE_RAMPS = _theme.CHANGE_RAMPS     # see theme.py; used by _style_change
+
+    def _style_dbright(self, lyr):
+        """Backwards-compatible shim — see _style_change."""
+        return self._style_change(lyr, "dbright")
+
+    def _style_change(self, lyr, kind="dbright"):
+        """Show ONLY where brightness DECREASED (dBright < 0); everything else clear.
+
+        dBright = post − pre broadband albedo (each 0–1), so a negative value means
+        the ground got darker after the event. An interpolated colour ramp runs from
+        an opaque blue at the strong-darkening end up to a fully transparent stop at
+        0. The ramp isn't clipped, so any value at or above 0 (no change, or a
+        brightening) clamps to that transparent 0-stop and doesn't render, while
+        values below the low bound clamp to the opaque end and stay visible."""
+        breaks, colours, what = self.CHANGE_RAMPS.get(
+            kind, self.CHANGE_RAMPS["dbright"])
+        lo, mid, near = breaks
+        stops = [
+            (lo,   colours[0], 255, f"≤ {lo:g} (strong {what})"),
+            (mid,  colours[1], 210, f"{mid:g}"),
+            (near, colours[2], 110, f"{near:g}"),
+            (0.0,  colours[2], 0,   "0 (no change — transparent)"),
+        ]
+        items = []
+        for value, color, alpha, text in stops:
+            c = QColor(color)
+            c.setAlpha(alpha)
+            items.append(QgsColorRampShader.ColorRampItem(value, c, text))
+        fn = QgsColorRampShader(lo, 0.0, None, QgsColorRampShader.Interpolated)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
+        renderer.setClassificationMin(lo)
+        renderer.setClassificationMax(0.0)
+        lyr.setRenderer(renderer)
+
     def _load_layers(self, layers, result):
+        # Each Run opens its OWN folder — "S2 7-20/7-21 20km", or "… (2)" if that
+        # event's folder already exists — so a new run never merges into a previous
+        # one. Inside it: one subfolder per product (NDVI, dNDVI, HONC…), with the
+        # predicted-epicentre point sitting at the run folder's top level.
+        prefix = SENSOR_TAG.get(result.get("sensor"), "Imagery")
+        dates = lg.date_pair(_first_date(result.get("pre_dates")),
+                             _first_date(result.get("post_dates")))
+        radius = lg.radius_tag(self._run_radius)   # e.g. "20km"; "" if unknown
+        run_group = None                 # opened on the first valid layer (never if empty)
+        subs = {}                        # product tag -> its subfolder within this run
         added = []
         for path in layers:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -1817,12 +2840,25 @@ class LandslideDock(QgsDockWidget):
             else:
                 continue
             if lyr.isValid():
-                QgsProject.instance().addMapLayer(lyr)
+                if run_group is None:
+                    run_group = lg.new_group(lg.name(prefix, dates, radius))
+                # Change rasters: show only the DECREASE that marks a scar.
+                # Previously only dBright was styled, so dNDVI and dNDSI loaded
+                # as flat grey and read as empty — the two layers the analyst is
+                # actually supposed to compare looked like failed downloads.
+                kind = _change_kind(name)
+                if kind:
+                    self._style_change(lyr, kind)
+                product = _core_product(name)
+                if product:
+                    if product not in subs:
+                        subs[product] = lg.subgroup(run_group, product)
+                    lg.add_to(lyr, subs[product])
+                else:
+                    lg.add_to(lyr, run_group)   # the predicted-epicentre point
                 added.append(lyr)
         if added:
-            extent = QgsRectangle(added[0].extent())
-            self.canvas.setExtent(extent)
-            self.canvas.refresh()
+            self._zoom_to_layers(added)   # frame the new outputs, not a stale extent
 
         # End-of-run banner: spell out WHICH satellite was actually used. In 'auto'
         # mode the pipeline falls back PlanetScope -> Sentinel-2 -> Landsat silently,
@@ -1860,6 +2896,46 @@ class LandslideDock(QgsDockWidget):
     # ---------- helpers ----------
     def _append_log(self, line):
         self.log.appendPlainText(line)
+        # Keep the tail in memory too. The child's stdout and stderr are merged
+        # into this widget, so when a run dies the cause is already here — what
+        # was missing was anything that read it back to the user.
+        try:
+            self._log_tail.append(line)
+        except AttributeError:
+            from collections import deque
+            self._log_tail = deque(maxlen=80)
+            self._log_tail.append(line)
+
+    def _log_tail_text(self, n=25):
+        try:
+            return "\n".join(list(self._log_tail)[-n:])
+        except AttributeError:
+            return ""
+
+    def report_failure(self, what, extra=""):
+        """Turn a dead-end into something the user can act on.
+
+        Replaces the pattern of writing one line to a log nobody was told to
+        look at and letting the progress bar simply vanish: names what failed,
+        adds a next step when the log matches a known cause (task.failure_hint),
+        and scrolls the log to the end so the traceback is on screen."""
+        from .task import failure_hint
+        tail = self._log_tail_text()
+        hint = failure_hint(tail)
+        msg = what
+        if extra:
+            msg += " " + extra
+        if hint:
+            msg += " " + hint
+        else:
+            msg += " See the Run log below for what it printed."
+        self._warn(msg)
+        try:
+            self.log.verticalScrollBar().setValue(
+                self.log.verticalScrollBar().maximum())
+        except (AttributeError, RuntimeError):
+            pass
+        return msg
 
     def _warn(self, text):
         self.iface.messageBar().pushWarning("Landslide", text.replace("\n", " "))
@@ -1871,6 +2947,12 @@ class LandslideDock(QgsDockWidget):
         self.settings.setValue("landslide/out", self.out_edit.text().strip())
 
     def teardown(self):
+        # hand the canvas back its previous tool: leaving the picker armed after
+        # the plugin is unloaded would swallow the user's next click
+        try:
+            self._end_pick()
+        except (AttributeError, RuntimeError):
+            pass
         # drop the project-signal connections first: they'd otherwise fire into
         # deleted widgets when the plugin is unloaded/reloaded with QGIS open
         state = getattr(self, "project_state", None)
@@ -1906,5 +2988,7 @@ class LandslideDock(QgsDockWidget):
             self.planet_tab.teardown()
         if getattr(self, "sar_tab", None) is not None:
             self.sar_tab.teardown()
+        if getattr(self, "fusion_tab", None) is not None:
+            self.fusion_tab.teardown()
         if getattr(self, "viewer3d_tab", None) is not None:
             self.viewer3d_tab.teardown()

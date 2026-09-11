@@ -59,6 +59,7 @@ OWNERS = (
     ("", ""),
     ("planet_tab", "planet"),
     ("sar_tab", "sar"),
+    ("fusion_tab", "fusion"),
     ("viewer3d_tab", "viewer3d"),
     ("volume_tab", "volume"),
 )
@@ -212,6 +213,34 @@ def _read_widget(w):
     return w.text()
 
 
+def combo_index(texts, value):
+    """Index of the saved combo choice in `texts`, or -1 to leave it alone.
+
+    Matching is on the LABEL, not the position, so reordering the items between
+    plugin versions cannot silently reinterpret a saved project.
+
+    An exact match wins. Failing that, the label is matched on the part before
+    the em-dash — the name of the thing — so that rewording the descriptive tail
+    does not lose the choice either. That case is real: nine saved projects
+    store "dNDSI — snow index change (recommended)", and moving the
+    "(recommended)" marker onto dBright would otherwise drop every one of them
+    to whatever happened to be the new default.
+
+    The head match must be UNAMBIGUOUS. If two items share a head, or none do,
+    the stored value is treated as unknown and the current choice stands —
+    guessing here would be worse than leaving a visible default in place."""
+    try:
+        return texts.index(value)
+    except ValueError:
+        pass
+    head = value.split("\u2014")[0].strip()
+    if not head:
+        return -1
+    hits = [i for i, t in enumerate(texts)
+            if t.split("\u2014")[0].strip() == head]
+    return hits[0] if len(hits) == 1 else -1
+
+
 def _write_widget(w, value):
     """Apply a stored string. Signals are left connected so dependent labels
     (day counts, cloud %) and handlers update exactly as on a user edit; a
@@ -233,9 +262,7 @@ def _write_widget(w, value):
     elif isinstance(w, QCheckBox):
         w.setChecked(value in ("1", "true", "True"))
     elif isinstance(w, QComboBox):
-        # match on label: survives items being reordered between versions, and
-        # a label that no longer exists simply leaves the current choice alone.
-        idx = w.findText(value)
+        idx = combo_index([w.itemText(i) for i in range(w.count())], value)
         if idx >= 0:
             w.setCurrentIndex(idx)
     elif isinstance(w, QLineEdit):

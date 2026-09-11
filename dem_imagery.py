@@ -36,6 +36,7 @@ it is reported, not filtered on).
 """
 from __future__ import annotations
 import datetime as dt
+import math
 import threading
 
 import pystac_client
@@ -51,6 +52,50 @@ COLLECTIONS = {
     "earthdem-strips-s2s041-2m": "EarthDEM",
     "rema-strips-s2s041-2m": "REMA",
 }
+
+# collection id -> machine 'dem_source' tag the plugin groups/ranks on
+DEM_SOURCE = {
+    "arcticdem-strips-s2s041-2m": "arcticdem",
+    "earthdem-strips-s2s041-2m": "earthdem",
+    "rema-strips-s2s041-2m": "rema",
+}
+
+# --- USGS 3DEP, via Microsoft Planetary Computer (imagery._client is signed) ---
+# 3DEP is the <50%-ArcticDEM-coverage fallback. Two collections:
+#   3dep-seamless    ONE collection holding both the ~10 m (1/3 arc-sec) and
+#                    ~30 m (1 arc-sec) BARE-EARTH DTM mosaic; per-item gsd tells
+#                    them apart. Timeless (no acquisition date). Tiled 1x1 deg,
+#                    so an AOI can span several tiles that must be mosaicked.
+#   3dep-lidar-dsm   lidar DIGITAL SURFACE MODEL (canopy/buildings included).
+#                    CONUS-ish coverage; essentially NONE in Alaska (there the
+#                    surface model is ArcticDEM 2 m). Emitted when present.
+# Assets live on a private Azure container -> the 'data' COG href must be
+# SAS-signed before a /vsicurl read; we store the UNSIGNED blob and let the
+# plugin re-sign fresh at warp time (tokens expire in ~1 h), mirroring the
+# Sentinel-2 preview path.
+PC_SEAMLESS = "3dep-seamless"
+PC_LIDAR_DSM = "3dep-lidar-dsm"
+
+# --- NRCan MRDEM (CanElevation), the Canadian analog to the 3DEP fallback ---
+# 3DEP is a US product, so it is empty north of the border — which bites on
+# Alaska/Yukon slides that sit just INSIDE Canada (longitude east of 141 W).
+# MRDEM-30 is a 30 m SEAMLESS bare-earth DTM + surface DSM over ALL of Canada,
+# distributed as anonymous Cloud-Optimized GeoTIFFs — no signing (unlike 3DEP),
+# and one national COG per model, so a bbox search returns a single item whose
+# 'dtm'/'dsm' assets are read straight over /vsicurl. Guaranteed coverage where
+# ArcticDEM is holey and 3DEP has nothing.
+CA_STAC_URL = "https://datacube.services.geo.ca/stac/api"
+MRDEM_COLL = "mrdem-30"
+
+# --- Copernicus GLO-30, the GLOBAL fallback (works anywhere on Earth) ---
+# ArcticDEM (Arctic), 3DEP (US) and MRDEM (Canada) are all REGIONAL: an AOI
+# outside them — the Alps, Andes, Himalaya, New Zealand, most of the world — gets
+# no terrain from any of the above. Copernicus GLO-30 is a near-global 30 m
+# SURFACE model (DSM, from TanDEM-X) distributed as anonymous Cloud-Optimized
+# GeoTIFFs in a public S3 bucket: no login, no signing, GDAL reads the COGs
+# straight over /vsicurl (same access path layover_dim already uses). Tiles are
+# 1°×1°, named by their SW-corner integer lat/lon; ocean cells have no tile.
+COP_DEM_BASE = "https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com"
 
 # how many candidates to return per side. Strip coverage is opportunistic:
 # a well-imaged Alaska geocell can hold dozens of strips over a decade while
@@ -72,6 +117,18 @@ def _client():
         c = pystac_client.Client.open(PGC_URL, stac_io=stac_io,
                                       timeout=im._TIMEOUT)
         _local.pgc_client = c
+    return c
+
+
+def _ca_client():
+    """Open (once per thread) and reuse the NRCan datacube STAC client — a
+    different API host from PGC, likewise anonymous and needing no signing."""
+    c = getattr(_local, "ca_client", None)
+    if c is None:
+        stac_io = StacApiIO(timeout=im._TIMEOUT, max_retries=im._RETRY)
+        c = pystac_client.Client.open(CA_STAC_URL, stac_io=stac_io,
+                                      timeout=im._TIMEOUT)
+        _local.ca_client = c
     return c
 
 
@@ -121,21 +178,205 @@ def _candidate(item, event_time):
         v = props.get(key)
         return None if v is None else round(100.0 * v, 1)
 
+    dem = _asset_href(item, "dem")
     return dict(id=item.id, date=d.isoformat() if d else None,
                 cloud_pct=pct("pgc:cloud_area_percent"),
-                gap_days=abs((d - event_time).days) if d else None,
+                gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=COLLECTIONS.get(item.collection_id, "DEM strip"),
-                thumb_url=None, cog_url=_asset_href(item, "dem"),
+                thumb_url=None, cog_url=dem,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None,
                 sensor=sensor,
                 is_xtrack=bool(props.get("pgc:is_xtrack")),
                 rmse=props.get("pgc:rmse"),
                 valid_pct=pct("pgc:valid_area_percent"),
                 gsd=props.get("gsd"),
-                dem_url=_asset_href(item, "dem"),
+                dem_url=dem, dem_urls=[dem] if dem else [],
                 hillshade_url=_asset_href(item, "hillshade"),
                 hillshade_masked_url=_asset_href(item, "hillshade_masked"),
-                mask_url=_asset_href(item, "mask"))
+                mask_url=_asset_href(item, "mask"),
+                # uniform cross-source fields (see _candidate_3dep / the plugin):
+                # a SETSM stereo strip is a first-return SURFACE model (canopy in).
+                dem_source=DEM_SOURCE.get(item.collection_id, "dem"),
+                terrain_model="DSM", is_dsm=True,
+                resolution_m=props.get("gsd") or 2,
+                provider="PGC", needs_signing=False)
+
+
+def _seamless_res(item):
+    """~10 m (1/3 arc-sec) vs ~30 m (1 arc-sec) 3DEP seamless tile, from gsd.
+    gsd is reported in metres; split at 20 m (values run ~10 and ~30)."""
+    gsd = item.properties.get("gsd")
+    if gsd is None:
+        return 10
+    return 10 if gsd < 20 else 30
+
+
+def _3dep_group(items, source, dem_source, terrain_model, is_dsm, resolution_m):
+    """Collapse the 3DEP tiles intersecting the AOI into ONE mosaic candidate.
+
+    3DEP is tiled (seamless 1x1 deg; lidar DSM smaller), so an AOI can touch
+    several tiles. Rather than flood the dropdown with tile rows, we emit a
+    single candidate whose `dem_urls` lists every tile's UNSIGNED blob href; the
+    plugin signs each and gdal.Warp mosaics them onto the AOI grid. geometry is
+    left None (a mosaic is meant to blanket the AOI; the plugin's post-warp
+    valid-pixel check is the real coverage gate). Returns None if no tile has a
+    readable 'data' asset."""
+    hrefs = []
+    for it in items:
+        a = it.assets.get("data")
+        if a is not None and a.href:
+            hrefs.append(a.href.split("?")[0])   # strip SAS; plugin re-signs
+    if not hrefs:
+        return None
+    dates = [it.datetime.replace(tzinfo=None) for it in items
+             if it.datetime is not None]
+    d = max(dates) if dates else None            # DSM tiles may carry a date
+    return dict(id=f"{dem_source}-{len(hrefs)}tile",
+                date=d.isoformat() if d else None,
+                cloud_pct=None, gap_days=None,
+                source=source, thumb_url=None, cog_url=None,
+                geometry=None, bbox=None,
+                sensor=None, is_xtrack=None, rmse=None, valid_pct=None,
+                gsd=resolution_m,
+                dem_url=hrefs[0], dem_urls=hrefs,
+                hillshade_url=None, hillshade_masked_url=None, mask_url=None,
+                dem_source=dem_source, terrain_model=terrain_model,
+                is_dsm=is_dsm, resolution_m=resolution_m,
+                provider="PlanetaryComputer", needs_signing=True)
+
+
+def search_3dep(lat, lon, radius_km):
+    """3DEP fallback candidates from Planetary Computer (SAS-signed reads).
+
+    Returns (candidates, dsm_found): up to three mosaic candidates — 3DEP 10 m
+    DTM, 3DEP 30 m DTM, 3DEP DSM — plus whether any lidar-DSM tile existed (so
+    search_event can note the Alaska no-DSM case). 3DEP is a bonus source: every
+    query is guarded so a PC hiccup (or an unknown collection) yields no
+    candidate rather than failing the whole DEM search."""
+    try:
+        cat = im._client()                        # Planetary Computer, signed
+        bbox = im._bbox(lat, lon, radius_km)
+    except Exception:
+        return [], False
+
+    def _find(coll):
+        try:
+            return im._search_items(cat, collections=[coll], bbox=bbox)
+        except Exception:
+            return []
+
+    seamless = _find(PC_SEAMLESS)
+    ten = [i for i in seamless if _seamless_res(i) == 10]
+    thirty = [i for i in seamless if _seamless_res(i) == 30]
+    dsm = _find(PC_LIDAR_DSM)
+    groups = [
+        _3dep_group(ten, "3DEP 10m", PC_SEAMLESS, "DTM", False, 10),
+        _3dep_group(thirty, "3DEP 30m", PC_SEAMLESS, "DTM", False, 30),
+        _3dep_group(dsm, "3DEP DSM", PC_LIDAR_DSM, "DSM", True, 1),
+    ]
+    return [g for g in groups if g], bool(dsm)
+
+
+def _mrdem_candidate(href, source, dem_source, terrain_model, is_dsm):
+    """One MRDEM asset -> a candidate row.
+
+    Same cross-source contract as _3dep_group, but a single ANONYMOUS COG
+    (needs_signing=False) with no date (a seamless mosaic). geometry is None:
+    MRDEM blankets Canada, so — as for 3DEP — the plugin's post-warp valid-pixel
+    check is the real coverage gate, not a footprint test."""
+    return dict(id=dem_source, date=None, cloud_pct=None, gap_days=None,
+                source=source, thumb_url=None, cog_url=href,
+                geometry=None, bbox=None,
+                sensor=None, is_xtrack=None, rmse=None, valid_pct=None,
+                gsd=30,
+                dem_url=href, dem_urls=[href],
+                hillshade_url=None, hillshade_masked_url=None, mask_url=None,
+                dem_source=dem_source, terrain_model=terrain_model,
+                is_dsm=is_dsm, resolution_m=30,
+                provider="NRCan", needs_signing=False)
+
+
+def search_canada(lat, lon, radius_km):
+    """NRCan MRDEM fallback: the CanElevation 30 m Canada-wide DEM (DTM + DSM).
+
+    The Canadian counterpart to search_3dep, for AOIs north of the border where
+    3DEP (a US product) is empty. Returns up to two candidates — MRDEM 30 m DTM
+    (bare earth) and DSM (surface) — or [] outside Canada / on any error, so it
+    stays a guarded bonus source like 3DEP. Both assets are anonymous COGs read
+    without signing."""
+    try:
+        cat = _ca_client()
+        bbox = im._bbox(lat, lon, radius_km)
+        items = im._search_items(cat, collections=[MRDEM_COLL], bbox=bbox)
+    except Exception:
+        return []
+    if not items:
+        return []
+    it = items[0]
+    out = []
+    dtm = _asset_href(it, "dtm")
+    dsm = _asset_href(it, "dsm")
+    if dtm:
+        out.append(_mrdem_candidate(dtm, "MRDEM 30m", "mrdem-30", "DTM", False))
+    if dsm:
+        out.append(_mrdem_candidate(dsm, "MRDEM 30m DSM", "mrdem-30-dsm", "DSM", True))
+    return out
+
+
+def _cop_dem_tile_url(sw_lat, sw_lon):
+    """URL of the 1°×1° Copernicus GLO-30 DSM COG whose SW corner is (sw_lat,
+    sw_lon). Mirrors layover_dim._cop_dem_tile_url so both read the same bucket."""
+    ns = f"N{sw_lat:02d}" if sw_lat >= 0 else f"S{abs(sw_lat):02d}"
+    ew = f"E{sw_lon:03d}" if sw_lon >= 0 else f"W{abs(sw_lon):03d}"
+    name = f"Copernicus_DSM_COG_10_{ns}_00_{ew}_00_DEM"
+    return f"{COP_DEM_BASE}/{name}/{name}.tif"
+
+
+def _url_exists(url, timeout=30):
+    """HEAD-check a COG so ocean/missing GLO-30 tiles are skipped before they're
+    handed to gdal.Warp (a non-existent /vsicurl source fails the whole warp)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200) == 200
+    except Exception:
+        return False
+
+
+def search_glo30(lat, lon, radius_km):
+    """Copernicus GLO-30 fallback: the near-global 30 m surface model (DSM).
+
+    The GLOBAL safety net, tried after every regional source — it delivers
+    terrain wherever ArcticDEM/3DEP/MRDEM don't reach. Returns a single mosaic
+    candidate whose `dem_urls` lists every intersecting 1°×1° tile COG that
+    actually exists (ocean cells have none), read straight over /vsicurl and
+    reprojected to the AOI grid by the plugin's warp — exactly like the 3DEP
+    mosaic, minus the signing. geometry is None (a near-global mosaic; the
+    plugin's post-warp valid-pixel check is the real coverage gate). Returns []
+    when no tile covers the AOI or on any error, so it stays a guarded bonus
+    source like 3DEP / MRDEM. Anonymous COGs, no signing."""
+    try:
+        west, south, east, north = im._bbox(lat, lon, radius_km)
+        tiles = [(la, lo)
+                 for la in range(math.floor(south), math.floor(north) + 1)
+                 for lo in range(math.floor(west), math.floor(east) + 1)]
+        hrefs = [u for u in (_cop_dem_tile_url(la, lo) for la, lo in tiles)
+                 if _url_exists(u)]
+    except Exception:
+        return []
+    if not hrefs:
+        return []
+    return [dict(id=f"cop-glo30-{len(hrefs)}tile", date=None,
+                 cloud_pct=None, gap_days=None,
+                 source="Copernicus GLO-30", thumb_url=None, cog_url=hrefs[0],
+                 geometry=None, bbox=None,
+                 sensor=None, is_xtrack=None, rmse=None, valid_pct=None,
+                 gsd=30,
+                 dem_url=hrefs[0], dem_urls=hrefs,
+                 hillshade_url=None, hillshade_masked_url=None, mask_url=None,
+                 dem_source="cop-glo30", terrain_model="DSM", is_dsm=True,
+                 resolution_m=30, provider="Copernicus", needs_signing=False)]
 
 
 def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIMIT):
@@ -215,6 +456,30 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=1825,
         if not found:
             notes.append(_nearest_outside_note(lat, lon, radius_km,
                                                event_time, side))
+    # 3DEP fallback candidates (bare-earth DTM + lidar DSM), always searched so
+    # the plugin can prefer them when ArcticDEM covers <50% of the AOI. They are
+    # timeless (date=None) and ride on the pre list; run_single's gap-sort pushes
+    # dateless rows to the back, and the plugin re-tiers by source.
+    extra, dsm_found = search_3dep(lat, lon, radius_km)
+    if not dsm_found:
+        notes.append("3DEP: no lidar DSM tiles at this AOI (expected in Alaska — "
+                     "ArcticDEM 2 m is the surface model there; 3DEP seamless "
+                     "adds a coarser bare-earth DTM fallback)")
+    # MRDEM: the Canadian fallback, tried after 3DEP. It blankets all of Canada,
+    # so it is the source that actually delivers terrain for slides just inside
+    # the border, where ArcticDEM is holey and 3DEP (US-only) is empty.
+    ca = search_canada(lat, lon, radius_km)
+    if ca:
+        notes.append("MRDEM: added NRCan CanElevation 30 m DEM (DTM + DSM), "
+                     "seamless over all of Canada — the fallback used when "
+                     "ArcticDEM is holey and 3DEP (US-only) has no data here")
+    # Copernicus GLO-30: the GLOBAL last resort, so the viewer/differencer can
+    # resolve terrain anywhere the regional sources above don't reach.
+    glo = search_glo30(lat, lon, radius_km)
+    if glo:
+        notes.append("GLO-30: added Copernicus GLO-30 (near-global 30 m surface "
+                     "model) — the global fallback used when no regional DEM "
+                     "(ArcticDEM / 3DEP / MRDEM) covers the AOI")
     return dict(source="DEM strips", notes=notes,
-                pre=[_candidate(i, event_time) for i in pre_items],
+                pre=[_candidate(i, event_time) for i in pre_items] + extra + ca + glo,
                 post=[_candidate(i, event_time) for i in post_items])

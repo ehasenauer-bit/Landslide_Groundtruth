@@ -241,6 +241,15 @@ def _overlaps(a, b, tol_km=DEFAULT_TOL_KM):
                 or a[1] - dlat > b[3] or a[3] + dlat < b[1])
 
 
+def _contains_point(box, lon, lat):
+    """Does (w, s, e, n) `box` bracket the point? The strict "covers the epicentre"
+    test — the delivered clip's footprint must actually surround the exact event
+    location, vs `_overlaps`, which passes any clip merely touching the AOI box. A
+    PlanetScope strip that clipped to one side of the AOI overlaps but does NOT contain
+    the epicentre, so this drops it where `_overlaps` would keep it."""
+    return box[0] <= lon <= box[2] and box[1] <= lat <= box[3]
+
+
 def record_bbox(rec):
     """(w, s, e, n) of what a record delivered: its stored bbox, else its centre."""
     if rec.get("bbox"):
@@ -252,7 +261,7 @@ def record_bbox(rec):
 
 def find(event_id=None, lat=None, lon=None, side=None, scene_ids=None,
          radius_km=None, require_radius_km=None, tol_km=DEFAULT_TOL_KM,
-         require_files=False):
+         require_files=False, require_point=False):
     """Ledger records for one event/AOI, newest first.
 
     Match rules:
@@ -277,6 +286,11 @@ def find(event_id=None, lat=None, lon=None, side=None, scene_ids=None,
                   pixels. It deliberately tests the requested radius, not the delivered
                   footprint — a strip that only partly covered the AOI delivered all it
                   ever will, so re-ordering it would buy identical pixels twice.
+    require_point: with a query lat/lon, require the record's delivered footprint to
+                  CONTAIN that point (see _contains_point), not merely overlap the AOI
+                  box. The strict "covers the exact epicentre" filter — mirrors the
+                  search side's --coverage point — used by the recall picker so a strip
+                  that clipped to one edge of the AOI, missing the event, is dropped.
     require_files: keep only records whose clips are still on disk (an offline recall).
     """
     want = set(scene_ids or [])
@@ -293,7 +307,10 @@ def find(event_id=None, lat=None, lon=None, side=None, scene_ids=None,
             continue
         rec_box = record_bbox(r)
         if query_box and rec_box:
-            if not _overlaps(query_box, rec_box, tol_km):
+            if require_point:
+                if not _contains_point(rec_box, lon, lat):
+                    continue
+            elif not _overlaps(query_box, rec_box, tol_km):
                 continue
         elif event_id:
             if r.get("event_id") != event_id:
@@ -327,24 +344,48 @@ def newest_by_side(recs):
     return out
 
 
+def _scene_date(sid):
+    """'20260625_215817_62_2538' -> '2026-06-25'; None if not date-prefixed.
+
+    A PlanetScope scene id begins with its acquisition date, which is how the imagery is
+    named everywhere the user sees it (layer names, the candidate table) — so it, not the
+    order-placement time, is what makes an order recognisable in the picker."""
+    d = (sid or "")[:8]
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else None
+
+
 def describe(rec):
-    """One-line human summary for logs and the plugin's order picker."""
-    when = (rec.get("created_utc") or "?")[:16].replace("T", " ")
+    """One-line human summary for logs and the plugin's order picker.
+
+    Leads with the SCENE acquisition date(s), NOT the order-placement time: that date is
+    what the layer names and candidate table show, so it is how the user matches an order
+    to imagery they already have. The narrow picker elides the MIDDLE of the label, so a
+    leading scene date and the trailing order-id/disk status stay visible while the raw
+    scene ids between them are what get truncated (they were the old label's lead, which
+    made an order read as its 2026-08-19 order date instead of its 2026-06-25 scene)."""
     ids = rec.get("scene_ids") or []
+    dates = sorted({d for d in (_scene_date(s) for s in ids) if d})
+    if not dates:
+        head = "ordered " + (rec.get("created_utc") or "?")[:10]
+    elif len(dates) == 1:
+        head = dates[0]
+    else:
+        head = f"{dates[0]}…{dates[-1]} ({len(dates)})"
     scenes = ", ".join(ids[:2]) + (f" +{len(ids) - 2}" if len(ids) > 2 else "")
     disk = "on disk" if has_files(rec) else "re-download (free)"
-    return (f"{rec.get('side') or '?'} · {when} · {scenes or 'scenes unknown'} · "
+    return (f"{rec.get('side') or '?'} · {head} · {scenes or 'scenes unknown'} · "
             f"order {rec['order_id'][:12]} · {disk}")
 
 
 def entries(event_id=None, lat=None, lon=None, radius_km=None,
-            tol_km=DEFAULT_TOL_KM):
+            tol_km=DEFAULT_TOL_KM, require_point=False):
     """Serializable ledger listing for the plugin's picker / --planet-list-orders.
 
     With no event_id/lat/lon the whole ledger is returned, so you can see everything
-    the account has already paid for across every project."""
+    the account has already paid for across every project. require_point restricts a
+    located query to orders whose delivered footprint contains the epicentre (see find)."""
     recs = (find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km,
-                 tol_km=tol_km)
+                 tol_km=tol_km, require_point=require_point)
             if (event_id or (lat is not None and lon is not None)) else load())
     return [dict(r, path=resolve_path(r), on_disk=has_files(r), label=describe(r))
             for r in recs]

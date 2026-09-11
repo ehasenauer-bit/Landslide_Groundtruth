@@ -16,10 +16,15 @@ creates/updates that native 3D view and points the camera at the AOI. The 3D doc
 a normal QGIS dock — drag it onto this panel's tab to sit them side by side.
 
 Terrain sources:
-  * Auto-fetch ArcticDEM 2 m — reuses the project's DEM-strip search
-    (`run_single.py --prefer dem --search-only`, PGC's anonymous AWS Open Data) to
-    find strips over the AOI, then warps the chosen strip to a local UTM GeoTIFF via
-    dem_diff.warp (/vsicurl ranged COG reads — only the AOI's bytes are fetched).
+  * Auto-fetch a DEM over the AOI — reuses the project's DEM search
+    (`run_single.py --prefer dem --search-only`) to find every DEM over the AOI,
+    then warps the chosen one to a local UTM GeoTIFF via dem_diff.warp (/vsicurl
+    ranged COG reads — only the AOI's bytes are fetched). A 'Preferred source'
+    picker chooses which to use: Auto (coverage-driven fallback chain) or a forced
+    ArcticDEM (PGC 2 m, Arctic/Alaska) / USGS 3DEP (US) / NRCan MRDEM (Canada) /
+    Copernicus GLO-30 (near-global 30 m) — the last making terrain resolvable
+    anywhere on Earth, not just the Arctic. Every found DEM is also listed in the
+    'DEM candidate' dropdown to override the pick by hand.
   * A DEM raster already loaded in the project (e.g. a local ArcticDEM / Copernicus
     GLO-30 mosaic) — used directly, nothing fetched.
 
@@ -29,6 +34,7 @@ helpers it shared (dem_diff.warp / utm_bounds / write_gtiff) are reused above.
 import os
 import math
 import re
+import hashlib
 
 import numpy as np
 
@@ -41,12 +47,14 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsTask,
     QgsVector3D, QgsHillshadeRenderer, QgsGeometry, QgsPointXY, Qgis,
-    QgsCoordinateTransform, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle,
 )
 from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 
 from . import dem_diff
+from . import layer_group as lg
 from .task import PipelineTask
+from .flow_layout import FlowRow
 
 # The terrain settings class we build ourselves (the canvas owns its
 # Qgs3DMapSettings; we mutate that live and only construct the terrain settings).
@@ -62,6 +70,47 @@ except Exception as e:                       # pragma: no cover - depends on bui
 
 # the native 3D view's title (used to create / find / close it)
 VIEW_NAME = "Landslide 3D"
+
+# Planetary Computer's public asset-signing endpoint. 3DEP 'data' COGs live in a
+# private Azure container; their SAS tokens expire (~1 h), so the pipeline stores
+# the UNSIGNED blob href in search.json and we re-sign fresh just before the warp.
+PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
+
+# machine 'dem_source' tags that mean a PGC SETSM strip (vs a fallback DEM)
+PGC_SOURCES = ("arcticdem", "earthdem", "rema")
+
+# Fallback DEM tiers, in the order they're tried when an ArcticDEM strip warps to
+# <50% valid pixels (or fails outright): USGS 3DEP first (finer where it exists,
+# but US-only), then NRCan MRDEM (30 m, seamless over Canada — the one that
+# actually delivers terrain just north of the border), and finally Copernicus
+# GLO-30 (near-global 30 m, so terrain resolves ANYWHERE the regional sources
+# don't reach). Matched on dem_source prefix; see _tier_of.
+FALLBACK_TIERS = ("3dep", "mrdem", "cop-glo30")
+
+# When the chosen terrain is an ArcticDEM strip, warp it together with the other
+# overlapping strips so one strip's gaps get filled by another's (a single
+# opportunistic stereo pass can leave the event point in a hole even when its
+# footprint clips the AOI). Cap the mosaic so a decade of strips over a well-
+# imaged geocell can't fan out into dozens of /vsicurl reads — the greedy
+# footprint pick in _pgc_gapfill_cands stops as soon as the AOI is blanketed.
+MAX_MOSAIC_STRIPS = 8
+
+
+def _pc_sign(href):
+    """SAS-sign a Planetary Computer blob href. Returns the signed URL, or the
+    original href on any failure (the warp then fails cleanly and is reported).
+    Runs off the GUI thread inside the warp worker, so it uses stdlib urllib."""
+    if not href or "windows.net" not in href:
+        return href                      # already local / non-PC → leave as-is
+    try:
+        import json
+        from urllib.request import urlopen
+        from urllib.parse import quote
+        url = PC_SIGN_URL + "?href=" + quote(href, safe="")
+        with urlopen(url, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8")).get("href") or href
+    except Exception:
+        return href
 
 # warp resolution for the auto-fetched ArcticDEM terrain. 2 m is native but the
 # ranged download and the terrain tessellation both grow quadratically as the
@@ -99,14 +148,25 @@ class Viewer3DTab(QWidget):
         self._warp_task = None           # in-flight ArcticDEM warp (in-process)
         self._search_result = None       # last search.json (strip candidates)
         self._gen = 0                    # terrain-build generation (drops stale warps)
+        self._pgc_fallback = None        # best ArcticDEM warp set aside while trying
+                                         # 3DEP, to install if 3DEP comes up empty
 
         self._dem_layer = None           # QgsRasterLayer used as terrain
         self._dem_mean_z = None          # mean AOI elevation, for the camera
+        self._dem_date = None            # terrain source acquisition date (display)
         self._hillshade_layer = None     # optional draped multidirectional hillshade
         self._canvas3d = None            # the native 3D canvas we created
         self._scene_extent = None        # last scene extent (scene CRS), for Reset
         self._flip_cache = {}            # imagery layer id -> aligned cache layer id
         self._extra_scene_layers = []    # non-drape layer ids kept in the scene (point)
+
+        # A terrain/hillshade layer removed from the project leaves a dangling C++
+        # handle; drop our reference before the object is deleted so later access
+        # (e.g. the before/after refresh) can't hit "C/C++ object has been deleted".
+        try:
+            QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_removed)
+        except Exception:
+            pass
 
         self._build_ui()
         self._on_source_changed()
@@ -159,7 +219,8 @@ class Viewer3DTab(QWidget):
         form.addRow("Event time (UTC)", self.dt_edit)
         root.addLayout(form)
 
-        copy_btn = QPushButton("Copy location & date from Sentinel-2 / Landsat tab")
+        # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
+        copy_btn = QPushButton("Copy location && date from Sentinel-2 / Landsat tab")
         copy_btn.clicked.connect(self._copy_from_main)
         root.addWidget(copy_btn)
 
@@ -168,15 +229,51 @@ class Viewer3DTab(QWidget):
         tform = QFormLayout(terr_box)
 
         self.source_combo = QComboBox()
-        self.source_combo.addItem("Auto-fetch ArcticDEM 2 m (PGC)", "arcticdem")
+        # data "arcticdem" is the legacy tag for the auto-fetch MODE (it now spans
+        # ArcticDEM/3DEP/MRDEM/GLO-30 — the actual source is the 'Preferred source'
+        # picker below); "loaded" uses a DEM already in the project.
+        self.source_combo.addItem("Auto-fetch a DEM over the AOI", "arcticdem")
         self.source_combo.addItem("Use a DEM layer loaded in the project", "loaded")
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         tform.addRow("Source", self.source_combo)
 
+        # which DEM the auto-fetch actually resolves terrain from. 'Auto' keeps the
+        # coverage-driven fallback chain; the rest force one source and fall back to
+        # the best available only if it has no data over the AOI.
+        self.pref_combo = QComboBox()
+        self.pref_combo.addItem("Auto — best coverage (recommended)", "auto")
+        self.pref_combo.addItem("ArcticDEM — PGC 2 m (Arctic / Alaska)", "pgc")
+        self.pref_combo.addItem("USGS 3DEP (United States)", "3dep")
+        self.pref_combo.addItem("NRCan MRDEM (Canada)", "mrdem")
+        self.pref_combo.addItem("Copernicus GLO-30 (global 30 m)", "cop-glo30")
+        self.pref_combo.setToolTip(
+            "Which DEM the auto-fetch builds terrain from. 'Auto' picks the best "
+            "coverage over the AOI — ArcticDEM (2 m, Arctic/Alaska) first, then "
+            "3DEP (US), MRDEM (Canada) and Copernicus GLO-30 (near-global 30 m) as "
+            "fallbacks. Force one to override that; if it has no data here the "
+            "search falls back to the best available (see the DEM candidate list). "
+            "Change it after a search to re-pick without re-searching.")
+        self.pref_row_label = QLabel("Preferred source")
+        self.pref_combo.currentIndexChanged.connect(self._on_pref_changed)
+        tform.addRow(self.pref_row_label, self.pref_combo)
+
         # loaded-DEM picker (raster layers in the project)
         self.loaded_combo = QComboBox()
-        self.loaded_dem_row_label = QLabel("Loaded DEM")
+        self.loaded_dem_row_label = QLabel("Loaded DEM / DSM")
+        self.loaded_combo.setToolTip(
+            "Any single-band elevation raster already loaded in the project — a "
+            "DSM (surface, canopy/buildings in) or a DTM (bare earth). Pick it, "
+            "tag its model below, then Fetch / build terrain.")
         tform.addRow(self.loaded_dem_row_label, self.loaded_combo)
+
+        # tag the loaded layer's terrain model so the layer name + the volume-tab
+        # DSM-vs-DTM guardrail know what it is (the search path tags this itself).
+        self.loaded_model_combo = QComboBox()
+        self.loaded_model_combo.addItem("Surface model (DSM — canopy/buildings in)", "DSM")
+        self.loaded_model_combo.addItem("Bare-earth model (DTM)", "DTM")
+        self.loaded_model_combo.addItem("Unknown / don't tag", "")
+        self.loaded_model_row_label = QLabel("This layer is a")
+        tform.addRow(self.loaded_model_row_label, self.loaded_model_combo)
 
         # auto-fetch controls
         self.res_combo = QComboBox()
@@ -187,7 +284,11 @@ class Viewer3DTab(QWidget):
 
         self.strip_combo = QComboBox()
         self.strip_combo.setEnabled(False)
-        self.strip_row_label = QLabel("ArcticDEM strip")
+        self.strip_combo.setToolTip(
+            "Every DEM found over the AOI, best-first — ArcticDEM strips plus any "
+            "3DEP / MRDEM / GLO-30 fallbacks. The 'Preferred source' picks which "
+            "one is selected here; override it by hand to warp a specific one.")
+        self.strip_row_label = QLabel("DEM candidate")
         self.strip_combo.currentIndexChanged.connect(self._on_strip_changed)
         tform.addRow(self.strip_row_label, self.strip_combo)
 
@@ -210,8 +311,17 @@ class Viewer3DTab(QWidget):
         self.zfactor_spin.setRange(0.5, 5.0)
         self.zfactor_spin.setSingleStep(0.5)
         self.zfactor_spin.setValue(1.0)
-        self.zfactor_spin.setPrefix("z ")
+        # Was an unlabelled "z 1.00" spinbox; give it a visible label + tooltip so
+        # it doesn't read as a mystery control next to the hillshade checkbox.
+        zfactor_lbl = QLabel("z-factor")
+        zfactor_tip = (
+            "Hillshade z-factor: vertical exaggeration applied only to the "
+            "shaded-relief calculation (steepens the shading). Separate from the "
+            "scene's Vertical exaggeration above; 1.0 = true slope.")
+        zfactor_lbl.setToolTip(zfactor_tip)
+        self.zfactor_spin.setToolTip(zfactor_tip)
         hs_row.addWidget(self.hillshade_check, 1)
+        hs_row.addWidget(zfactor_lbl)
         hs_row.addWidget(self.zfactor_spin)
         tform.addRow("Hillshade", self._wrap(hs_row))
 
@@ -237,6 +347,8 @@ class Viewer3DTab(QWidget):
         dlay.addWidget(hint)
         self.drape_list = QListWidget()
         self.drape_list.setMinimumHeight(120)
+        # (un)ticking a drape layer changes what the Before/After pickers may offer
+        self.drape_list.itemChanged.connect(self._on_drape_checks_changed)
         dlay.addWidget(self.drape_list)
         refresh_btn = QPushButton("Refresh layer list")
         refresh_btn.clicked.connect(self._refresh_drape_list)
@@ -301,6 +413,15 @@ class Viewer3DTab(QWidget):
         self.add_point_btn.clicked.connect(self._add_point_to_3d)
         fbl.addWidget(self.add_point_btn)
 
+        orow = QFormLayout()
+        self.overlay_combo = QgsCheckableComboBox()
+        self.overlay_combo.setToolTip(
+            "Vector layers to drape on the exported 3D web viewer's terrain: "
+            "polygons (translucent fill + outline), lines, and points (peaks — a "
+            "marker on a short pole). Tick any you want baked into the viewer.")
+        orow.addRow("Overlays (web)", self.overlay_combo)
+        fbl.addLayout(orow)
+
         self.web_btn = QPushButton("Export instant-flip 3D web viewer")
         self.web_btn.setToolTip(
             "Bake the DEM plus the ticked Before/After image(s) into a single "
@@ -313,19 +434,67 @@ class Viewer3DTab(QWidget):
         fbl.addWidget(self.web_btn)
         root.addWidget(flip_box)
 
+        # --- figure Details (captions for the exported PNG) ---------------
+        det_box = QgsCollapsibleGroupBox("Figure details (exported PNG)")
+        det_box.setSaveCollapsedState(False)
+        det_box.setCollapsed(True)
+        dform = QFormLayout(det_box)
+        # imagery source is a dropdown of the plugin's sources (editable for others)
+        self.det_imagery_sat = QComboBox()
+        self.det_imagery_sat.setEditable(True)
+        self.det_imagery_sat.addItems([
+            "", "PlanetScope (~3 m)", "Sentinel-2 (~10 m)", "Landsat (~30 m)",
+            "Sentinel-1 (SAR)", "Maxar / WorldView"])
+        self.det_imagery_sat.setToolTip(
+            "Satellite/source of the before & after imagery — pick one or type your own.")
+        dform.addRow("Imagery satellite", self.det_imagery_sat)
+        self.det_terrain_sat = QLineEdit()
+        self.det_area = QLineEdit()
+        self.det_cl_length = QLineEdit()
+        self.det_cl_drop = QLineEdit()
+        self.det_volume = QLineEdit()
+        for lbl, w, tip in (
+            ("Terrain satellite", self.det_terrain_sat, "auto-filled from the DEM source; editable"),
+            ("Area", self.det_area, "landslide area (Pull from the Volume tab, or type)"),
+            ("Centerline length", self.det_cl_length, "runout horizontal length"),
+            ("Vertical drop", self.det_cl_drop, "centerline elevation drop"),
+            ("Volume", self.det_volume, "paste the estimate from the Volume tab"),
+        ):
+            # the placeholder already shows `tip` in the empty field; an
+            # identical tooltip would only repeat it (rule b), so don't set one.
+            w.setPlaceholderText(tip)
+            dform.addRow(lbl, w)
+        self.pull_vol_btn = QPushButton("↻ Pull area / centerline / volume from Volume tab")
+        self.pull_vol_btn.setToolTip(
+            "Copy the latest area, centerline length + vertical drop, and volume "
+            "estimate from the 'Volume from area' tab into the fields above. Run a "
+            "measurement (and the centerline) there first.")
+        self.pull_vol_btn.clicked.connect(self._pull_volume_details)
+        dform.addRow(self.pull_vol_btn)
+        root.addWidget(det_box)
+
         # --- actions -------------------------------------------------------
-        btn_row = QHBoxLayout()
+        # FlowRow (not a fixed QHBoxLayout) so the three buttons wrap onto a
+        # second line instead of clipping their labels in a narrow dock.
+        btn_row = FlowRow()
         self.open_btn = QPushButton("Open / update 3D view")
         self.open_btn.clicked.connect(self._open_view)
         self.open_btn.setEnabled(False)
+        self.open_btn.setToolTip(
+            "Fetch / build terrain first — the 3D scene needs a terrain DEM. "
+            "Once terrain is built this opens (or updates) the QGIS 3D view.")
+        # open_btn was the primary action (added with stretch 2); FlowRow has no
+        # stretch, so carry that emphasis with a bold font + default button.
+        f = self.open_btn.font(); f.setBold(True); self.open_btn.setFont(f)
+        self.open_btn.setDefault(True)
         self.reset_btn = QPushButton("Reset camera")
         self.reset_btn.clicked.connect(self._reset_camera)
         self.close_btn = QPushButton("Close 3D view")
         self.close_btn.clicked.connect(self._close_view)
-        btn_row.addWidget(self.open_btn, 2)
-        btn_row.addWidget(self.reset_btn, 1)
-        btn_row.addWidget(self.close_btn, 1)
-        root.addLayout(btn_row)
+        btn_row.addWidget(self.open_btn)
+        btn_row.addWidget(self.reset_btn)
+        btn_row.addWidget(self.close_btn)
+        root.addWidget(btn_row)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -369,10 +538,11 @@ class Viewer3DTab(QWidget):
 
     def _on_source_changed(self):
         auto = self.source_combo.currentData() == "arcticdem"
-        for w in (self.res_combo, self.res_row_label, self.strip_combo,
-                  self.strip_row_label):
+        for w in (self.pref_combo, self.pref_row_label, self.res_combo,
+                  self.res_row_label, self.strip_combo, self.strip_row_label):
             w.setVisible(auto)
-        for w in (self.loaded_combo, self.loaded_dem_row_label):
+        for w in (self.loaded_combo, self.loaded_dem_row_label,
+                  self.loaded_model_combo, self.loaded_model_row_label):
             w.setVisible(not auto)
         if not auto:
             self._populate_loaded_dems()
@@ -397,6 +567,7 @@ class Viewer3DTab(QWidget):
         Preserve the user's ticks across refreshes; on the first populate (nothing
         ticked yet) default to the layers currently visible in the tree."""
         prev = set(self._checked_drape_ids())
+        self.drape_list.blockSignals(True)      # rebuild silently; refresh once below
         self.drape_list.clear()
         root = QgsProject.instance().layerTreeRoot()
         for lyr in self._project_rasters():
@@ -412,6 +583,7 @@ class Viewer3DTab(QWidget):
                 check = bool(node and node.isVisible())
             item.setCheckState(Qt.Checked if check else Qt.Unchecked)
             self.drape_list.addItem(item)
+        self.drape_list.blockSignals(False)
         self._refresh_before_after()
 
     def _checked_drape_ids(self):
@@ -421,6 +593,11 @@ class Viewer3DTab(QWidget):
             if it.checkState() == Qt.Checked:
                 ids.append(it.data(Qt.UserRole))
         return ids
+
+    def _on_drape_checks_changed(self, *_):
+        """A drape layer was (un)ticked. The Before/After pickers only offer
+        layers that are being draped, so re-populate them to match."""
+        self._refresh_before_after()
 
     def _aoi(self):
         """(lat, lon, radius_km) or None with a warning."""
@@ -456,6 +633,7 @@ class Viewer3DTab(QWidget):
         self.strip_combo.setEnabled(False)
         self.strip_combo.blockSignals(False)
         self._search_result = None
+        self._pgc_fallback = None
         self._busy(True)
         self._log("Searching PGC for ArcticDEM strips over the AOI (free, no download)…")
         self.task = PipelineTask(python, script, project, args, out,
@@ -479,7 +657,9 @@ class Viewer3DTab(QWidget):
         out = os.path.join(base_out, "viewer3d")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -502,30 +682,47 @@ class Viewer3DTab(QWidget):
             self._log("Search finished with no result.")
             return
         self._search_result = result
-        # merge pre + post candidates; prefer strips that actually cover the event
+        # merge pre + post candidates (ArcticDEM strips + the 3DEP fallbacks the
+        # pipeline appends); keep only those carrying a data URL.
         cands = list(result.get("pre", [])) + list(result.get("post", []))
-        cands = [c for c in cands if c.get("dem_url")]
+        cands = [c for c in cands if c.get("dem_url") or c.get("dem_urls")]
         if not cands:
-            self._log("No ArcticDEM strips found over this AOI. Try a larger radius, "
-                      "or load a DEM manually and use 'Use a DEM layer'.")
-            self._warn("No ArcticDEM strips found over the AOI.")
+            self._log("No DEM (ArcticDEM or 3DEP) found over this AOI. Try a larger "
+                      "radius, or load a DEM manually and use 'Use a DEM layer'.")
+            self._warn("No DEM found over the AOI.")
             return
         cands = self._rank_strips(cands)
         self.strip_combo.blockSignals(True)
         self.strip_combo.clear()
         for c in cands:
-            date = (c.get("date") or "?")[:10]
+            date = (c.get("date") or "seamless")[:10]
+            src = c.get("source", "DEM")
+            model = c.get("terrain_model", "")
             cov = "covers event" if c.get("_covers") else "overlaps AOI"
-            self.strip_combo.addItem(f"{date}  ·  {cov}", c)
+            label = " ".join(x for x in (date, "·", src, model, "·", cov) if x)
+            self.strip_combo.addItem(label, c)
         self.strip_combo.setEnabled(True)
+        # default selection: honor the 'Preferred source' picker if it forces one,
+        # else auto — ArcticDEM if its footprints blanket >=50% of the AOI,
+        # otherwise the best fallback (the <50% trigger).
+        self.strip_combo.setCurrentIndex(self._default_strip_index(cands))
         self.strip_combo.blockSignals(False)
-        self._log(f"Found {len(cands)} ArcticDEM strip(s). Warping the top one; "
-                  f"switch strips with the dropdown if it has gaps over the AOI.")
+        n_pgc = sum(1 for c in cands if c.get("dem_source") in PGC_SOURCES)
+        n_3dep = sum(1 for c in cands if str(c.get("dem_source", "")).startswith("3dep"))
+        self._log(f"Found {n_pgc} ArcticDEM + {n_3dep} 3DEP DEM option(s). Warping "
+                  f"the selected one; switch with the dropdown if it has gaps.")
+        for note in result.get("notes", []):
+            self._log("note: " + note)
         self._warp_selected_strip()
 
     def _rank_strips(self, cands):
-        """Best-first: strips that cover the event point, then newest acquisition
-        first (the most current terrain surface)."""
+        """Best-first, in source tiers so a fallback never outranks usable
+        ArcticDEM.
+
+        Tier 0 = PGC SETSM strips (ArcticDEM/EarthDEM/REMA), then the fallbacks
+        in FALLBACK_TIERS order (3DEP → MRDEM → GLO-30). Within a tier: entries
+        covering the event point first, then ArcticDEM by newest acquisition and
+        the fallbacks by finest resolution (DSM 1 m → 10 m → 30 m)."""
         result = self._search_result or {}
         try:
             lat, lon = float(result.get("lat")), float(result.get("lon"))
@@ -533,9 +730,18 @@ class Viewer3DTab(QWidget):
             lat = lon = None
         for c in cands:
             c["_covers"] = self._covers_point(c, lat, lon)
-        # stable sort: newest date first, then bring covering strips to the front
-        cands.sort(key=lambda c: (c.get("date") or ""), reverse=True)
-        cands.sort(key=lambda c: 0 if c["_covers"] else 1)
+
+        def key(c):
+            covers = 0 if c["_covers"] else 1
+            if c.get("dem_source") in PGC_SOURCES:
+                dstr = (c.get("date") or "").replace("-", "")
+                dnum = int(dstr) if dstr.isdigit() else 0
+                return (0, covers, -dnum)          # newest ArcticDEM first
+            tier = self._tier_of(c)                # 3DEP → MRDEM → GLO-30
+            rank = 1 + FALLBACK_TIERS.index(tier) if tier in FALLBACK_TIERS else 99
+            return (rank, covers, c.get("resolution_m") or 999)   # finest first
+
+        cands.sort(key=key)
         return cands
 
     def _covers_point(self, cand, lat, lon):
@@ -549,9 +755,240 @@ class Viewer3DTab(QWidget):
             return True
         return geom.contains(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
+    def _arcticdem_footprint_cover(self, cands, lat, lon, radius_km):
+        """Fraction of the AOI box the ArcticDEM footprints (union) blanket.
+
+        Cheap, geometry-only, zero byte reads — answers 'can ArcticDEM cover this
+        AOI at all' (the <50% trigger) better than any single strip's post-warp
+        valid-pixel fraction. Uses unaryUnion so overlapping strips aren't double
+        counted. Interior holes the footprint polygon can't see are caught later
+        by the post-warp check in _on_warp_done."""
+        dlat = radius_km / 111.32
+        dlon = radius_km / (111.32 * math.cos(math.radians(lat)))
+        aoi = QgsGeometry.fromRect(
+            QgsRectangle(lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+        geoms = []
+        for c in cands:
+            if c.get("dem_source") not in PGC_SOURCES:
+                continue
+            g = self.dock._qgs_geom(c.get("geometry"))
+            if g is not None and not g.isEmpty():
+                geoms.append(g)
+        if not geoms:
+            return 0.0
+        inter = QgsGeometry.unaryUnion(geoms).intersection(aoi)
+        area = aoi.area()
+        if inter is None or inter.isEmpty() or area <= 0:
+            return 0.0
+        return min(1.0, inter.area() / area)
+
+    def _point_in_pgc_footprint(self, cands, lat, lon):
+        """True if the event point lies inside the union of ArcticDEM strip
+        footprints — i.e. at least one strip actually has data AT the point, not
+        just somewhere in the AOI box. This is the coverage that matters: a strip
+        can blanket >=50% of the box off to one side and still leave the centred
+        point in a hole (the '56% covered but the point is bare' case). Strips
+        without footprint geometry are ignored here; if none carry geometry this
+        returns False and the box-coverage test below still gets a say."""
+        pt = QgsGeometry.fromPointXY(QgsPointXY(lon, lat))
+        for c in cands:
+            if c.get("dem_source") not in PGC_SOURCES:
+                continue
+            g = self.dock._qgs_geom(c.get("geometry"))
+            if g is not None and not g.isEmpty() and g.contains(pt):
+                return True
+        return False
+
+    def _preferred_source(self):
+        """The 'Preferred source' picker's tag ('auto' / 'pgc' / '3dep' /
+        'mrdem' / 'cop-glo30'). 'auto' means the coverage-driven fallback chain."""
+        try:
+            return self.pref_combo.currentData() or "auto"
+        except Exception:
+            return "auto"
+
+    def _default_strip_index(self, cands):
+        """Combo index to auto-warp, honoring the 'Preferred source' picker.
+
+        'Auto' defers to _pick_default_strip (coverage-driven). A forced source
+        selects its best-ranked candidate; if that source found nothing over the
+        AOI, it logs and falls back to the auto pick rather than leaving the user
+        with no terrain. `cands` is ranked, so the first tier match is the best."""
+        pref = self._preferred_source()
+        if pref == "auto":
+            return self._pick_default_strip(cands)
+        for i, c in enumerate(cands):
+            if self._tier_of(c) == pref:
+                self._log(f"Preferred source: using {c.get('source', pref)} "
+                          f"(forced — change 'Preferred source' to Auto to let "
+                          f"coverage decide).")
+                return i
+        label = self.pref_combo.currentText()
+        self._log(f"Preferred source '{label}' found no DEM over this AOI — "
+                  f"using the best available instead.")
+        return self._pick_default_strip(cands)
+
+    def _on_pref_changed(self):
+        """Re-apply the source preference to the current search without re-
+        fetching. Does nothing until a search has populated the candidate list."""
+        if not self.strip_combo.isEnabled() or self.strip_combo.count() == 0:
+            return
+        cands = [self.strip_combo.itemData(i)
+                 for i in range(self.strip_combo.count())]
+        # a fresh, deliberate source choice — drop any ArcticDEM held from an
+        # earlier auto <50% → fallback switch so the forced pick installs cleanly.
+        self._pgc_fallback = None
+        self._select_and_warp_index(self._default_strip_index(cands))
+
+    def _pick_default_strip(self, cands):
+        """Combo index to auto-warp: the best ArcticDEM strip if any strip covers
+        the event point OR the strip footprints blanket >=50% of the AOI, else the
+        first available fallback (3DEP, then MRDEM). `cands` is ranked, so index 0
+        is the best ArcticDEM strip when any exist. The gaps around the chosen
+        strip get mosaicked shut at warp time (see _pgc_gapfill_cands)."""
+        result = self._search_result or {}
+        try:
+            lat, lon = float(result.get("lat")), float(result.get("lon"))
+            radius = float(result.get("params", {}).get("radius_km"))
+        except (TypeError, ValueError):
+            return 0
+        cover = self._arcticdem_footprint_cover(cands, lat, lon, radius)
+        point_ok = self._point_in_pgc_footprint(cands, lat, lon)
+        if point_ok or cover >= 0.5:
+            why = ("covers the event point" if point_ok
+                   else f"blankets ~{cover*100:.0f}% of the AOI (>=50%)")
+            self._log(f"ArcticDEM {why} — using ArcticDEM (overlapping strips "
+                      f"mosaicked to fill gaps).")
+            return 0
+        nxt = self._fallback_index("pgc")
+        if nxt >= 0:
+            src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
+            self._log(f"No ArcticDEM strip covers the event point and its footprints "
+                      f"blanket only ~{cover*100:.0f}% of the AOI — defaulting to "
+                      f"{src}.")
+            return nxt
+        self._log(f"No ArcticDEM strip covers the event point and its footprints "
+                  f"cover only ~{cover*100:.0f}% of the AOI, and no fallback DEM was "
+                  f"found here — using ArcticDEM (may have gaps).")
+        return 0
+
+    def _tier_of(self, cand):
+        """Source tier of a candidate: 'pgc' (ArcticDEM/EarthDEM/REMA), a fallback
+        tier from FALLBACK_TIERS ('3dep' / 'mrdem'), or 'other'."""
+        cand = cand or {}
+        if cand.get("dem_source") in PGC_SOURCES:
+            return "pgc"
+        ds = str(cand.get("dem_source", ""))
+        for tier in FALLBACK_TIERS:
+            if ds.startswith(tier):
+                return tier
+        return "other"
+
+    def _fallback_index(self, after_tier):
+        """Combo index of the next fallback DEM to try after `after_tier`, or -1.
+
+        'pgc' starts at the first fallback tier; a fallback tier starts at the one
+        after it — so the chain runs ArcticDEM → 3DEP → MRDEM and stops."""
+        if after_tier == "pgc":
+            start = 0
+        elif after_tier in FALLBACK_TIERS:
+            start = FALLBACK_TIERS.index(after_tier) + 1
+        else:
+            start = 0
+        for tier in FALLBACK_TIERS[start:]:
+            for i in range(self.strip_combo.count()):
+                if self._tier_of(self.strip_combo.itemData(i)) == tier:
+                    return i
+        return -1
+
+    def _select_and_warp_index(self, idx):
+        """Switch the dropdown to a specific candidate and warp it WITHOUT firing
+        the manual-pick handler — that would clear the ArcticDEM safety net we
+        need if this fallback also comes up empty."""
+        self.strip_combo.blockSignals(True)
+        self.strip_combo.setCurrentIndex(idx)
+        self.strip_combo.blockSignals(False)
+        self._warp_selected_strip()
+
     def _on_strip_changed(self):
         if self.strip_combo.isEnabled() and self.strip_combo.currentData():
+            # a manual pick starts fresh — drop any ArcticDEM held from an earlier
+            # auto <50% → 3DEP switch, so hand-selecting 3DEP can't install it
+            self._pgc_fallback = None
             self._warp_selected_strip()
+
+    @staticmethod
+    def _cand_urls(cand):
+        """A candidate's data URLs (dem_urls list, or the single dem_url)."""
+        return list(cand.get("dem_urls") or
+                    ([cand["dem_url"]] if cand.get("dem_url") else []))
+
+    def _mosaic_urls_for(self, primary, lat, lon, radius):
+        """URLs to warp for `primary`. For an ArcticDEM strip, greedily fold in
+        the other overlapping strips so their footprints, unioned with the
+        primary's, blanket the AOI box — one strip's gaps get filled by another's.
+        Non-PGC sources (3DEP/MRDEM) are already AOI-wide mosaics, so they warp
+        from their own tiles unchanged.
+
+        Ordering matters: gdal.Warp paints sources in list order and the LAST
+        valid pixel wins, so `primary` (the strip the dropdown label names, and
+        whose date the layer carries) goes last to stay on top, better-ranked
+        fillers just under it, and the rest below — the others only ever show
+        through where the strips above them have no data."""
+        if self._tier_of(primary) != "pgc":
+            return self._cand_urls(primary)
+
+        dlat = radius / 111.32
+        dlon = radius / (111.32 * math.cos(math.radians(lat)))
+        box = QgsGeometry.fromRect(
+            QgsRectangle(lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+        box_area = box.area()
+
+        def cover_in_box(cand):
+            g = self.dock._qgs_geom(cand.get("geometry"))
+            if g is None or g.isEmpty():
+                return None
+            g = g.intersection(box)
+            return None if (g is None or g.isEmpty()) else g
+
+        # candidates in ranked (best-first) order, primary excluded
+        others = []
+        for i in range(self.strip_combo.count()):
+            c = self.strip_combo.itemData(i)
+            if c is not primary and self._tier_of(c) == "pgc" and self._cand_urls(c):
+                others.append(c)
+
+        covered = cover_in_box(primary)
+        chosen = []                          # fillers, best-ranked first
+        for c in others:
+            if len(chosen) + 1 >= MAX_MOSAIC_STRIPS:
+                break
+            g = cover_in_box(c)
+            if g is None:
+                continue
+            if covered is None:
+                covered, chosen = g, chosen + [c]
+                continue
+            gain = g.difference(covered)
+            if gain is not None and not gain.isEmpty() and gain.area() > 0.02 * box_area:
+                covered = covered.combine(g)
+                chosen.append(c)
+            if covered is not None and covered.area() >= 0.98 * box_area:
+                break
+
+        # painter's order: worst filler first … best filler … primary last (top).
+        # Primary's url(s) are appended last unconditionally, so even if a filler
+        # repeats one it can't pull the primary off the top of the stack.
+        primary_urls = self._cand_urls(primary)
+        pset = set(primary_urls)
+        urls, seen = [], set()
+        for c in reversed(chosen):
+            for u in self._cand_urls(c):
+                if u and u not in seen and u not in pset:
+                    seen.add(u)
+                    urls.append(u)
+        urls += [u for u in primary_urls if u]
+        return urls
 
     def _warp_selected_strip(self):
         cand = self.strip_combo.currentData()
@@ -561,90 +998,265 @@ class Viewer3DTab(QWidget):
         if aoi is None:
             return
         lat, lon, radius = aoi
-        res = self.res_combo.currentData()
+        # don't oversample a coarse source onto a finer grid than it carries: warp
+        # at max(user resolution, the candidate's native resolution).
+        res = max(self.res_combo.currentData(), int(cand.get("resolution_m") or 0))
         epsg = dem_diff.utm_epsg(lat, lon)
         dlat = radius / 111.32
         dlon = radius / (111.32 * math.cos(math.radians(lat)))
         bounds = dem_diff.utm_bounds(lon - dlon, lat - dlat, lon + dlon, lat + dlat,
                                      epsg, res)
+        # Radius and resolution are independent controls, so nothing stopped a
+        # combination that cannot finish: 50 km at 2 m is a 50000x50000 grid,
+        # ~10 GB per float32 array. QGIS gives no warning for that, it just stops
+        # responding. Refuse it here and say which of the two knobs to turn.
+        from . import limits
+        ok, msg = limits.check_grid(bounds[2] - bounds[0], bounds[3] - bounds[1],
+                                    res, what="terrain grid")
+        if not ok:
+            self._warn(msg)
+            self._log(msg)
+            return
+        if msg:
+            self._log(msg)
         base_out = self.dock.out_edit.text().strip() or os.path.join(
             self.dock.project_edit.text().strip(), "out", "interactive")
         out_dir = os.path.join(base_out, "viewer3d")
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"terrain_{epsg}_{res}m.tif")
-        url = cand["dem_url"]
+        # source in the cache name so ArcticDEM and 3DEP at the same epsg/res don't
+        # clobber each other.
+        src_tag = cand.get("dem_source", "src")
+        out_path = os.path.join(out_dir, f"terrain_{epsg}_{res}m_{src_tag}.tif")
+        urls = self._mosaic_urls_for(cand, lat, lon, radius)
+        if not urls:
+            self._warn("Selected DEM candidate has no data URL.")
+            return
+        src_label = cand.get("source", "DEM")
         self._gen += 1
         gen = self._gen
         self._busy(True)
-        self._log(f"Warping strip to {res} m over the AOI (EPSG:{epsg})…")
+        if self._tier_of(cand) == "pgc" and len(urls) > 1:
+            extra = f" (mosaicking {len(urls)} overlapping strips to fill gaps)"
+        elif len(urls) > 1:
+            extra = f" ({len(urls)} tiles)"
+        else:
+            extra = ""
+        self._log(f"Warping {src_label}{extra} to {res} m over the AOI (EPSG:{epsg})…")
         self._warp_task = QgsTask.fromFunction(
-            "Warp ArcticDEM strip", self._warp_worker,
+            f"Warp {src_label}", self._warp_worker,
             on_finished=lambda exc, res_: self._on_warp_done(exc, res_, gen, out_path),
-            url=url, bounds=bounds, epsg=epsg, res=res, out_path=out_path)
+            url=urls, bounds=bounds, epsg=epsg, res=res, out_path=out_path,
+            sign=bool(cand.get("needs_signing")))
         QgsApplication.taskManager().addTask(self._warp_task)
 
     @staticmethod
-    def _warp_worker(task, url, bounds, epsg, res, out_path):
+    def _warp_worker(task, url, bounds, epsg, res, out_path, sign=False):
         """Runs off the GUI thread: /vsicurl ranged read + warp to the AOI grid.
-        Touches only GDAL/numpy (dem_diff), never Qt."""
-        arr, gt, proj = dem_diff.warp(url, bounds, epsg, res)
+        Touches only GDAL/numpy/urllib (dem_diff + PC signing), never Qt."""
+        urls = [url] if isinstance(url, str) else list(url)
+        if sign:                          # 3DEP: SAS-sign each blob href fresh
+            urls = [_pc_sign(u) for u in urls]
+        arr, gt, proj = dem_diff.warp(urls, bounds, epsg, res)
         valid = dem_diff.valid_heights(arr)
         cover = float(valid.mean()) if valid.size else 0.0
         if cover <= 0.0:
             return {"error": "no valid elevation pixels over the AOI"}
+        # whether the AOI centre — the event point, since bounds are centred on
+        # it — actually resolved to a valid pixel. A strip can cover most of the
+        # box yet leave the point itself in a hole, which is the coverage the
+        # user cares about; drives the point-aware fallback in _on_warp_done.
+        h, w = valid.shape
+        point_valid = bool(valid[h // 2, w // 2])
         zmean = float(np.nanmean(arr[valid]))
         dem_diff.write_gtiff(out_path, np.where(valid, arr, np.nan), gt, proj)
-        return {"path": out_path, "zmean": zmean, "cover": cover}
+        return {"path": out_path, "zmean": zmean, "cover": cover,
+                "point_valid": point_valid, "n_sources": len(urls)}
 
     def _on_warp_done(self, exc, result, gen, out_path):
         if gen != self._gen:
             return                       # a newer fetch superseded this one
         self._busy(False)
         self._warp_task = None
-        if exc is not None:
-            self._log(f"Warp failed: {exc}")
-            self._warn("ArcticDEM warp failed — see the log.")
+
+        cand = self.strip_combo.currentData() or {}
+        tier = self._tier_of(cand)
+
+        if exc is not None or not result or result.get("error"):
+            reason = (str(exc) if exc is not None
+                      else (result or {}).get("error", "unknown error"))
+            # Walk the fallback chain: the source that just failed hands off to
+            # the next tier (ArcticDEM <50% → 3DEP → MRDEM). When the chain is
+            # exhausted, install the partial ArcticDEM we set aside rather than
+            # leave the user with nothing — it was already warped to disk.
+            nxt = self._fallback_index(tier)
+            if nxt >= 0:
+                src = (self.strip_combo.itemData(nxt) or {}).get("source", "the next DEM")
+                self._log(f"{cand.get('source', 'That source')} produced no "
+                          f"terrain ({reason}); trying {src}…")
+                self._select_and_warp_index(nxt)
+                return
+            if self._pgc_fallback is not None:
+                saved = self._pgc_fallback
+                self._pgc_fallback = None
+                pct = saved["result"]["cover"] * 100
+                self._log(f"No fallback DEM resolved terrain here ({reason}); "
+                          f"installing the ArcticDEM strip despite covering just "
+                          f"{pct:.0f}% of the AOI. Expect holes — pick another "
+                          f"strip or shrink the radius if they matter.")
+                self._warn("Fallback DEMs empty here — using the partial "
+                           "ArcticDEM strip (see log).")
+                self._install_warp_result(saved["result"], saved["cand"])
+                return
+            if exc is not None:
+                self._log(f"Warp failed: {reason}")
+                self._warn("DEM warp failed — see the log.")
+            else:
+                self._log(f"Warp produced no terrain: {reason}. Try another strip "
+                          f"or a larger radius.")
             return
-        if not result or result.get("error"):
-            msg = (result or {}).get("error", "unknown error")
-            self._log(f"Warp produced no terrain: {msg}. Try another strip or a "
-                      f"larger radius.")
-            return
+
+        cover = result["cover"]
+        point_bare = not result.get("point_valid", True)
+        # post-warp safety net: the ArcticDEM mosaic warped to <50% valid pixels
+        # over the AOI, or — even at decent box coverage — left the event point
+        # itself in a hole (no overlapping strip had data there). Either way try
+        # the fallback chain rather than install terrain that's holey where it
+        # matters, but hold on to THIS result so that if every fallback is empty
+        # here we still fall back to it (a partial surface beats no terrain).
+        # Only in Auto mode: a user who FORCED ArcticDEM gets ArcticDEM (holes and
+        # a coverage warning), not a silent switch to a coarser source.
+        if (self._preferred_source() == "auto" and tier == "pgc"
+                and (cover < 0.5 or point_bare)):
+            nxt = self._fallback_index("pgc")
+            if nxt >= 0:
+                self._pgc_fallback = {"result": result, "cand": cand}
+                src = (self.strip_combo.itemData(nxt) or {}).get("source", "a fallback DEM")
+                if point_bare:
+                    why = ("left the event point in a hole"
+                           + (f" and resolved only {cover*100:.0f}% of the AOI"
+                              if cover < 0.5 else
+                              f" ({cover*100:.0f}% of the AOI covered elsewhere)"))
+                else:
+                    why = f"resolved only {cover*100:.0f}% valid pixels over the AOI (<50%)"
+                self._log(f"The ArcticDEM mosaic {why}; trying {src}…")
+                self._select_and_warp_index(nxt)
+                return
+        self._pgc_fallback = None
+        self._install_warp_result(result, cand)
+
+    def _install_warp_result(self, result, cand):
+        """Install a completed warp as the terrain layer: mean Z for the camera, a
+        descriptive name, the DSM/DTM guardrail note, and a low-coverage warning.
+
+        Shared by the normal success path and the "3DEP was empty, keep the
+        partial ArcticDEM" fallback, so both name and warn about the terrain the
+        same way — the caller has already decided this result is the one to use."""
         cover = result["cover"]
         self._dem_mean_z = result["zmean"]
-        self._set_terrain_from_file(result["path"],
-                                    f"ArcticDEM terrain ({cover*100:.0f}% AOI cover)")
+        src = cand.get("source", "DEM")
+        model = cand.get("terrain_model", "")
+        d = cand.get("date")
+        if d:
+            date_str = d[:10]                       # ArcticDEM strip acquisition day
+        elif str(cand.get("dem_source", "")).startswith("3dep-seamless"):
+            date_str = "seamless mosaic"            # 3DEP seamless is timeless
+        else:
+            date_str = "undated"
+        n_src = result.get("n_sources", 1)
+        is_pgc_mosaic = cand.get("dem_source") in PGC_SOURCES and n_src > 1
+        mosaic_tag = f"+{n_src - 1} strip mosaic" if is_pgc_mosaic else ""
+        name = " ".join(x for x in (src, model, date_str, mosaic_tag, "terrain",
+                                    f"({cover*100:.0f}% AOI cover)") if x)
+        self._set_terrain_from_file(result["path"], name, date_str)
+        if not self.det_terrain_sat.text().strip():
+            self.det_terrain_sat.setText(self._terrain_sensor(cand))
+        # A gap-filling mosaic mixes strips of different dates and a few metres of
+        # per-strip vertical bias — fine as context terrain, wrong for differencing.
+        if is_pgc_mosaic:
+            self._log(f"Terrain is a mosaic of {n_src} ArcticDEM strips — the gaps in "
+                      f"the {date_str} strip are filled from others. Fine for the 3D "
+                      f"view, but the patches carry different dates and small vertical "
+                      f"offsets, so don't feed THIS layer into the volume/differencing "
+                      f"tab; pick a single dated strip there.")
+        # DSM vs DTM guardrail (this terrain may feed the volume/differencing tab).
+        if model:
+            kind = ("surface model — canopy/buildings INCLUDED" if cand.get("is_dsm")
+                    else "bare-earth model — canopy/buildings removed")
+            self._log(f"Terrain is a {model} ({kind}). Do NOT difference a DSM "
+                      f"against a DTM in the volume tab — the canopy/building height "
+                      f"offset reads as fake elevation change.")
         if cover < 0.6:
-            self._log(f"Note: this strip covers only {cover*100:.0f}% of the AOI — "
-                      f"pick another strip in the dropdown if the terrain has holes.")
+            self._log(f"Note: this DEM covers only {cover*100:.0f}% of the AOI — pick "
+                      f"another entry in the dropdown if the terrain has holes.")
 
-    def _set_terrain_from_file(self, path, name):
+    def _set_terrain_from_file(self, path, name, date=None):
         lyr = QgsRasterLayer(path, name)
         if not lyr.isValid():
             self._warn(f"Could not load terrain raster:\n{path}")
             return
-        QgsProject.instance().addMapLayer(lyr)
-        self._install_terrain_layer(lyr)
+        lg.add_to_group(lyr, "3D terrain")
+        self._install_terrain_layer(lyr, date=date)
 
     def _use_loaded_dem(self):
         lid = self.loaded_combo.currentData()
         lyr = QgsProject.instance().mapLayer(lid) if lid else None
         if lyr is None or not isinstance(lyr, QgsRasterLayer):
-            self._warn("Pick a single-band DEM raster loaded in the project.")
+            self._warn("Pick a single-band DEM/DSM raster loaded in the project.")
             return
         self._dem_mean_z = self._sample_center_z(lyr)
-        self._install_terrain_layer(lyr)
+        model = self.loaded_model_combo.currentData()
+        name = f"{lyr.name()} ({model})" if model else lyr.name()
+        # the plugin can't know a loaded raster's acquisition date, but DEM files
+        # usually carry it in the name/path (e.g. SETSM ..._20150803_...) — sniff it.
+        sniff = self._sniff_date(lyr.name(), lyr.source())
+        date = f"{sniff} (from filename)" if sniff else "unknown (loaded layer)"
+        self._install_terrain_layer(lyr, name, date)
+        if not self.det_terrain_sat.text().strip():
+            self.det_terrain_sat.setText(lyr.name())
+        if model:
+            kind = ("surface model — canopy/buildings INCLUDED" if model == "DSM"
+                    else "bare-earth model — canopy/buildings removed")
+            self._log(f"Loaded terrain tagged as {model} ({kind}). Do NOT difference "
+                      f"a DSM against a DTM in the volume tab.")
 
-    def _install_terrain_layer(self, lyr):
-        """Adopt `lyr` as the terrain DEM, (re)build the hillshade, refresh lists."""
+    def _install_terrain_layer(self, lyr, name=None, date=None):
+        """Adopt `lyr` as the terrain DEM, (re)build the hillshade, refresh lists.
+
+        `name` overrides the display label (e.g. a source/model-tagged name);
+        `date` is the source's acquisition date (or a note like 'seamless
+        mosaic' / 'unknown (loaded layer)'), shown so the terrain's provenance
+        is visible."""
         self._dem_layer = lyr
-        self.terrain_label.setText(f"Terrain: {lyr.name()}")
+        self._dem_date = date
+        label = name or lyr.name()
+        datetxt = f"   ·   acquired {date}" if date else ""
+        self.terrain_label.setText(f"Terrain: {label}{datetxt}")
         self.open_btn.setEnabled(True)
         self.web_btn.setEnabled(True)
         self._rebuild_hillshade()
         self._refresh_drape_list()
-        self._log(f"Terrain ready: {lyr.name()}. Tick drape layers, then "
-                  f"'Open / update 3D view'.")
+        self._log(f"Terrain ready: {label}"
+                  + (f" — acquired {date}" if date else "")
+                  + ". Tick drape layers, then 'Open / update 3D view'.")
+
+    @staticmethod
+    def _sniff_date(*texts):
+        """First YYYY-MM-DD / YYYYMMDD date found in the given strings, or None.
+
+        DEM filenames commonly embed the acquisition date (ArcticDEM/SETSM strips
+        as ..._YYYYMMDD_..., Copernicus/USGS tiles as YYYY-MM-DD), so this recovers
+        it for a hand-loaded DEM the plugin has no metadata for."""
+        import re
+        for t in texts:
+            if not t:
+                continue
+            m = re.search(r"(?:19|20)\d{2}[-_]?\d{2}[-_]?\d{2}", str(t))
+            if m:
+                s = re.sub(r"[-_]", "", m.group(0))
+                mo, dy = int(s[4:6]), int(s[6:8])
+                if 1 <= mo <= 12 and 1 <= dy <= 31:      # guard against a random 8-digit run
+                    return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+        return None
 
     def _rebuild_hillshade(self):
         """Add/refresh a multidirectional hillshade of the terrain DEM as a drapeable
@@ -652,14 +1264,12 @@ class Viewer3DTab(QWidget):
         renderer — no extra file written."""
         # drop a stale hillshade
         if self._hillshade_layer is not None:
-            try:
-                QgsProject.instance().removeMapLayer(self._hillshade_layer.id())
-            except Exception:
-                pass
+            lg.remove_layer(self._hillshade_layer)
             self._hillshade_layer = None
-        if not self.hillshade_check.isChecked() or self._dem_layer is None:
+        dem = self._alive(self._dem_layer)
+        if not self.hillshade_check.isChecked() or dem is None:
             return
-        src = self._dem_layer.source()
+        src = dem.source()
         hs = QgsRasterLayer(src, "Hillshade (multidirectional)")
         if not hs.isValid():
             return
@@ -667,7 +1277,7 @@ class Viewer3DTab(QWidget):
         renderer.setMultiDirectional(True)
         renderer.setZFactor(self.zfactor_spin.value())
         hs.setRenderer(renderer)
-        QgsProject.instance().addMapLayer(hs)
+        lg.add_to_group(hs, "3D terrain")
         self._hillshade_layer = hs
 
     @staticmethod
@@ -734,6 +1344,14 @@ class Viewer3DTab(QWidget):
         if not scene_crs.isValid() or extent.isEmpty():
             self._warn("Could not derive a projected scene CRS from the DEM.")
             return
+        # Clip the scene to where the ticked before/after imagery actually
+        # covers (their combined bbox ∩ DEM); fall back to the full DEM when
+        # nothing is ticked yet.
+        proj = QgsProject.instance()
+        ba_ids = self._checked_ids(self.before_combo) + \
+            self._checked_ids(self.after_combo)
+        extent = self._drape_crop_extent(
+            scene_crs, [proj.mapLayer(i) for i in ba_ids], extent)
         center = extent.center()
         zc = self._dem_mean_z if self._dem_mean_z is not None else 0.0
 
@@ -888,16 +1506,46 @@ class Viewer3DTab(QWidget):
                 return l
         return None
 
+    @staticmethod
+    def _alive(obj):
+        """Return obj if its underlying C++ object still exists, else None.
+
+        Guards against 'wrapped C/C++ object … has been deleted' when a stored
+        layer is removed from the project but our Python reference lingers."""
+        if obj is None:
+            return None
+        try:
+            from qgis.PyQt import sip
+        except ImportError:
+            try:
+                import sip
+            except ImportError:
+                return obj                     # can't check -> assume alive
+        try:
+            return None if sip.isdeleted(obj) else obj
+        except Exception:
+            return None
+
+    def _on_layers_removed(self, layer_ids):
+        """Drop terrain/hillshade references when their layers leave the project."""
+        ids = set(layer_ids)
+        for attr in ("_dem_layer", "_hillshade_layer"):
+            lyr = self._alive(getattr(self, attr, None))
+            if lyr is not None and lyr.id() in ids:
+                setattr(self, attr, None)
+
     def _candidate_rasters(self):
         """Project rasters selectable as before/after images.
 
         Excludes our own '(3D cache)' copies and the current terrain DEM /
         hillshade, so the pickers list imagery, not the surface it drapes on."""
         skip = set()
-        if self._dem_layer is not None:
-            skip.add(self._dem_layer.id())
-        if self._hillshade_layer is not None:
-            skip.add(self._hillshade_layer.id())
+        dem = self._alive(self._dem_layer)
+        if dem is not None:
+            skip.add(dem.id())
+        hs = self._alive(self._hillshade_layer)
+        if hs is not None:
+            skip.add(hs.id())
         return [l for l in self._project_rasters()
                 if not l.name().endswith("(3D cache)") and l.id() not in skip]
 
@@ -907,7 +1555,18 @@ class Viewer3DTab(QWidget):
         On the first populate, default the ticks to an auto-detected pre/post
         pair (…_pre_/…_post_ or PlanetScope before/after) so the common case
         needs no picking; the user can tick any other layer(s), one or more."""
-        rasters = self._candidate_rasters()
+        # The Before/After pickers only offer layers ticked for draping — you
+        # can't flip to imagery that isn't on the terrain. Keep drape-list order;
+        # if nothing is ticked yet, fall back to all candidates so the UI isn't
+        # dead on first open.
+        cand = self._candidate_rasters()
+        checked = self._checked_drape_ids()
+        if checked:
+            rank = {lid: n for n, lid in enumerate(checked)}
+            rasters = sorted((l for l in cand if l.id() in rank),
+                             key=lambda l: rank[l.id()])
+        else:
+            rasters = cand
         first = self.before_combo.count() == 0 and self.after_combo.count() == 0
         for combo in (self.before_combo, self.after_combo):
             prev = set(self._checked_ids(combo))
@@ -934,6 +1593,17 @@ class Viewer3DTab(QWidget):
             self.before_btn.setChecked(False)
             self.after_btn.setChecked(False)
         self.add_point_btn.setEnabled(HAS_3D and self._find_point_layer() is not None)
+        # web-viewer overlays: any vector layer (polygon / line / point), stable
+        # order so ticks don't jump around on refresh.
+        prevv = set(self._checked_ids(self.overlay_combo))
+        self.overlay_combo.blockSignals(True)
+        self.overlay_combo.clear()
+        vlayers = sorted((l for l in QgsProject.instance().mapLayers().values()
+                          if isinstance(l, QgsVectorLayer)), key=lambda l: l.name())
+        for l in vlayers:
+            self.overlay_combo.addItem(l.name(), l.id())
+        self._set_checked(self.overlay_combo, prevv)
+        self.overlay_combo.blockSignals(False)
 
     def _checked_ids(self, combo):
         """Layer ids ticked in a QgsCheckableComboBox, in list order."""
@@ -1076,9 +1746,13 @@ class Viewer3DTab(QWidget):
             return None
         src_uri = src.source()
         safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in src.name())
+        # Disambiguate by SOURCE, not just display name: two different layers can
+        # sanitize to the same `safe` string and would otherwise share one cache
+        # file, so one layer would flip to the other's imagery.
+        uid = hashlib.sha1(src_uri.encode("utf-8", "surrogatepass")).hexdigest()[:8]
         crs = self._scene_crs()
         dtag = ((crs.authid() if crs else "") or "utm").replace(":", "_")
-        out_path = os.path.join(d, f"{safe}__{dtag}.3dcache.tif")
+        out_path = os.path.join(d, f"{safe}__{uid}__{dtag}.3dcache.tif")
         if not os.path.exists(out_path):
             self._log(f"flip cache: building {os.path.basename(out_path)} …")
             opts = dict(
@@ -1210,6 +1884,70 @@ class Viewer3DTab(QWidget):
                     continue
         return False
 
+    # ------------------------------------------- figure details ----
+    def _pull_volume_details(self):
+        """Copy area / centerline / volume from the Volume tab's last result.
+
+        Reads only the volume tab's public-ish result dict (self._current);
+        defensive so it degrades to a warning if the tab hasn't run or its
+        shape changed. Every field stays user-editable afterwards."""
+        vt = getattr(self.dock, "volume_tab", None)
+        cur = getattr(vt, "_current", None) if vt is not None else None
+        if not cur:
+            self._warn("No Volume-tab result yet — run a measurement in the "
+                       "'Volume from area' tab (and compute the centerline) first.")
+            return
+
+        def num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        a = num(cur.get("a_conv")) or num(cur.get("a_total")) or num(cur.get("src_best"))
+        vb, vl, vh = num(cur.get("v_best")), num(cur.get("v_low")), num(cur.get("v_high"))
+        ln, dr = num(cur.get("length")), num(cur.get("drop"))
+        if a is not None:
+            self.det_area.setText(f"{a/1e6:.2f} km²" if a >= 1e5 else f"{a:.0f} m²")
+        if ln is not None:
+            self.det_cl_length.setText(f"{ln/1000:.2f} km" if ln >= 1000 else f"{ln:.0f} m")
+        if dr is not None:
+            self.det_cl_drop.setText(f"{dr:.0f} m")
+        if vb is not None:
+            s = self._fmt_vol(vb)
+            if vl is not None and vh is not None:
+                if abs(vb) >= 1e6 and abs(vl) >= 1e6 and abs(vh) >= 1e6:
+                    s += f"  ({vl/1e6:.2f}–{vh/1e6:.2f} Mm³)"   # unit once, for legibility
+                else:
+                    s += f"  ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
+            self.det_volume.setText(s)
+        got = [k for k, v in (("area", a), ("length", ln), ("drop", dr),
+                              ("volume", vb)) if v is not None]
+        if got:
+            self._log("Pulled from Volume tab: " + ", ".join(got) + ".")
+        else:
+            self._warn("Volume tab has a result but no area/centerline/volume "
+                       "numbers yet — measure + compute the centerline there.")
+
+    @staticmethod
+    def _fmt_vol(v):
+        if v is None:
+            return "?"
+        return f"{v/1e6:.2f} Mm³" if abs(v) >= 1e6 else f"{v:,.0f} m³"
+
+    @staticmethod
+    def _terrain_sensor(cand):
+        """A sensor label for the terrain source, for the figure Details."""
+        s = str(cand.get("dem_source", ""))
+        if s in ("arcticdem", "earthdem", "rema"):
+            return "Maxar WorldView (stereo photogrammetry)"
+        if s.startswith("3dep"):
+            return "USGS 3DEP"
+        if s.startswith("mrdem"):
+            return "NRCan MRDEM (CanElevation)"
+        if s.startswith("cop-glo30"):
+            return "Copernicus GLO-30 (TanDEM-X)"
+        return cand.get("source", "DEM")
+
     # -------------------------------------- instant-flip web viewer ----
     def _export_web_viewer(self):
         """Bake DEM + before/after imagery into a standalone WebGL viewer.
@@ -1233,6 +1971,11 @@ class Viewer3DTab(QWidget):
         if not scene_crs.isValid() or extent.isEmpty():
             self._warn("Could not derive a projected scene CRS/extent from the DEM.")
             return
+        # Clip the terrain to where the before/after imagery actually HAS pixels —
+        # the intersection of their valid-data footprints (two scenes can share a
+        # bounding box yet cover very different ground via nodata fill), clamped to
+        # the DEM. Keeps a partial scene from padding the figure with a black void.
+        extent = self._drape_crop_extent(scene_crs, before + after, extent)
         self._busy(True)
         self._log("Exporting instant-flip 3D web viewer (rendering imagery, "
                   "reading DEM)…")
@@ -1253,11 +1996,19 @@ class Viewer3DTab(QWidget):
         except OSError as e:
             self._warn(f"Cannot create output dir: {e}")
             return
-        path = os.path.join(out_dir, "instant_flip_3d.html")
+        # Named for the event and never clobbered. Every export used to write
+        # the same instant_flip_3d.html, so a second event — or a second render
+        # of the same one with different layers — silently destroyed the figure
+        # you had already sent someone. These are ~600 KB self-contained pages
+        # that people keep and share, not scratch output.
+        path = _unique_path(out_dir, self._viewer_stem(), ".html")
         try:
-            with open(path, "w") as f:
+            # utf-8 explicitly: the HTML declares utf-8 and always contains non-ASCII
+            # glyphs (◀ ▶ ⬇ · —), so the platform default encoding (e.g. cp1252 on a
+            # non-UTF-8 locale) would raise UnicodeEncodeError and fail the export.
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(html)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             self._warn(f"Could not write the viewer: {e}")
             return
         self._log(f"Wrote {path} ({round(len(html)/1024)} KB). Opening in browser…")
@@ -1267,6 +2018,21 @@ class Viewer3DTab(QWidget):
         self.iface.messageBar().pushInfo(
             "3D viewer", "Opened the instant-flip 3D viewer in your browser — "
             "orbit freely; Space or the buttons flip before/after with no loading.")
+
+
+    def _viewer_stem(self):
+        """A filename stem naming the event, e.g. 'AK2026-0204_3d' — falling back
+        to the imagery dates, then to the old fixed name."""
+        det = getattr(self.dock, "detection", None)
+        if det is not None and getattr(det, "event_id", ""):
+            return _safe_name(det.event_id) + "_3d"
+        try:
+            when = self.dt_edit.dateTime().toString("yyyy-MM-dd")
+            if when:
+                return f"landslide_{when}_3d"
+        except (AttributeError, RuntimeError):
+            pass
+        return "instant_flip_3d"
 
     def _build_web_viewer(self, w3d, scene_crs, extent, before, after):
         """Render the two image sets + DEM to embedded assets; return the HTML."""
@@ -1317,8 +2083,447 @@ class Viewer3DTab(QWidget):
             "elev_b64": elev_b64,
             "before_uri": before_uri,
             "after_uri": after_uri,
+            # provenance + georeferencing for the exported figure's axes/caption
+            "crs": scene_crs.authid() or "",
+            "utm": [extent.xMinimum(), extent.yMinimum(),
+                    extent.xMaximum(), extent.yMaximum()],
+            "before_date": self._sniff_date(label(before)) or "",
+            "after_date": self._sniff_date(label(after)) or "",
         }
+        polys, lines, points = self._collect_overlays(scene_crs, extent)
+        cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
+        # extra Details rows for the figure (satellites, area, centerline, volume)
+        det = []
+        img = self.det_imagery_sat.currentText().strip()
+        if img:
+            det.append(["Imagery", img])
+        for lbl, w in (("Terrain", self.det_terrain_sat), ("Area", self.det_area),
+                       ("Centerline length", self.det_cl_length),
+                       ("Vertical drop", self.det_cl_drop), ("Volume", self.det_volume)):
+            v = w.text().strip()
+            if lbl == "Volume" and v:      # normalize any older ×10⁶ m³ text to Mm³
+                v = v.replace(" ×10⁶ m³", " Mm³").replace("×10⁶ m³", "Mm³")
+            if v:
+                det.append([lbl, v])
+        cfg["extra_details"] = det
+        if polys or lines or points:
+            self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
+                      f"{len(points)} point layer(s).")
         return w3d.build_viewer_html(cfg)
+
+    def _overlay_extent(self, scene_crs):
+        """Combined bounding box (scene CRS) of the ticked polygon/line overlays.
+
+        Points (peaks) are skipped — they can be scattered across the whole AOI
+        and would defeat the crop. Returns None if nothing usable is ticked, in
+        which case the export falls back to the full DEM extent."""
+        from qgis.core import QgsCoordinateTransform, QgsWkbTypes
+        proj = QgsProject.instance()
+        rect = None
+        for lid in self._checked_ids(self.overlay_combo):
+            lyr = proj.mapLayer(lid)
+            if not isinstance(lyr, QgsVectorLayer):
+                continue
+            if QgsWkbTypes.geometryType(lyr.wkbType()) == QgsWkbTypes.PointGeometry:
+                continue
+            ext = lyr.extent()
+            if ext is None or ext.isEmpty():
+                continue
+            try:
+                ext = QgsCoordinateTransform(
+                    lyr.crs(), scene_crs, proj).transformBoundingBox(ext)
+            except Exception:
+                continue
+            if rect is None:
+                rect = QgsRectangle(ext)
+            else:
+                rect.combineExtentWith(ext)
+        return rect
+
+    def _imagery_extent(self, scene_crs, layers):
+        """Combined bounding box (scene CRS) of the given raster layers.
+
+        Used to clip the 3D terrain to the smallest area the before/after
+        imagery actually covers, so the scene isn't padded out with DEM that
+        has no drape on it. Returns None if no layer has a usable extent."""
+        proj = QgsProject.instance()
+        rect = None
+        for lyr in layers:
+            if lyr is None:
+                continue
+            ext = lyr.extent()
+            if ext is None or ext.isEmpty():
+                continue
+            try:
+                ext = QgsCoordinateTransform(
+                    lyr.crs(), scene_crs, proj).transformBoundingBox(ext)
+            except Exception:
+                continue
+            if rect is None:
+                rect = QgsRectangle(ext)
+            else:
+                rect.combineExtentWith(ext)
+        return rect
+
+    def _valid_data_bbox(self, layer, scene_crs, max_dim=1024):
+        """Bounding box (scene CRS) of a raster layer's VALID (non-nodata) pixels.
+
+        Two drape images can share a file bounding box yet cover very different
+        ground — a partial satellite scene is padded with nodata to the AOI grid —
+        so layer.extent() over-reports coverage. Read a decimated validity mask
+        (any band off its nodata, or != 0 when none is set), take the tight box of
+        valid pixels, return it in the scene CRS. None if unreadable or all-nodata."""
+        from osgeo import gdal
+        try:
+            ds = gdal.Open(layer.source())
+        except Exception:
+            ds = None
+        if ds is None:
+            return None
+        W, H = ds.RasterXSize, ds.RasterYSize
+        if W <= 0 or H <= 0:
+            return None
+        step = max(1, int(max(W, H) / float(max_dim)))
+        ow, oh = max(1, W // step), max(1, H // step)
+        valid = np.zeros((oh, ow), dtype=bool)
+        for b in range(1, ds.RasterCount + 1):
+            band = ds.GetRasterBand(b)
+            try:
+                a = band.ReadAsArray(0, 0, W, H, ow, oh)   # decimated read
+            except Exception:
+                a = None
+            if a is None:
+                continue
+            nod = band.GetNoDataValue()
+            # NaN-filled float overlays (dNDVI/dNDSI/SWIR): NaN != nod and NaN != 0
+            # both test True, so NaN would count as data and defeat the crop. Treat
+            # only FINITE non-nodata cells as valid (isfinite is all-True on ints).
+            finite = np.isfinite(a)
+            valid |= finite & ((a != nod) if nod is not None else (a != 0))
+        gt = ds.GetGeoTransform()
+        ds = None
+        ys, xs = np.where(valid)
+        if xs.size == 0:
+            return None
+        px0, px1 = int(xs.min()) * step, (int(xs.max()) + 1) * step
+        py0, py1 = int(ys.min()) * step, (int(ys.max()) + 1) * step
+        gxs, gys = [], []
+        for px, py in ((px0, py0), (px1, py1)):
+            gxs.append(gt[0] + px * gt[1] + py * gt[2])
+            gys.append(gt[3] + px * gt[4] + py * gt[5])
+        rect = QgsRectangle(min(gxs), min(gys), max(gxs), max(gys))
+        if layer.crs() != scene_crs:
+            try:
+                rect = QgsCoordinateTransform(
+                    layer.crs(), scene_crs,
+                    QgsProject.instance()).transformBoundingBox(rect)
+            except Exception:
+                return None
+        return rect
+
+    def _drape_crop_extent(self, scene_crs, layers, dem_extent):
+        """Extent to clip the 3D scene to: the INTERSECTION of the drape layers'
+        valid-data footprints, clamped to the DEM — so the scene is cropped to the
+        SMALLER area a partial before/after scene actually covers, not padded out
+        with the black void of its nodata fill. Falls back to the union of the full
+        layer extents, then the DEM, when nodata can't be read."""
+        layers = [l for l in layers if l is not None]
+        inter = None
+        for lyr in layers:
+            vb = self._valid_data_bbox(lyr, scene_crs)
+            if vb is None or vb.isEmpty():
+                continue
+            inter = QgsRectangle(vb) if inter is None else inter.intersect(vb)
+            if inter is None or inter.isEmpty():
+                break
+        if inter is None or inter.isEmpty():
+            inter = self._imagery_extent(scene_crs, layers)     # union of full extents
+        if inter is None or inter.isEmpty():
+            return dem_extent
+        r = inter.intersect(dem_extent)
+        return r if (r is not None and not r.isEmpty()) else dem_extent
+
+    def _collect_overlays(self, scene_crs, extent):
+        """Ticked vector layers → (polys, lines, points) in mesh-local metres.
+
+        Each feature is transformed to the scene CRS, offset to the mesh centre
+        (so it lines up with the exported terrain), and polygon rings are
+        triangulated for the draped fill. Points become peak markers, lines
+        become draped polylines."""
+        from . import web3d_export
+        from qgis.core import (QgsCoordinateTransform, QgsWkbTypes, QgsExpression,
+                               QgsExpressionContext, QgsExpressionContextUtils)
+        proj = QgsProject.instance()
+        cx, cy = extent.center().x(), extent.center().y()
+        # densify/subdivide target (scene metres) so draped polygons CONFORM to
+        # the terrain instead of spanning flat sheets between boundary vertices.
+        step = max(extent.width(), extent.height()) / 200.0
+        polys, lines, points = [], [], []
+        for i, lid in enumerate(self._checked_ids(self.overlay_combo)):
+            lyr = proj.mapLayer(lid)
+            if not isinstance(lyr, QgsVectorLayer):
+                continue
+            color = self._overlay_color(lyr, i)
+            name = lyr.name()
+            try:
+                xform = QgsCoordinateTransform(lyr.crs(), scene_crs, proj)
+            except Exception:
+                xform = None
+            gtype = QgsWkbTypes.geometryType(lyr.wkbType())
+            # label expression for points (peaks): the layer's display field/expr
+            lexpr = lctx = None
+            if gtype == QgsWkbTypes.PointGeometry and lyr.displayExpression():
+                lexpr = QgsExpression(lyr.displayExpression())
+                lctx = QgsExpressionContext(
+                    QgsExpressionContextUtils.globalProjectLayerScopes(lyr))
+            rings, paths, coords, labels = [], [], [], []
+            for feat in lyr.getFeatures():
+                g = feat.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                if xform is not None:
+                    g = QgsGeometry(g)
+                    try:
+                        g.transform(xform)
+                    except Exception:
+                        continue
+                if gtype == QgsWkbTypes.PolygonGeometry:
+                    mps = g.asMultiPolygon() if g.isMultipart() else [g.asPolygon()]
+                    for poly in mps:
+                        if not poly:
+                            continue
+                        ring = [[p.x() - cx, p.y() - cy] for p in poly[0]]
+                        if len(ring) >= 3:
+                            rings.append({
+                                "outline": web3d_export.densify_ring(ring, step),
+                                "tris": web3d_export.subdivide_tris(
+                                    web3d_export.triangulate_ring(ring), step)})
+                elif gtype == QgsWkbTypes.LineGeometry:
+                    mls = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
+                    for ln in mls:
+                        path = [[p.x() - cx, p.y() - cy] for p in ln]
+                        if len(path) >= 2:
+                            paths.append(path)
+                elif gtype == QgsWkbTypes.PointGeometry:
+                    pts = g.asMultiPoint() if g.isMultipart() else [g.asPoint()]
+                    lbl = self._feature_label(lexpr, lctx, feat)
+                    for p in pts:
+                        # only keep peaks that fall within the terrain (hillshade)
+                        if not extent.contains(QgsPointXY(p.x(), p.y())):
+                            continue
+                        coords.append([p.x() - cx, p.y() - cy])
+                        labels.append(lbl)
+            try:
+                rtype = type(lyr.renderer()).__name__
+            except Exception:
+                rtype = "?"
+            if rings:
+                has_fill, frgb, lrgb, falpha = self._poly_style(lyr, color)
+                polys.append({"name": name, "color": frgb, "line_color": lrgb,
+                              "fill": has_fill, "fill_alpha": falpha, "rings": rings})
+                self._log(f"overlay '{name}' [{rtype}] polygon: outline rgb={lrgb} "
+                          f"fill={'on '+str(frgb)+f' α{falpha:.2f}' if has_fill else 'off'}")
+                self._log(f"    symbol: {self._describe_symbol(lyr)}")
+            if paths:
+                lines.append({"name": name, "color": color, "paths": paths})
+                self._log(f"overlay '{name}' [{rtype}] line: rgb={color}")
+                self._log(f"    symbol: {self._describe_symbol(lyr)}")
+            if coords:
+                points.append({"name": name, "color": color,
+                               "coords": coords, "labels": labels})
+                self._log(f"overlay '{name}' [{rtype}] point×{len(coords)}: rgb={color}")
+        return polys, lines, points
+
+    @staticmethod
+    def _feature_label(expr, ctx, feat):
+        """Evaluate a layer's display expression for one feature; '' on failure."""
+        if expr is None:
+            return ""
+        try:
+            ctx.setFeature(feat)
+            v = expr.evaluate(ctx)
+            return "" if v is None else str(v)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _layer_symbol(lyr):
+        """A representative QgsSymbol for the layer across renderer types — single,
+        categorized, graduated, rule-based — so colour extraction isn't limited to
+        single-symbol renderers (which silently fell back to the palette before).
+        None if it can't be resolved."""
+        try:
+            r = lyr.renderer()
+        except Exception:
+            return None
+        if r is None:
+            return None
+        try:
+            s = r.symbol()                       # single-symbol renderer
+            if s is not None:
+                return s
+        except Exception:
+            pass
+        try:                                     # categorized / graduated / rule-based
+            from qgis.core import QgsRenderContext
+            syms = r.symbols(QgsRenderContext())
+            if syms:
+                return syms[0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _rgb_of(color):
+        return [color.red(), color.green(), color.blue()]
+
+    @staticmethod
+    def _sat(rgb):
+        """HSV-ish saturation 0..1 of an [r,g,b] — 0 for grey/black/white."""
+        mx = max(rgb)
+        return 0.0 if mx == 0 else (mx - min(rgb)) / float(mx)
+
+    @staticmethod
+    def _symbol_colors(sym):
+        """Every meaningful colour a symbol's layers draw, skipping transparent ones.
+
+        Type-aware: a line layer's only real colour is color() — its fillColor()/
+        strokeColor() are bogus (0,0,0) — while a fill layer's are stroke/fill, and a
+        marker's are color/fill/stroke. Trusting the wrong accessor is what made line-
+        styled overlays read as black."""
+        cols = []
+        try:
+            cols.append(Viewer3DTab._rgb_of(sym.color()))
+        except Exception:
+            pass
+        try:
+            for k in range(sym.symbolLayerCount()):
+                sl = sym.symbolLayer(k)
+                try:
+                    lt = sl.layerType()
+                except Exception:
+                    lt = ""
+                if "Line" in lt:
+                    attrs = ("color",)
+                elif "Fill" in lt:
+                    attrs = ("strokeColor", "fillColor")
+                else:
+                    attrs = ("color", "fillColor", "strokeColor")
+                for attr in attrs:
+                    try:
+                        c = getattr(sl, attr)()
+                        if c.alpha() > 0:
+                            cols.append([c.red(), c.green(), c.blue()])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return cols
+
+    @staticmethod
+    def _overlay_color(lyr, i):
+        """The layer's VISIBLE colour, else a palette colour.
+
+        symbol.color() alone is unreliable — a multi-layer line symbol reports its
+        first layer (often a dark casing), so a yellow centreline came back dark.
+        Instead pick the most-saturated colour the symbol actually draws (a vivid
+        line/marker beats a grey casing; brightness breaks ties so white markers
+        still resolve to white)."""
+        pal = [[255, 70, 70], [255, 220, 60], [90, 200, 255],
+               [130, 230, 130], [220, 130, 230], [255, 150, 60]]
+        s = Viewer3DTab._layer_symbol(lyr)
+        if s is not None:
+            cols = Viewer3DTab._symbol_colors(s)
+            if cols:
+                cols.sort(key=lambda c: (Viewer3DTab._sat(c), sum(c)))
+                return cols[-1]
+        return pal[i % len(pal)]
+
+    @staticmethod
+    def _describe_symbol(lyr):
+        """Dump a layer's symbol structure for the diagnostic log — symbol colour
+        plus each symbol layer's class and its color/fill/stroke/brush, so a wrong
+        overlay colour can be traced to the exact symbol without QGIS access here."""
+        sym = Viewer3DTab._layer_symbol(lyr)
+        if sym is None:
+            return "no symbol"
+        parts = []
+        try:
+            parts.append("sym.color=" + str(Viewer3DTab._rgb_of(sym.color())))
+        except Exception:
+            pass
+        try:
+            for k in range(sym.symbolLayerCount()):
+                sl = sym.symbolLayer(k)
+                d = type(sl).__name__
+                for attr in ("fillColor", "strokeColor", "color"):
+                    try:
+                        d += " %s=%s" % (attr, Viewer3DTab._rgb_of(getattr(sl, attr)()))
+                    except Exception:
+                        pass
+                for attr in ("brushStyle", "strokeStyle"):
+                    try:
+                        d += " %s=%d" % (attr, int(getattr(sl, attr)()))
+                    except Exception:
+                        pass
+                parts.append(d)
+        except Exception:
+            pass
+        return " | ".join(parts)
+
+    @staticmethod
+    def _poly_style(lyr, fallback_rgb):
+        """Outline colour of a polygon layer's symbol (drawn OUTLINE-ONLY).
+
+        Routing on the symbol-layer TYPE is essential: a landslide 'polygon' is often
+        styled as a plain LINE symbol used as the ring (QgsSimpleLineSymbolLayer),
+        whose visible colour is color() — but which ALSO answers fillColor()/
+        strokeColor() with a bogus (0,0,0). Reading those made the rings export black.
+        So: for a fill-type layer the ring is its strokeColor(); for a line/marker
+        layer the ring is its own color(). Returns (False, fill_rgb, line_rgb, 0.0) —
+        outline-only per preference, so no translucent fill is drawn."""
+        from qgis.PyQt.QtCore import Qt
+        line_rgb = list(fallback_rgb)
+        sym = Viewer3DTab._layer_symbol(lyr)
+        if sym is None:
+            return False, list(fallback_rgb), line_rgb, 0.0
+        try:
+            sls = [sym.symbolLayer(k) for k in range(sym.symbolLayerCount())]
+        except Exception:
+            sls = []
+        outline = []                                    # candidate ring colours
+        for sl in sls:
+            try:
+                lt = sl.layerType()
+            except Exception:
+                lt = ""
+            if "Fill" in lt:                            # fill symbol -> the ring is its STROKE
+                try:
+                    pen_ok = int(sl.strokeStyle()) != int(Qt.NoPen)
+                except Exception:
+                    pen_ok = True
+                try:
+                    sc = sl.strokeColor()
+                    if pen_ok and sc.alpha() > 0:
+                        outline.append([sc.red(), sc.green(), sc.blue()])
+                except Exception:
+                    pass
+            else:                                       # line/marker symbol -> its own colour is the ring
+                try:
+                    c = sl.color()
+                    if c.alpha() > 0:
+                        outline.append([c.red(), c.green(), c.blue()])
+                except Exception:
+                    pass
+        if outline:
+            outline.sort(key=lambda c: (Viewer3DTab._sat(c), sum(c)))
+            line_rgb = outline[-1]                       # most-saturated visible ring colour
+        else:
+            try:
+                line_rgb = Viewer3DTab._rgb_of(sym.color())
+            except Exception:
+                pass
+        return False, line_rgb, line_rgb, 0.0            # outline-only: no fill
 
     def _dem_grid(self, scene_crs, extent, ncols, nrows):
         """Warp the DEM to an ncols×nrows grid over `extent` (north-first rows).
@@ -1353,3 +2558,24 @@ class Viewer3DTab(QWidget):
                 except Exception:
                     pass
         self.task = self._warp_task = None
+
+
+def _safe_name(text):
+    """Filesystem-safe stem: keep word characters, dot and dash; collapse rest."""
+    import re as _re
+    out = _re.sub(r"[^\w.\-]+", "_", str(text or "")).strip("._-")
+    return out or "landslide"
+
+
+def _unique_path(directory, stem, ext):
+    """`<stem><ext>`, or the first free `<stem> (2)<ext>` / `(3)` … in `directory`.
+
+    An export must never silently replace a figure the user may already have
+    shared; a new file beside the old one is always recoverable, an overwrite is
+    not."""
+    path = os.path.join(directory, stem + ext)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, f"{stem} ({n}){ext}")
+        n += 1
+    return path

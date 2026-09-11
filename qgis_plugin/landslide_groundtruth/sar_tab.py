@@ -47,6 +47,7 @@ scene nearest the event, then the nearest pre scene from the SAME track (the
 """
 import math
 import os
+import re
 import tempfile
 from urllib.parse import quote
 
@@ -68,6 +69,10 @@ from qgis.core import (
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import sar_change
+from . import sar_pairing
+from . import layover_dim
+from . import layer_group as lg
+from .flow_layout import FlowRow
 from .task import PipelineTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
 
@@ -81,6 +86,13 @@ PC_TOKEN_URL = f"https://planetarycomputer.microsoft.com/api/sas/v1/token/{COLLE
 # Planetary Computer Explorer itself uses for the VV grayscale render; RTC
 # normalization is why one fixed stretch reads well across scenes and dates.
 DEFAULT_STRETCH = 0.20
+
+# "Preview on map (quick)" renders a small fixed-size image for speed — coarse
+# pixels, no client-side smoothing, thrown away after — so it appears almost
+# immediately at any AOI size. "Run (full detail)" instead honors the Pixel size
+# combo and saves a GeoTIFF. This is the quick preview's square dimension in px:
+# small enough to render/download fast, big enough to read the scene at a glance.
+PREVIEW_PX = 384
 
 # selectable polarizations (VV is the standard choice for land/landslides; VH
 # is more sensitive to volume scattering/vegetation structure)
@@ -115,6 +127,23 @@ CD_NEED = {k: n for k, _l, n, _d in CD_PRODUCTS}
 CD_NAMES = {"mtcorr": "multi-temporal intensity correlation",
             "tsint": "multi-temporal intensity (brightness z)",
             "intcorr": "intensity correlation", "logratio": "log-ratio"}
+
+# change-product color ramps as (lo, hi, [(value, hexcolor, alpha0_255), …]),
+# mirroring _style_cd_layer. Used to bake a pseudocolor RGBA when the layover fade
+# needs a per-pixel alpha (see sar_change.colorize / _write_change_with_fade).
+CD_RAMP = {
+    "logratio": (-6.0, 6.0, [(-6.0, "#b2182b", 255), (-1.5, "#f4a582", 120),
+                             (0.0, "#f7f7f7", 0), (1.5, "#92c5de", 120),
+                             (6.0, "#2166ac", 255)]),
+    "tsint": (-5.0, 5.0, [(-5.0, "#2166ac", 255), (-2.0, "#92c5de", 120),
+                          (0.0, "#f7f7f7", 0), (2.0, "#f4a582", 120),
+                          (5.0, "#b2182b", 255)]),
+    "intcorr": (0.0, 0.6, [(0.0, "#ffffff", 0), (0.15, "#fdae61", 90),
+                           (0.30, "#f46d43", 180), (0.60, "#a50026", 255)]),
+    "mtcorr": (0.0, 1.0, [(0.0, "#ffffff", 0), (0.60, "#ffffff", 0),
+                          (0.80, "#fdae61", 120), (0.90, "#f46d43", 200),
+                          (1.00, "#a50026", 255)]),
+}
 
 # Speckle filter applied to EACH change-detection input scene before the
 # detectors run (Gap 1). Distinct from the display-only median filter in the
@@ -172,14 +201,24 @@ class SarTab(QWidget):
         self._tif_replies = []           # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0
         self._preview_added = []         # raster layers added by the current preview
+        self._amp_group = None           # layer-tree folder the amplitude preview loads into
         self._preview_failed = []
+        self._preview_mode = "preview"   # 'preview' (quick) | 'run' (full detail + save)
+        self._preview_res = None         # effective render resolution of the last render
+        self._preview_smooth = 0         # median window applied to the last render (0=off)
+        self._preview_saved = []         # GeoTIFF paths saved by the current Run
         self._gallery_replies = []       # in-flight quicklook-thumbnail requests
         self._footprint_layers = []      # scene-footprint vector layers on the map
         self._cd_replies = []            # in-flight change-detection downloads
         self._cd_pending = 0
         self._cd_paths = {}              # role ('pre0'…/'post') -> tif path
         self._cd_meta = None             # products/pol/window of the running compute
-        self._cd_last_layers = []        # newest change maps (kept above context)
+        self._cd_last_layers = []        # newest change maps (kept above amplitude previews)
+        # recent per-geometry computed change arrays, for the asc+desc merge
+        # (rec #5): each = {mkey, track, direction, out, gt, proj, thr, pre_d, post_d}
+        self._cd_results = []
+        # AOI-grid Copernicus DEM cache for the layover fade, keyed by (gt, shape)
+        self._dem_cache = {}
         self._build_ui()
 
     # ---------- UI ----------
@@ -219,7 +258,8 @@ class SarTab(QWidget):
         self.dt_edit.setDateTime(self.dock.dt_edit.dateTime())
         form.addRow("Event time (UTC)", self.dt_edit)
 
-        copy_btn = QPushButton("⟵ Copy location & date from Sentinel-2 / Landsat tab")
+        # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
+        copy_btn = QPushButton("⟵ Copy location && date from Sentinel-2 / Landsat tab")
         copy_btn.setToolTip("Pull latitude, longitude, radius, event time and the "
                             "before/after windows from the other tab so you don't "
                             "re-enter the same event.")
@@ -254,27 +294,47 @@ class SarTab(QWidget):
         root.addWidget(self._build_filter_box())
 
         # --- buttons ---
-        btn_row = QHBoxLayout()
+        # FlowRow (not a fixed QHBoxLayout) so the four buttons wrap onto a
+        # second line instead of clipping their labels in a narrow dock.
+        btn_row = FlowRow()
         self.search_btn = QPushButton("Search (free)")
         self.search_btn.setToolTip(
             "Free STAC search for candidate before/after Sentinel-1 RTC scenes. "
             "Nothing is downloaded; no cloud filter is needed (radar sees through "
             "cloud).")
         self.search_btn.clicked.connect(self._search)
-        self.map_preview_btn = QPushButton("Preview on map")
+        self.map_preview_btn = QPushButton("Preview on map (quick)")
         self.map_preview_btn.setToolTip(
-            "Render the TICKED scene(s) — or the best same-track before/after "
-            "pair if nothing is ticked — as grayscale amplitude clipped to the "
-            "AOI, straight onto the canvas. Double-click a row to preview just "
-            "that scene. Toggle the layers to compare before vs after.")
+            "FAST, coarse look: render the TICKED scene(s) — or the best "
+            "same-track before/after pair if nothing is ticked — as grayscale "
+            "amplitude clipped to the AOI, at a small fixed resolution and with "
+            "no smoothing, so it appears almost immediately. Double-click a row "
+            "to preview just that scene. Use 'Run (full detail)' for the full-"
+            "resolution render. Toggle the layers to compare before vs after.")
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
+        self.run_btn = QPushButton("Run (full detail)")
+        self.run_btn.setToolTip(
+            "Full-resolution render of the same scene(s) at the Pixel size and "
+            "speckle filter set in 'Display && pairing options', and SAVES each "
+            "as a GeoTIFF under the tab's output folder "
+            "(out/interactive/sar/amplitude) so it persists after the session. "
+            "Lands in the same 'SAR …/… amplitude' layer folder, replacing the "
+            "quick preview. Slower than Preview — a full-size AOI render can take "
+            "a few seconds when the endpoint is cold.")
+        self.run_btn.setEnabled(False)
+        self.run_btn.clicked.connect(self._run_full)
+        f = self.run_btn.font()
+        f.setBold(True)
+        self.run_btn.setFont(f)
+        self.run_btn.setDefault(True)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        for b in (self.search_btn, self.map_preview_btn, self.cancel_btn):
+        for b in (self.search_btn, self.map_preview_btn, self.run_btn,
+                  self.cancel_btn):
             btn_row.addWidget(b)
-        root.addLayout(btn_row)
+        root.addWidget(btn_row)
 
         self.footprint_check = QCheckBox("Show scene footprints on map")
         self.footprint_check.setToolTip(
@@ -301,9 +361,16 @@ class SarTab(QWidget):
         tl.addWidget(QLabel(
             "Candidate scenes  (★ = default same-track pair; tick the scenes to "
             "preview on the map)"))
-        self.table = QTableWidget(0, 6)
+        # seismic-time bracket summary for the starred pair (see sar_pairing)
+        self.pair_summary = QLabel("")
+        self.pair_summary.setWordWrap(True)
+        self.pair_summary.setTextFormat(Qt.PlainText)
+        self.pair_summary.setVisible(False)
+        self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
+        tl.addWidget(self.pair_summary)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -447,7 +514,8 @@ class SarTab(QWidget):
         self.stretch_spin.setValue(DEFAULT_STRETCH)
         self.stretch_spin.setToolTip(
             "LINEAR mode only: gamma-naught from 0 (black) to this value (white). "
-            "0.20 matches the Planetary Computer Explorer. Ignored in dB mode.")
+            "0.20 matches the Microsoft Planetary Computer Explorer. Ignored in "
+            "dB mode.")
         form.addRow("Stretch (max γ⁰)", self.stretch_spin)
 
         # Speckle control: SAR's salt-and-pepper noise averages out when pixels
@@ -480,7 +548,9 @@ class SarTab(QWidget):
             "can dim features smaller than ~3 pixels across (at 10 m px, ~30 m). "
             "Combines well with Pixel size: median at 10 m often reads better "
             "than unfiltered 20 m. Applies to the next Preview on map.")
-        form.addRow("Speckle filter", self.smooth_combo)
+        # Named "Render smoothing" (not "Speckle filter") to distinguish it from the
+        # Noise reduction panel's analysis speckle filter, which feeds the detectors.
+        form.addRow("Render smoothing", self.smooth_combo)
         return box
 
     # ---------- change detection (drop-down) ----------
@@ -548,7 +618,12 @@ class SarTab(QWidget):
         checks_row = QVBoxLayout()
         checks_row.setContentsMargins(0, 0, 0, 0)
         for key, label, need, default in CD_PRODUCTS:
-            cb = QCheckBox(label)
+            # Surface the before-scene requirement in the label so it's visible
+            # before ticking (the "before" count is what blocks a run). "N+" for
+            # the detectors that also use extra before-scenes; a plain count for
+            # log-ratio, which uses exactly one.
+            req = "1 before" if need == 1 else f"{need}+ before"
+            cb = QCheckBox(f"{label}  (needs {req})")
             cb.setChecked(default)
             cb.setToolTip(cd_tips[key])
             self.cd_product_checks[key] = cb
@@ -566,29 +641,15 @@ class SarTab(QWidget):
             "7×7 at 10 m px ≈ 70 m — close to the paper's 16×16 at 3 m.")
         form.addRow("Stat window", self.cd_window_combo)
 
-        # the change map is TRANSPARENT wherever the pixel looks normal, so on
-        # an empty canvas a quiet result looks like nothing happened — render
-        # the compared amplitude scenes beneath it by default
-        self.cd_context_check = QCheckBox(
-            "Show the compared before/after amplitude beneath the change map")
-        self.cd_context_check.setChecked(True)
-        self.cd_context_check.setToolTip(
-            "The change map only colors anomalous pixels — everywhere normal "
-            "is transparent by design. This loads the nearest before scene and "
-            "the after scene as grayscale amplitude under the overlay, so the "
-            "result always has visual context (and a blank-looking map means "
-            "'no anomalies', not 'nothing happened').")
-        form.addRow(self.cd_context_check)
-
         # compute the maps and log their statistics without adding any layer to
         # the canvas — for checking whether a method/window/filter combination
         # is worth rendering before you clutter the map with it
         self.cd_stats_only_check = QCheckBox("Compute stats only (no map layer)")
         self.cd_stats_only_check.setToolTip(
             "Run the detectors and print each product's coverage and anomaly "
-            "spread to the Log, but don't add any raster layer (or the "
-            "amplitude context) to the map. Useful for comparing windows and "
-            "filters quickly without piling up layers.")
+            "spread to the Log, but don't add any raster layer to the map. "
+            "Useful for comparing windows and filters quickly without piling "
+            "up layers.")
         form.addRow(self.cd_stats_only_check)
 
         self.cd_btn = QPushButton("Compute change map")
@@ -604,6 +665,23 @@ class SarTab(QWidget):
             "new layers, so you can compare products, windows and filters.")
         self.cd_btn.clicked.connect(self._run_change_detection)
         form.addRow(self.cd_btn)
+
+        # rec #5: merge the ascending + descending change maps so a scar lost to
+        # layover in one geometry is recovered from the other. Workflow: compute
+        # with an ascending after-scene, compute again with a descending one, then
+        # Merge. Degrades honestly to one geometry where the terrain has only one.
+        self.cd_merge_btn = QPushButton("Merge geometries (asc + desc)")
+        self.cd_merge_btn.setEnabled(False)
+        self.cd_merge_btn.setToolTip(
+            "Combine the most recent ascending and descending change maps of each "
+            "product into one, recovering scar pixels that layover blanked in a "
+            "single orbit. Compute once with an ascending after-scene and once "
+            "with a descending one first. If only one geometry has been computed "
+            "(common in this terrain — many areas lack both passes), it still runs "
+            "but flags that the opposite-facing slopes, possibly the source "
+            "headscarp, are unrecovered.")
+        self.cd_merge_btn.clicked.connect(self._merge_geometries_action)
+        form.addRow(self.cd_merge_btn)
         return box
 
     # ---------- noise reduction (drop-down) ----------
@@ -627,6 +705,23 @@ class SarTab(QWidget):
         info.setStyleSheet("QLabel { color: palette(mid); }")
         form.addRow(info)
 
+        # fade radar-layover slopes: the layover-facing side (east on descending,
+        # west on ascending) reads as false high amplitude / false change
+        self.layover_check = QCheckBox(
+            "Fade layover slopes (dim high signal on the layover-facing side)")
+        self.layover_check.setChecked(False)
+        self.layover_check.setToolTip(
+            "Sentinel-1 is right-looking, so slopes facing the radar — east-facing "
+            "on descending passes, west-facing on ascending — are foreshortened / "
+            "laid over and read as artificially bright: false high amplitude and "
+            "false change (the main artifact at single-geometry sites like interior "
+            "Denali). With this on, those steep layover-facing pixels are dimmed to "
+            "25% opacity on BOTH the amplitude preview and the change maps, from "
+            "slope aspect off a Copernicus GLO-30 DEM fetched over the AOI. Only "
+            "high-value pixels are dimmed; flat ground and the well-imaged slopes "
+            "are untouched. The DEM downloads once per AOI the first time.")
+        form.addRow(self.layover_check)
+
         self.speckle_cd_combo = QComboBox()
         for label, value in SPECKLE_FILTERS:
             self.speckle_cd_combo.addItem(label, value)
@@ -639,9 +734,9 @@ class SarTab(QWidget):
             "the correlation detectors, where speckle artificially "
             "decorrelates windows and invents change. Median is a simpler "
             "fallback. Set to None to feed the raw γ⁰ (noisiest). Distinct "
-            "from the Display panel's median, which only cleans the on-screen "
-            "amplitude preview.")
-        form.addRow("Speckle filter", self.speckle_cd_combo)
+            "from the Display panel's Render smoothing, which only cleans the "
+            "on-screen amplitude preview.")
+        form.addRow("Analysis speckle filter", self.speckle_cd_combo)
 
         self.blob_combo = QComboBox()
         for label, value in BLOB_MIN_AREAS:
@@ -676,7 +771,7 @@ class SarTab(QWidget):
         one Planetary Computer collection this plugin uses that requires a (free)
         account subscription key to read pixels — the Sentinel-2/Landsat tab stays
         anonymous. NOT the same thing as the Planet account on the PlanetScope tab."""
-        box = QgsCollapsibleGroupBox("Planetary Computer key (optional)")
+        box = QgsCollapsibleGroupBox("Microsoft Planetary Computer key (optional)")
         box.setSaveCollapsedState(False)
         box.setCollapsed(True)
         self.key_box = box
@@ -684,9 +779,9 @@ class SarTab(QWidget):
 
         info = QLabel(
             'No login needed — Sentinel-1 RTC works anonymously. If you have an '
-            'old Planetary Computer subscription key, storing it here raises API '
-            'rate limits; otherwise leave this blank. (Unrelated to your Planet '
-            'account on the PlanetScope tab.)')
+            'old Microsoft Planetary Computer subscription key, storing it here '
+            'raises API rate limits; otherwise leave this blank. (Unrelated to '
+            'your Planet Labs account on the PlanetScope tab.)')
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
@@ -733,7 +828,7 @@ class SarTab(QWidget):
             return                       # a check is already in flight
         key = self.key_edit.text().strip()
         if not key:
-            self._set_key_status("Paste your Planetary Computer key first.", "warn")
+            self._set_key_status("Paste your Microsoft Planetary Computer key first.", "warn")
             return
         self._set_key_status("Testing key against the token endpoint…", "info")
         self.key_btn.setEnabled(False)
@@ -758,8 +853,8 @@ class SarTab(QWidget):
             self.key_box.setCollapsed(True)
         elif status in (401, 403):
             self._set_key_status(
-                "✗ Key rejected — check it against your Planetary Computer "
-                "account page.", "error")
+                "✗ Key rejected — check it against your Microsoft Planetary "
+                "Computer account page.", "error")
         else:
             self._set_key_status(
                 f"Could not verify (HTTP {status or '—'}); nothing saved. "
@@ -802,7 +897,9 @@ class SarTab(QWidget):
         out = os.path.join(base_out, "sar")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -833,6 +930,10 @@ class SarTab(QWidget):
         self.log.clear()
         self.table.setRowCount(0)
         self._search_result = None
+        # a new search = new AOI/event: drop any recorded per-geometry change maps
+        # so the asc+desc merge can never combine rasters from different ground
+        self._cd_results = []
+        self.cd_merge_btn.setEnabled(False)
         self._preview_pix = None
         self.preview.setText("Search, then select a scene to preview it.")
         self._clear_gallery()
@@ -865,6 +966,7 @@ class SarTab(QWidget):
             self._append_log("note: " + note)
         npre, npost = len(result.get("pre", [])), len(result.get("post", []))
         self.map_preview_btn.setEnabled(bool(npre or npost))
+        self.run_btn.setEnabled(bool(npre or npost))
         self.cd_btn.setEnabled(bool(npre and npost))
         self.iface.messageBar().pushInfo(
             "SAR", f"Found {npre} pre / {npost} post Sentinel-1 scene(s) "
@@ -893,6 +995,31 @@ class SarTab(QWidget):
         if geom is None or geom.isEmpty():
             return True
         return geom.contains(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+    def _aoi_coverage(self, c):
+        """Fraction (0..1) of the search-AOI box this scene's footprint fills:
+        area(footprint ∩ AOI) / area(AOI), taken in the AOI's own lon/lat space
+        so the box's degree anisotropy cancels. 0.0 when geometry or AOI is
+        missing. Sentinel-1 IW frames are ~250 km wide, so this is usually 1.0;
+        a value below it flags an edge frame that clips the search box. Reuses the
+        tab's _aoi_bbox (the same box the amplitude render clips to), mirroring
+        dock._aoi_coverage."""
+        bbox = self._aoi_bbox()
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy, _ = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
 
     def _pair_for(self, pre_all, post_all, mode, direction=None):
         """(pre, post, note) — best matching-geometry pair, optionally restricted
@@ -986,6 +1113,15 @@ class SarTab(QWidget):
         pre = result.get("pre", [])
         post = result.get("post", [])
         default_picks, _notes = self._default_picks()
+        # surface how the starred pair brackets the seismic event time (rec #1)
+        try:
+            ev = self.dt_edit.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+            summary = sar_pairing.summarize(default_picks, ev)
+        except Exception:
+            summary = ""
+        self.pair_summary.setText(("Event bracket —  " + summary.replace("\n", "\n                 "))
+                                  if summary else "")
+        self.pair_summary.setVisible(bool(summary))
         star = {(side, c.get("id")) for side, c in default_picks}
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
@@ -996,8 +1132,15 @@ class SarTab(QWidget):
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
             orbit = (c.get("orbit_state") or "")[:4]
             track = "" if c.get("relative_orbit") is None else str(c["relative_orbit"])
+            # "AOI %" = how much of the search box this frame's footprint fills
+            # (area of overlap ÷ AOI area), the same client-side geometry measure
+            # the optical tabs use. Sentinel-1 IW frames are ~250 km wide so this
+            # is usually 100; a lower value flags an along-track edge frame that
+            # clips the box (and may leave the event point in the gap — see below).
+            cover_frac = self._aoi_coverage(c)
+            cover = f"{cover_frac*100:.0f}" if cover_frac > 0 else "—"
             marker = "★ " if is_star else "  "
-            cells = [marker + side, date, gap, orbit, track, cid or ""]
+            cells = [marker + side, date, gap, orbit, track, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_star:
                 bg = bg.darker(112)
@@ -1010,6 +1153,21 @@ class SarTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
+            # "AOI %" tooltip (col 5): the fraction of the search box with pixels,
+            # with a flag when the frame clips the box but leaves the event point
+            # itself outside its footprint (the pairing already demotes those).
+            covers_pt = self._covers_event(c)
+            cover_tip = (
+                f"Footprint covers {cover}% of your search box — how much of the "
+                f"AOI this frame images (radar has no cloud, so this is coverage, "
+                f"not clarity). Sentinel-1 IW frames are ~250 km wide, so this is "
+                f"usually 100%; a lower value means an along-track edge frame that "
+                f"clips the box."
+                if cover_frac > 0 else
+                "No footprint geometry reported for this scene — coverage unknown.")
+            if not covers_pt:
+                cover_tip += "\n⚠ Does NOT cover the event point itself."
+            self.table.item(r, 5).setToolTip(cover_tip)
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1119,7 +1277,9 @@ class SarTab(QWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\n{orbit} {track} · {gap}")
-        tile.setToolTip(f"{cid}\n{date}  {orbit} track {track}  {gap}")
+        cover_frac = self._aoi_coverage(c)
+        cover = f"AOI coverage {cover_frac*100:.0f}%" if cover_frac > 0 else "AOI coverage —"
+        tile.setToolTip(f"{cid}\n{date}  {orbit} track {track}  {gap}\n{cover}")
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         if cid:
             url = self._preview_url(cid, c.get("polarizations"), max_size=512)
@@ -1261,13 +1421,13 @@ class SarTab(QWidget):
         return self._labeled(picks)
 
     def _preview_row_on_map(self, item):
-        """Double-click a row -> preview exactly that one scene (ignores ticks)."""
+        """Double-click a row -> quick-preview exactly that one scene (ignores ticks)."""
         head = self.table.item(item.row(), 0)
         if head is None:
             return
         side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
         if c:
-            self._render_scenes(self._labeled([(side, c)]))
+            self._render_scenes(self._labeled([(side, c)]), mode="preview")
 
     def _aoi_bbox(self):
         """(minx, miny, maxx, maxy, radius_km) of the search AOI in lon/lat."""
@@ -1287,27 +1447,81 @@ class SarTab(QWidget):
         if not picks:
             self._warn("Run Search first — no Sentinel-1 scene to preview.")
             return
-        self._render_scenes(picks)
+        self._render_scenes(picks, mode="preview")
 
-    def _render_scenes(self, picks):
-        """Download + load the AOI amplitude render for each (label, candidate)."""
+    def _run_full(self):
+        picks = self._preview_picks()
+        if not picks:
+            self._warn("Run Search first — no Sentinel-1 scene to render.")
+            return
+        self._render_scenes(picks, mode="run")
+
+    def _abort_tif_replies(self):
+        """Abort in-flight AOI-amplitude downloads and forget them. blockSignals
+        stops their finished() from decrementing the NEXT render's _tif_pending —
+        a row double-click can re-enter _render_scenes mid-download, and a late
+        finish would otherwise drive the counter negative and fire the completion
+        handler early/twice, mixing layers from two operations."""
+        for reply in list(self._tif_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tif_replies = []
+
+    def _render_scenes(self, picks, mode="preview"):
+        """Download + load the AOI amplitude render for each (label, candidate).
+
+        mode='preview' is the FAST coarse look: a small fixed image (PREVIEW_PX),
+        no client-side smoothing, dropped in from a throwaway temp file.
+        mode='run' is the full-detail render at the chosen Pixel size + median
+        filter, and SAVES each GeoTIFF under out/interactive/sar/amplitude so it
+        survives the session. Both land in the same "SAR <pre>/<post> amplitude"
+        folder, so a Run replaces the quick preview (and vice versa)."""
         bbox = self._aoi_bbox()
         if bbox is None:
             self._warn("Run Search first — no Sentinel-1 scene to preview.")
             return
         self.dock._ensure_network_timeout()   # AOI renders can be slow when cold
+        # Folder for the amplitude layers: "SAR <pre>/<post> amplitude" from the
+        # before/after dates in the picks (side read from the label _labeled() built).
+        pre = post = ""
+        for label, c in picks:
+            d = (c.get("date") or "")[:10]
+            if "before" in label:
+                pre = d
+            elif "after" in label:
+                post = d
+        self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude")
         self._clear_preview_layers()
-        res = self.detail_combo.currentData() or 10
-        k = self.smooth_combo.currentData()
+        minx, miny, maxx, maxy, radius = bbox
+        if mode == "run":
+            res = self.detail_combo.currentData() or 10
+            k = self.smooth_combo.currentData()
+            px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
+            res_txt = f"{res} m px"
+        else:                                    # quick preview: fixed small image
+            px = PREVIEW_PX
+            res = max(1, round(radius * 2 * 1000 / px))   # effective, for the log
+            k = 0                                         # skip smoothing for speed
+            res_txt = f"~{res} m px"
+        self._preview_mode = mode
+        self._preview_res = res
+        self._preview_smooth = k
+        self._preview_saved = []
         smooth = f", median {k}×{k}" if k else ""
+        head = "Run (full detail)" if mode == "run" else "Preview (quick)"
         self._append_log(
-            f"Preview on map: rendering {len(picks)} amplitude scene(s) over the "
-            f"AOI ({self._render_desc()} grayscale, {res} m px{smooth})…")
+            f"{head}: rendering {len(picks)} amplitude scene(s) over the AOI "
+            f"({self._render_desc()} grayscale, {res_txt}{smooth})…")
         self.map_preview_btn.setEnabled(False)
+        self.run_btn.setEnabled(False)
+        self._abort_tif_replies()    # a re-entry (row double-click while a render is
+                                     # in flight) must not share this batch's counter
         self._preview_failed = []
         self._tif_pending = len(picks)
-        minx, miny, maxx, maxy, radius = bbox
-        px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
         for label, c in picks:
             self._append_log(f"  {label}")
             url = self._with_key(
@@ -1318,9 +1532,28 @@ class SarTab(QWidget):
             reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
             self._tif_replies.append(reply)
             reply.finished.connect(
-                lambda r=reply, l=label: self._tif_loaded(r, l))
+                lambda r=reply, l=label, cand=c: self._tif_loaded(r, l, cand))
 
-    def _tif_loaded(self, reply, label):
+    def _amp_out_dir(self):
+        """Output folder for saved Run amplitude GeoTIFFs, mirroring _collect's
+        search dir: <output or project/out/interactive>/sar/amplitude."""
+        base = self.dock.out_edit.text().strip() or os.path.join(
+            self.dock.project_edit.text().strip(), "out", "interactive")
+        return os.path.join(base, "sar", "amplitude")
+
+    def _amp_save_path(self, c, res):
+        """Persistent path for a Run amplitude GeoTIFF. The filename encodes
+        date/orbit/track/polarization/resolution, so re-running a scene at the
+        same settings overwrites its file instead of piling up copies."""
+        out = self._amp_out_dir()
+        os.makedirs(out, exist_ok=True)
+        date = (c.get("date") or "")[:10] or "undated"
+        orbit = (c.get("orbit_state") or "")[:4] or "orb"
+        track = c.get("relative_orbit")
+        pol = self._pol_for(c.get("polarizations")).upper()
+        return os.path.join(out, f"S1_{date}_{orbit}_t{track}_{pol}_{res}m.tif")
+
+    def _tif_loaded(self, reply, label, cand):
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
@@ -1330,20 +1563,35 @@ class SarTab(QWidget):
         added = False
         if ok and data:
             try:
-                fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_sar_")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                k = self.smooth_combo.currentData()
+                # Run saves a persistent GeoTIFF in the output folder; Preview
+                # uses a throwaway temp file (fast, coarse look).
+                if self._preview_mode == "run":
+                    path = self._amp_save_path(cand, self._preview_res)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                else:
+                    fd, path = tempfile.mkstemp(suffix=".tif",
+                                                prefix="landslide_sar_")
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                k = self._preview_smooth
                 if k:
                     self._apply_median(path, k)
+                # optionally dim the layover-facing slopes (rewrites path as RGBA)
+                self._apply_layover_amplitude(path, cand)
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
-                    QgsProject.instance().addMapLayer(lyr)
+                    lg.add_to_group(lyr, self._amp_group)
                     self._preview_added.append(lyr)
-                    self._append_log(f"  loaded {label}")
+                    if self._preview_mode == "run":
+                        self._preview_saved.append(path)
+                        self._append_log(
+                            f"  loaded {label} → saved {os.path.basename(path)}")
+                    else:
+                        self._append_log(f"  loaded {label}")
                     added = True
-            except OSError:
-                pass
+            except OSError as e:
+                self._append_log(f"  write failed for {label}: {e}")
         if not added:
             self._preview_failed.append(label)
             hint = " (HTTP 401/403 — check the key)" if status in (401, 403) else ""
@@ -1385,10 +1633,15 @@ class SarTab(QWidget):
                 f"    median filter skipped ({type(e).__name__}: {e})")
 
     def _raise_cd_layer(self):
-        """Keep the newest change maps above the amplitude context layers —
-        addMapLayer stacks new layers on top, so the async preview renders
-        would otherwise bury the overlays they exist to support."""
+        """Keep the newest change maps above any amplitude preview layers.
+
+        The change overlays live in their OWN top-level group, and a later
+        Preview/Run builds a SEPARATE amplitude group that addMapLayer stacks on
+        top. Raising the individual change layers within their group would not lift
+        that group past the amplitude group, so hoist the whole top-level change
+        group (the change layer's top-level ancestor) to the top of the tree."""
         root = QgsProject.instance().layerTreeRoot()
+        moved = []
         for lyr in reversed(self._cd_last_layers):
             try:
                 node = root.findLayer(lyr.id())
@@ -1396,18 +1649,31 @@ class SarTab(QWidget):
                 continue                  # layer was removed/deleted
             if node is None:
                 continue
-            parent = node.parent() or root
-            clone = node.clone()
-            parent.insertChildNode(0, clone)
-            parent.removeChildNode(node)
+            # Walk up to the top-level node under root — the change GROUP, or the
+            # layer itself if it sits directly under root — and move THAT to index 0.
+            top = node
+            while top.parent() is not None and top.parent() != root:
+                top = top.parent()
+            if top.parent() is None or any(top == m for m in moved):
+                continue                  # detached, or this group already hoisted
+            moved.append(top)
+            clone = top.clone()
+            root.insertChildNode(0, clone)
+            root.removeChildNode(top)
 
     def _finish_map_preview(self):
         self.map_preview_btn.setEnabled(bool(self._search_result))
+        self.run_btn.setEnabled(bool(self._search_result))
         self._raise_cd_layer()
         if self._preview_added:
             self._zoom_to_aoi()
-            msg = (f"Loaded {len(self._preview_added)} SAR amplitude scene(s) over "
-                   f"the AOI. Toggle the layers to compare before vs after.")
+            kind = "full-detail" if self._preview_mode == "run" else "quick"
+            msg = (f"Loaded {len(self._preview_added)} {kind} SAR amplitude "
+                   f"scene(s) over the AOI. Toggle the layers to compare before "
+                   f"vs after.")
+            if self._preview_saved:
+                msg += (f" Saved {len(self._preview_saved)} GeoTIFF(s) to "
+                        f"{self._amp_out_dir()}.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("SAR", msg)
@@ -1416,10 +1682,7 @@ class SarTab(QWidget):
 
     def _clear_preview_layers(self):
         for lyr in self._preview_added:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_added = []
 
     def _zoom_to_aoi(self):
@@ -1486,7 +1749,8 @@ class SarTab(QWidget):
         else:
             self._append_log("note: no after-scene footprint contains the "
                              "event point — using the nearest anyway")
-        post = min(post_pool, key=self._gap)
+        need = max(CD_NEED[m] for m in requested)
+        post = self._cd_post(post_pool, pre_all, need)
         track = post.get("relative_orbit")
         direction = post.get("orbit_state") or "?"
         same_track = [c for c in pre_all if c.get("relative_orbit") == track]
@@ -1516,7 +1780,6 @@ class SarTab(QWidget):
             self._append_log(
                 f"note: no ticked before-scene is a usable t{track} frame — "
                 f"using the same-track scenes instead")
-        need = max(CD_NEED[m] for m in requested)
         if chosen and len(chosen) < need:
             days = {(c.get("date") or "")[:10] for c in chosen}
             extra = [c for c in pool if (c.get("date") or "")[:10] not in days]
@@ -1563,6 +1826,73 @@ class SarTab(QWidget):
         count = (MT_MAX_PRE if any(m in ("mtcorr", "tsint") for m in products)
                  else max(CD_NEED[m] for m in products))
         return products, post, pre_pool[:count]
+
+    def _cd_post(self, post_pool, pre_all, need):
+        """Nearest after-scene, broken toward the track that can actually be
+        differenced and has the freshest reference stack.
+
+        Ordering is (after-scene DATE, staleness of the before-stack) over the
+        tracks that have `need` before-DATES imaging the event point — the same
+        test the reference stack is built with below, so this cannot prefer a
+        track that then fails. An earlier after-date still wins outright; the
+        before-stack only separates tracks that image on the same day.
+
+        Both halves are needed, and one real event shows why. Knik-Barry is
+        imaged on 2026-08-21 by t65 (ascending) AND t160 (descending), so the
+        gap ties. On a 60-day before-window t65 has no usable before-scene at
+        all and picking it starves every detector — that is the usability half.
+        Widen the window to 150 days and t65 gains three before-dates 78-127
+        days back, enough to look usable while spanning a seasonal snow change;
+        t160 has the same after date with before-scenes 12-36 days back — that
+        is the staleness half. Counting dates alone would pick t65 again, and so
+        would sorting on gap, because t65's pass is a few hours earlier.
+
+        Ticks still win: post_pool is already the ticked subset when the user
+        ticked an after-row, and a single ticked scene is returned unchanged."""
+        blind = min(post_pool, key=self._gap)
+        by_track = {}
+        for c in pre_all:
+            if self._covers_event(c):
+                by_track.setdefault(c.get("relative_orbit"), []).append(c)
+
+        def stack(c):
+            return self._one_per_day(by_track.get(c.get("relative_orbit"), []))
+
+        def staleness(c):
+            # how far back the reference stack has to reach. Only ever called
+            # for a track already known to have `need` dates — the filter below
+            # is the single gate, so this is allowed to index straight in.
+            return self._gap(stack(c)[need - 1])
+
+        def order(c):
+            # Rank on the after-scene's DATE, not its rounded gap. Two tracks
+            # imaging the same day differ only by time of day — Knik-Barry is
+            # 11 days on t65 (03:35) and 12 on t160 (16:12), which is not a real
+            # difference in recency, yet it is enough to stop a plain gap sort
+            # from ever reaching the tie-break. Within one date the freshest
+            # before-stack wins; _gap only settles the remainder.
+            return ((c.get("date") or "9999")[:10], staleness(c), self._gap(c))
+
+        usable = [c for c in post_pool if len(stack(c)) >= need]
+        if not usable:
+            return blind                      # the existing warning explains it
+        post = min(usable, key=order)
+        if post.get("id") == blind.get("id"):
+            return post
+        if len(stack(blind)) < need:
+            why = (f"only {len(stack(blind))} of {need} before-date(s) imaging "
+                   f"the event point")
+        else:
+            why = (f"its {need} nearest before-date(s) reach back "
+                   f"{staleness(blind):.0f} days, against "
+                   f"{staleness(post):.0f} days")
+        self._append_log(
+            f"note: the nearest after-scene is on t{blind.get('relative_orbit')} "
+            f"({(blind.get('date') or '')[:10]}) — {why}. Using "
+            f"t{post.get('relative_orbit')} "
+            f"({(post.get('date') or '')[:10]}) instead. Tick an after-scene to "
+            f"override.")
+        return post
 
     def _one_per_day(self, cands, what=None):
         """`cands` nearest-first, one scene per acquisition day.
@@ -1787,6 +2117,10 @@ class SarTab(QWidget):
         pre_d = (roles[pre_roles[0]].get("date") or "")[:10]
         post_d = (roles["post"].get("date") or "")[:10]
         tail = f"(t{track} {pol}, {k}×{k})"
+        # short product tag per change metric, for the layer-tree subfolder name
+        CD_PRODUCT = {"logratio": "Log-ratio", "intcorr": "Int-corr",
+                      "tsint": "Brightness-z", "mtcorr": "MT-corr"}
+        cd_group = None                  # this compute's own folder (opened lazily)
         added = computed = 0
         for mkey, out in outs:
             if mkey == "logratio":
@@ -1836,23 +2170,59 @@ class SarTab(QWidget):
             cov = 100.0 * np.isfinite(out).mean() if out.size else 0.0
 
             if not stats_only:
+                # Durable float32 export FIRST, before any display baking. The
+                # layover fade writes RGBA and destroys the signed values, and a
+                # tempfile does not survive the session — so the ANALYSIS product
+                # is written unconditionally, under the layer's own name, for the
+                # Fusion tab to consume.
+                data_path = self._cd_export_float(label, out, gt, proj, meta)
                 try:
                     fd, opath = tempfile.mkstemp(suffix=".tif",
                                                  prefix="landslide_change_")
                     os.close(fd)
-                    sar_change.write_gtiff(opath, out, gt, proj)
+                    faded = self._write_change_with_fade(
+                        opath, out, gt, proj,
+                        roles["post"].get("orbit_state"), SIG[mkey][1], mkey)
                 except Exception as e:               # noqa: BLE001
                     self._warn(f"Could not write {label}: {e}")
                     continue
+                if not faded and data_path:
+                    # unfaded, the temp file is byte-identical to the durable one
+                    # — point the layer at the durable copy so the map does not
+                    # go stale when the temp dir is cleaned
+                    try:
+                        os.remove(opath)
+                    except OSError:
+                        pass
+                    opath = data_path
                 lyr = QgsRasterLayer(opath, label)
                 if not lyr.isValid():
                     self._warn(f"{label}: result raster failed to load.")
                     continue
-                self._style_cd_layer(lyr, mkey)
-                QgsProject.instance().addMapLayer(lyr)
+                if not faded:                        # RGBA (faded) is self-styled
+                    self._style_cd_layer(lyr, mkey)
+                if cd_group is None:
+                    cd_group = lg.new_group(
+                        lg.name("SAR", lg.date_pair(pre_d, post_d), "change"))
+                sub = lg.subgroup(cd_group, CD_PRODUCT.get(mkey, mkey))
+                lg.add_to(lyr, sub)
                 self._cd_last_layers.append(lyr)
                 added += 1
             computed += 1
+            # record this geometry's map for a later asc+desc merge (rec #5) — only
+            # for real computes: stats-only asked for NO layers, and merge writes
+            # layers. Keep the in-memory array (true signed values, not read_band's
+            # γ⁰>0 validity) plus the keys the merge must check for commensurability:
+            # shape/gt (same AOI grid) and k/pol/res (same detector settings).
+            if not stats_only:
+                self._cd_results.append(dict(
+                    mkey=mkey, track=track,
+                    direction=(roles["post"].get("orbit_state") or ""),
+                    out=out, gt=gt, proj=proj, shape=out.shape,
+                    thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
+                    pre_d=pre_d, post_d=post_d))
+                self._cd_results = self._cd_results[-12:]
+                self.cd_merge_btn.setEnabled(True)
             self._append_log(
                 ("  layer added: " if not stats_only else "  computed: ") +
                 f"{label} ({cov:.0f}% of AOI valid)")
@@ -1863,6 +2233,16 @@ class SarTab(QWidget):
                            "frames that cover your area of interest.")
             if not finite.size:
                 continue
+            # rec #2: for the signed brightness detectors, report the deposit
+            # (backscatter↑) vs scar (↓) tail split so the analyst can key on the
+            # fresh-debris signal (see sar_change.split_tails)
+            _dep, _scar, _sm = sar_change.split_tails(out, mkey, SIG[mkey][1])
+            if _sm["signed"]:
+                self._append_log(
+                    f"  sign split (|·|>{_sm['threshold']:.0f}): "
+                    f"{_sm['n_deposit']} deposit px (backscatter↑, fresh debris) "
+                    f"vs {_sm['n_scar']} scar px (↓) — favor deposit over smooth "
+                    "snow/ice/bedrock; treat both as candidates over talus/vegetation")
             if mkey == "logratio":
                 p2, p98 = np.percentile(finite, [2, 98])
                 frac = 100.0 * (np.abs(finite) > 3.0).mean()
@@ -1899,14 +2279,11 @@ class SarTab(QWidget):
         self._zoom_to_aoi()
         self.iface.messageBar().pushInfo(
             "SAR", f"{added} change layer(s) added — colored = anomalous, "
-                   "transparent = normal (per-layer stats in the Log). Wet "
-                   "snow / melt between scenes also reads as change — verify "
-                   "candidates against imagery.")
-        # amplitude context beneath the overlays, so a quiet (mostly
-        # transparent) result never reads as a blank canvas
-        if self.cd_context_check.isChecked():
-            self._render_scenes(self._labeled(
-                [("pre", roles[pre_roles[0]]), ("post", roles["post"])]))
+                   "transparent = normal (per-layer stats in the Log). A "
+                   "blank-looking map means 'no anomalies' — use Preview on "
+                   "map for grayscale amplitude beneath. Wet snow / melt "
+                   "between scenes also reads as change — verify candidates "
+                   "against imagery.")
 
     def _style_cd_layer(self, lyr, method):
         """Pseudocolor with alpha: no-change fades out so the map shows through.
@@ -1958,6 +2335,269 @@ class SarTab(QWidget):
         renderer.setClassificationMin(lo)
         renderer.setClassificationMax(hi)
         lyr.setRenderer(renderer)
+
+    def _style_cd_confidence(self, lyr):
+        """Discrete style for the asc+desc merge confidence raster: 1 recovered
+        from a single orbit where the other was blind, 2 both orbits agree (high
+        confidence), 3 orbits disagree (suspect); 0 (no change) fades out."""
+        stops = [(0.0, "#f7f7f7", 0, "0  no change"),
+                 (1.0, "#fdae61", 160, "1  recovered (single orbit, other blind)"),
+                 (2.0, "#b2182b", 255, "2  agreement (both orbits)"),
+                 (3.0, "#762a83", 220, "3  disagree (suspect)")]
+        items = []
+        for value, color, alpha, text in stops:
+            c = QColor(color)
+            c.setAlpha(alpha)
+            items.append(QgsColorRampShader.ColorRampItem(value, c, text))
+        fn = QgsColorRampShader(0.0, 3.0, None, QgsColorRampShader.Discrete)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
+        renderer.setClassificationMin(0.0)
+        renderer.setClassificationMax(3.0)
+        lyr.setRenderer(renderer)
+
+    # ---------- layover fade (dim the layover-facing slopes) ----------
+    def _aoi_dem(self, gt, shape):
+        """Copernicus GLO-30 DEM on the raster's EXACT grid, cached per
+        (geotransform, shape). None if unavailable — caller then skips dimming."""
+        key = (tuple(round(float(v), 6) for v in gt), tuple(shape))
+        if key in self._dem_cache:
+            return self._dem_cache[key]
+        h, w = shape
+        minx, maxy = gt[0], gt[3]
+        maxx, miny = gt[0] + gt[1] * w, gt[3] + gt[5] * h
+        dem = None
+        try:
+            self._append_log("  layover fade: fetching Copernicus DEM for the AOI…")
+            dem = layover_dim.fetch_dem_on_grid(minx, miny, maxx, maxy, w, h)
+            if dem is None:
+                self._append_log("  layover fade: no Copernicus DEM covers this AOI")
+        except Exception as e:                       # noqa: BLE001 — optional feature
+            self._append_log(f"  layover fade: DEM fetch failed "
+                             f"({type(e).__name__}: {e})")
+        self._dem_cache[key] = dem
+        return dem
+
+    def _cd_out_dir(self):
+        """Output folder for the durable float32 change rasters, mirroring
+        _amp_out_dir: <output or project/out/interactive>/sar/change.
+
+        "" when neither Environment path is set — both default to empty, and
+        os.path.join("", "out", "interactive") is the RELATIVE "out/interactive",
+        which would drop rasters wherever QGIS happened to be launched from."""
+        out = self.dock.out_edit.text().strip()
+        proj = self.dock.project_edit.text().strip()
+        if not out and not proj:
+            return ""
+        base = out or os.path.join(proj, "out", "interactive")
+        return os.path.join(base, "sar", "change")
+
+    @staticmethod
+    def _safe_name(label):
+        """Layer name -> filesystem-safe basename. Kept recognisable rather than
+        hashed: the file is meant to be findable by eye next to the layer it came
+        from, so only the characters that cannot survive a filesystem change."""
+        s = label.replace("\u2192", "_to_").replace("\u00d7", "x")
+        s = re.sub(r"[^\w.+-]+", "_", s)
+        return s.strip("_") or "change"
+
+    @staticmethod
+    def _cd_settings_tag(meta):
+        """Compact tag for the settings that change the PIXELS but not the label.
+
+        The layer label carries only dates, track, polarization and window k, but
+        resolution changes the grid itself, and the speckle filter, radiometric
+        normalization and blob sieve all change the values. Without these in the
+        filename, re-running the same scene pair at a different resolution
+        overwrites the previous file in place — and the Fusion tab would then be
+        reading pixels that no longer match the layer it was told to fuse."""
+        res = meta.get("res")
+        sp = meta.get("speckle")
+        parts = [f"{int(res)}m" if res else "nativem",
+                 f"{sp[0]}{sp[1]}" if sp else "nosp"]
+        if meta.get("radionorm"):
+            parts.append("rn")
+        if meta.get("min_area"):
+            parts.append(f"a{int(meta['min_area'])}")
+        return "_".join(parts)
+
+    def _cd_export_float(self, label, out, gt, proj, meta=None):
+        """Write the signed float32 change raster under the layer's own name.
+
+        Always written, even when the layover fade is on: the fade bakes a colour
+        ramp into RGBA, so true values would otherwise survive only in
+        self._cd_results -- in memory, capped at 12 and cleared on the next
+        Search. The fusion tab consumes these files, so a tempfile would not do.
+        Returns the path, or None if the write failed (never fatal: the layer
+        still loads from the temp copy)."""
+        try:
+            d = self._cd_out_dir()
+            if not d:
+                self._append_log("  not saved: set the Output or Project folder "
+                                 "in the Environment box to keep change rasters")
+                return None
+            os.makedirs(d, exist_ok=True)
+            tag = self._cd_settings_tag(meta or {})
+            path = os.path.join(d, f"{self._safe_name(label)}_{tag}.tif")
+            sar_change.write_gtiff(path, out, gt, proj)
+            self._append_log(f"  saved: {path}")
+            return path
+        except Exception as e:                       # noqa: BLE001
+            self._append_log("  could not save the float32 change raster: "
+                             f"{type(e).__name__}: {e}")
+            return None
+
+    def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey):
+        """Write a change raster. If the layover fade is on and a DEM is available,
+        bake the pseudocolor ramp into an RGBA raster whose alpha dims the layover-
+        facing steep high-anomaly pixels (QGIS renders RGBA alpha reliably, unlike a
+        single-band renderer's alpha band). Returns True if an RGBA raster was
+        written — the caller then does NOT apply the pseudocolor renderer."""
+        import numpy as np
+        if self.layover_check.isChecked():
+            dem = self._aoi_dem(gt, out.shape)
+            if dem is not None:
+                try:
+                    a, meta = layover_dim.layover_alpha(
+                        out, np.isfinite(out), dem, gt, orbit_state,
+                        lat_hint=gt[3] + gt[5] * out.shape[0] / 2.0,
+                        mode="change", thr=thr, dim=0.25)
+                    if meta["n_dimmed"]:
+                        lo, hi, stops = CD_RAMP.get(mkey, CD_RAMP["mtcorr"])
+                        rgba = sar_change.colorize(out, lo, hi, stops)
+                        rgba[..., 3] *= a            # fold the layover alpha in
+                        sar_change.write_rgba(
+                            opath, np.clip(rgba, 0, 255).astype("uint8"), gt, proj)
+                        self._append_log(f"  layover fade: {meta['note']} "
+                                         f"({meta['n_dimmed']} px)")
+                        return True
+                except Exception as e:               # noqa: BLE001
+                    self._append_log(f"  layover fade skipped: "
+                                     f"{type(e).__name__}: {e}")
+        sar_change.write_gtiff(opath, out, gt, proj)
+        return False
+
+    def _apply_layover_amplitude(self, path, cand):
+        """In place, rewrite a grayscale amplitude GeoTIFF as RGBA whose alpha dims
+        the layover-facing steep bright pixels (QGIS honors the alpha band). No-op
+        unless the fade is on and a DEM is available."""
+        if not self.layover_check.isChecked():
+            return
+        import numpy as np
+        try:
+            gray, gt, proj = sar_change.read_raster(path)
+            valid = np.isfinite(gray) & (gray > 0)
+            dem = self._aoi_dem(gt, gray.shape)
+            if dem is None:
+                return
+            a, meta = layover_dim.layover_alpha(
+                gray, valid, dem, gt, cand.get("orbit_state"),
+                lat_hint=gt[3] + gt[5] * gray.shape[0] / 2.0,
+                mode="amplitude", high_percentile=75.0, dim=0.25)
+            if not meta["n_dimmed"]:
+                return
+            gray_u8 = np.clip(np.nan_to_num(gray, nan=0.0), 0, 255).astype("uint8")
+            sar_change.write_gray_rgba(
+                path, gray_u8, layover_dim.as_alpha_band(a), gt, proj)
+            self._append_log(f"  layover fade: {meta['note']} ({meta['n_dimmed']} px)")
+        except Exception as e:                       # noqa: BLE001
+            self._append_log(f"  layover fade skipped: {type(e).__name__}: {e}")
+
+    def _merge_geometries_action(self):
+        """Merge the most recent ascending + descending change maps of each product
+        so a scar lost to layover in one viewing geometry is recovered from the
+        other (report rec #5). Reads the in-memory computed arrays (true signed
+        values, not read_band's γ⁰>0 validity). Degrades honestly to one geometry
+        where only one pass was computed — common in this steep terrain."""
+        if not self._cd_results:
+            self._warn("Compute a change map first — ideally once with an "
+                       "ascending after-scene and once with a descending one — "
+                       "then Merge.")
+            return
+        NAME = {"logratio": "log-ratio", "intcorr": "int-corr",
+                "tsint": "brightness-z", "mtcorr": "MT-corr"}
+        # group by product, newest first; keep the latest result per orbit direction
+        by_prod = {}
+        for r in reversed(self._cd_results):
+            sel = by_prod.setdefault(r["mkey"], {})
+            # group by orbit direction; if the scene lacked orbit_state, fall back
+            # to the track so two real geometries aren't collapsed under one key
+            gk = r["direction"] or f"t{r['track']}"
+            sel.setdefault(gk, r)                  # first (newest) per geometry wins
+        merge_group = None
+        added = 0
+        for mkey, sel in by_prod.items():
+            results = list(sel.values())
+            # commensurability: 'strongest anomaly wins' only makes sense across
+            # rasters on the SAME grid computed with the SAME detector settings
+            def _grid(rr):
+                return (rr["shape"], tuple(round(float(v), 6) for v in rr["gt"]),
+                        rr["k"], rr["pol"], rr["res"])
+            if any(_grid(rr) != _grid(results[0]) for rr in results):
+                self._warn(
+                    f"Merge {NAME.get(mkey, mkey)}: geometries were computed with "
+                    "different AOI / window / polarization / resolution — recompute "
+                    "them with identical settings, then merge. Skipped.")
+                continue
+            try:
+                merged, conf, meta = sar_change.merge_geometries(
+                    [r["out"] for r in results], mkey, results[0]["thr"])
+            except Exception as e:               # noqa: BLE001 — surface, don't crash
+                self._warn(f"Merge ({NAME.get(mkey, mkey)}) failed: "
+                           f"{type(e).__name__}: {e}")
+                continue
+            dirs = "+".join(sorted({(r["direction"] or "?")[:4] for r in results}))
+            r0 = results[0]
+            gt, proj, pre_d, post_d = r0["gt"], r0["proj"], r0["pre_d"], r0["post_d"]
+            self._append_log(
+                f"Merge {NAME.get(mkey, mkey)} [{dirs}, "
+                f"{meta['n_geometries']} geometry(ies)]: {meta['note']}")
+            if meta["single_geometry"]:
+                self._warn(
+                    f"Merge {NAME.get(mkey, mkey)}: only one geometry available — "
+                    "the opposite-facing slopes (possibly the source headscarp) "
+                    "are unrecovered. Compute the other orbit direction if this "
+                    "terrain has coverage.")
+            else:
+                self._append_log(
+                    f"  recovered (single-orbit, other blind)={meta['n_single']} px · "
+                    f"agree (both orbits)={meta['n_agree']} px · "
+                    f"disagree/suspect={meta['n_conflict']} px")
+            try:
+                fd, mpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_merge_")
+                os.close(fd)
+                sar_change.write_gtiff(mpath, merged, gt, proj)
+                fd, cpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_conf_")
+                os.close(fd)
+                sar_change.write_gtiff(cpath, conf, gt, proj)
+            except Exception as e:               # noqa: BLE001
+                self._warn(f"Could not write merged {NAME.get(mkey, mkey)}: {e}")
+                continue
+            mlyr = QgsRasterLayer(
+                mpath, f"S1 change {NAME.get(mkey, mkey)} MERGED {dirs} "
+                       f"{pre_d}→{post_d}")
+            clyr = QgsRasterLayer(
+                cpath, f"S1 MERGED confidence {dirs} {pre_d}→{post_d}")
+            if not mlyr.isValid() or not clyr.isValid():
+                self._warn(f"Merged {NAME.get(mkey, mkey)}: raster failed to load.")
+                continue
+            self._style_cd_layer(mlyr, mkey)
+            self._style_cd_confidence(clyr)
+            if merge_group is None:
+                merge_group = lg.new_group(
+                    lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged"))
+            sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
+            lg.add_to(clyr, sub)          # confidence underneath
+            lg.add_to(mlyr, sub)          # merged change on top
+            self._cd_last_layers += [clyr, mlyr]
+            added += 1
+        if added:
+            self.iface.messageBar().pushInfo(
+                "SAR", f"Merged {added} product(s) across geometries — read the "
+                "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
+                "from one orbit (other blind), 3 = orbits disagree (suspect).")
 
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
@@ -2033,14 +2673,17 @@ class SarTab(QWidget):
         self.progress.setVisible(on)
         self.search_btn.setEnabled(not on)
         self.cancel_btn.setEnabled(on)
-        self.map_preview_btn.setEnabled(
-            (not on) and bool(self._search_result and
-                              (self._search_result.get("pre") or
-                               self._search_result.get("post"))))
+        have = bool(self._search_result and
+                    (self._search_result.get("pre") or
+                     self._search_result.get("post")))
+        self.map_preview_btn.setEnabled((not on) and have)
+        self.run_btn.setEnabled((not on) and have)
         self.cd_btn.setEnabled(
             (not on) and bool(self._search_result and
                               self._search_result.get("pre") and
                               self._search_result.get("post")))
+        # merge is available only when idle and at least one geometry is recorded
+        self.cd_merge_btn.setEnabled((not on) and bool(self._cd_results))
 
     def _append_log(self, line):
         self.log.appendPlainText(line)

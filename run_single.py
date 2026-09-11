@@ -73,40 +73,58 @@ def _write_render_json(a, event_id, r):
     'available' lists every cached order for the event so the plugin can offer a
     picker — together they're how you can tell what this render actually cost."""
     import review_package as rp
-    out = dict(pre=None, post=None, notes=[], pending={}, tone=a.planet_tone,
-               event_id=event_id, reused=r.get("reused") or {},
-               available=r.get("available") or [])
+    out = dict(pre=None, post=None, dbright=None, notes=[], pending={},
+               tone=a.planet_tone, event_id=event_id,
+               reused=r.get("reused") or {}, available=r.get("available") or [])
     base = os.path.join(a.out, event_id)
-    tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
-                else rp.CONTRAST)
-    if a.planet_tone == "knee":
-        tone["knee"] = a.planet_knee if a.planet_knee is not None else rp.KNEE
-        tone["white"] = a.planet_white if a.planet_white is not None else rp.WHITE
-        tone["desat"] = a.planet_desat if a.planet_desat is not None else rp.DESAT
-        # Fit the stretch to the scene when the scene needs it — an all-ice AOI has
-        # nothing inside the knee curve's untouched linear zone and renders flat white
-        # otherwise (see review_package.auto_stretch). Computed ONCE from both sides so
-        # the before/after layers stay photometrically comparable under the swipe tool.
-        # An explicit --planet-white/--planet-black means the caller has already decided
-        # what stretch they want, so auto steps aside; auto is skipped entirely by
-        # --planet-no-auto-stretch.
-        manual = a.planet_white is not None or a.planet_black is not None
-        if a.planet_black is not None:
-            tone["black"] = a.planet_black
-        comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
-        if manual or a.planet_no_auto_stretch:
-            out["notes"].append(
-                "auto-stretch: off — " + ("explicit --planet-white/--planet-black"
-                                          if manual else "--planet-no-auto-stretch"))
-        elif comps:
-            black, white_used, onset, note = rp.auto_stretch(
-                comps, white=tone["white"], knee=tone["knee"])
-            tone.update(black=black, white=white_used, onset=onset)
-            out["notes"].append(note)
-        tone.setdefault("black", 0.0)
-        # what the pixels were actually rendered with, for the log and for reproducing it
-        out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
-    render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
+    if a.planet_tone == "linear":
+        # "None" tone mode: a plain black/white stretch with NO shaping — no rolloff,
+        # cube root, desaturation, or S-curve. It honours the manual stretch spin boxes
+        # but NOT the auto-stretch (a scene-fitted stretch is itself a processing choice
+        # this mode exists to switch off), and contrast doesn't apply. See rp._linear.
+        tone = dict(white=a.planet_white if a.planet_white is not None else rp.WHITE,
+                    black=a.planet_black if a.planet_black is not None else 0.0)
+        out["stretch"] = dict(tone)
+        render = rp._linear
+    elif a.planet_tone == "hdr":
+        # HDR (exposure fusion): renders and fuses its own spread of exposures
+        # (rp.HDR_WHITES), so there is no single white point and no auto-stretch — the fusion
+        # IS the dynamic-range fit. Honours knee + contrast; the manual white/black don't apply.
+        tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None else rp.CONTRAST,
+                    knee=a.planet_knee if a.planet_knee is not None else rp.KNEE)
+        out["stretch"] = {"hdr": "adaptive exposures"}   # per-scene, see review_package._hdr_whites
+        render = rp._highlight_hdr
+    else:
+        tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
+                    else rp.CONTRAST)
+        if a.planet_tone == "knee":
+            tone["knee"] = a.planet_knee if a.planet_knee is not None else rp.KNEE
+            tone["white"] = a.planet_white if a.planet_white is not None else rp.WHITE
+            tone["desat"] = a.planet_desat if a.planet_desat is not None else rp.DESAT
+            # Fit the stretch to the scene when the scene needs it — an all-ice AOI has
+            # nothing inside the knee curve's untouched linear zone and renders flat white
+            # otherwise (see review_package.auto_stretch). Computed ONCE from both sides so
+            # the before/after layers stay photometrically comparable under the swipe tool.
+            # An explicit --planet-white/--planet-black means the caller has already decided
+            # what stretch they want, so auto steps aside; auto is skipped entirely by
+            # --planet-no-auto-stretch.
+            manual = a.planet_white is not None or a.planet_black is not None
+            if a.planet_black is not None:
+                tone["black"] = a.planet_black
+            comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
+            if manual or a.planet_no_auto_stretch:
+                out["notes"].append(
+                    "auto-stretch: off — " + ("explicit --planet-white/--planet-black"
+                                              if manual else "--planet-no-auto-stretch"))
+            elif comps:
+                black, white_used, onset, note = rp.auto_stretch(
+                    comps, white=tone["white"], knee=tone["knee"])
+                tone.update(black=black, white=white_used, onset=onset)
+                out["notes"].append(note)
+            tone.setdefault("black", 0.0)
+            # what the pixels were actually rendered with, for the log and for reproducing it
+            out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
+        render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
     for side in ("pre", "post"):
         comp = r.get(side)
         if comp is None:
@@ -117,7 +135,40 @@ def _write_render_json(a, event_id, r):
             out[side] = path
         except Exception as e:
             out["notes"].append(f"{side}: render failed: {e}")
+    # dBrightness change (post − pre broadband albedo), but ONLY when BOTH sides exist
+    # AND were produced with the SAME product. Differencing an SR side against a DN/TOA
+    # side compares two different radiometric scales, so the "change" would be a product
+    # artefact, not ground change — refuse it. A single render is always internally
+    # consistent (its reuse is bundle-filtered), but Recall (newest cached order per
+    # side) and Re-tone (whatever clips are on disk) can pair an SR side with a TOA one,
+    # so the guard lives here where both sides meet. Derived from the raw composites, not
+    # the tone curve, so it's identical on every path and costs only a subtraction.
+    pre_c, post_c = r.get("pre"), r.get("post")
+    prod = r.get("product") or {}
+    pre_p, post_p = prod.get("pre"), prod.get("post")
+    if pre_c is not None and post_c is not None:
+        if not (pre_p and post_p and pre_p == post_p):
+            out["notes"].append(
+                f"dbright: skipped — pre and post are not the same product "
+                f"(pre={pre_p or 'unknown'}, post={post_p or 'unknown'}). A brightness "
+                f"difference is only meaningful between matching SR (or matching TOA) "
+                f"pixels; re-render both sides the same way to get it.")
+        else:
+            import imagery as im
+            try:
+                dbright = (im._brightness(post_c) - im._brightness(pre_c)).rename("dbright")
+                dpath = f"{base}_dbright.tif"
+                dbright.rio.write_crs(pre_c.rio.crs).rio.to_raster(dpath, driver="GTiff")
+                out["dbright"] = dpath
+            except Exception as e:
+                out["notes"].append(f"dbright: render failed: {e}")
     out["notes"] += r.get("notes", [])
+    out["toa"] = bool(r.get("toa"))   # DN/TOA render vs SR — the plugin labels the layer
+    # scene ids actually composited per side, so the plugin can date the layers on ANY path
+    # (render/recall/re-tone) — not just when it launched the render with the scenes ticked.
+    out["scenes"] = r.get("scenes") or {
+        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
+        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
     orders = r.get("pending") or {}
     if orders:
         out["pending"] = {"orders": orders, "lat": a.lat, "lon": a.lon,
@@ -137,9 +188,12 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
     """Search ONE source ('planet'/'s2'/'landsat') for candidate pre/post scenes.
 
     Returns (result_dict, note): result_dict is search_event's output (or None on
-    failure) and note is a per-source message (or None). Self-contained and
-    touches no shared state, so the preview can fan several of these out across
-    threads."""
+    failure) and note is a per-source message (or None). Self-contained, so the
+    preview can fan several of these out across threads. The one piece of shared
+    state it reaches is imagery's OmniCloudMask ensemble, which guards itself
+    with a lock (see imagery._OCM_LOCK) — torch's MPS backend segfaults if two
+    threads dispatch to it at once, so anything added here that runs a model must
+    serialise the same way."""
     try:
         if s == "planet":
             import planet_imagery as pi
@@ -213,6 +267,11 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             pre += r["pre"]
             post += r["post"]
             notes += r.get("notes", [])   # source-specific hints (e.g. DEM strips)
+            # OmniCloudMask fell back to the SCL/QA lower bound for this source —
+            # surface WHY (bad venv, read error) instead of silently showing the
+            # under-counting number.
+            if r.get("aoi_cloud_note"):
+                notes.append("⚠ " + r["aoi_cloud_note"])
         if note is not None:
             notes.append(note)
     pre.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
@@ -331,6 +390,14 @@ def main():
                          "write <out>/render.json with the layer paths. Unlike the free "
                          "tile preview this PLACES A PLANET ORDER (uses quota); used by "
                          "the plugin's PlanetScope tab.")
+    ap.add_argument("--planet-toa", action="store_true",
+                    help="with --planet-render, order the DN ('analytic') product instead "
+                         "of surface reflectance and convert it to TOA reflectance + "
+                         "white-balance its atmospheric cast ourselves (see planet_imagery "
+                         "TOA_BUNDLE / _toa_from_dn / _balance_cast). Avoids Planet's SR "
+                         "atmospheric correction, which over-corrects bright snow/ice. A "
+                         "recall/re-tone of a DN order is detected from the files, so this "
+                         "flag is only needed at order time.")
     ap.add_argument("--planet-recall", action="store_true",
                     help="load PlanetScope imagery ALREADY ORDERED for this event back "
                          "onto the map from the shared order cache: no search, no order, "
@@ -372,17 +439,26 @@ def main():
                          "same --lat/--lon/--radius-km/--datetime (or --event-id) the "
                          "original render used, so it finds the same workdir. Backs the "
                          "plugin's tone-mode switch.")
-    ap.add_argument("--planet-tone", default="knee", choices=["knee", "natural"],
+    ap.add_argument("--planet-tone", default="knee",
+                    choices=["knee", "natural", "linear", "hdr"],
                     help="tone curve for the --planet-render / --planet-resume GeoTIFFs. "
                          "'knee' (DEFAULT) = highlight rolloff: a plain linear stretch "
                          "below the knee, so midtones/shadows are untouched and only "
                          "highlights get compressed. 'natural' = Highlight Optimized "
                          "Natural Color (cube root: even detail across the whole range, "
                          "including inside bright ice, at the cost of softer global "
-                         "contrast). Both get a gentle S-curve; see "
-                         "review_package.TONE_MODES. 'knee' additionally fits its "
-                         "black/white points to a frame that is all snow/ice — see "
-                         "--planet-no-auto-stretch.")
+                         "contrast). 'linear' = None: a plain black/white stretch with NO "
+                         "shaping at all (no rolloff, cube root, desaturation, or S-curve) "
+                         "— the un-toned reference; bright ice clips to flat white. knee "
+                         "and natural get a gentle S-curve (see --planet-contrast); linear "
+                         "never does. See review_package.TONE_MODES. 'knee' additionally "
+                         "fits its black/white points to a frame that is all snow/ice — see "
+                         "--planet-no-auto-stretch; 'linear' honours --planet-white/"
+                         "--planet-black but never auto-fits. 'hdr' = exposure fusion: "
+                         "renders the knee curve at several exposures and fuses them "
+                         "(Mertens) so deep shadow AND blown snow both keep detail in one "
+                         "image; it fits its own dynamic range, so white/black/auto-stretch "
+                         "don't apply (see review_package._highlight_hdr).")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "
@@ -419,8 +495,9 @@ def main():
                          "neutral to remove it; midtones and shadows below the knee are "
                          "untouched at any setting. 0 = off (pure ratio-preserving).")
     ap.add_argument("--planet-contrast", type=float, default=None,
-                    help="S-curve contrast strength for either tone mode (default 1.15; "
-                         "1.0 = off/identity).")
+                    help="S-curve contrast strength for the knee/natural tone modes "
+                         "(default 1.15; 1.0 = off/identity). No effect on --planet-tone "
+                         "linear, which never adds contrast.")
     ap.add_argument("--resume-pre-order", default=None,
                     help="Planet order id for the PRE side to resume (see --planet-resume).")
     ap.add_argument("--resume-post-order", default=None,
@@ -490,6 +567,7 @@ def main():
     # which no longer handles PlanetScope — this calls planet_imagery directly.
     if a.planet_render:
         import planet_imagery as pi
+        pi.set_toa_ordering(a.planet_toa)   # order DN (TOA path) vs SR; see --planet-toa
         pre_ids = [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()]
         post_ids = [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]
         if not pre_ids and not post_ids:

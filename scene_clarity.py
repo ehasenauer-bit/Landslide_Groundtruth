@@ -113,7 +113,7 @@ def _browse_url(item):
 def _row(item, event_time, lat, lon, radius_km, sensor, tile_only):
     d = item.datetime.replace(tzinfo=None)
     tile_cloud = item.properties.get("eo:cloud_cover")
-    gap = abs((d - event_time).days)
+    gap = round(abs((d - event_time).total_seconds()) / 86400.0)
     # imagery.py's default ranking cost (cloud_weight=0.5); lower = picked sooner
     blend = gap + 0.5 * (100.0 if tile_cloud is None else tile_cloud)
     aoi = dict(cloud_pct=None, snow_pct=None, coverage_pct=None)

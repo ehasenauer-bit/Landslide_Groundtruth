@@ -30,7 +30,7 @@ import random
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QUrl, QByteArray, QSize, QTimer
-from qgis.PyQt.QtGui import QPixmap, QIcon
+from qgis.PyQt.QtGui import QPixmap, QIcon, QBrush
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
@@ -41,13 +41,14 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
     QgsNetworkAccessManager, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsField, QgsFeature, QgsFillSymbol,
+    QgsField, QgsFeature, QgsFillSymbol, QgsGeometry, QgsPointXY,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import QVariant
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from . import layer_group as lg
 
 # Planet's Data API tile service (undocumented, but stable — it's what Planet
 # Explorer's "Add preview to map" relies on). POST scene ids to get a tile hash,
@@ -125,8 +126,14 @@ QSlider::handle:horizontal {{
 }}
 """
 
-# table row tints, matching the Sentinel tab (pre = blue, post = green)
-from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG  # noqa: E402
+# table row tints, matching the Sentinel tab (pre = blue, post = green), plus the
+# AOI-cloud thresholds/colours so the "Cloud" number reads identically to the
+# Sentinel/Landsat tab's (dock.py is the single source of truth for both).
+from .dock import (  # noqa: E402
+    PRE_BG, POST_BG, ROW_FG, MUTED_FG,
+    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX,
+    CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
+)
 
 # auto-resume wait after a Render-detail order times out, and a cap on how many
 # times we'll auto-retry before falling back to the manual button (so a genuinely
@@ -149,6 +156,8 @@ class PlanetTab(QWidget):
         self._preview_pix = None         # last loaded thumbnail, kept for rescaling
         self._tile_replies = []          # in-flight tile-hash POSTs
         self._detail_labels = None       # side -> layer label for the pending SR render
+        self._detail_dates = None        # side -> acquisition date for the pending SR render (folder name)
+        self._preview_group = None       # layer-tree folder the tile preview loads into
         self._preview_layers = []        # preview layers (XYZ tiles / SR GeoTIFFs) on the map
         self._preview_extent = None      # union of previewed scene footprints (EPSG:4326)
         self._footprint_layers = []      # scene-footprint vector layers on the map
@@ -217,13 +226,6 @@ class PlanetTab(QWidget):
         # --- Search window (drop-down) — what dates to look at, per event ---
         form = self._options_group(root, "Search window", collapsed=False)
 
-        self.auto_check = QCheckBox("Auto: tightest window (nearest clear scene each side)")
-        self.auto_check.setToolTip(
-            "Use only the clear scene nearest the event date on each side. The day "
-            "sliders below then set the MAXIMUM days to search each side.")
-        self.auto_check.toggled.connect(self._update_day_labels)
-        form.addRow(self.auto_check)
-
         # Window: how far before / after the event to search, as day sliders.
         self.pre_slider = QSlider(Qt.Horizontal)
         self.pre_slider.setRange(1, 365)
@@ -271,6 +273,7 @@ class PlanetTab(QWidget):
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
         self.coverage_combo.addItem("Cover the exact epicentre (stricter)", "point")
+        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))  # default
         self.coverage_combo.setToolTip(
             "AOI overlap: accept any scene overlapping the search box — recovers "
             "partial-coverage scenes near the event date. Epicentre: require the "
@@ -280,6 +283,7 @@ class PlanetTab(QWidget):
         self.quality_combo = QComboBox()
         self.quality_combo.addItem("Standard quality only", "standard")
         self.quality_combo.addItem("Include test-quality (match Planet Explorer)", "any")
+        self.quality_combo.setCurrentIndex(self.quality_combo.findData("any"))  # default
         self.quality_combo.setToolTip(
             "Near a fresh event the nearest/clearest scenes are often published as "
             "'test' quality (looser geo/radiometric calibration). Fine for a visual "
@@ -301,6 +305,9 @@ class PlanetTab(QWidget):
                                 "highlights", "knee")
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
+        self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
+        self.tone_combo.addItem("HDR (exposure fusion) — shadow AND snow detail at once",
+                                "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
             "• Highlight rolloff (knee) — THE DEFAULT. A plain linear stretch below "
@@ -314,15 +321,47 @@ class PlanetTab(QWidget):
             "the whole range: snow lands near DN 215 with real texture. The cost is "
             "global contrast — it brightens everything below 0.127 reflectance and "
             "darkens everything above, which reads as milky midtones.\n"
+            "• None (linear) — turns OFF all of the above: a plain black/white stretch of "
+            "the reflectance itself, no rolloff, cube root, desaturation, or S-curve. "
+            "Bright ice clips to flat white, exactly as a naive stretch would — the point "
+            "is to see the un-toned pixels. Honours the Manual stretch below, but not "
+            "Auto-stretch or Contrast (neither applies).\n"
+            "• HDR (exposure fusion) — renders the rolloff curve at several exposures and "
+            "fuses them (Mertens exposure fusion), so a scene with deep shadow AND blown "
+            "snow keeps detail at BOTH ends in one image. It fits its own dynamic range, so "
+            "the white point / Auto-stretch / Manual stretch don't apply. Slower to render "
+            "(a few exposures + the fusion), the local-tone-map answer when a single white "
+            "point can't hold the scene.\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
-            "once. Both get a gentle S-curve contrast nudge that cannot clip either end.\n"
+            "once; pick None to check what the raw reflectance looks like unshaped. rolloff "
+            "and Natural Color get a gentle S-curve contrast nudge (see 'Contrast' below) "
+            "that cannot clip either end.\n"
             "Switching this after a render is FREE — see 'Re-tone'.")
         tone_mode = self.settings.value("landslide/planet_tone", "knee", type=str)
         idx = self.tone_combo.findData(tone_mode)
         self.tone_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.tone_combo.currentIndexChanged.connect(self._on_tone_changed)
         form.addRow("SR tone curve", self.tone_combo)
+
+        # The gentle S-curve nudge both shaped curves get (run_single --planet-contrast,
+        # review_package.CONTRAST = 1.15). ON by default keeps every existing render
+        # byte-identical; OFF passes contrast 1.0 (identity). Greyed out for the None
+        # curve, which never adds contrast.
+        self.contrast_check = QCheckBox("Add S-curve contrast")
+        self.contrast_check.setChecked(self.settings.value(
+            "landslide/planet_contrast_scurve", True, type=bool))
+        self.contrast_check.setToolTip(
+            "ON (default): apply a gentle S-curve contrast nudge (strength 1.15, roughly a "
+            "'+10' in photo-editor terms) to the Highlight rolloff and Natural Color "
+            "renders. It pivots at mid-grey and pins BOTH ends, so it can never clip "
+            "shadows to black or highlights to white.\n"
+            "Turn it OFF to render the tone curve with nothing added on top — contrast "
+            "1.0, an exact identity.\n"
+            "No effect on the None tone curve, which never adds contrast. Switching this "
+            "is FREE — see 'Re-tone'.")
+        self.contrast_check.toggled.connect(self._on_tone_changed)
+        form.addRow("Contrast", self.contrast_check)
 
         # The rolloff curve's fixed stretch assumes the frame contains terrain. On an AOI
         # that is ALL snow/ice there is nothing in its untouched linear zone, the whole
@@ -351,6 +390,55 @@ class PlanetTab(QWidget):
             "clips to near-black. Switching this is FREE — see 'Re-tone'.")
         self.autostretch_check.toggled.connect(self._on_tone_changed)
         form.addRow("Auto-stretch", self.autostretch_check)
+
+        # Order the DN ('analytic') product and do our own TOA-reflectance + haze
+        # conversion, instead of Planet's Surface Reflectance. SR over-corrects bright
+        # snow/ice (impossible >1.0 reflectance, the cyan/pink cast); TOA applies no
+        # atmospheric model so it can't over-correct, and dark-object subtraction removes
+        # the residual blue haze (see run_single --planet-toa / planet_imagery). Unlike the
+        # tone controls above this changes what is ORDERED, so it needs a fresh Render
+        # detail (a Re-tone/Recall of an existing order can't apply it) and it USES QUOTA.
+        self.toa_check = QCheckBox("Raw TOA + haze (skip Planet's SR correction)")
+        self.toa_check.setChecked(self.settings.value(
+            "landslide/planet_toa", False, type=bool))
+        self.toa_check.setToolTip(
+            "OFF (default): order Surface Reflectance (analytic_sr_udm2) — Planet's own "
+            "atmospheric correction.\n"
+            "ON: order the DN 'analytic' product (analytic_udm2) and convert it to "
+            "top-of-atmosphere reflectance with a dark-object haze removal here, skipping "
+            "Planet's SR correction. SR over-corrects bright snow/ice — impossible >1.0 "
+            "reflectance and a cyan/pink cast — because atmospheric correction over bright "
+            "targets is error-prone; TOA can't over-correct because it applies no model.\n"
+            "This changes what is ORDERED, so it takes a fresh 'Render detail' and USES "
+            "QUOTA — a Re-tone or Recall of an existing SR order can't switch to it.")
+        self.toa_check.toggled.connect(
+            lambda v: self.settings.setValue("landslide/planet_toa", v))
+        form.addRow("Product", self.toa_check)
+
+        # dBrightness change layer: post − pre broadband albedo (each 0–1), styled to
+        # show ONLY where the ground DARKENED — a fresh scar exposing shadowed/wet debris,
+        # or lost bright snow/vegetation. It's derived from the raw composites (not the
+        # tone curve), so it's FREE and identical on every path; this only controls whether
+        # it's loaded onto the map. Needs BOTH a pre and a post scene rendered (it's a
+        # difference), so a one-sided render produces none.
+        self.dbright_check = QCheckBox("Load brightness-change layer (dBrightness)")
+        self.dbright_check.setChecked(self.settings.value(
+            "landslide/planet_dbright", True, type=bool))
+        self.dbright_check.setToolTip(
+            "ON (default): alongside the before/after SR detail, load a dBrightness "
+            "change layer — the pre→post change in broadband albedo (the mean of the "
+            "four SR bands), the same product the Sentinel-2/Landsat tab exports.\n"
+            "It's styled to show ONLY where brightness DECREASED (blue = strong "
+            "darkening), so a fresh scar that exposes shadowed or wet debris, or that "
+            "buries bright snow/vegetation, stands out while unchanged ground stays "
+            "transparent.\n"
+            "Derived from the raw surface-reflectance composites, so it does NOT depend "
+            "on the tone curve and costs no extra quota — toggling this and hitting "
+            "Re-tone (free) loads or drops it. Needs both a pre and a post scene "
+            "rendered; a one-sided render has nothing to difference.")
+        self.dbright_check.toggled.connect(
+            lambda v: self.settings.setValue("landslide/planet_dbright", v))
+        form.addRow("Change layer", self.dbright_check)
 
         # Hard override for the stretch, for when neither the fixed curve nor the fitted
         # one is what you want. 0 = leave it to the auto-stretch above.
@@ -432,6 +520,9 @@ class PlanetTab(QWidget):
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
         self.detail_btn = QPushButton("Render detail (quota)")
+        # Primary commit button: the only action here that PLACES a Planet order and
+        # uses quota, so it gets the bold + default emphasis (FlowRow has no stretch).
+        f = self.detail_btn.font(); f.setBold(True); self.detail_btn.setFont(f); self.detail_btn.setDefault(True)
         self.detail_btn.setToolTip(
             "Planet's free tiles are pre-rendered 8-bit RGB that clips bright terrain "
             "(snow/ice) to flat white — no brightness slider can recover detail that "
@@ -538,9 +629,9 @@ class PlanetTab(QWidget):
         tl.setContentsMargins(0, 0, 0, 0)
         tl.addWidget(self._section(
             "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)"))
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Cloud %", "Scene ID"])
+            ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -596,6 +687,10 @@ class PlanetTab(QWidget):
         # Wire the auto-resume combo now that the Resume button it toggles exists.
         self.autoresume_combo.currentIndexChanged.connect(self._on_autoresume_changed)
         self._refresh_resume_btn()
+        # Match the greying of Contrast/Auto-stretch to the restored tone curve (None
+        # disables both) — the combo's setCurrentIndex above ran before the handler was
+        # connected, so it didn't fire.
+        self._sync_tone_controls()
         # Show what this account already owns from the moment the panel opens, so a
         # previously-ordered event can be recalled without searching first.
         self._refresh_recall_combo()
@@ -628,9 +723,8 @@ class PlanetTab(QWidget):
         return form
 
     def _update_day_labels(self, *_):
-        suffix = " (max)" if self.auto_check.isChecked() else ""
-        self.pre_lbl.setText(f"{self.pre_slider.value()} d{suffix}")
-        self.post_lbl.setText(f"{self.post_slider.value()} d{suffix}")
+        self.pre_lbl.setText(f"{self.pre_slider.value()} d")
+        self.post_lbl.setText(f"{self.post_slider.value()} d")
 
     def _section(self, text):
         """A section heading styled in Planet teal (see THEME_QSS QLabel#section)."""
@@ -646,7 +740,7 @@ class PlanetTab(QWidget):
         recovered key flows into the SAME PL_API_KEY / QgsSettings path everything
         else on this tab already uses, so login is just a friendlier front door to
         the existing key field."""
-        box = QgsCollapsibleGroupBox("Planet account")
+        box = QgsCollapsibleGroupBox("Planet Labs account")
         box.setSaveCollapsedState(False)
         # start collapsed only when actually signed in (an explicit account/pasted
         # key); a bare PL_API_KEY env var leaves the box open to prompt sign-in
@@ -655,7 +749,7 @@ class PlanetTab(QWidget):
         form = QFormLayout(box)
 
         info = QLabel(
-            'Sign in with your Planet account to search PlanetScope and stream '
+            'Sign in with your Planet Labs account to search PlanetScope and stream '
             'full-res previews. No account? '
             '<a href="https://www.planet.com/explorer/">planet.com</a>. You can also '
             'paste an API key directly instead of signing in.')
@@ -721,7 +815,7 @@ class PlanetTab(QWidget):
         if self._auth_source() == "env":
             self._set_login_status(
                 "A PL_API_KEY environment variable is set and will be used as a "
-                "fallback. Log in to use your Planet account instead.", "warn")
+                "fallback. Log in to use your Planet Labs account instead.", "warn")
         return box
 
     def _set_login_status(self, text, tone="info"):
@@ -739,14 +833,14 @@ class PlanetTab(QWidget):
         self.logout_btn.setEnabled(bool(self._stored_key()))
         if src == "account":
             self.login_box.setTitle(
-                f"Planet account — signed in{f' ({user})' if user else ''}")
+                f"Planet Labs account — signed in{f' ({user})' if user else ''}")
         elif src == "manual":
-            self.login_box.setTitle("Planet account — using a pasted API key")
+            self.login_box.setTitle("Planet Labs account — using a pasted API key")
         elif src == "env":
             self.login_box.setTitle(
-                "Planet account — using PL_API_KEY (env) · log in to use your account")
+                "Planet Labs account — using PL_API_KEY (env) · log in to use your account")
         else:
-            self.login_box.setTitle("Planet account — sign in")
+            self.login_box.setTitle("Planet Labs account — sign in")
 
     def _planet_login(self):
         if self._login_reply is not None:
@@ -852,7 +946,6 @@ class PlanetTab(QWidget):
         self.lon_edit.setText(d.lon_edit.text())
         self.radius_spin.setValue(d.radius_spin.value())
         self.dt_edit.setDateTime(d.dt_edit.dateTime())
-        self.auto_check.setChecked(d.auto_check.isChecked())
         self.pre_slider.setValue(d.pre_slider.value())
         self.post_slider.setValue(d.post_slider.value())
 
@@ -927,7 +1020,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return None
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -950,8 +1045,6 @@ class PlanetTab(QWidget):
             "--quality", self.quality_combo.currentData(),
             "--search-only", "--out", out,
         ]
-        if self.auto_check.isChecked():
-            args.append("--auto-window")
         return python, script, project, out, args
 
     # ---------- search ----------
@@ -1023,12 +1116,96 @@ class PlanetTab(QWidget):
             return 1e9 if g is None else g
 
         def cloud(c):
-            v = c.get("cloud_pct")
+            v = c.get("aoi_cloud_pct")          # cloud over the AOI, when measured
+            if v is None:
+                v = c.get("cloud_pct")          # else the whole-scene metric
             return 100.0 if v is None else v
 
         if auto:
             return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
         return sorted(cands, key=lambda c: gap(c) + cw * cloud(c))
+
+    def _cloud_color(self, pct):
+        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
+
+        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when pct
+        is None. Matches the Sentinel/Landsat tab exactly (same thresholds and
+        colours, imported from dock.py) — replicated here rather than shared because
+        dock's version is a method bound to its own widget. For PlanetScope the number
+        is grey on every preview row: the AOI cloud number needs a UDM2 order and so
+        isn't measured in the free dry-run (see planet_imagery.search_event), so the
+        cell shows the whole-scene value with a ~ and must not read as clear/cloudy."""
+        if pct is None:
+            return CLOUD_UNKNOWN
+        if pct <= CLOUD_GREEN_MAX:
+            return CLOUD_CLEAR
+        if pct <= CLOUD_AMBER_MAX:
+            return CLOUD_SOME
+        return CLOUD_HEAVY
+
+    # ---------- AOI coverage for the "Coverage" column ----------
+    # Mirrors dock.py's Sentinel/Landsat coverage helpers, but measured against
+    # THIS tab's own search AOI: the Planet tab has its own lat/lon/radius inputs
+    # (self._search_result), which need not match the Sentinel tab's, so dock's
+    # AOI-bound versions can't be reused directly. The stateless GeoJSON→geometry
+    # parser (dock._qgs_geom) is shared.
+    def _aoi_bbox(self):
+        """(minx, miny, maxx, maxy) of the Planet search AOI box in lon/lat, or None.
+
+        Same lat/lon + radius_km box the search covers (see _aoi); degree
+        conversion matches dock._aoi_bbox so both tabs measure coverage alike."""
+        aoi = self._aoi()
+        if aoi is None:
+            return None
+        lat, lon, radius = aoi
+        dlat = radius / 111.32
+        dlon = radius / (111.32 * math.cos(math.radians(lat)))
+        return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
+    def _event_point(self):
+        """QgsPointXY of the event epicentre from this tab's last search, or None."""
+        aoi = self._aoi()
+        if aoi is None:
+            return None
+        lat, lon, _ = aoi
+        return QgsPointXY(lon, lat)
+
+    def _covers_event(self, c):
+        """True if the scene footprint actually contains the event point.
+
+        A strip can clip a corner of the AOI box yet leave the epicentre in a
+        nodata gap. Absent/unparseable geometry or point -> True (never flag a
+        scene we cannot test). Mirrors dock._covers_event."""
+        pt = self._event_point()
+        if pt is None:
+            return True
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if g is None or g.isEmpty():
+            return True
+        return g.contains(pt)
+
+    def _aoi_coverage(self, c):
+        """Fraction (0..1) of the AOI box the scene footprint fills.
+
+        area(footprint ∩ AOI) / area(AOI), taken in the AOI's own lon/lat space so
+        the box's degree anisotropy cancels. 0.0 when geometry or AOI is missing.
+        Mirrors dock._aoi_coverage against this tab's Planet AOI."""
+        bbox = self._aoi_bbox()
+        g = self.dock._qgs_geom(c.get("geometry"))
+        if bbox is None or g is None or g.isEmpty():
+            return 0.0
+        minx, miny, maxx, maxy = bbox
+        aoi = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+        aoi_area = aoi.area()
+        if aoi_area <= 0:
+            return 0.0
+        try:
+            inter = g.intersection(aoi)
+        except Exception:
+            return 0.0
+        if inter is None or inter.isEmpty():
+            return 0.0
+        return max(0.0, min(1.0, inter.area() / aoi_area))
 
     def _fill_table(self, result):
         pre = result.get("pre", [])
@@ -1044,9 +1221,26 @@ class PlanetTab(QWidget):
             is_top = cid is not None and cid == top[side]
             date = (c.get("date") or "")[:16].replace("T", " ")
             gap = "" if c.get("gap_days") is None else str(c["gap_days"])
-            cloud = "" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}"
+            # "Cloud" column = cloud over YOUR AOI (per-pixel) when it's known. For
+            # PlanetScope that number is UDM2, which the free preview doesn't order,
+            # so aoi_cloud is None and a leading "~" marks the whole-scene cloud_cover
+            # fallback — never confusing the two. (See planet_imagery.search_event.)
+            aoi_cloud = c.get("aoi_cloud_pct")
+            scene_cloud = c.get("cloud_pct")
+            if aoi_cloud is not None:
+                cloud = f"{aoi_cloud:.0f}%"
+            elif scene_cloud is not None:
+                cloud = f"~{scene_cloud:.0f}%"
+            else:
+                cloud = ""
+            # "Coverage" = how much of your AOI box this scene's footprint fills
+            # (area of overlap ÷ AOI area), same client-side geometry measure as the
+            # Sentinel/Landsat tab. A PlanetScope strip often clips the box, so this
+            # flags the scenes with the fewest nodata gaps over your area.
+            cover_frac = self._aoi_coverage(c)
+            cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else "  "
-            cells = [marker + side, date, gap, cloud, cid or ""]
+            cells = [marker + side, date, gap, cloud, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_top:
                 bg = bg.darker(112)
@@ -1059,6 +1253,32 @@ class PlanetTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
+            # colour the Cloud number itself + tooltip (col 3): green/amber/red by
+            # AOI cloud, grey when only the whole-scene value is known — which, for
+            # the free PlanetScope preview, is always (UDM2 is order-gated).
+            cloud_item = self.table.item(r, 3)
+            cloud_item.setForeground(QBrush(self._cloud_color(aoi_cloud)))
+            if aoi_cloud is not None:
+                tip = (f"Cloud, shadow & haze over your AOI: {aoi_cloud:.0f}%.\n"
+                       f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       f"· red above.")
+                if scene_cloud is not None:
+                    tip += f"\nWhole scene (cloud_cover): {scene_cloud:.0f}%."
+            else:
+                tip = ("Whole-scene cloud cover (Planet cloud_cover), shown with a ~ "
+                       "and a grey number. Cloud over just your AOI comes from the UDM2 "
+                       "mask, which Planet delivers only with a paid order — so it "
+                       "isn't measured in this free preview.\n")
+                tip += (f"Whole scene (cloud_cover): {scene_cloud:.0f}%."
+                        if scene_cloud is not None else "No cloud metric reported.")
+            cloud_item.setToolTip(tip)
+            # "Coverage" tooltip (col 4): AOI-box fill %, with a flag when the strip
+            # clips the box but leaves the epicentre itself in a nodata gap.
+            covers_pt = self._covers_event(c)
+            self.table.item(r, 4).setToolTip(
+                f"Footprint covers {cover}% of your AOI box — how much of the search "
+                f"area has pixels, NOT how cloudy it is (that's the Cloud column)."
+                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1105,7 +1325,18 @@ class PlanetTab(QWidget):
 
     def _make_tile(self, c):
         date = (c.get("date") or "")[:10]
-        cloud = "?" if c.get("cloud_pct") is None else f"{c['cloud_pct']:.0f}%"
+        # cloud over the AOI where measured; a leading "~" falls back to the whole-
+        # scene metric, matching the table's Cloud column. PlanetScope's AOI number
+        # needs a UDM2 order, so the free preview always shows the ~whole-scene value
+        # (see planet_imagery.search_event).
+        aoi_cloud = c.get("aoi_cloud_pct")
+        scene_cloud = c.get("cloud_pct")
+        if aoi_cloud is not None:
+            cloud = f"{aoi_cloud:.0f}%"
+        elif scene_cloud is not None:
+            cloud = f"~{scene_cloud:.0f}%"
+        else:
+            cloud = "?"
         gap = "" if c.get("gap_days") is None else f"gap {c['gap_days']}d"
         cid = c.get("id")
         tile = QToolButton()
@@ -1114,7 +1345,9 @@ class PlanetTab(QWidget):
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
         tile.setText(f"{date}\ncloud {cloud} · {gap}")
-        tile.setToolTip(f"{cid}\n{date}  cloud {cloud}  {gap}")
+        cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
+                     else f"whole-scene cloud {cloud}")
+        tile.setToolTip(f"{cid}\n{date}  {cloud_tip}  {gap}")
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._auth_thumb(c.get("thumb_url"))
         if url:
@@ -1251,10 +1484,32 @@ class PlanetTab(QWidget):
         for c in (self._search_result or {}).get(side, []):
             if c.get("id") == cid:
                 return (c.get("date") or "")[:10]
-        return ""
+        return self._date_from_id(cid)      # fall back to the id itself (no search needed)
+
+    @staticmethod
+    def _date_from_id(cid):
+        """PlanetScope scene id -> acquisition date, e.g. '20240131_210809_72_2479' ->
+        '2024-01-31'. '' if the id isn't date-prefixed. Lets a layer be dated straight from
+        render.json's scene ids, with no dependency on the current search result."""
+        p = (cid or "")[:8]
+        return f"{p[:4]}-{p[4:6]}-{p[6:8]}" if len(p) == 8 and p.isdigit() else ""
 
     def _preview_on_map(self):
         self._render_picks(self._preview_picks())
+
+    def _abort_tile_replies(self):
+        """Abort in-flight tile-hash POSTs and forget them. blockSignals stops their
+        finished() from decrementing the NEXT preview's _tile_pending — a row
+        double-click can re-enter _render_picks mid-request, and a late finish would
+        otherwise drive the counter negative and re-zoom/re-enable on a stale batch."""
+        for reply in list(self._tile_replies):
+            try:
+                reply.blockSignals(True)
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+        self._tile_replies = []
 
     def _render_picks(self, picks):
         key = self._api_key()
@@ -1264,7 +1519,23 @@ class PlanetTab(QWidget):
         if not picks:
             self._warn("Run Search first — no PlanetScope scene to preview.")
             return
+        # Folder for the tile preview layers: "Planet <pre>/<post> <radius> preview"
+        # when the picks give a clean before/after pair, else just "Planet preview".
+        # The side comes from the label _label_for() built; the date from the search
+        # result; the radius from this tab's own search AOI.
+        pre = post = ""
+        for label, ids in picks:
+            side = "pre" if "before" in label else "post" if "after" in label else None
+            if side and ids:
+                if side == "pre":
+                    pre = self._date_for("pre", ids[0])
+                else:
+                    post = self._date_for("post", ids[0])
+        self._preview_group = lg.name("Planet", lg.date_pair(pre, post),
+                                      lg.radius_tag(self.radius_spin.value()), "preview")
         self._clear_preview_layers()
+        self._abort_tile_replies()   # a re-entry (row double-click mid-request) must
+                                     # not share this batch's _tile_pending counter
         self._preview_extent = None
         self._append_log(f"Preview on map: requesting tiles for {len(picks)} scene(s)…")
         self.map_preview_btn.setEnabled(False)
@@ -1396,7 +1667,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1411,6 +1684,8 @@ class PlanetTab(QWidget):
             "--datetime", when, "--radius-km", f"{radius:.2f}",
             "--prefer", "planet", "--planet-render", "--out", out,
         ] + self._tone_args()
+        if self.toa_check.isChecked():
+            args.append("--planet-toa")   # order DN + our TOA/haze instead of Planet SR
         if picks["pre"]:
             args += ["--pre-scene-ids", ",".join(picks["pre"])]
         if picks["post"]:
@@ -1423,6 +1698,13 @@ class PlanetTab(QWidget):
         # GeoTIFF layers get the same "PlanetScope before <date>" naming as the tiles
         self._detail_labels = {
             side: (self._label_for(side, ids[0]) if ids else None)
+            for side, ids in picks.items()
+        }
+        # …and the acquisition date per side, so the loaded layers land in a folder
+        # named for the pre/post dates (e.g. "Planet 7-20/7-21 HONC"). Kept across a
+        # Re-tone (same scenes) so the tone switch only changes the product suffix.
+        self._detail_dates = {
+            side: (self._date_for(side, ids[0]) if ids else "")
             for side, ids in picks.items()
         }
         self._append_log(
@@ -1472,13 +1754,43 @@ class PlanetTab(QWidget):
         # a render.json written before tone modes existed — those were always cube-root,
         # so it is NOT the current default leaking in here.
         tone = result.get("tone") or "natural"
-        tone_word = "rolloff" if tone == "knee" else "natural"
+        tone_word = {"knee": "rolloff", "natural": "natural",
+                     "linear": "linear", "hdr": "HDR"}.get(tone, "natural")
         # Two rolloff renders of the same scene can now differ in their stretch as well
         # as their curve, so say which one this is in the layer name — otherwise a fitted
-        # and an unfitted layer sit on the canvas under identical labels.
+        # and an unfitted layer sit on the canvas under identical labels. A nonzero black
+        # is scene-fitted on knee but a manual choice on linear (which never auto-fits).
         stretch = result.get("stretch") or {}
         if stretch.get("black"):
-            tone_word += f", fitted {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
+            kind = "stretch" if tone == "linear" else "fitted"
+            tone_word += f", {kind} {stretch['black']:.2f}-{stretch.get('white', 0):.2f}"
+        # DN/TOA render (--planet-toa) vs Planet SR: stamp it so a TOA layer is obvious
+        # next to an SR one on the canvas. render.json carries the flag (set from the
+        # actual product, so recall/re-tone of a TOA order are labelled too).
+        toa = bool(result.get("toa"))
+        if toa:
+            tone_word += ", TOA"
+        # Date the layers (and their folder) from the scenes render.json says were actually
+        # composited, so a recall or re-tone still gets "PlanetScope before <date>" naming
+        # even when we didn't launch it here (e.g. after a plugin reload cleared the labels
+        # we cache at render time). The scene id carries the date, so no search is needed.
+        scenes = result.get("scenes") or {}
+        labels = dict(self._detail_labels or {})
+        dates = dict(self._detail_dates or {})
+        for s in ("pre", "post"):
+            ids = scenes.get(s) or []
+            if ids and not dates.get(s):
+                d = self._date_from_id(ids[0])
+                dates[s] = d
+                labels.setdefault(
+                    s, f"PlanetScope {'before' if s == 'pre' else 'after'} {d}".strip())
+        product = {"knee": "Roll off", "natural": "HONC",
+                   "linear": "None", "hdr": "HDR"}.get(tone, "HONC") + (" TOA" if toa else "")
+        # radius the detail was rendered at (from _last_render); after a plugin reload
+        # or recall that cache is gone, so fall back to the current search-AOI spinner.
+        radius = (self._last_render or {}).get("radius", self.radius_spin.value())
+        group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")),
+                        lg.radius_tag(radius), product)
         # replace whatever the previous preview (tiles or SR) put on the map
         self._clear_preview_layers()
         self._preview_extent = None
@@ -1487,24 +1799,53 @@ class PlanetTab(QWidget):
             path = result.get(side)
             if not path or not os.path.exists(path):
                 continue
-            label = (self._detail_labels or {}).get(side) \
+            label = labels.get(side) \
                 or f"PlanetScope {'before' if side == 'pre' else 'after'}"
             label += f" · SR detail ({tone_word})"
             lyr = QgsRasterLayer(path, label)
             if lyr.isValid():
-                QgsProject.instance().addMapLayer(lyr)
+                lg.add_to_group(lyr, group)
                 self._preview_layers.append(lyr)
                 loaded += 1
                 self._append_log(f"  loaded {label}")
             else:
                 self._append_log(f"  could not open the rendered {side} layer")
+        # dBrightness change layer (post − pre albedo): only when both sides rendered
+        # (run_single writes it into render.json in that case) and the user asked for it.
+        # Same run folder as the RGB, styled to show only darkening (reuses the S2/Landsat
+        # tab's ramp). Not counted in `loaded` — it's a change raster, not an SR-detail
+        # tone layer — but tracked so the next render/preview clears it.
+        dpath = result.get("dbright")
+        if dpath and os.path.exists(dpath) and self.dbright_check.isChecked():
+            dpair = lg.date_pair(dates.get("pre"), dates.get("post"))
+            dlabel = "PlanetScope dBrightness" + (f" {dpair}" if dpair else "")
+            dlyr = QgsRasterLayer(dpath, dlabel)
+            if dlyr.isValid():
+                self.dock._style_dbright(dlyr)
+                lg.add_to_group(dlyr, group)
+                self._preview_layers.append(dlyr)
+                self._append_log(f"  loaded {dlabel} (brightness decreases only)")
+            else:
+                self._append_log("  could not open the dBrightness layer")
+        elif (self.dbright_check.isChecked() and not dpath
+              and result.get("pre") and result.get("post")):
+            # Both sides rendered and the user wanted dBrightness, but run_single refused
+            # it — the two sides aren't the same product (SR vs TOA), so their brightness
+            # difference wouldn't be comparable. Surface that rather than silently omitting
+            # the layer (the exact reason is in the notes, already logged above).
+            self.iface.messageBar().pushWarning(
+                "PlanetScope", "dBrightness skipped: the before and after scenes aren't "
+                "the same product (one SR, one TOA). Re-render both sides with the same "
+                "'Raw TOA' setting to get a comparable brightness-change layer.")
         if loaded:
             # The GeoTIFFs are clipped to the AOI box, so framing the AOI frames the
             # render exactly (no per-layer extent bookkeeping needed).
             self.zoom_btn.setEnabled(True)
             self._zoom_to_aoi()
-            shown = "Highlight rolloff" if tone == "knee" \
-                else "Highlight Optimized Natural Color"
+            shown = {"knee": "Highlight rolloff",
+                     "natural": "Highlight Optimized Natural Color",
+                     "linear": "None (plain linear stretch)"}.get(
+                         tone, "Highlight Optimized Natural Color")
             other = "Natural Color" if tone == "knee" else "Highlight rolloff"
             self.iface.messageBar().pushInfo(
                 "PlanetScope", f"Loaded {loaded} SR detail layer(s) — {shown}, "
@@ -1526,7 +1867,7 @@ class PlanetTab(QWidget):
             self.iface.messageBar().pushInfo(
                 "PlanetScope",
                 f"A PlanetScope order ({side_word}) is still processing. It's saved "
-                f"in your Planet account — resume it (no re-order) to finish.")
+                f"in your Planet Labs account — resume it (no re-order) to finish.")
             if self._autoresume_mode() == "auto15" and not self._resume_timer.isActive():
                 self._arm_auto_resume()
 
@@ -1577,17 +1918,17 @@ class PlanetTab(QWidget):
         order shows up straight away. `entries` comes from render.json's 'available'
         block when a run just produced one; otherwise the ledger is read directly.
 
-        Orders near the AOI head the list, because those are the ones that answer
-        "do I need to spend quota on this event?". Everything else the account has
-        paid for follows under a separator instead of being dropped: before a search
-        there is often no AOI to filter on, so the picker listed the whole ledger and
-        then appeared to LOSE orders the moment you hit Search. They are all still
-        recallable — an order from another location simply composites to nothing over
-        this AOI and says so — so hiding them only made paid-for imagery unreachable."""
+        Only orders whose delivered footprint COVERS the epicentre are listed (the
+        strict pc.entries(require_point=True) filter), so the picker answers "which
+        paid-for orders actually image THIS event?" instead of the whole cumulative
+        ledger. When no AOI is known yet (no lat/lon in the form, no prior search) there
+        is nothing to filter on, so the entire ledger is shown. Trade-off, chosen
+        deliberately: an order for a different location no longer appears here — set the
+        form to that location to bring its orders back into range."""
         combo = getattr(self, "recall_combo", None)
         if combo is None:
             return
-        near, rest = entries, []
+        near = entries
         pc = self._ledger()
         if near is None:
             if pc is None:
@@ -1602,41 +1943,27 @@ class PlanetTab(QWidget):
                 # project — this runs on the GUI thread and walking venv/ would stall it.
                 pc.adopt([base_out, os.path.join(project, "out"),
                           os.path.join(project, "Output")], log=lambda *_: None)
-                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2])
+                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
+                                   require_point=True)
                         if aoi else pc.entries())
             except Exception as e:
                 self._append_log(f"could not list cached Planet orders: {e}")
                 return
-        if pc is not None:
-            try:
-                seen = {e.get("order_id") for e in near or []}
-                rest = [e for e in pc.entries() if e.get("order_id") not in seen]
-            except Exception:
-                rest = []          # the near list is the important half; don't lose it
         keep = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Newest cached order per side", None)
         n = 0
 
-        def _add(e, suffix=""):
+        def _add(e):
             oid, side = e.get("order_id"), e.get("side")
             if not oid or side not in ("pre", "post"):
                 return 0
-            combo.addItem((e.get("label") or oid) + suffix, (side, oid))
+            combo.addItem(e.get("label") or oid, (side, oid))
             return 1
 
         for e in near or []:
             n += _add(e)
-        if rest:
-            added = 0
-            mark = combo.count()
-            for e in rest:
-                # the event id is what tells these apart once they're out of area
-                added += _add(e, f" · {e.get('event_id') or 'other AOI'}")
-            if added:
-                combo.insertSeparator(mark)
-                n += added
         if keep is not None:
             idx = combo.findData(keep)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1666,7 +1993,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1692,8 +2021,11 @@ class PlanetTab(QWidget):
         self._last_render = dict(lat=lat, lon=lon, radius=radius, when=when,
                                  event_id=None)
         # the recalled scenes need not be in the current search result, so let
-        # _on_detail_done fall back to generic before/after labels
+        # _on_detail_done fall back to generic before/after labels — and clear the
+        # stale date-pair too, or the recalled imagery is filed under the PREVIOUS
+        # render's dates (its layer group name / folder come from _detail_dates).
         self._detail_labels = None
+        self._detail_dates = None
         self._append_log(
             "Recall: loading PlanetScope scenes already ordered for this event"
             + (f" (order {picked[1][:12]})" if picked else "")
@@ -1731,11 +2063,25 @@ class PlanetTab(QWidget):
         args = ["--planet-tone", self._tone_mode()]
         if not self.autostretch_check.isChecked():
             args.append("--planet-no-auto-stretch")
+        # Off -> render with contrast 1.0 (identity); on -> omit so run_single keeps the
+        # default 1.15 and the output stays byte-identical. Harmless for the None curve,
+        # which ignores contrast either way.
+        if not self.contrast_check.isChecked():
+            args += ["--planet-contrast", "1.0"]
         if self.white_spin.value() > 0:
             args += ["--planet-white", f"{self.white_spin.value():.4f}"]
         if self.black_spin.value() > 0:
             args += ["--planet-black", f"{self.black_spin.value():.4f}"]
         return args
+
+    def _sync_tone_controls(self):
+        """Grey out the controls that do nothing for the selected curve. The None (linear)
+        mode adds no contrast and never auto-fits, so its Contrast and Auto-stretch boxes
+        would be misleading if left live; Manual stretch stays enabled, since linear
+        honours it."""
+        shaped = self._tone_mode() != "linear"
+        self.contrast_check.setEnabled(shaped)
+        self.autostretch_check.setEnabled(shaped)
 
     def _on_tone_changed(self, *_):
         """Remember the choice, and nudge toward the free re-render rather than letting
@@ -1743,8 +2089,11 @@ class PlanetTab(QWidget):
         self.settings.setValue("landslide/planet_tone", self._tone_mode())
         self.settings.setValue("landslide/planet_autostretch",
                                self.autostretch_check.isChecked())
+        self.settings.setValue("landslide/planet_contrast_scurve",
+                               self.contrast_check.isChecked())
         self.settings.setValue("landslide/planet_white", self.white_spin.value())
         self.settings.setValue("landslide/planet_black", self.black_spin.value())
+        self._sync_tone_controls()
         if self._last_render and self.task is None:
             self._append_log(
                 f"Tone curve set to '{self._tone_label()}' — click Re-tone to re-render "
@@ -1777,7 +2126,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1875,7 +2226,9 @@ class PlanetTab(QWidget):
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
-            self._warn("Set a valid venv python path in Environment (top of the panel).")
+            # shared gate: warns, opens the Environment box, marks and focuses
+            # the offending field (dock.env_gate)
+            self.dock.env_gate()
             return
         if not os.path.exists(script):
             self._warn(f"run_single.py not found in project dir:\n{script}")
@@ -1935,7 +2288,7 @@ class PlanetTab(QWidget):
         if not lyr.isValid():
             self._append_log(f"    could not build the tile layer for {name}")
             return
-        QgsProject.instance().addMapLayer(lyr)
+        lg.add_to_group(lyr, self._preview_group)
         self._preview_layers.append(lyr)
         self._append_log(f"    added: {name}")
 
@@ -1955,10 +2308,7 @@ class PlanetTab(QWidget):
 
     def _clear_preview_layers(self):
         for lyr in self._preview_layers:
-            try:
-                QgsProject.instance().removeMapLayer(lyr.id())
-            except (RuntimeError, AttributeError):
-                pass
+            lg.remove_layer(lyr)
         self._preview_layers = []
         if hasattr(self, "zoom_btn"):
             self.zoom_btn.setEnabled(False)
@@ -2033,13 +2383,25 @@ class PlanetTab(QWidget):
 
     # ---------- misc ----------
     def _aoi(self):
-        """(lat, lon, radius_km) from the last search result, or None."""
+        """(lat, lon, radius_km) from the last search result, else the last render's
+        AOI, else None.
+
+        Recall / re-tone / resume set _last_render but run no search, so without the
+        fallback _search_result is None and the imagery just loaded can't be framed
+        (_zoom_to_aoi / 'Zoom to scene' would do nothing)."""
         result = self._search_result or {}
         try:
             return (float(result.get("lat")), float(result.get("lon")),
                     float(result.get("params", {}).get("radius_km")))
         except (TypeError, ValueError):
-            return None
+            pass
+        last = self._last_render
+        if last:
+            try:
+                return (float(last["lat"]), float(last["lon"]), float(last["radius"]))
+            except (TypeError, ValueError, KeyError):
+                pass
+        return None
 
     def _zoom_to_preview(self):
         """Frame the previewed scene footprint(s); fall back to the AOI box."""

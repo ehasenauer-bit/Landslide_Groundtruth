@@ -47,10 +47,11 @@ data-API render of DEM-aligned RTC scenes from the same relative orbit, so
 the arrays line up pixel-for-pixel without any resampling in this module.
 
 Pure numpy + GDAL (both ship inside QGIS; no scipy). All window statistics
-run on integral images, so cost is independent of the window size.
+run on integral images, so cost is independent of the window size. GDAL is
+imported lazily inside the I/O helpers only, so the pure-numpy detectors and
+tail-split helpers import (and unit-test) without osgeo present.
 """
 import numpy as np
-from osgeo import gdal
 
 NODATA = -9999.0
 
@@ -62,6 +63,7 @@ def read_band(path):
     Valid excludes NaN/±inf, the band's nodata value, the render's mask band,
     and non-positive pixels — gamma-naught is positive over real ground, and
     0 is what masked/empty areas of a data-API render come back as."""
+    from osgeo import gdal
     ds = gdal.Open(path)
     if ds is None:
         raise IOError(f"GDAL could not open {path}")
@@ -86,6 +88,7 @@ def read_band(path):
 
 def write_gtiff(path, arr, gt, proj):
     """Write float32 `arr` (NaN → NODATA) as a single-band deflate GeoTIFF."""
+    from osgeo import gdal
     h, w = arr.shape
     drv = gdal.GetDriverByName("GTiff")
     ds = drv.Create(path, w, h, 1, gdal.GDT_Float32,
@@ -93,9 +96,104 @@ def write_gtiff(path, arr, gt, proj):
     ds.SetGeoTransform(gt)
     ds.SetProjection(proj)
     band = ds.GetRasterBand(1)
-    band.WriteArray(np.where(np.isfinite(arr), arr, NODATA).astype(np.float32))
+    # nodata BEFORE the write: on GDAL 3.12 an uncompressed GTiff never writes
+    # all-zero blocks, and a SetNoDataValue arriving afterwards backfills them
+    # with nodata (measured: 72000 of 90000 px). COMPRESS=DEFLATE above happens
+    # to suppress it, but the ordering should not depend on a creation option.
     band.SetNoDataValue(NODATA)
+    band.WriteArray(np.where(np.isfinite(arr), arr, NODATA).astype(np.float32))
     band.FlushCache()
+    ds = None
+
+
+def read_raster(path, band=1):
+    """(arr float32 with NODATA→NaN, geotransform, projection) of `band`. Unlike
+    read_band this applies NO γ⁰>0 validity test, so it is safe for DEMs and for
+    already-computed change rasters that can legitimately be zero or negative."""
+    from osgeo import gdal
+    ds = gdal.Open(path)
+    if ds is None:
+        raise IOError(f"GDAL could not open {path}")
+    b = ds.GetRasterBand(band)
+    arr = b.ReadAsArray().astype(np.float32)
+    nd = b.GetNoDataValue()
+    if nd is not None:
+        arr = np.where(arr == nd, np.nan, arr)
+    gt, proj = ds.GetGeoTransform(), ds.GetProjection()
+    ds = None
+    return arr, gt, proj
+
+
+def write_gtiff_2band(path, value, alpha_u8, gt, proj):
+    """Band 1 = float value (NaN→NODATA), band 2 = 0..255 alpha. A single-band
+    renderer keeps its styling on band 1 while QGIS modulates opacity by band 2
+    (renderer.setAlphaBand(2)) — used to fade radar-layover pixels."""
+    from osgeo import gdal
+    h, w = value.shape
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 2, gdal.GDT_Float32,
+                                              options=["COMPRESS=DEFLATE"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    b1 = ds.GetRasterBand(1)
+    b1.WriteArray(np.where(np.isfinite(value), value, NODATA).astype(np.float32))
+    b1.SetNoDataValue(NODATA)
+    ds.GetRasterBand(2).WriteArray(np.asarray(alpha_u8).astype(np.float32))
+    ds.FlushCache()
+    ds = None
+
+
+def write_gray_rgba(path, gray_u8, alpha_u8, gt, proj):
+    """4-band Byte RGBA (R=G=B=gray, A=alpha) — QGIS auto-renders it with per-pixel
+    opacity, revealing the basemap beneath dimmed pixels. For the grayscale
+    amplitude preview, whose auto grayscale styling can't take an external alpha."""
+    from osgeo import gdal
+    g = np.asarray(gray_u8).astype(np.uint8)
+    a = np.asarray(alpha_u8).astype(np.uint8)
+    h, w = g.shape
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 4, gdal.GDT_Byte,
+                                              options=["COMPRESS=DEFLATE", "ALPHA=YES"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    for i in (1, 2, 3):
+        ds.GetRasterBand(i).WriteArray(g)
+    ab = ds.GetRasterBand(4)
+    ab.WriteArray(a)
+    ab.SetColorInterpretation(gdal.GCI_AlphaBand)
+    ds.FlushCache()
+    ds = None
+
+
+def colorize(value, lo, hi, stops):
+    """Map a float array to RGBA (float32, shape H×W×4, 0..255) by linear
+    interpolation over `stops` = [(value, '#rrggbb', alpha0_255), …] ascending.
+    NaN → fully transparent. Bakes a pseudocolor ramp into pixels so the result
+    can carry a per-pixel alpha (the layover fade) that QGIS renders reliably —
+    which a single-band renderer's alpha band does not."""
+    v = np.asarray(value, dtype=np.float32)
+    xs = np.array([s[0] for s in stops], dtype=np.float64)
+    cols = np.array([[int(s[1][1:3], 16), int(s[1][3:5], 16),
+                      int(s[1][5:7], 16), s[2]] for s in stops], dtype=np.float64)
+    vc = np.clip(v, lo, hi).astype(np.float64)
+    out = np.empty(v.shape + (4,), dtype=np.float32)
+    for ch in range(4):
+        out[..., ch] = np.interp(vc, xs, cols[:, ch])
+    out[~np.isfinite(v)] = 0.0
+    return out
+
+
+def write_rgba(path, rgba_u8, gt, proj):
+    """H×W×4 uint8 RGBA → GeoTIFF that QGIS auto-renders with per-pixel opacity."""
+    from osgeo import gdal
+    a = np.asarray(rgba_u8)
+    h, w = a.shape[:2]
+    ds = gdal.GetDriverByName("GTiff").Create(path, w, h, 4, gdal.GDT_Byte,
+                                              options=["COMPRESS=DEFLATE", "ALPHA=YES"])
+    ds.SetGeoTransform(gt)
+    ds.SetProjection(proj)
+    for i in range(4):
+        ds.GetRasterBand(i + 1).WriteArray(a[..., i].astype(np.uint8))
+    ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ds.FlushCache()
     ds = None
 
 
@@ -187,9 +285,29 @@ def sieve_small_blobs(values, mask, min_area, fill=0.0, connectivity=8):
     m = np.asarray(mask) & np.isfinite(out)
     if min_area <= 1 or not m.any():
         return out
+    ys, xs, roots = label_blobs(m, connectivity)
+    counts = np.bincount(roots, minlength=ys.size)
+    small = counts[roots] < min_area
+    out[ys[small], xs[small]] = fill
+    return out
+
+
+def label_blobs(mask, connectivity=8):
+    """Connected components of `mask` -> (ys, xs, roots).
+
+    `ys`/`xs` are the mask pixels and `roots[i]` is the component id of pixel i
+    (an arbitrary but stable member index, so np.bincount(roots) gives component
+    sizes directly). Same pure-numpy union-find sieve_small_blobs has always
+    used — lifted out so callers that need the components themselves, not just
+    a size filter, do not reimplement it. QGIS ships no scipy.
+
+    Only mask pixels are unioned, so cost scales with the mask, not the image."""
+    m = np.asarray(mask, dtype=bool)
     h, w = m.shape
     ys, xs = np.nonzero(m)
     n = ys.size
+    if n == 0:
+        return ys, xs, np.zeros(0, dtype=np.int64)
     idx = -np.ones((h, w), dtype=np.int64)
     idx[ys, xs] = np.arange(n)
     parent = np.arange(n, dtype=np.int64)
@@ -214,10 +332,7 @@ def sieve_small_blobs(values, mask, min_area, fill=0.0, connectivity=8):
         for a, b in zip(np.nonzero(nb >= 0)[0].tolist(), nb[nb >= 0].tolist()):
             union(a, b)
     roots = np.array([find(i) for i in range(n)], dtype=np.int64)
-    counts = np.bincount(roots, minlength=n)
-    small = counts[roots] < min_area
-    out[ys[small], xs[small]] = fill
-    return out
+    return ys, xs, roots
 
 
 # ---------- detectors ----------
@@ -359,3 +474,179 @@ def intensity_zscore(pres, post, valids, vpost, k, sigma_floor_db=0.75):
         z = (10.0 * np.log10(mp) - mu) / sd
     z[(n < 2) | ~np.isfinite(z)] = np.nan
     return z.astype(np.float32)
+
+
+# ---------- deposit / scar tail split (report rec #2: "sign the change map") ----------
+# Deposit polarity of each SIGNED brightness detector: the sign of the change
+# VALUE where a fresh, rougher deposit (a backscatter INCREASE) shows up. The
+# correlation-family detectors are one-sided change-MAGNITUDE measures (→ high =
+# change, either direction) with no deposit/scar polarity, so they map to None
+# and must NOT be split into tails. Keys match sar_tab's CD_PRODUCTS.
+DEPOSIT_SIGN = {
+    "logratio": -1,   # 10·log10(pre/post): brighter-after ⇒ post>pre ⇒ NEGATIVE
+    "tsint":    +1,   # post brighter than the pre-stack ⇒ POSITIVE z-score
+    "intcorr":  None,  # normalized correlation loss: 0→1 magnitude, no direction
+    "mtcorr":   None,  # multi-temporal possibility: ~0.5 normal → 1 change
+}
+
+
+def deposit_sign(kind):
+    """+1 / −1 for a signed brightness detector (the value-sign of a fresh
+    deposit), or None for an unsigned change-magnitude detector."""
+    return DEPOSIT_SIGN.get(kind)
+
+
+def deposit_oriented(arr, kind):
+    """Re-orient a change map so DEPOSIT (backscatter increase) reads POSITIVE and
+    SCAR (decrease) reads NEGATIVE, whatever the detector's native sign. Returns a
+    float32 array, or None for an unsigned (correlation-family) detector."""
+    s = DEPOSIT_SIGN.get(kind)
+    if s is None:
+        return None
+    return (np.asarray(arr, dtype=np.float32) * s).astype(np.float32)
+
+
+def split_tails(arr, kind, threshold, fill=np.nan):
+    """Split a SIGNED change map into its deposit and scar tails (report rec #2).
+
+    ``threshold`` ≥ 0 is a magnitude cut in the detector's own units — dB for
+    log-ratio, σ for the z-score. Returns ``(deposit, scar, meta)``:
+
+      deposit  the deposit-oriented value where it is ≥ +threshold: the fresh
+               backscatter-INCREASE signal (rough debris on a smoother substrate —
+               the primary co-event deposit indicator over snow/ice/bedrock);
+               ``fill`` elsewhere.
+      scar     the POSITIVE magnitude where the oriented value is ≤ −threshold: a
+               backscatter DECREASE (scar / smoothing / de-vegetation); ``fill``
+               elsewhere.
+      meta     {'signed', 'deposit_sign', 'threshold', 'n_deposit', 'n_scar'}.
+
+    Caveat carried from the Alaska report: the deposit=increase rule holds over
+    SMOOTH substrate (snow, ice, stripped bedrock); over talus/moraine/vegetated
+    runout the sign can flip, so treat both tails as candidates there.
+
+    For an unsigned detector (correlation family) a deposit/scar split is not
+    physically meaningful: ``deposit`` and ``scar`` come back all-``fill`` and
+    ``meta['signed']`` is False — keep the single one-sided magnitude map instead.
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    thr = abs(float(threshold))
+    oriented = deposit_oriented(a, kind)
+    if oriented is None:
+        empty = np.full(a.shape, fill, dtype=np.float32)
+        return empty, empty.copy(), {"signed": False, "deposit_sign": None,
+                                     "threshold": thr, "n_deposit": 0, "n_scar": 0}
+    finite = np.isfinite(oriented)
+    dep_mask = finite & (oriented >= thr)
+    scar_mask = finite & (oriented <= -thr)
+    deposit = np.where(dep_mask, oriented, fill).astype(np.float32)
+    scar = np.where(scar_mask, -oriented, fill).astype(np.float32)
+    return deposit, scar, {"signed": True, "deposit_sign": DEPOSIT_SIGN[kind],
+                           "threshold": thr, "n_deposit": int(dep_mask.sum()),
+                           "n_scar": int(scar_mask.sum())}
+
+
+# ---------- dual-geometry merge (report rec #5) ----------
+def merge_geometries(maps, kind, threshold, agree_min=2):
+    """Combine per-geometry change maps (ascending + descending) into one, so a
+    scar pixel lost to layover in one viewing geometry is recovered from the other.
+
+    ``maps`` — one change array per geometry ACTUALLY available (same shape, same
+    detector ``kind``, each in the detector's NATIVE units with NaN where that
+    geometry has no valid / layover-free data). That count is often **1** in
+    Alaska's steep terrain, where a given AOI/track has only ascending OR only
+    descending coverage — this function degrades to that case honestly rather
+    than faking a merge (see ``meta['single_geometry']`` / ``meta['note']``).
+
+    ``threshold`` — significance magnitude: dB or σ for the signed detectors, the
+    ``>`` cut for the unsigned correlation family.
+
+    Cross-geometry backscatter is NOT directly comparable, so values are never
+    averaged across geometries. Per pixel the geometry with the STRONGEST anomaly
+    wins (its native value, sign preserved), and a companion CONFIDENCE map records
+    how many geometries saw the pixel and whether they agree:
+
+        NaN  no geometry has valid data here
+        0    valid, but not anomalous in any geometry (background)
+        1    anomalous in one orbit while every other orbit was BLIND (NaN) here —
+             a true layover recovery (the whole point of the merge)
+        2    anomalous in ≥agree_min geometries, CONSISTENT sign (high confidence)
+        3    orbits DISAGREE — either anomalous with conflicting sign, or one orbit
+             flagged it while another orbit had valid data and saw no change;
+             suspect / possible geometry artifact, inspect before trusting
+
+    Returns ``(merged, confidence, meta)`` — merged in native units (so the tab's
+    existing styling applies unchanged), plus a confidence raster and a meta dict.
+    """
+    arrs = [np.asarray(m, dtype=np.float32) for m in maps]
+    if not arrs:
+        raise ValueError("merge_geometries needs at least one map")
+    shape = arrs[0].shape
+    for a in arrs:
+        if a.shape != shape:
+            raise ValueError("geometry maps differ in shape")
+    thr = abs(float(threshold))
+    signed = DEPOSIT_SIGN.get(kind) is not None
+
+    agree_min = max(2, int(agree_min))
+    stack = np.stack(arrs)                       # (G, H, W)
+    valid = np.isfinite(stack)
+    if signed:
+        strength = np.where(valid, np.abs(stack), -np.inf)
+        anom = valid & (np.abs(stack) >= thr)
+    else:
+        strength = np.where(valid, stack, -np.inf)
+        anom = valid & (stack >= thr)
+
+    valid_count = valid.sum(0)
+    any_valid = valid_count > 0
+    n_geom = int(sum(int(v.any()) for v in valid))      # geometries with ANY data
+
+    # merged value: the geometry with the strongest anomaly at each pixel wins;
+    # sign is preserved so deposit/scar polarity survives the merge
+    idx = np.argmax(strength, axis=0)
+    merged = np.take_along_axis(stack, idx[None], axis=0)[0].astype(np.float32)
+    merged[~any_valid] = np.nan
+
+    ncount = anom.sum(0)                                 # geometries flagging anomaly
+    multi = ncount >= agree_min
+    # sub-quorum: anomalous in fewer than agree_min geometries (normally exactly 1
+    # for an asc+desc pair). Split by whether the NON-anomalous geometries were
+    # blind (NaN → true layover recovery) or valid-but-saw-no-change (disagreement,
+    # a lower-confidence / possible-artifact pixel — NOT a recovery).
+    sub = any_valid & (ncount >= 1) & ~multi
+    others_valid = valid_count > ncount                  # a valid orbit saw no anomaly
+    conf = np.zeros(shape, dtype=np.float32)
+    conf[~any_valid] = np.nan
+    conf[sub & ~others_valid] = 1.0                      # recovered (others blind)
+    conf[sub & others_valid] = 3.0                       # single-orbit, contradicted
+    if signed:
+        # agreement = every anomalous orbit shares sign; conflict = a deposit and a
+        # scar are claimed at one pixel by different orbits
+        has_pos = (anom & (stack > 0)).any(0)
+        has_neg = (anom & (stack < 0)).any(0)
+        sign_conflict = multi & has_pos & has_neg
+        conf[multi & ~sign_conflict] = 2.0
+        conf[sign_conflict] = 3.0
+    else:
+        conf[multi] = 2.0
+    n_conflict = int((conf == 3).sum())
+
+    if n_geom < 2:
+        note = ("single-geometry only — layover on the opposite-facing slopes "
+                "(possibly the source headscarp) is UNRECOVERED; add the other "
+                "orbit direction if this terrain has coverage")
+    else:
+        note = (f"merged {n_geom} geometries — conf 2 (both orbits agree) is "
+                f"highest confidence, conf 1 is recovered from a single orbit "
+                f"where the other was blind to layover, conf 3 pixels disagree "
+                f"(opposite sign, or one orbit saw no change) and are suspect")
+    meta = dict(
+        n_geometries=n_geom,
+        single_geometry=(n_geom < 2),
+        n_single=int((conf == 1).sum()),
+        n_agree=int((conf == 2).sum()),
+        n_conflict=n_conflict,
+        note=note,
+    )
+    return merged, conf.astype(np.float32), meta
