@@ -158,7 +158,8 @@ def _write_render_json(a, event_id, r):
             try:
                 dbright = (im._brightness(post_c) - im._brightness(pre_c)).rename("dbright")
                 dpath = f"{base}_dbright.tif"
-                dbright.rio.write_crs(pre_c.rio.crs).rio.to_raster(dpath, driver="GTiff")
+                # tiled + overviewed, same as every other package raster
+                rp._to_tif(dbright, dpath, pre_c.rio.crs)
                 out["dbright"] = dpath
             except Exception as e:
                 out["notes"].append(f"dbright: render failed: {e}")

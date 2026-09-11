@@ -178,6 +178,96 @@ AUTO_MIN_PIXELS = 50000   # ... or one too thinly sampled to resolve AUTO_BLACK_
 AUTO_SAMPLE = 500000      # target sample size for the percentile scan (strided read)
 
 
+# ---------------------------------------------------------------------------
+# How every raster in this package is written.
+#
+# A bare .rio.to_raster(path, driver="GTiff") takes GDAL's defaults: ONE-ROW
+# strips, no compression, no overviews. That layout is what makes a stitched
+# multi-tile output unpannable in QGIS. The block is a whole raster-width row,
+# so filling a ~1900 px screen window drags in the FULL width, once per row --
+# a ~5x over-read and ~1100 separate block reads per repaint, which also blows
+# GDAL's block cache so the next pan step re-reads everything it just threw
+# away. 512x512 tiles turn the same repaint into ~12 block reads of pixels the
+# screen actually wants, and adjacent pan steps reuse them.
+#
+# Measured on a 9344x9329 dBright (Bering Glacier), GDAL cache 64 MB,
+# 24 pan repaints at 1900x1100: 0.36 s -> 0.13 s, file 697 -> 315 MB.
+#
+# ZSTD level 1 is LOSSLESS -- pixels read back bit-identical -- and is chosen
+# over DEFLATE because DEFLATE's decompression cost cancels most of the tiling
+# win (0.29 s on the same test, barely better than no tiling at all).
+#
+# float64 change rasters are written as float32. These are bounded indices
+# (dBright / dNDSI / dNDVI all sit inside about +-2), so float32's ~7 significant
+# digits are orders of magnitude more than the data carries -- and it halves
+# every byte the renderer has to move.
+#
+# Measured before switching, against the hand-digitized "Total Area" scar
+# outlines in the shared-drive QGIS projects: 51 polygon x raster combinations,
+# 559,515 scar pixels. 41 combinations were unchanged outright; the other 10
+# moved exactly ONE 10 m pixel across a display/floor threshold. Worst area
+# disagreement anywhere: 100 m². For scale, one pixel of wobble in where the
+# outline was drawn is worth +-123,718 m² on the Iliamna scar -- the digitizing
+# hand is ~1,200x the larger error term.
+#
+# Pass keep_float64=True for anything that is NOT a bounded index (absolute
+# coordinates, timestamps) -- nothing in this module currently needs it.
+# ---------------------------------------------------------------------------
+TILE = 512                # internal block size, px
+OVERVIEW_FLOOR = 512      # stop halving once the smallest level is under this
+
+
+def _tif_opts(dtype):
+    """GTiff creation options for `dtype`. PREDICTOR is dtype-specific: 3 is the
+    floating-point predictor, 2 the integer one; using the wrong one just costs
+    compression ratio, but there is no reason to."""
+    pred = 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2
+    return dict(driver="GTiff", tiled=True, blockxsize=TILE, blockysize=TILE,
+                compress="ZSTD", zstd_level=1, predictor=pred,
+                bigtiff="IF_SAFER", num_threads="ALL_CPUS")
+
+
+def _add_overviews(path):
+    """Append internal pyramid levels, halving until the top level is small.
+
+    Overviews are DISPLAY ONLY -- every read that does not ask for a decimated
+    view (Identify, the fusion/volume tabs, gdal.Warp) still gets full
+    resolution. They exist so a zoomed-out repaint reads a 292 px thumbnail
+    instead of decimating 9344 px of source. Internal (inside the .tif), not a
+    .ovr sidecar, so the pyramid cannot get separated from the raster when a
+    package folder is moved or shared.
+
+    Best-effort: a package whose overviews failed to build is still a valid,
+    correct package, so never fail the export over it."""
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+        with rasterio.open(path, "r+") as ds:
+            n, f, factors = max(ds.width, ds.height), 2, []
+            while n // f >= OVERVIEW_FLOOR:
+                factors.append(f)
+                f *= 2
+            if factors:
+                ds.build_overviews(factors, Resampling.average)
+    except Exception as e:
+        print(f"note: could not build overviews for {os.path.basename(path)}: {e}")
+
+
+def _to_tif(da, path, src_crs, nodata=None, keep_float64=False):
+    """Write `da` as a tiled, overviewed GeoTIFF. The single write path for this
+    module -- see the block comment above for why the options matter.
+
+    float64 is narrowed to float32 unless `keep_float64`; the cast happens BEFORE
+    the CRS/nodata tags go on, because astype() drops rioxarray's encoding."""
+    if not keep_float64 and np.dtype(da.dtype) == np.float64:
+        da = da.astype("float32")
+    da = da.rio.write_crs(src_crs)
+    if nodata is not None:
+        da = da.rio.write_nodata(nodata)
+    da.rio.to_raster(path, **_tif_opts(da.dtype))
+    _add_overviews(path)
+
+
 def _rgb(comp, bands, path, src_crs):
     """Write a 3-band uint8 GeoTIFF from reflectance bands, stretched 0-0.3 -> 0-255."""
     rgb = comp.sel(band=bands)
@@ -186,7 +276,7 @@ def _rgb(comp, bands, path, src_crs):
     # sources (e.g. Planet) carry a float NaN nodata that can't cast to uint8 and
     # a 4-band 'long_name' that trips rioxarray's band-name check.
     rgb.attrs = {}
-    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+    _to_tif(rgb, path, src_crs, nodata=0)
 
 
 def _contrast(d, k=1.0):
@@ -577,7 +667,7 @@ def _write_rgb(rgb, path, src_crs):
     """Write a 0-255 float rgb DataArray (NaN = nodata) as the 3-band uint8 GeoTIFF."""
     rgb = rgb.fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
-    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+    _to_tif(rgb, path, src_crs, nodata=0)
 
 
 def _highlight_rolloff(comp, path, src_crs, **kw):
@@ -653,7 +743,7 @@ def _highlight_natural(comp, path, src_crs, contrast=1.0):
     rgb = _contrast(rgb, contrast)
     rgb = (rgb * 255).fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
-    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+    _to_tif(rgb, path, src_crs, nodata=0)
 
 
 def _linear(comp, path, src_crs, white=WHITE, black=0.0):
@@ -680,7 +770,7 @@ def _linear(comp, path, src_crs, white=WHITE, black=0.0):
         rgb = rgb.clip(1.0, 255.0)
     rgb = rgb.fillna(0).astype("uint8")
     rgb.attrs = {}    # see _rgb: stale float-nodata / 4-band long_name would break the write
-    rgb.rio.write_crs(src_crs).rio.write_nodata(0).rio.to_raster(path, driver="GTiff")
+    _to_tif(rgb, path, src_crs, nodata=0)
 
 
 def _date_tag(dates):
@@ -782,25 +872,25 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
 
     # raw NDVI pre/post — the inputs behind dNDVI, handy for thresholding by eye
     if "ndvi" in want:
-        write_sides("ndvi", source="ndvi_", render=lambda a, p: a.rename("ndvi")
-                    .rio.write_crs(src_crs).rio.to_raster(p, driver="GTiff"))
+        write_sides("ndvi", source="ndvi_",
+                    render=lambda a, p: _to_tif(a.rename("ndvi"), p, src_crs))
 
     # change rasters — where a scar lights up. Each is a pre->post DIFFERENCE, so
     # all three are None (and skipped) on a one-sided run.
     if "dndvi" in want and img.get("dndvi") is not None:
         path = _change_path(base, "dndvi", pre_tag, post_tag)
-        img["dndvi"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        _to_tif(img["dndvi"], path, src_crs)
         layers.append(path)
     # NDSI change — new dark debris on snow/ice drives NDSI down, so a strong
     # NEGATIVE dNDSI is the debris-on-glacier signal (works where there is no
     # vegetation for dNDVI to catch). None when the composite carried no SWIR.
     if "dndsi" in want and img.get("dndsi") is not None:
         path = _change_path(base, "dndsi", pre_tag, post_tag)
-        img["dndsi"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        _to_tif(img["dndsi"], path, src_crs)
         layers.append(path)
     if "dbright" in want and img.get("dbright") is not None:
         path = _change_path(base, "dbright", pre_tag, post_tag)
-        img["dbright"].rio.write_crs(src_crs).rio.to_raster(path, driver="GTiff")
+        _to_tif(img["dbright"], path, src_crs)
         layers.append(path)
 
     # the predicted epicentre to search around (digitize the scar against it)
