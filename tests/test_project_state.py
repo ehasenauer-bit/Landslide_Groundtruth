@@ -1,6 +1,7 @@
 """Saved-project combo restore survives items being reordered or reworded.
 
-Run with any python:  ./venv/bin/python test_project_state.py
+Run with tests/run_all.sh, or any python at all — it needs no QGIS:
+    ./venv/bin/python tests/test_project_state.py
 
 project_state stores a combo choice as its LABEL. Nine of the QGIS projects on
 the shared drive hold "dNDSI — snow index change (recommended)". When dBright
@@ -9,10 +10,16 @@ would have silently dropped all nine to the new default — turning six dNDSI
 projects into dBright ones on open, with no message. combo_index is what stops
 that, so it is tested against the strings those files actually contain.
 """
+import os
 import re
 import sys
 
-SRC = "qgis_plugin/landslide_groundtruth/project_state.py"
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = os.path.join(ROOT, "qgis_plugin")
+PLUG = os.path.join(PKG, "landslide_groundtruth")
+
+SRC = os.path.join(PLUG, "project_state.py")
 
 # project_state imports qgis.PyQt; lift the pure helper out instead.
 _src = open(SRC).read()

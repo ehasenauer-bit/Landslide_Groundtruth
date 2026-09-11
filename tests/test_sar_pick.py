@@ -1,6 +1,7 @@
 """Which after-scene does change detection run on?  (sar_tab._cd_post)
 
-Run with any python that has no QGIS:  ./venv/bin/python test_sar_pick.py
+Run with tests/run_all.sh, or any python at all — it needs no QGIS:
+    ./venv/bin/python tests/test_sar_pick.py
 
 sar_tab imports qgis.PyQt, so the method under test is read OUT of the file and
 bound to a stub tab. That is deliberate: the test exercises the shipped source
@@ -12,11 +13,16 @@ usable before-scenes, which starves every detector and stops the run — measure
 on Knik-Barry 2026-08-09, where t65 and t160 both image on 2026-08-21 but only
 t160 has recent before-scenes.
 """
+import os
 import re
 import sys
 import textwrap
 
-SRC = "qgis_plugin/landslide_groundtruth/sar_tab.py"
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = os.path.join(ROOT, "qgis_plugin")
+PLUG = os.path.join(PKG, "landslide_groundtruth")
+SRC = os.path.join(PLUG, "sar_tab.py")
 
 
 def _bind(*names):

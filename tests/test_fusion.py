@@ -24,7 +24,7 @@ import types
 
 import numpy as np
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "qgis_plugin", "landslide_groundtruth")
 
 fails = []
