@@ -1970,6 +1970,14 @@ class SarTab(QWidget):
         k = self.cd_window_combo.currentData()
         minx, miny, maxx, maxy, radius = bbox
         px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
+        # What the render will ACTUALLY be. The 2048 cap is a hard ceiling on the
+        # data API request, so past ~20 km radius at 20 m (or ~10 km at 10 m) the
+        # Pixel size control stops having any effect and the grid coarsens
+        # instead: a 28 km radius is 27.3 m whichever size was asked for, a 45 km
+        # radius 44 m. Everything downstream that says "20 m" — the filename, the
+        # log, the blob sieve's px — was quoting the request, not the result.
+        eff_res = (2000.0 * radius / px) if px else float(res)
+        capped = px >= 2048 and eff_res > res + 0.05
         # snapshot the Noise-reduction panel now, so tweaking it mid-download
         # can't change what this run computes
         self._cd_meta = dict(
@@ -1978,7 +1986,7 @@ class SarTab(QWidget):
             speckle=self.speckle_cd_combo.currentData(),
             min_area=self.blob_combo.currentData(),
             radionorm=self.radionorm_check.isChecked(),
-            radius=radius,
+            radius=radius, px=px, eff_res=eff_res,
             stats_only=self.cd_stats_only_check.isChecked())
         self._cd_paths = {}
         self._cd_pending = len(roles)
@@ -1986,7 +1994,17 @@ class SarTab(QWidget):
         self.cd_btn.setEnabled(False)
         self._append_log(
             "Change detection (" + " + ".join(CD_NAMES[m] for m in products) +
-            f", {pol.upper()}, {k}×{k} window at {res} m px):")
+            f", {pol.upper()}, {k}×{k} window at {eff_res:.3g} m px):")
+        if capped:
+            self._warn(
+                f"A {radius:g} km radius will not fit at {res} m: the render is "
+                f"capped at {px}×{px} pixels, so the change map comes back at "
+                f"{eff_res:.3g} m per pixel, not {res} m. Every pixel-denominated "
+                f"setting scales with it — the {k}×{k} window spans "
+                f"{k * eff_res:.0f} m, and the min change area "
+                f"{self._cd_meta['min_area'] or 0} px is "
+                f"{(self._cd_meta['min_area'] or 0) * eff_res ** 2 / 1e4:.2f} ha. "
+                "Reduce the radius to get the detail back.")
         spk = self._cd_meta["speckle"]
         self._append_log(
             "  filters: speckle " +
@@ -2419,15 +2437,29 @@ class SarTab(QWidget):
         """Compact tag for the settings that change the PIXELS but not the label.
 
         The layer label carries only dates, track, polarization and window k, but
-        resolution changes the grid itself, and the speckle filter, radiometric
-        normalization and blob sieve all change the values. Without these in the
-        filename, re-running the same scene pair at a different resolution
-        overwrites the previous file in place — and the Fusion tab would then be
-        reading pixels that no longer match the layer it was told to fuse."""
-        res = meta.get("res")
+        the grid and the values depend on much more, and anything left out of this
+        tag is a file silently overwritten in place — with the Fusion tab then
+        reading pixels that no longer match the layer it was told to fuse.
+
+        RADIUS leads, because it is the only complete key for the grid. It was
+        missing, and `res` did not cover for it: past the 2048-pixel render cap
+        the requested resolution is ignored, so 20 km, 28 km and 45 km runs of one
+        scene pair at "20 m" produced three different rasters under ONE name.
+        (Measured: they all wrote
+        S1_change_log-ratio_..._t116_VV_7x7_20m_lee5_rn_a8.tif.) Rounding the
+        resolution alone would not do either — 27.8 km and 28.0 km radii both
+        round to 27 m while covering different ground.
+
+        The resolution that follows is the EFFECTIVE one, so the name states what
+        the pixels are rather than what was asked for."""
         sp = meta.get("speckle")
-        parts = [f"{int(res)}m" if res else "nativem",
-                 f"{sp[0]}{sp[1]}" if sp else "nosp"]
+        res = meta.get("eff_res") or meta.get("res")
+        parts = []
+        rt = lg.radius_tag(meta.get("radius"))
+        if rt:
+            parts.append(rt)
+        parts += [f"{int(round(res))}m" if res else "nativem",
+                  f"{sp[0]}{sp[1]}" if sp else "nosp"]
         if meta.get("radionorm"):
             parts.append("rn")
         if meta.get("min_area"):
