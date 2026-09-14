@@ -76,10 +76,22 @@ OPTICAL_EXCLUDE = ("s1 ", "log-ratio", "logratio", "int-corr", "mt-corr",
                    "brightness z")
 SAR_EXCLUDE = ("dndsi", "dbright", "dndvi", "ndvi")
 
-# How much of each other two change rasters must cover before the tab will treat
-# them as describing the same event. Measured as min(a-in-b, b-in-a), so it is
-# the SMALLER of the two containments — see _footprint_match for why the
-# one-directional version of this test was worse than no test at all.
+# Two different questions about a candidate pair, deliberately kept apart. One
+# threshold tried to answer both, and answered each one wrong in a different
+# direction — too lax when the SAR swallowed the optical, too strict when it
+# merely surrounded it.
+#
+# CAN these two be fused at all? Only the OPTICAL AOI is at stake: the fused grid
+# is cropped to the intersection (fusion_grid.crop_to_common), so the question is
+# how much of the optical footprint has SAR underneath it. That is a ONE-WAY
+# measurement, _overlap_fraction(optical, sar), and it is the gate — below it
+# there is no ground to fuse over and the row is greyed out.
+AOI_COVERAGE_MIN = 0.60
+# WHICH candidate is the best partner? That is a ranking, and it must be
+# SYMMETRIC — min(a-in-b, b-in-a) — so a huge scene cannot win by swallowing the
+# optical whole (see _footprint_match). Below this the two rasters are on very
+# different scales: still fusable, since the crop confines the result to the
+# optical AOI, but said out loud rather than paired in silence.
 FOOTPRINT_MATCH_MIN = 0.60
 
 # score ramp: transparent below 0.2 so a quiet AOI renders as nothing at all
@@ -136,7 +148,8 @@ class FusionTab(QWidget):
         self._sar_user_choice = False  # True once the user picks SAR by hand
         self._refreshing = False
         self._applying_preset = False
-        self._pair_overlap = None      # last auto-pair's footprint overlap
+        self._pair_overlap = None      # last auto-pair's symmetric footprint match
+        self._pair_coverage = None     # …and how much of the optical AOI it covers
         self._rescan = QTimer(self)
         self._rescan.setSingleShot(True)
         self._rescan.setInterval(400)
@@ -256,21 +269,29 @@ class FusionTab(QWidget):
         if sar:
             n = 1 + (len(self._sar_siblings(sar))
                      if self.pair_sar_check.isChecked() else 0)
-            ov = self._pair_overlap
-            detail = (f"{ov:.0%} footprint match with the optical raster"
-                      if ov is not None else "")
+            ov, cov = self._pair_overlap, self._pair_coverage
+            # Coverage is the number that decides whether the pair is usable, so
+            # it leads. The symmetric match earns a clause only when the scales
+            # differ enough that the fused EXTENT will surprise someone.
+            if cov is None:
+                detail = ""
+            elif ov is not None and ov < FOOTPRINT_MATCH_MIN:
+                detail = (f"SAR covers {cov:.0%} of the optical AOI — a much "
+                          "larger scene, fused to the optical footprint")
+            else:
+                detail = f"SAR covers {cov:.0%} of the optical AOI"
             self._set_step(1, f"✓ {n} detector{'s' if n != 1 else ''}",
-                           CLR_OK if (ov is None or ov >= 0.80) else CLR_WARN,
+                           CLR_OK if (cov is None or cov >= 0.80) else CLR_WARN,
                            detail)
         elif not self.out_fused_check.isChecked():
             self._set_step(1, "Not needed", CLR_MUTED,
                            "'Fused score' is unticked — this is an optical-only run")
         else:
-            ov = self._pair_overlap
-            if ov is not None and ov < FOOTPRINT_MATCH_MIN:
+            cov = self._pair_coverage
+            if cov is not None and cov < AOI_COVERAGE_MIN:
                 self._set_step(1, "No SAR raster covers this area", CLR_BAD,
-                               f"best match {ov:.0%} — pick one, or run SAR "
-                               "change detection for this event")
+                               f"best covers {cov:.0%} of the AOI — pick one, or "
+                               "run SAR change detection for this event")
             else:
                 self._set_step(1, "Choose a SAR raster", CLR_BAD,
                                "a change raster from the SAR tab")
@@ -573,10 +594,15 @@ class FusionTab(QWidget):
         self._sar_combo = QComboBox()
         self._sar_combo.setToolTip(
             "The change map from the SAR tab — chosen automatically as the one "
-            "whose footprint MATCHES the optical raster above. A raster covering "
-            "noticeably different ground is listed greyed out with how far off "
-            "it is, rather than offered as a pair; the … button forces any file "
-            "you like past that.\n\nThe SAR tab "
+            "whose footprint best MATCHES the optical raster above. A raster is "
+            "offered when it covers at least "
+            f"{AOI_COVERAGE_MIN:.0%} of the optical AOI; one that covers less is "
+            "listed greyed out with its coverage rather than offered as a pair, "
+            "and the … button forces any file you like past that.\n\n"
+            "A SAR scene LARGER than the optical AOI is a fine partner — the "
+            "fused raster is cropped to the ground both inputs cover, so it "
+            "spans the optical footprint and the tab says so in the step above. "
+            "What it cannot be is a scene centred somewhere else.\n\nThe SAR tab "
             "saves a float32 copy under the layer's own name in "
             "<output>/sar/change. Older runs left only a temporary file, and a "
             "temp file that has since been cleaned up shows here greyed out as "
@@ -1103,11 +1129,16 @@ class FusionTab(QWidget):
         # overlap. Only re-pick when the user has not chosen the SAR layer
         # themselves.
         self._pair_overlap = None
+        self._pair_coverage = None
         if opt_path and not self._sar_user_choice:
             idx, ov = self._best_footprint_match(self._sar_combo, SAR_HINTS,
                                                  anchor, SAR_EXCLUDE)
             self._sar_combo.blockSignals(True)
-            if idx > 0 and ov >= FOOTPRINT_MATCH_MIN:
+            # Ranking alone decides here. Every row still selectable has already
+            # cleared AOI_COVERAGE_MIN in _fill_combo, and _best_footprint_match
+            # skips the greyed rows, so a second veto on the SYMMETRIC score
+            # only re-imposed the problem this split exists to remove.
+            if idx > 0:
                 self._sar_combo.setCurrentIndex(idx)
             else:
                 self._sar_combo.setCurrentIndex(0)   # no honest pair — ask
@@ -1115,34 +1146,53 @@ class FusionTab(QWidget):
             self._autodetect_measure("sar")
             if idx > 0:
                 self._pair_overlap = ov
+                self._pair_coverage = self._overlap_fraction(
+                    anchor, self._bbox4326(self._sar_combo.currentData()))
+                if ov < FOOTPRINT_MATCH_MIN and not quiet:
+                    # Covered, but on a quite different scale. Fusing is correct
+                    # — the crop confines the result to the optical AOI — and the
+                    # half of the old bug worth keeping is that this must never
+                    # happen in silence.
+                    ok, sk = self._footprint_km(opt_path), self._footprint_km(
+                        self._sar_combo.currentData())
+                    self._warn(
+                        "The paired SAR raster is a much larger scene than the "
+                        "optical AOI"
+                        + (f" ({sk[0]:.0f}×{sk[1]:.0f} km against "
+                           f"{ok[0]:.0f}×{ok[1]:.0f} km)" if ok and sk else "")
+                        + f", but it covers {self._pair_coverage:.0%} of it, so "
+                        "the two are paired. The fused raster will span the "
+                        "OPTICAL footprint only. If you meant to work at the "
+                        "larger radius, pick that run's dBright/dNDSI instead.")
             else:
                 # The search above only sees rows the filter left selectable, so
                 # when it finds nothing it returns 0.0 — and reporting "best 0%"
                 # for a raster that missed by a whisker would send the user
                 # looking for the wrong problem. Score every SAR-looking raster,
                 # greyed or not, and report the real near-miss.
-                near = [self._footprint_match(anchor, self._bbox4326(src))
+                near = [self._overlap_fraction(anchor, self._bbox4326(src))
                         for nm, src in rasters
                         if any(h in nm.lower() for h in SAR_HINTS)
                         and not any(x in nm.lower() for x in SAR_EXCLUDE)]
-                self._pair_overlap = max(near) if near else None
+                self._pair_coverage = max(near) if near else None
                 if near and not quiet:
                     self._warn(
-                        "No SAR change raster covers the same ground as the "
-                        f"selected optical raster (a pair needs a "
-                        f"{FOOTPRINT_MATCH_MIN:.0%} footprint match; the "
-                        f"closest of {len(near)} manages {max(near):.0%}). "
-                        "Every one is listed greyed out with how far off it is "
-                        "— the usual cause is an optical raster left over from "
-                        "a run at a different radius. Run SAR change detection "
-                        "over the same AOI, or use the … button to force a file.")
+                        "No SAR change raster covers enough of the selected "
+                        f"optical AOI (a pair needs {AOI_COVERAGE_MIN:.0%} "
+                        f"coverage; the best of {len(near)} covers "
+                        f"{max(near):.0%}). Every one is listed greyed out with "
+                        "its coverage — the usual cause is a SAR run centred on "
+                        "a DIFFERENT event, which the group names in the layer "
+                        "tree will show. Run SAR change detection over this AOI, "
+                        "or use the … button to force a file.")
         elif opt_path:
             # user-chosen SAR: still report the match, so the step panel says
             # what this pair actually is instead of going silent
             sar_path = self._sar_combo.currentData()
             if sar_path:
-                self._pair_overlap = self._footprint_match(
-                    anchor, self._bbox4326(sar_path))
+                bb = self._bbox4326(sar_path)
+                self._pair_overlap = self._footprint_match(anchor, bb)
+                self._pair_coverage = self._overlap_fraction(anchor, bb)
 
         # blockSignals above suppressed currentIndexChanged, so the measure
         # auto-detect never ran for a selection made BY the refresh — which is
@@ -1277,7 +1327,12 @@ class FusionTab(QWidget):
         scene. A flawless score, for a pair that shares 5% of its ground — so the
         tab auto-paired them, said "100% footprint overlap" in the step panel,
         and fused a 90 km raster carrying optical evidence over a twentieth of
-        itself."""
+        itself.
+
+        This is the RANKING metric only. Do not reach for it as the pairing gate
+        as well — that was the other half of the same mistake, and it refused
+        concentric pairs that fuse perfectly well. The gate is coverage of the
+        optical AOI; see AOI_COVERAGE_MIN and _footprint_reason."""
         if not a or not b:
             return 0.0
         return min(FusionTab._overlap_fraction(a, b),
@@ -1286,6 +1341,16 @@ class FusionTab(QWidget):
     def _footprint_reason(self, path, anchor):
         """Why this raster cannot pair with the anchor footprint, or None.
 
+        The test is COVERAGE OF THE OPTICAL AOI, one-directional, because that is
+        what the fused product needs: crop_to_common confines the output to the
+        intersection, so a SAR scene larger than the optical AOI is not a problem
+        to be refused — it is simply trimmed. Measuring this symmetrically
+        refused a 20 km optical against the 28 km SAR of the same event,
+        concentric to 400 m and fully covered, on a 54% score.
+
+        What the symmetric score is still for is RANKING (_footprint_match) and
+        for saying so when the scales are very different; it is not a veto.
+
         None whenever the footprint is unknown or there is no anchor yet: this
         filter exists to stop an accident, and it must never block on ignorance."""
         if not anchor or not path:
@@ -1293,14 +1358,14 @@ class FusionTab(QWidget):
         bb = self._bbox4326(path)
         if not bb:
             return None
-        m = self._footprint_match(anchor, bb)
-        if m >= FOOTPRINT_MATCH_MIN:
+        cov = self._overlap_fraction(anchor, bb)
+        if cov >= AOI_COVERAGE_MIN:
             return None
         # Kept short on purpose: the dock can be 360 px wide and a combo elides
         # from the right, so the number has to arrive before the explanation does
-        if m <= 0.0:
+        if cov <= 0.0:
             return "no overlap with the optical raster"
-        return f"{m:.0%} of the optical footprint, needs {FOOTPRINT_MATCH_MIN:.0%}"
+        return f"covers {cov:.0%} of the optical AOI, needs {AOI_COVERAGE_MIN:.0%}"
 
     @staticmethod
     def _overlap_fraction(a, b):
@@ -1323,8 +1388,8 @@ class FusionTab(QWidget):
         rasters describe the same place, so pair on it.
 
         Rows the footprint filter greyed out carry no path and are skipped here
-        too, so this only ever ranks candidates that already cover the same
-        ground; the score it returns is what the step panel reports.
+        too, so this only ever ranks candidates that already cover enough of the
+        optical AOI to be fusable; choosing between them is all that is left.
 
         Returns (index, match) with index -1 when nothing matches."""
         best, best_m = -1, 0.0

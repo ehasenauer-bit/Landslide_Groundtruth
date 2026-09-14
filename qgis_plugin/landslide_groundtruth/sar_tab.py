@@ -1478,15 +1478,18 @@ class SarTab(QWidget):
         no client-side smoothing, dropped in from a throwaway temp file.
         mode='run' is the full-detail render at the chosen Pixel size + median
         filter, and SAVES each GeoTIFF under out/interactive/sar/amplitude so it
-        survives the session. Both land in the same "SAR <pre>/<post> amplitude"
-        folder, so a Run replaces the quick preview (and vice versa)."""
+        survives the session. Both land in the same
+        "SAR <pre>/<post> amplitude <radius>km" folder — the radius comes from the
+        same search AOI either way — so a Run replaces the quick preview (and
+        vice versa)."""
         bbox = self._aoi_bbox()
         if bbox is None:
             self._warn("Run Search first — no Sentinel-1 scene to preview.")
             return
         self.dock._ensure_network_timeout()   # AOI renders can be slow when cold
-        # Folder for the amplitude layers: "SAR <pre>/<post> amplitude" from the
-        # before/after dates in the picks (side read from the label _labeled() built).
+        # Folder for the amplitude layers: "SAR <pre>/<post> amplitude <radius>km"
+        # from the before/after dates in the picks (side read from the label
+        # _labeled() built)…
         pre = post = ""
         for label, c in picks:
             d = (c.get("date") or "")[:10]
@@ -1494,9 +1497,15 @@ class SarTab(QWidget):
                 pre = d
             elif "after" in label:
                 post = d
-        self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude")
-        self._clear_preview_layers()
+        # …and the AOI radius, because the dates do not identify a run. Two
+        # renders of the same scene pair at different radii otherwise produce two
+        # top-level folders with the SAME name, told apart only by the "(2)"
+        # new_group appends — and the Fusion tab pairs on ground, so picking the
+        # wrong one of those is a mismatch you cannot see from the tree.
         minx, miny, maxx, maxy, radius = bbox
+        self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude",
+                                  lg.radius_tag(radius))
+        self._clear_preview_layers()
         if mode == "run":
             res = self.detail_combo.currentData() or 10
             k = self.smooth_combo.currentData()
@@ -1969,6 +1978,7 @@ class SarTab(QWidget):
             speckle=self.speckle_cd_combo.currentData(),
             min_area=self.blob_combo.currentData(),
             radionorm=self.radionorm_check.isChecked(),
+            radius=radius,
             stats_only=self.cd_stats_only_check.isChecked())
         self._cd_paths = {}
         self._cd_pending = len(roles)
@@ -2203,7 +2213,8 @@ class SarTab(QWidget):
                     self._style_cd_layer(lyr, mkey)
                 if cd_group is None:
                     cd_group = lg.new_group(
-                        lg.name("SAR", lg.date_pair(pre_d, post_d), "change"))
+                        lg.name("SAR", lg.date_pair(pre_d, post_d), "change",
+                                lg.radius_tag(meta.get("radius"))))
                 sub = lg.subgroup(cd_group, CD_PRODUCT.get(mkey, mkey))
                 lg.add_to(lyr, sub)
                 self._cd_last_layers.append(lyr)
@@ -2220,7 +2231,7 @@ class SarTab(QWidget):
                     direction=(roles["post"].get("orbit_state") or ""),
                     out=out, gt=gt, proj=proj, shape=out.shape,
                     thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
-                    pre_d=pre_d, post_d=post_d))
+                    radius=meta.get("radius"), pre_d=pre_d, post_d=post_d))
                 self._cd_results = self._cd_results[-12:]
                 self.cd_merge_btn.setEnabled(True)
             self._append_log(
@@ -2587,7 +2598,8 @@ class SarTab(QWidget):
             self._style_cd_confidence(clyr)
             if merge_group is None:
                 merge_group = lg.new_group(
-                    lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged"))
+                    lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged",
+                            lg.radius_tag(results[0].get("radius"))))
             sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
             lg.add_to(clyr, sub)          # confidence underneath
             lg.add_to(mlyr, sub)          # merged change on top
