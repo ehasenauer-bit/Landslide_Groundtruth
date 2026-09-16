@@ -172,12 +172,13 @@ def search_scenes(pl, aoi, start, end, event_time, max_cloud=0.6, limit=6,
       None  -> rank by temporal proximity to event_time alone (the tightest
         --auto-window mode).
     cover: if a GeoJSON geometry (the event point) is given, REQUIRE each scene's
-    footprint to contain it instead of merely intersecting the AOI bbox. A single
-    PlanetScope strip only covers a few km, so over a large search box the plain
-    bbox filter can return a scene clipping only the AOI's edge — leaving the
-    epicentre uncovered. Requiring coverage of the point guarantees the chosen
-    scenes actually overlap the location being ground-truthed (and, when none do,
-    the caller falls back to Sentinel-2/Landsat rather than mapping an off-centre
+    footprint to contain it instead of merely intersecting the AOI bbox. A
+    PlanetScope scene is ~32 x 20 km (SuperDove) and is framed along the satellite
+    track on no tiling grid, so over a large search box the plain bbox filter can
+    return a scene clipping only the AOI's edge — leaving the epicentre
+    uncovered. Requiring coverage of the point guarantees the chosen scenes
+    actually overlap the location being ground-truthed (and, when none do, the
+    caller falls back to Sentinel-2/Landsat rather than mapping an off-centre
     strip).
     """
     from planet import data_filter as df

@@ -611,8 +611,10 @@ class PlanetTab(QWidget):
             "box, so you can see whether a strip actually covers the epicentre. "
             "With table rows selected, only THOSE scenes' footprints are drawn — "
             "click a row to isolate its strip, Ctrl/Shift-click for several, "
-            "click in empty table space to show all candidates again. A single "
-            "PlanetScope strip is only a few km wide.")
+            "click in empty table space to show all candidates again. A SuperDove "
+            "scene is about 32 × 20 km, usually bigger than the search box — but "
+            "the frames follow the satellite's track and sit on no tiling grid, so a "
+            "scene can overlap the box and still miss the epicentre.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
         root.addWidget(self.footprint_check)
 
@@ -1606,9 +1608,10 @@ class PlanetTab(QWidget):
         if self._tile_pending <= 0:
             self.map_preview_btn.setEnabled(True)
             if self._preview_layers:
-                # Frame the actual scene footprint, not the AOI: a PlanetScope strip
-                # is only a few km wide and can sit well off the epicentre, so zooming
-                # to the AOI can leave the imagery off-screen (blank canvas).
+                # Frame the actual scene footprint, not the AOI: a PlanetScope scene
+                # (~32 x 20 km, framed along-track on no tiling grid) can overlap the
+                # AOI at one corner and sit well off the epicentre, so zooming to the
+                # AOI can leave the imagery off-screen (blank canvas).
                 self.zoom_btn.setEnabled(True)
                 if self._preview_extent is not None:
                     self._zoom_to_rect(self._preview_extent)
