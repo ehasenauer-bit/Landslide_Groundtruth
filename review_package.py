@@ -463,6 +463,20 @@ def _strip_cast(rgb, strength, cool, gate_lo=None, gate_hi=None):
 HDR_EXPOSURE_PCTS = (30.0, 62.0, 94.0)   # scene reflectance percentiles -> bright/mid/dark exposures
 HDR_WHITES = (0.16, 0.35, 0.75)      # fallback exposure white points if percentiles can't be taken
 HDR_WELLEXP_SIGMA = 0.2              # width of the well-exposedness (mid-tone) Gaussian weight
+# Percentiles alone are not enough to BRACKET a scene: they describe where the pixels are, not
+# what range they span. On a frame that is mostly snow/cloud the 30th percentile is already snow,
+# so all three "exposures" land in the highlights within ~1.6x of each other and NONE of them
+# exposes the terrain — measured on an 85%-snow frame, reflectance 0.02 renders at DN 7.7/6.2/5.0
+# in the three exposures, i.e. the fusion has nothing but black to choose from and the shadows
+# come out as one flat, featureless block. So the bright exposure is additionally required to
+# expose the scene's own dark tail (HDR_DARK_PCT reflectance placed at HDR_DARK_LEVEL, where the
+# well-exposedness weight peaks) and to leave the bracket spanning at least HDR_MIN_SPAN. Both
+# are one-sided clamps that can only LOWER the bright white point, so a scene whose p30 is
+# already dark — anything below roughly 70% snow cover — renders bit-for-bit as before.
+HDR_DARK_PCT = 5.0                   # the dark tail the bright exposure must actually expose
+HDR_DARK_LEVEL = 0.5                 # ... placed at mid-grey, the peak of the well-exposedness weight
+HDR_DARK_FLOOR = 0.03                # ... but never a white point below this (noise, not detail)
+HDR_MIN_SPAN = 6.0                   # dark/bright white-point ratio the bracket must at least span
 # Exposure fusion compresses a scene into the mid-tones — punchy locally, but flat globally.
 # _hdr_finish restores contrast to a CONSISTENT TARGET rather than maximising it: it scales
 # luminance contrast toward HDR_TARGET_STD, so a flat cloudy scene is boosted while an already
@@ -689,6 +703,10 @@ def _hdr_whites(comp):
     q = np.clip(np.percentile(v, HDR_EXPOSURE_PCTS).astype(float), 0.05, 1.3)
     q[1] = max(q[1], q[0] * 1.25)        # keep the three exposures distinct on a flat scene
     q[2] = max(q[2], q[1] * 1.25)
+    # ... and keep the BRACKET spanning the scene, not just the snow (see HDR_MIN_SPAN): pull the
+    # bright exposure down until it exposes the dark tail and the spread covers the real range.
+    q[0] = min(q[0], max(float(np.percentile(v, HDR_DARK_PCT)) / HDR_DARK_LEVEL, HDR_DARK_FLOOR),
+               q[2] / HDR_MIN_SPAN)
     return tuple(float(x) for x in q)
 
 
@@ -715,6 +733,11 @@ def _highlight_hdr(comp, path, src_crs, knee=KNEE, contrast=1.0, desat=DESAT,
     fused = _exposure_fusion(imgs)                         # (H, W, 3) in 0-1 (flat/muddy)
     fused = _hdr_finish(fused, ~nod)                       # reclaim shadow depth + midtones
     arr = np.moveaxis(fused, 2, 0) * 255.0                 # (3, H, W)
+    # nodata is 0, so a valid pixel the fusion (or _hdr_finish's clip) drove to 0 would punch a
+    # transparent HOLE in the layer exactly where the deepest shadow is. Floor the valid pixels
+    # at 1 — the same guard _rolloff_rgb applies under a manual black point, which this path
+    # never reaches because it renders every exposure at black=0.
+    np.maximum(arr, 1.0, out=arr)
     arr[:, nod] = np.nan                                   # restore nodata -> transparent
     _write_rgb(exps[0].copy(data=arr), path, src_crs)
 
