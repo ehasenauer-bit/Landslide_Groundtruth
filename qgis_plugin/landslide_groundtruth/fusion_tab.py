@@ -2105,10 +2105,15 @@ class FusionTab(QWidget):
           S1_change_log-ratio_<pre>_to_<post>_t36_VV_7x7_20m_lee5_rn_a8.tif
           S1_change_int-corr_3xpre_to_<post>_t36_VV_7x7_20m_lee5_rn_a8.tif
         so globbing on everything from '_t<track>_' onward plus the post date
-        finds the set. Returns [(path, kind)] excluding `path` itself."""
+        finds the set. Returns [(path, kind)] excluding `path` itself.
+
+        An asc+desc MERGED raster names every track it combined — '_t36+131_VV_' —
+        so the same glob pools the merged detectors with each other and can never
+        pair a merged raster with a single-geometry one: the track list is part of
+        the key, and '_t36+131_' does not match '_t36_'."""
         import glob
         base = os.path.basename(path)
-        m = re.search(r"_to_(\d{4}-\d{2}-\d{2})(_t\d+_[A-Z]{2}_.*\.tif)$", base)
+        m = re.search(r"_to_(\d{4}-\d{2}-\d{2})(_t[0-9+]+_[A-Z]{2}_.*\.tif)$", base)
         if not m:
             return []
         post, suffix = m.group(1), m.group(2)

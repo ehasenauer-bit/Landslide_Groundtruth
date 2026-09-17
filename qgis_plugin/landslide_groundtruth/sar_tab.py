@@ -2249,7 +2249,13 @@ class SarTab(QWidget):
                     direction=(roles["post"].get("orbit_state") or ""),
                     out=out, gt=gt, proj=proj, shape=out.shape,
                     thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
-                    radius=meta.get("radius"), pre_d=pre_d, post_d=post_d))
+                    radius=meta.get("radius"), pre_d=pre_d, post_d=post_d,
+                    # the merge writes a durable raster of its own, and
+                    # _cd_settings_tag has to name it after the WHOLE recipe or
+                    # two runs that differ only in noise reduction overwrite each
+                    # other — the same trap the tag was introduced to close
+                    eff_res=meta.get("eff_res"), speckle=speckle,
+                    radionorm=radionorm, min_area=min_area))
                 self._cd_results = self._cd_results[-12:]
                 self.cd_merge_btn.setEnabled(True)
             self._append_log(
@@ -2559,8 +2565,14 @@ class SarTab(QWidget):
                        "ascending after-scene and once with a descending one — "
                        "then Merge.")
             return
+        # EXACTLY the spellings _cd_compute uses for the single-geometry layers.
+        # They used to read "brightness-z" / "MT-corr" here, which no other part
+        # of the plugin says: the Fusion tab's measure auto-detect knows
+        # "brightness z" and "MT int-corr", found neither, and silently scored a
+        # merged raster as a log-ratio against a 3.0 floor — which admits nothing
+        # at all from MT int-corr, whose values live in 0–1.
         NAME = {"logratio": "log-ratio", "intcorr": "int-corr",
-                "tsint": "brightness-z", "mtcorr": "MT-corr"}
+                "tsint": "brightness z", "mtcorr": "MT int-corr"}
         # group by product, newest first; keep the latest result per orbit direction
         by_prod = {}
         for r in reversed(self._cd_results):
@@ -2572,17 +2584,26 @@ class SarTab(QWidget):
         merge_group = None
         added = 0
         for mkey, sel in by_prod.items():
-            results = list(sel.values())
+            # sorted, not dict order: the durable filename below is built from
+            # results[0], and iteration order here could otherwise differ between
+            # detectors of one merge run and name them after different geometries
+            results = [sel[gk] for gk in sorted(sel)]
             # commensurability: 'strongest anomaly wins' only makes sense across
-            # rasters on the SAME grid computed with the SAME detector settings
+            # rasters on the SAME grid computed with the SAME detector settings.
+            # The noise-reduction recipe and the significance threshold belong in
+            # here too — they change the pixels, they are named in the durable
+            # file's settings tag, and thr is what decides which pixels count as
+            # anomalous in the confidence raster.
             def _grid(rr):
                 return (rr["shape"], tuple(round(float(v), 6) for v in rr["gt"]),
-                        rr["k"], rr["pol"], rr["res"])
+                        rr["k"], rr["pol"], rr["res"], rr.get("thr"),
+                        rr.get("speckle"), rr.get("radionorm"), rr.get("min_area"))
             if any(_grid(rr) != _grid(results[0]) for rr in results):
                 self._warn(
                     f"Merge {NAME.get(mkey, mkey)}: geometries were computed with "
-                    "different AOI / window / polarization / resolution — recompute "
-                    "them with identical settings, then merge. Skipped.")
+                    "different AOI / window / polarization / resolution / noise "
+                    "reduction — recompute them with identical settings, then "
+                    "merge. Skipped.")
                 continue
             try:
                 merged, conf, meta = sar_change.merge_geometries(
@@ -2608,19 +2629,45 @@ class SarTab(QWidget):
                     f"  recovered (single-orbit, other blind)={meta['n_single']} px · "
                     f"agree (both orbits)={meta['n_agree']} px · "
                     f"disagree/suspect={meta['n_conflict']} px")
+            # The tail mirrors a single-geometry layer's — "(t36 VV, 7×7)" — but
+            # names EVERY track that went in, so the file becomes
+            # S1_change_log-ratio_MERGED_..._to_<post>_t36+131_VV_7x7_….tif.
+            # That is what lets the Fusion tab pool the merged detectors with each
+            # other (_sar_siblings keys on the post date plus this tail) while
+            # never pooling a merged raster with a single-geometry one.
+            tracks = "+".join(str(t) for t in sorted(
+                {r["track"] for r in results if r.get("track") is not None}))
+            tail = f"(t{tracks or '?'} {r0['pol'].upper()}, {r0['k']}×{r0['k']})"
+            label = (f"S1 change {NAME.get(mkey, mkey)} MERGED {dirs} "
+                     f"{pre_d}→{post_d} {tail}")
+            # Durable float32 export FIRST, exactly as a single-geometry compute
+            # does it. A merged raster used to exist only as a tempfile, so the
+            # Fusion tab could not glob its siblings (pooling silently off), the
+            # layer went stale when the temp dir was swept, and there was no
+            # metadata beside it to date the event from.
+            tag_meta = dict(radius=r0.get("radius"), eff_res=r0.get("eff_res"),
+                            res=r0.get("res"), speckle=r0.get("speckle"),
+                            radionorm=r0.get("radionorm"),
+                            min_area=r0.get("min_area"))
+            mpath = self._cd_export_float(label, merged, gt, proj, tag_meta)
+            cpath = self._cd_export_float(
+                f"S1 MERGED confidence {dirs} {pre_d}→{post_d} {tail}",
+                conf, gt, proj, tag_meta)
             try:
-                fd, mpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_merge_")
-                os.close(fd)
-                sar_change.write_gtiff(mpath, merged, gt, proj)
-                fd, cpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_conf_")
-                os.close(fd)
-                sar_change.write_gtiff(cpath, conf, gt, proj)
+                if not mpath:                    # no Output/Project folder set
+                    fd, mpath = tempfile.mkstemp(suffix=".tif",
+                                                 prefix="landslide_merge_")
+                    os.close(fd)
+                    sar_change.write_gtiff(mpath, merged, gt, proj)
+                if not cpath:
+                    fd, cpath = tempfile.mkstemp(suffix=".tif",
+                                                 prefix="landslide_conf_")
+                    os.close(fd)
+                    sar_change.write_gtiff(cpath, conf, gt, proj)
             except Exception as e:               # noqa: BLE001
                 self._warn(f"Could not write merged {NAME.get(mkey, mkey)}: {e}")
                 continue
-            mlyr = QgsRasterLayer(
-                mpath, f"S1 change {NAME.get(mkey, mkey)} MERGED {dirs} "
-                       f"{pre_d}→{post_d}")
+            mlyr = QgsRasterLayer(mpath, label)
             clyr = QgsRasterLayer(
                 cpath, f"S1 MERGED confidence {dirs} {pre_d}→{post_d}")
             if not mlyr.isValid() or not clyr.isValid():
