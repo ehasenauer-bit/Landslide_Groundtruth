@@ -4,12 +4,18 @@ Every number the Volume tab can print, the equation behind it, the paper it
 comes from, and the reason that method is (or is no longer) the one to reach
 for. Written 2026-09-21.
 
-Two of these are the ones you asked about specifically:
+Where each one stands:
 
-* **The previous method** — §1, Larsen et al. (2010) area–volume scaling
-  `V = αA^γ`. It is still in the plugin and still the default Fit, but it is no
-  longer the method to quote for an Alaska rock/ice avalanche.
-* **The current method** — §2, `∫Δh` over the outline from a differenced DEM.
+* **§1, Larsen et al. (2010) area–volume scaling `V = αA^γ` — the previous
+  default.** Still in the plugin, but no longer the method to quote for an
+  Alaska rock/ice avalanche: the calibration does not cover ice.
+* **§2, `∫Δh` over a differenced DEM — the best measurement, when it is
+  available.** It measures the event instead of inferring it. In practice two
+  DEM epochs bracketing one of these events usually do not exist, so it cannot
+  be the thing the tab opens on.
+* **§3, deposit area × thickness — what the tab now defaults to.** The only fit
+  that runs on an outline alone. Read §3's second half before trusting it on a
+  small event, and §7 for what a better version would look like.
 
 ---
 
@@ -121,7 +127,7 @@ and it is the community-standard relation for doing so.
 
 ---
 
-## 2. `∫Δh` — elevation change over the outline — *the current method*
+## 2. `∫Δh` — elevation change over the outline — *the best measurement*
 
 ### The equation
 
@@ -212,7 +218,7 @@ count is reported in the log.
 
 ---
 
-## 3. Deposit area × mean thickness
+## 3. Deposit area × mean thickness — *the tab's default*
 
 ### The paper
 
@@ -295,9 +301,37 @@ Two things argue against extrapolating downward:
 
 * **The field does not consider the scaling solved.** The largest Alaska
   supraglacial inventory — 69 rock avalanches in Glacier Bay, 1984–2020 —
-  deliberately works in *area* and closes by calling for "more robust
-  area-volume scaling relationships". Had a near-constant supraglacial thickness
-  been established, that paper would have used one.
+  never converts to volume at all. It reports deposit **area** throughout, and
+  states outright that "the derivation of volume from area is poorly
+  constrained", citing the erosion/entrainment/compaction problem of
+  Bessette-Kirton et al. (2018). It assumes no thickness — the word appears
+  twice in the paper, neither time as a measurement — and closes by listing
+  more robust area–volume scaling as future work. Had a near-constant
+  supraglacial thickness been established, that paper would have used one.
+
+  Its area distribution is the useful part for this plugin, since it is the
+  population our events are drawn from:
+
+  | | Deposit area |
+  |---|---|
+  | Mean, all 69 RAs (1984–2020) | **1.16 ± 2.9 km²** |
+  | Mean, 1984–2016 combined inventory | 1.34 ± 3.29 km² |
+  | Mean, the 27 they newly detected | 0.49 ± 0.33 km² |
+  | Range | 0.097 km² → 22.19 km² (2016 Lamplugh) |
+  | Detection floor | 0.05 km² |
+  | Share under 0.5 km² | ~71 % |
+
+  At the default 1.5 m, a mean 1.16 km² deposit implies ~1.7 Mm³ — an order of
+  magnitude below the ~10 Mm³ where the 1.5 m anchor is actually calibrated.
+  **The typical Alaska supraglacial event sits in exactly the size range where
+  the thickness is least supported.**
+
+  The paper also notes that glacially-deposited rock avalanches spread further
+  for a given volume than non-glacial ones (after Sosio et al. 2012), which it
+  invokes to explain the roll-off at large sizes in its frequency–area
+  distribution. That is a mechanism for deposits being *thinner* than a
+  constant-thickness assumption predicts, and it argues against the card's
+  "larger events run thicker" as much as against a constant.
 
   > Smith, W. D., Dunning, S. A., Ross, N., Telling, J., Jensen, E. K.,
   > Shugar, D. H., Coe, J. A., & Geertsema, M. (2023). Revising supraglacial
@@ -383,6 +417,102 @@ Three small things in existing files, none of which change a computed number:
 
 ---
 
+## 7. Has anyone constrained it since? (checked 2026-09-21)
+
+Smith et al. (2023) listed supraglacial area–volume scaling as future work. **No
+one has published it.** What has appeared since goes the other way — more
+single-event volumes measured from DEMs, which is a reason to prefer §2 where a
+DEM pair exists, not a better scaling law:
+
+* **Tracy Arm, SE Alaska, 10 Aug 2025** — >64×10⁶ m³ onto South Sawyer Glacier
+  and into the fjord, 481 m runup. A single event, glacier-emplaced, and the
+  closest thing to our setting published recently.
+  > Shugar, D. H., Barnhart, K. R., Berdahl, M., Caplan-Auerbach, J.,
+  > Ekström, G., et al. (2026). A 481 m-high landslide-tsunami in a cruise
+  > ship-frequented Alaska fjord. **Science**.
+  > doi:[10.1126/science.aec3187](https://doi.org/10.1126/science.aec3187)
+
+* **Jan Mayen, 10 Mar 2025** — an Mʳ 6.5 transform earthquake triggered a rock
+  avalanche onto Kjerulf Glacier ~7 km from the epicentre, reconstructed from
+  seismic, GNSS, infrasound and imagery. Directly relevant to this plugin's
+  premise, and to the epicentre-distance prior.
+  > Earthquake-triggered cascading hazards under Arctic amplification (2026).
+  > **PNAS**. doi:[10.1073/pnas.2617210123](https://doi.org/10.1073/pnas.2617210123)
+
+* **Not applicable:** Korup, Pánek & Břežný (2025), *Comms Earth & Environ.*,
+  doi:[10.1038/s43247-025-02614-5](https://doi.org/10.1038/s43247-025-02614-5)
+  models volume for Earth's largest landslides — but its floor is **1 km³**
+  (1000 Mm³), three orders of magnitude above our events.
+
+### The 2/3 spreading law — published, calibrated, and wrong for ice
+
+There **is** a properly calibrated area–volume relation for rock avalanches. It
+is not the one to use here, and finding out why is the useful part.
+
+> Griswold, J. P., & Iverson, R. M. (2008, rev. 2014). Mobility statistics and
+> automated hazard mapping for debris flows and rock avalanches.
+> **USGS Scientific Investigations Report 2007–5276**.
+> [pubs.usgs.gov/sir/2007/5276](https://pubs.usgs.gov/sir/2007/5276/)
+
+Planimetric inundation area goes as the 2/3 power of volume — a form supported
+by Davies (1982), Hungr (1990), Vallance & Scott (1997), Dade & Huppert (1998),
+Iverson et al. (1998) and Legros (2002), and here **regressed on 143 rock
+avalanches spanning 10⁵–10¹¹ m³**, r² = 0.76–0.91:
+
+```
+B = α · V^(2/3)          α = 20 for rock avalanches (also debris flows;
+                                 200 for lahars)
+inverted for our workflow:   V = (B / α)^(3/2)
+```
+
+Note the form is the same power law as Larsen's, seen from the other side:
+`V ∝ A^1.5` against Larsen's `V ∝ A^1.41` for bedrock scars. Both say mean
+thickness grows with size; neither is constant.
+
+**Applied to supraglacial deposits, α = 20 fails badly:**
+
+| Event | Outline | V measured | V at α = 20 | Error |
+|---|---|---|---|---|
+| Sherman 1964 | 8.25 km² | 10.1 Mm³ | 265 Mm³ | **26× high** |
+| Lamplugh 2016 | 22.19 km² | ~70 Mm³ | 1169 Mm³ | **17× high** |
+
+At 12 Mm³ it implies a mean thickness of 11.4 m where Toney et al. assume 1.5 m.
+That is the substrate: α = 20 is calibrated on *subaerial* rock avalanches, and
+ice is exactly what changes the spreading.
+
+**Re-anchoring the same form on ice.** Fitting α to Toney's Iliamna figure
+(12 Mm³ at 1.5 m) gives **α ≈ 153** — i.e. a supraglacial deposit covers about
+**7.6× the area** of a subaerial rock avalanche of the same volume. That is a
+number for what Smith et al. and Sosio et al. (2012) describe qualitatively. It
+then reproduces the cases it was *not* fitted to:
+
+| Event | Predicted | Observed |
+|---|---|---|
+| Sherman 1964, volume from 8.25 km² | 12.6 Mm³ | 10.1 Mm³ |
+| Lamplugh 2016, volume from 22.19 km² | 55 Mm³ | ~70 Mm³ (incl. entrained ice) |
+| Brenndalsbreen 2010, thickness at 0.13 Mm³ | 0.33 m | 0.40 m |
+
+**What is and is not established here.** The functional form is well published
+and tested over six orders of magnitude. The coefficient **for ice is not
+published** — α ≈ 153 is fitted here to a single point and tested against two
+events, which is not a calibration. Griswold & Iverson's own scatter is 0.32–0.45
+in log₁₀ (a factor of 2.1–2.8), so even the published version is not precise.
+Deriving a supraglacial α properly — from Smith et al.'s 69 mapped areas plus
+DEM-differenced volumes — is the paper nobody has written.
+
+**What it would change.** For a 1 km² outline, near Smith et al.'s 1.16 km²
+Alaska mean:
+
+| | Volume for a 1 km² outline |
+|---|---|
+| Constant 1.5 m (what the tab does now) | 1.50 Mm³ |
+| Supraglacial α ≈ 153 | **0.53 Mm³** |
+| Published α = 20 (subaerial — do not use) | 11.2 Mm³ |
+
+**Not implemented.** This is a science call, not a code call.
+
+---
+
 ## Full reference list
 
 | Paper | Backs | Access |
@@ -396,6 +526,7 @@ Three small things in existing files, none of which change a computed number:
 | Huggel et al. 2007, *JVGR* 168, 114–136, [10.1016/j.jvolgeores.2007.08.009](https://doi.org/10.1016/j.jvolgeores.2007.08.009) | Iliamna ice-rock avalanche setting | paywalled |
 | Higman et al. 2018, *Sci. Rep.* 8, 12993, [10.1038/s41598-018-30475-w](https://doi.org/10.1038/s41598-018-30475-w) | large-event thickness comparator | open access |
 | Ekström & Stark 2013, *Science* 339, 1416–1419, [10.1126/science.1232887](https://doi.org/10.1126/science.1232887) | seismic mass/volume cross-check | paywalled |
+| Griswold & Iverson 2008 (rev. 2014), *USGS SIR* 2007–5276, [pubs.usgs.gov/sir/2007/5276](https://pubs.usgs.gov/sir/2007/5276/) | `B = 20·V^(2/3)` for rock avalanches, 143 events — subaerial, fails on ice | open access |
 | Smith et al. 2023, *Geomorphology* 425, 108591, [10.1016/j.geomorph.2023.108591](https://doi.org/10.1016/j.geomorph.2023.108591) | 69-event Alaska supraglacial inventory; scaling still an open problem | open access |
 | Engen et al. 2024, *Landslides*, [10.1007/s10346-024-02275-z](https://doi.org/10.1007/s10346-024-02275-z) | measured small supraglacial deposit, 0.40 ± 0.20 m | paywalled |
 | Jung & Yun 2020, *Remote Sens.* 12, 265, [10.3390/rs12020265](https://doi.org/10.3390/rs12020265) | SAR change detection (not volume) | open access |
