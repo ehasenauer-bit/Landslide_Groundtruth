@@ -60,9 +60,19 @@ MATERIALS = [
     ("Soil", "soil"),
 ]
 
-# Which calibration the area is run through. "scar" is the supplied script's fit
-# and always available; "total" needs LARSEN_TOTAL filled in (see above).
+# Which calibration the area is run through, in the order the tab offers them —
+# the FIRST entry is what the Fit combo comes up on.
+#
+# "thickness" leads because it is the only fit that runs on an outline ALONE.
+# The others each want something that usually isn't there: "ddem" needs two DEM
+# epochs bracketing the event (or an imported Δh), which for these events
+# rarely exists; "total" needs LARSEN_TOTAL coefficients that ship empty; and
+# "scar" — the supplied script's fit, always available — is calibrated on soil
+# and bedrock hillslope failures, a population a rock-and-ice avalanche off a
+# glacierized headwall is not in. Area × thickness makes its one assumption
+# (the mean thickness) visible on screen instead of burying it in a regression.
 FITS = [
+    ("Deposit area × thickness", "thickness"),
     ("Source scar (Larsen Table S1)", "scar"),
     ("Total landslide area", "total"),
     ("Elevation change (∫Δh over outline)", "ddem"),
@@ -80,6 +90,13 @@ FIT_OUTLINE = {
              "that outline instead of scaling an area, so it must cover "
              "everything that moved; erosion (loss) and deposition (gain) are "
              "reported separately. Needs a Δh raster assigned below."),
+    "thickness": ("Outline the DEPOSIT / total affected area — this fit is just "
+                  "its plan area × a mean thickness (no DEM needed), the Toney "
+                  "et al. (2021) estimate for a rock/ice avalanche. Set the mean "
+                  "thickness and its low/high below. ~1.5 m (0.5–2.5 m) is the "
+                  "published figure for an Iliamna-class sheet (~10 Mm³); it is an "
+                  "anchor at that size, not a constant — widen the range a long "
+                  "way for a much smaller deposit."),
 }
 
 
@@ -201,3 +218,20 @@ def volume_source(A_best, A_low=None, A_high=None, material="bedrock",
     V, Vlow, Vhigh = _fallback_volume_source(
         A_best, A_low=A_low, A_high=A_high, type=material)
     return V, Vlow, Vhigh, "built-in scar fit (project dir not set)"
+
+
+def volume_thickness(area, t_best, t_low=None, t_high=None):
+    """(V, Vlow, Vhigh, label) for a deposit AREA times a mean THICKNESS.
+
+    The Toney et al. (2021) style estimate for a rock/ice avalanche when no
+    stereo DEM is available to difference: V = plan area × mean deposit
+    thickness. Unlike the Larsen fits there is no fitted coefficient — the range
+    is just the low/high thickness carried straight through, because the mean
+    thickness IS the dominant uncertainty. `area` in m², thickness in m, V in m³.
+    A low ≥ best or high ≤ best is treated as 'not given' (no range on that side)."""
+    V = area * t_best
+    Vlow = area * t_low if (t_low is not None and t_low < t_best) else None
+    Vhigh = area * t_high if (t_high is not None and t_high > t_best) else None
+    rng = (f", {t_low:g}–{t_high:g}"
+           if (Vlow is not None and Vhigh is not None) else "")
+    return V, Vlow, Vhigh, f"deposit area × thickness ({t_best:g} m{rng})"

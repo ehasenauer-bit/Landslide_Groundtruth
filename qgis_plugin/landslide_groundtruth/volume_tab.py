@@ -1,11 +1,17 @@
-"""The Volume tab: landslide area -> volume via Larsen et al. (2010).
+"""The Volume tab: a digitized outline -> a landslide volume.
 
 Where this sits in the workflow: the other tabs get you imagery and elevation
 change; this one turns the polygons you digitize over that imagery into numbers.
 
-WHICH OUTLINE THE VOLUME COMES FROM: it follows the Fit, because the Larsen
-coefficients are calibrated per outline definition. The source-scar fit (Larsen
-Table S1, the default) converts the BEST SOURCE outline and widens the volume
+THE DEFAULT FIT IS "Deposit area × thickness" (Toney et al. 2021), because it
+is the only one that runs on an outline alone. Differencing DEMs is the better
+measurement where two epochs exist over the event, but for these events they
+usually do not, so the tab comes up on the estimate that always works rather
+than on one that has to be abandoned.
+
+WHICH OUTLINE THE VOLUME COMES FROM: it follows the Fit, because each
+calibration is defined against a particular outline. The source-scar fit (Larsen
+Table S1) converts the BEST SOURCE outline and widens the volume
 range with the low/high source outlines when they are assigned. The total-area
 fit converts the TOTAL outline instead, once its coefficients are filled in (see
 LARSEN_TOTAL in volume_calc). Whichever outline is NOT the fit's calibrated input
@@ -34,10 +40,12 @@ How the pieces fit:
             stay valid. Slope-corrected true surface area would be larger and
             would NOT be what the regression was fitted to.
 
-  Fit       Which calibration to run: the supplied source-scar fit, or a
-            total-area fit whose coefficients ship EMPTY (see volume_calc). The
-            outline instruction on the tab follows this choice, so the polygon
-            and the calibration can't silently disagree.
+  Fit       Which calculation to run, defaulting to deposit area × mean
+            thickness; also the supplied source-scar fit, a total-area fit whose
+            coefficients ship EMPTY, and ∫Δh over an elevation-change raster
+            (see volume_calc). The outline instruction on the tab follows this
+            choice, so the polygon and the calibration can't silently disagree,
+            and the selected fit's own input box is expanded for you.
 
   Length    A medial-axis centerline of the total landslide outline (see
             centerline.py) — a whole-slide runout length, taken from the total
@@ -257,12 +265,14 @@ class VolumeTab(QWidget):
         root.setSpacing(8)
 
         intro = QLabel(
-            "Volume from landslide area — Larsen et al. (2010) area–volume "
-            "scaling. The area converted to a volume follows the Fit below: the "
-            "source-scar fit converts the BEST SOURCE outline (and widens the ± "
-            "range with the low/high source outlines); the total-area fit "
-            "converts the TOTAL outline. The outline not used is measured and "
-            "reported alongside. Assign the layers below and press Measure.")
+            "Volume from a digitized outline. The default fit is deposit area "
+            "× mean thickness (Toney et al. 2021) — an estimate that needs no "
+            "DEM, with the thickness set below. The area converted follows the "
+            "Fit: area × thickness and the total-area fit convert the TOTAL "
+            "outline, the source-scar fit converts the BEST SOURCE outline (and "
+            "widens the ± range with the low/high source outlines). The outline "
+            "not used is measured and reported alongside. Assign the layers "
+            "below and press Measure.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         root.addWidget(intro)
@@ -288,16 +298,27 @@ class VolumeTab(QWidget):
         for label, _key in volume_calc.FITS:
             self.fit_combo.addItem(label)
         self.fit_combo.setToolTip(
-            "Which calibration to run the area through.\n\n"
+            "Which calculation to run on the outline.\n\n"
+            "Deposit area × thickness (default) — plan area × a mean deposit "
+            "thickness you set. The only fit that needs nothing but an outline, "
+            "which is why it leads. Its one assumption is on screen rather than "
+            "inside a coefficient; carry a low and high thickness, because that "
+            "spread IS the volume range.\n\n"
             "Source scar — the fit carried by larsen_BR_volume.py; the outline "
-            "must be the evacuated source scar alone.\n\n"
+            "must be the evacuated source scar alone. Calibrated on soil and "
+            "bedrock hillslope failures, so a rock-and-ice avalanche is outside "
+            "it.\n\n"
             "Total landslide area — source + runout + deposit. Needs its own "
             "coefficients: see LARSEN_TOTAL in volume_calc.py. Until those are "
             "filled in the tab reports it as not configured rather than reusing "
-            "the scar fit on a larger polygon, which would read high.")
+            "the scar fit on a larger polygon, which would read high.\n\n"
+            "Elevation change (∫Δh) — the real measurement, summing Δh over the "
+            "outline. Needs a pre/post DEM pair to difference or an imported Δh "
+            "raster; use it whenever you actually have one.")
         self.fit_combo.currentIndexChanged.connect(self._on_fit_changed)
         form.addRow("Fit", self.fit_combo)
 
+        self._form = form
         self.material_combo = QComboBox()
         for label, _key in volume_calc.MATERIALS:
             self.material_combo.addItem(label)
@@ -317,6 +338,7 @@ class VolumeTab(QWidget):
             "before comparing them.")
         ice_note.setWordWrap(True)
         ice_note.setStyleSheet("QLabel { color: palette(mid); }")
+        self._ice_note = ice_note
         form.addRow("", ice_note)
         root.addLayout(form)
 
@@ -352,7 +374,11 @@ class VolumeTab(QWidget):
 
         root.addWidget(self._build_current_box())
         root.addWidget(self._build_centerline_box())
-        root.addWidget(self._build_ddem_box())
+        # Held so _on_fit_changed can open whichever one the selected fit needs.
+        self._ddem_box = self._build_ddem_box()
+        root.addWidget(self._ddem_box)
+        self._thickness_box = self._build_thickness_box()
+        root.addWidget(self._thickness_box)
 
         # --- results ---
         split = QSplitter(Qt.Vertical)
@@ -771,6 +797,12 @@ class VolumeTab(QWidget):
                     "Assign the total landslide outline to “Total area layer” — "
                     "the elevation-change fit sums Δh over it. A source outline "
                     "is used instead if no total is assigned.")
+            elif fit == "thickness":
+                self.role_lbl.setText(
+                    "Assign the deposit/total outline to “Total area layer” — the "
+                    "area × thickness fit multiplies its plan area by the mean "
+                    "thickness you set below. A source outline is used if no "
+                    "total is assigned.")
             elif fit == "total":
                 self.role_lbl.setText(
                     "Assign the total landslide outline to “Total area layer” — "
@@ -792,6 +824,9 @@ class VolumeTab(QWidget):
             elif fit == "ddem" and "total" not in areas and "best" not in areas:
                 problem = ("No outline assigned — the elevation-change fit sums "
                            "Δh over the total (or source) outline.")
+            elif fit == "thickness" and "total" not in areas and "best" not in areas:
+                problem = ("No outline assigned — the area × thickness fit needs "
+                           "a total (or source) outline.")
             elif fit == "scar" and "best" not in areas:
                 problem = ("No source-best layer assigned — the source-scar fit "
                            "converts the best source outline.")
@@ -1197,6 +1232,67 @@ class VolumeTab(QWidget):
         v.addLayout(row)
         return box
 
+    def _build_thickness_box(self):
+        """Inputs for the "Deposit area × thickness" fit — the no-DEM volume
+        estimate (Toney et al. 2021): V = the outline's plan area × mean
+        thickness, with the low/high thickness giving the volume range.
+
+        Used only by that fit. The mean thickness is the dominant uncertainty,
+        which is why it's carried as an explicit low/best/high rather than hidden
+        in a coefficient."""
+        box = QgsCollapsibleGroupBox("Deposit thickness (area × thickness fit)")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        v = QVBoxLayout(box)
+        note = QLabel(
+            "For the “Deposit area × thickness” fit — a volume estimate that needs "
+            "no DEM. V = the outline's plan area × mean thickness. Start at "
+            "~1.5 m, bracket 0.5–2.5 m (Toney et al. 2021 use 1.5 ± 1 m at "
+            "Iliamna).\n\n"
+            "Treat 1.5 m as an ANCHOR AT ~10 Mm³, not a constant. It rests on one "
+            "measured sheet (Sherman, 1.65 m over 8.25 km²) and one assumed value "
+            "(Iliamna), both at about that size. Well below ~10 Mm³ nothing "
+            "published supports it — the only measured small supraglacial deposit, "
+            "Brenndalsbreen 2010 at 0.13 Mm³, came out near 0.4 m — so widen the "
+            "low/high a long way there instead of printing a tight range.\n\n"
+            "Go higher (2–5 m) for a blocky, confined, non-glacier deposit. "
+            "Outlining the SOURCE scar instead? That wants a detachment depth "
+            "(~5–30 m), not a deposit thickness. Low/high sets the volume range.")
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: palette(mid); }")
+        v.addWidget(note)
+        form = QFormLayout()
+        self.thick_best_edit = QLineEdit("1.5")
+        self.thick_best_edit.setToolTip(
+            "Mean deposit thickness in metres, averaged over the whole outline "
+            "(thick in the source/deposit, thin along the track).")
+        form.addRow("Mean thickness (m)", self.thick_best_edit)
+        self.thick_low_edit = QLineEdit("1.0")
+        self.thick_low_edit.setToolTip(
+            "Low thickness → low volume. Must be less than the mean; blank for no "
+            "lower bound.")
+        form.addRow("Low (m)", self.thick_low_edit)
+        self.thick_high_edit = QLineEdit("2.5")
+        self.thick_high_edit.setToolTip(
+            "High thickness → high volume. Must be greater than the mean; blank "
+            "for no upper bound.")
+        form.addRow("High (m)", self.thick_high_edit)
+        v.addLayout(form)
+        return box
+
+    def _thickness_values(self):
+        """(t_best, t_low, t_high) in metres from the thickness fields, or
+        (None, None, None) if the mean is blank/invalid. Low/high come back None
+        unless they parse to a positive number."""
+        def _f(edit):
+            try:
+                val = float(edit.text().strip())
+                return val if val > 0 else None
+            except (ValueError, AttributeError):
+                return None
+        return (_f(self.thick_best_edit), _f(self.thick_low_edit),
+                _f(self.thick_high_edit))
+
     def _ro(self, text=""):
         e = QLineEdit(text)
         e.setReadOnly(True)
@@ -1227,12 +1323,42 @@ class VolumeTab(QWidget):
             text += ("  Not configured yet: add LARSEN_TOTAL to "
                      "larsen_BR_volume.py (or volume_calc.py) — see the log.")
         self.outline_lbl.setText("⚠ " + text if text else "")
+        # The selected fit's own inputs must not sit behind a collapsed group —
+        # the thickness box especially, now that it holds the DEFAULT fit's only
+        # parameter. Opening is one-way on purpose: re-collapsing a box the
+        # analyst just opened for another fit would fight them.
+        box = {"thickness": getattr(self, "_thickness_box", None),
+               "ddem": getattr(self, "_ddem_box", None)}.get(fit)
+        if box is not None:
+            box.setCollapsed(False)
+        # Bedrock/soil is read only by the two Larsen fits. Under area ×
+        # thickness or ∫Δh it is a prominent control that changes nothing, so
+        # hide it rather than invite a choice that has no effect.
+        self._set_material_visible(fit in ("scar", "total"))
         # The role readout names which layer the fit needs, so keep it in step.
         if hasattr(self, "role_lbl"):
             self._update_role_label()
 
+    def _set_material_visible(self, on):
+        """Show the "What failed?" row only for the fits that actually read it.
+
+        Qt5's QFormLayout has no setRowVisible, so the field and its label are
+        hidden individually via labelForField."""
+        form = getattr(self, "_form", None)
+        for w in (getattr(self, "material_combo", None),
+                  getattr(self, "_ice_note", None)):
+            if w is None:
+                continue
+            w.setVisible(on)
+            lbl = form.labelForField(w) if form is not None else None
+            if lbl is not None:
+                lbl.setVisible(on)
+
     def _fit(self):
-        return dict(volume_calc.FITS).get(self.fit_combo.currentText(), "scar")
+        # The fallback is the combo's first entry, so an unrecognised label
+        # degrades to the default fit rather than to a different one.
+        return dict(volume_calc.FITS).get(
+            self.fit_combo.currentText(), volume_calc.FITS[0][1])
 
     def _material(self):
         return dict(volume_calc.MATERIALS).get(
@@ -1306,6 +1432,17 @@ class VolumeTab(QWidget):
             conv_role, conv_area = "total", a_total
             conv_feat, conv_layer = total_feat, total_layer
             conv_low = conv_high = None
+        elif fit == "thickness":
+            # Deposit footprint × mean thickness (Toney): convert the TOTAL
+            # outline, falling back to the source scar if no total is digitized
+            # (then the thickness is a scar-depth, not a deposit thickness).
+            if total_feat is not None:
+                conv_role, conv_area = "total", a_total
+                conv_feat, conv_layer = total_feat, total_layer
+            else:
+                conv_role, conv_area = "source", a_best
+                conv_feat, conv_layer = best_feat, best_layer
+            conv_low = conv_high = None
         else:  # scar: the calibrated input is the source scar
             conv_role, conv_area = "source", a_best
             conv_feat, conv_layer = best_feat, best_layer
@@ -1315,7 +1452,12 @@ class VolumeTab(QWidget):
             # A layer that is assigned but empty/unmeasurable already produced a
             # specific message in _role_area; only the truly-unassigned case
             # needs the "pick a layer" guidance here.
-            if conv_layer is None and fit == "total":
+            if conv_layer is None and fit == "thickness":
+                self._append_log(
+                    "The deposit area × thickness fit needs an outline — assign a "
+                    "Total area (or Source area) layer, then set the thickness "
+                    "below.")
+            elif conv_layer is None and fit == "total":
                 self._append_log(
                     "No layer is assigned to “Total area layer”. The total-area "
                     "fit converts the TOTAL landslide outline, so assign that "
@@ -1331,18 +1473,29 @@ class VolumeTab(QWidget):
 
         material, material_label = self._material(), self.material_combo.currentText()
         fit_label = self.fit_combo.currentText()
-        try:
-            v_best, v_low, v_high, calc = volume_calc.volume_source(
-                conv_area, A_low=conv_low, A_high=conv_high,
-                material=material, fit=fit,
-                project_dir=self.dock.project_edit.text().strip())
-        except volume_calc.NotConfigured as e:
-            self._append_log(str(e))
-            self._on_fit_changed()
-            return
-        except Exception as e:
-            self._append_log(f"Volume calculation failed: {e}")
-            return
+        if fit == "thickness":
+            t, t_lo, t_hi = self._thickness_values()
+            if t is None:
+                self._append_log(
+                    "Enter a mean deposit thickness (m) in the “Deposit "
+                    "thickness” box below — the volume is area × thickness. "
+                    "~1.5 m (0.5–3 m) is typical for a rock/ice avalanche.")
+                return
+            v_best, v_low, v_high, calc = volume_calc.volume_thickness(
+                conv_area, t, t_low=t_lo, t_high=t_hi)
+        else:
+            try:
+                v_best, v_low, v_high, calc = volume_calc.volume_source(
+                    conv_area, A_low=conv_low, A_high=conv_high,
+                    material=material, fit=fit,
+                    project_dir=self.dock.project_edit.text().strip())
+            except volume_calc.NotConfigured as e:
+                self._append_log(str(e))
+                self._on_fit_changed()
+                return
+            except Exception as e:
+                self._append_log(f"Volume calculation failed: {e}")
+                return
 
         if conv_role == "source" and total_feat is not None:
             self._warn_if_total_excludes_source(total_feat, total_layer, best_layer)
@@ -1419,7 +1572,16 @@ class VolumeTab(QWidget):
             self._append_log(
                 "Also measured (not converted): " + ", ".join(others) + ".")
         # Say where the ± range came from.
-        if conv_role == "source" and conv_low is not None and conv_high is not None:
+        if fit == "thickness":
+            if v_low is not None and v_high is not None:
+                self._append_log(
+                    "Range is the low/high thickness — the dominant uncertainty "
+                    "in an area × thickness estimate.")
+            else:
+                self._append_log(
+                    "Single thickness given, so no range — set a low and high "
+                    "thickness below to bracket the volume.")
+        elif conv_role == "source" and conv_low is not None and conv_high is not None:
             self._append_log(
                 "Range combines the published fit uncertainty with the source "
                 "low/high area spread.")
@@ -2699,7 +2861,8 @@ class VolumeTab(QWidget):
         if larsen:
             lines.append(f"Area scaling&nbsp;&nbsp;{larsen / 1e6:.3g} ×10⁶ m³"
                          f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
-                         f"({area.get('material') or 'material?'}, ×2 typical spread)</span>")
+                         f"({src.get('material') or area.get('material') or 'material?'}"
+                         f", ×2 typical spread)</span>")
         if eros:
             extra = ("" if net is None else
                      f"&nbsp;&nbsp;<span style='color:palette(mid);'>"
