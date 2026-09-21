@@ -9,7 +9,10 @@ The folder-name convention (built by each tab) is
 e.g. "Planet 7-20/7-21 20km HONC", "SAR 7-20/7-21 Log-ratio",
 "S2 7-20/7-21 20km NDVI". The optional <radius> is the search radius the run
 used (radius_tag()); it lets two runs over the same dates but different AOI
-sizes sit in their own folders instead of colliding.
+sizes sit in their own folders instead of colliding. SAR folders carry the orbit
+direction too (orbit_tag(): 'asc' / 'desc' / 'asc+desc'), which is the other
+thing two runs of one event routinely differ by and nothing else in the name
+records.
 Same scenes re-rendered with a different tone/product get a different <product>,
 so they land in their own folder side by side instead of overwriting each other.
 
@@ -59,6 +62,31 @@ def radius_tag(km):
         return ""
     # drop a trailing '.0' so whole-km radii read '20km', not '20.0km'
     return f"{v:.1f}".rstrip("0").rstrip(".") + "km"
+
+
+def orbit_tag(*states):
+    """Sentinel-1 orbit directions for a group name: 'asc', 'desc', or 'asc+desc'
+    when one folder holds both. '' when no direction is known, so name() drops it
+    and the folder keeps its old, direction-less name.
+
+    Accepts whatever the STAC item carried — 'ASCENDING', 'descending', a stored
+    '' — and anything unrecognisable is ignored rather than guessed at.
+
+    It earns its place for the same reason radius_tag() does: ascending and
+    descending runs over one event share their dates AND their AOI, so without it
+    the only thing telling two of them apart in the tree is the '(2)' new_group
+    appends — and which run that lands on depends on the order they happened to
+    be rendered in. Geometry is the thing you most need to read off a SAR folder:
+    it decides which slopes are in layover, and the Fusion tab will not pool a
+    raster from one geometry with a raster from the other.
+    """
+    seen = []
+    for st in states:
+        head = str(st or "").strip().lower()[:3]
+        tag = {"asc": "asc", "des": "desc"}.get(head)
+        if tag and tag not in seen:
+            seen.append(tag)
+    return "+".join(sorted(seen))
 
 
 def name(*parts):

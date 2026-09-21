@@ -650,3 +650,34 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
         note=note,
     )
     return merged, conf.astype(np.float32), meta
+
+
+def agreeing_only(merged, conf):
+    """`merged` with the pixels the geometries DISAGREE about knocked out (NaN).
+
+    A display filter, not an analysis one — and the distinction is deliberate.
+    merge_geometries' rule is "strongest anomaly wins", which is right for a
+    layover recovery and reads wrong on the map for a contradiction: at a conf-3
+    pixel one orbit shouted and the other looked at the same ground and saw
+    nothing (or claimed the opposite sign), and the merged raster shows you the
+    shouting orbit with nothing to say the other one disagreed. On ice that is
+    most of the AOI, so the merged heat map renders as change nearly everywhere.
+
+    It is NOT applied to the raster the Fusion tab scores, and must not be.
+    Measured over six truthed events, conf-3 pixels are ENRICHED in the scar
+    (mean lift 2.0; Logan 5.6, Iliamna 4.1) — over a real scar the two look
+    directions genuinely do disagree. Dropping them from the fused score moved
+    scar area detected 90.0% -> 80.5% and the worst candidate rank 3 -> 7, with
+    Valdez worst hit (76.9% -> 48.1% area). So the SAR tab writes this copy for
+    the map and keeps the full max-pooled values on disk for Fusion.
+
+    NaN rather than a substituted value: the point is to show nothing where the
+    orbits contradict each other, and a NoData pixel is the only thing that
+    renders as nothing without also claiming a measurement.
+    """
+    merged = np.asarray(merged, dtype=np.float32)
+    conf = np.asarray(conf, dtype=np.float32)
+    if merged.shape != conf.shape:
+        raise ValueError("merged and confidence differ in shape")
+    out = np.where(conf == 3.0, np.float32(np.nan), merged).astype(np.float32)
+    return out, int(np.count_nonzero(conf == 3.0))

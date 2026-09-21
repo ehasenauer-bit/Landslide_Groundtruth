@@ -74,7 +74,17 @@ SAR_HINTS = ("log-ratio", "logratio", "log_ratio", "brightness z", "tsint")
 # a candidate carrying one is never auto-preselected for this side
 OPTICAL_EXCLUDE = ("s1 ", "log-ratio", "logratio", "int-corr", "mt-corr",
                    "brightness z")
-SAR_EXCLUDE = ("dndsi", "dbright", "dndvi", "ndvi")
+# "agreeing only" is not another sensor — it is the SAR tab's DISPLAY copy of a
+# merged asc+desc raster, with the pixels the two orbits contradict each other
+# about knocked out so the heat map is readable. It carries a detector name, so
+# SAR_HINTS matches it and it would otherwise sit in the combo one row from the
+# full raster and win the preselect by alphabetical luck. Measured over six
+# truthed events, feeding the agreeing-only pixels to fusion INSTEAD moved scar
+# area detected 90.0% -> 80.5% and the worst candidate rank 3 -> 7 (see
+# sar_change.agreeing_only), so it must never be chosen for you. It stays
+# selectable by hand, and _fuse says so in the log when it is.
+SAR_EXCLUDE = ("dndsi", "dbright", "dndvi", "ndvi", "agreeing only",
+               "agreeing_only")
 
 # Two different questions about a candidate pair, deliberately kept apart. One
 # threshold tried to answer both, and answered each one wrong in a different
@@ -1602,6 +1612,21 @@ class FusionTab(QWidget):
                        "change raster for one and the SAR change raster for the "
                        "other.")
             return
+        # The asc+desc merge writes a confidence raster beside its change raster,
+        # and it is the one file in the SAR folder that must never be fused. Its
+        # values are the class codes 0/1/2/3, and 3 means "the orbits DISAGREE" —
+        # so against any SAR floor below 3 the only pixels it admits are the
+        # disagreements, and the fused score would rank the class code itself. It
+        # is not auto-preselected (no SAR_HINTS fragment is in its name), but it
+        # sits one combo row from the raster that is, and nothing downstream
+        # would notice the mistake.
+        if sar_path and "merged_confidence" in os.path.basename(sar_path).lower():
+            self._warn("That is the merge's CONFIDENCE raster, not a change "
+                       "raster — its values are class codes (3 = the orbits "
+                       "disagree), so fusing it would score the class code and "
+                       "nothing else. Pick the 'S1 change … MERGED …' raster in "
+                       "the same group.")
+            return
         for label, p in ([("Optical", opt_path)]
                          + ([("SAR", sar_path)] if sar_path else [])):
             ok, why = fusion_grid.describe_raster(p)
@@ -1640,6 +1665,16 @@ class FusionTab(QWidget):
         ev_o, ev_s = self._event_id(opt_path), self._event_id(sar_path)
         if ev_o:
             self._step(f"  EVENT: {ev_o}")
+
+        # A deliberate choice, never an automatic one (see SAR_EXCLUDE) — but it
+        # has to be visible in the log, because the two rasters look identical in
+        # the combo and differ only in pixels that were measured to matter.
+        if sar_path and "agreeing_only" in os.path.basename(sar_path).lower():
+            self._step("  NOTE: this SAR raster is the merge's AGREEING-ONLY "
+                       "display copy — the pixels the two orbits disagree about "
+                       "are NoData in it. Those pixels are enriched inside the "
+                       "scar (6 truthed events), so expect LESS of the scar to "
+                       "score than with the full merged raster beside it.")
 
         # 1. reference grid = the COARSER input; a fused score is only as good as
         # its worst input, and upsampling SAR would manufacture detail from speckle

@@ -121,4 +121,53 @@ hi = 8 * meta_for(45)["eff_res"] ** 2
 assert hi / lo > 4.5, "the drift this documents is real, not rounding"
 print(f"   the same '8 px' setting is {hi / lo:.1f}x larger at 45 km than at 20 km")
 
+print("=== 9. a SAR layer-tree folder says which orbit direction it holds ===")
+# Ascending and descending runs of one event share their dates AND their AOI, so
+# "SAR 8-23/9-4 change 17km" was the name of both and the tree told them apart
+# only by the "(2)" new_group appends — on whichever was rendered second. The
+# direction is the one thing you most need to read off a SAR folder: it decides
+# which slopes sit in layover, and Fusion refuses to pool across it.
+from landslide_groundtruth import layer_group as lg
+
+for states, want in ((("ASCENDING",), "asc"),
+                     (("DESCENDING",), "desc"),
+                     (("ascending", "ascending"), "asc"),
+                     (("ascending", "DESCENDING"), "asc+desc"),
+                     (("descending", "ascending"), "asc+desc"),
+                     ((), ""), ((None,), ""), (("",), ""),
+                     (("sideways",), "")):
+    got = lg.orbit_tag(*states)
+    print(f"   {str(states):34s} -> {got!r}")
+    assert got == want, f"{states} gave {got!r}, expected {want!r}"
+
+asc = lg.name("SAR", lg.date_pair("2026-08-23", "2026-09-04"), "change",
+              lg.radius_tag(17), lg.orbit_tag("ASCENDING"))
+desc = lg.name("SAR", lg.date_pair("2026-08-23", "2026-09-04"), "change",
+               lg.radius_tag(17), lg.orbit_tag("DESCENDING"))
+print(f"   {asc}\n   {desc}")
+assert asc != desc, "the two runs the screenshot showed still collide"
+assert asc == "SAR 8-23/9-4 change 17km asc"
+assert desc == "SAR 8-23/9-4 change 17km desc"
+
+# an unknown direction must degrade to the OLD name, not to a folder called
+# "SAR ... change 17km None" or a stray trailing space
+legacy = lg.name("SAR", lg.date_pair("2026-08-23", "2026-09-04"), "change",
+                 lg.radius_tag(17), lg.orbit_tag(None))
+assert legacy == "SAR 8-23/9-4 change 17km", repr(legacy)
+print(f"   unknown direction -> {legacy!r} (unchanged from before)")
+
+# and the merge, which is asc+desc by definition, now says so
+merged = lg.name("SAR", lg.date_pair("2026-08-30", "2026-09-01"), "change merged",
+                 lg.radius_tag(17), lg.orbit_tag("ascending", "descending"))
+assert merged == "SAR 8-30/9-1 change merged 17km asc+desc", repr(merged)
+print(f"   {merged}")
+
+print("   all three SAR groups pass a direction")
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "qgis_plugin", "landslide_groundtruth",
+                        "sar_tab.py")).read()
+assert src.count("lg.orbit_tag(") == 3, \
+    f"expected amplitude + change + merge to tag the direction, found " \
+    f"{src.count('lg.orbit_tag(')}"
+
 print("\nSAR CHANGE-RASTER NAMING VERIFIED")

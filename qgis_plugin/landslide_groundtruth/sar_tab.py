@@ -679,7 +679,17 @@ class SarTab(QWidget):
             "with a descending one first. If only one geometry has been computed "
             "(common in this terrain — many areas lack both passes), it still runs "
             "but flags that the opposite-facing slopes, possibly the source "
-            "headscarp, are unrecovered.")
+            "headscarp, are unrecovered.\n\n"
+            "Three layers come back per product. The heat map on top is "
+            "AGREEING ONLY: pixels the two orbits contradict each other about "
+            "(confidence class 3 — one orbit flags it and the other saw nothing "
+            "there, or they claim opposite signs) are left out, because "
+            "'strongest anomaly wins' otherwise paints them exactly like a real "
+            "detection and over ice that is most of the AOI. Beneath it sits the "
+            "full merged raster, unticked — that is the one the Fusion tab "
+            "scores, and it deliberately keeps the disagreements: over six "
+            "truthed events they are enriched inside the scar, and dropping them "
+            "from the fused score made detection worse.")
         self.cd_merge_btn.clicked.connect(self._merge_geometries_action)
         form.addRow(self.cd_merge_btn)
         return box
@@ -1497,14 +1507,20 @@ class SarTab(QWidget):
                 pre = d
             elif "after" in label:
                 post = d
-        # …and the AOI radius, because the dates do not identify a run. Two
-        # renders of the same scene pair at different radii otherwise produce two
+        # …the AOI radius and the ORBIT DIRECTION, because the dates do not
+        # identify a run. Two renders of the same scene pair at different radii —
+        # or, more often, the ascending and the descending render of one event,
+        # which share their dates AND their radius — otherwise produce two
         # top-level folders with the SAME name, told apart only by the "(2)"
-        # new_group appends — and the Fusion tab pairs on ground, so picking the
-        # wrong one of those is a mismatch you cannot see from the tree.
+        # new_group appends, which lands on whichever was rendered second. The
+        # Fusion tab pairs on ground and will not pool across geometries, so
+        # picking the wrong one of those is a mismatch you cannot see from the
+        # tree.
         minx, miny, maxx, maxy, radius = bbox
         self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude",
-                                  lg.radius_tag(radius))
+                                  lg.radius_tag(radius),
+                                  lg.orbit_tag(*(c.get("orbit_state")
+                                                 for _label, c in picks)))
         self._clear_preview_layers()
         if mode == "run":
             res = self.detail_combo.currentData() or 10
@@ -2232,7 +2248,8 @@ class SarTab(QWidget):
                 if cd_group is None:
                     cd_group = lg.new_group(
                         lg.name("SAR", lg.date_pair(pre_d, post_d), "change",
-                                lg.radius_tag(meta.get("radius"))))
+                                lg.radius_tag(meta.get("radius")),
+                                lg.orbit_tag(roles["post"].get("orbit_state"))))
                 sub = lg.subgroup(cd_group, CD_PRODUCT.get(mkey, mkey))
                 lg.add_to(lyr, sub)
                 self._cd_last_layers.append(lyr)
@@ -2374,11 +2391,16 @@ class SarTab(QWidget):
     def _style_cd_confidence(self, lyr):
         """Discrete style for the asc+desc merge confidence raster: 1 recovered
         from a single orbit where the other was blind, 2 both orbits agree (high
-        confidence), 3 orbits disagree (suspect); 0 (no change) fades out."""
+        confidence), 3 orbits disagree (suspect); 0 (no change) fades out.
+
+        Class 3 is where this layer earns its place: those pixels are the ones
+        held out of the "agreeing only" heat map above it, so this is the only
+        place on the map they can be seen at all."""
         stops = [(0.0, "#f7f7f7", 0, "0  no change"),
                  (1.0, "#fdae61", 160, "1  recovered (single orbit, other blind)"),
                  (2.0, "#b2182b", 255, "2  agreement (both orbits)"),
-                 (3.0, "#762a83", 220, "3  disagree (suspect)")]
+                 (3.0, "#762a83", 220,
+                  "3  disagree (suspect) — held out of the heat map")]
         items = []
         for value, color, alpha, text in stops:
             c = QColor(color)
@@ -2653,6 +2675,22 @@ class SarTab(QWidget):
             cpath = self._cd_export_float(
                 f"S1 MERGED confidence {dirs} {pre_d}→{post_d} {tail}",
                 conf, gt, proj, tag_meta)
+            # The heat map you READ is the agreeing-only copy: "strongest anomaly
+            # wins" paints a conf-3 contradiction exactly like a real detection,
+            # and over ice that is most of the AOI. The full max-pooled raster is
+            # still written, still loaded and still what the Fusion tab scores —
+            # see sar_change.agreeing_only for why dropping the disagreements
+            # from the SCORE was measured and rejected.
+            shown, n_hidden = sar_change.agreeing_only(merged, conf)
+            # NOT "S1 change ..." like every analysis product: FusionTab's
+            # _sar_siblings globs "S1_change_*_to_<post>_t<tracks>_<POL>_*" to pool
+            # the detectors of one pair, and this copy shares that whole tail. Named
+            # as a change raster it would be pooled with the very raster it is a
+            # filtered view of — the merged log-ratio MAX-pooled with itself minus
+            # its disagreements — which is both meaningless and invisible.
+            dlabel = (f"S1 MERGED agreeing only {NAME.get(mkey, mkey)} "
+                      f"{dirs} {pre_d}→{post_d} {tail}")
+            dpath = self._cd_export_float(dlabel, shown, gt, proj, tag_meta)
             try:
                 if not mpath:                    # no Output/Project folder set
                     fd, mpath = tempfile.mkstemp(suffix=".tif",
@@ -2664,31 +2702,54 @@ class SarTab(QWidget):
                                                  prefix="landslide_conf_")
                     os.close(fd)
                     sar_change.write_gtiff(cpath, conf, gt, proj)
+                if not dpath:
+                    fd, dpath = tempfile.mkstemp(suffix=".tif",
+                                                 prefix="landslide_agree_")
+                    os.close(fd)
+                    sar_change.write_gtiff(dpath, shown, gt, proj)
             except Exception as e:               # noqa: BLE001
                 self._warn(f"Could not write merged {NAME.get(mkey, mkey)}: {e}")
                 continue
             mlyr = QgsRasterLayer(mpath, label)
             clyr = QgsRasterLayer(
                 cpath, f"S1 MERGED confidence {dirs} {pre_d}→{post_d}")
-            if not mlyr.isValid() or not clyr.isValid():
+            dlyr = QgsRasterLayer(dpath, dlabel)
+            if not mlyr.isValid() or not clyr.isValid() or not dlyr.isValid():
                 self._warn(f"Merged {NAME.get(mkey, mkey)}: raster failed to load.")
                 continue
             self._style_cd_layer(mlyr, mkey)
+            self._style_cd_layer(dlyr, mkey)     # same ramp: only the holes differ
             self._style_cd_confidence(clyr)
             if merge_group is None:
                 merge_group = lg.new_group(
                     lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged",
-                            lg.radius_tag(results[0].get("radius"))))
+                            lg.radius_tag(results[0].get("radius")),
+                            lg.orbit_tag(*(r["direction"] for r in results))))
             sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
             lg.add_to(clyr, sub)          # confidence underneath
-            lg.add_to(mlyr, sub)          # merged change on top
-            self._cd_last_layers += [clyr, mlyr]
+            # The full raster is LOADED but unticked. It has to be in the project
+            # or the Fusion tab cannot offer it at all — that tab builds its combos
+            # from the project's raster layers, not from the folder — but two
+            # near-identical heat maps drawn on top of each other is not a map.
+            node = lg.add_to(mlyr, sub)
+            try:
+                node.setItemVisibilityChecked(False)
+            except (AttributeError, RuntimeError):
+                pass                      # visibility is cosmetic; never fatal
+            lg.add_to(dlyr, sub)          # agreeing-only heat map on top, ticked
+            self._cd_last_layers += [clyr, mlyr, dlyr]
+            self._append_log(
+                f"  heat map shown: agreeing only ({n_hidden} disagreeing px "
+                f"hidden); the full raster is loaded unticked and is what the "
+                f"Fusion tab reads")
             added += 1
         if added:
             self.iface.messageBar().pushInfo(
                 "SAR", f"Merged {added} product(s) across geometries — read the "
                 "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
-                "from one orbit (other blind), 3 = orbits disagree (suspect).")
+                "from one orbit (other blind), 3 = orbits disagree and are left "
+                "out of the heat map on top (the full raster is loaded unticked "
+                "beneath it, and is the one the Fusion tab reads).")
 
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
