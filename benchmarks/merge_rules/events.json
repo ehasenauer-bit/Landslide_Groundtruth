@@ -1,0 +1,20 @@
+[
+ {"name": "Azumi", "lat": 61.5, "lon": -147.2, "datetime": "2026-08-24T14:54:00",
+  "optical": "2026-08-24 Azumi Event_dbright_2026-08-13_vs_2026-09-02.tif",
+  "scar_folder": "2026-08-24 Azumi Event"},
+ {"name": "Hubbard", "lat": 60.25, "lon": -139.6, "datetime": "2026-07-28T15:26:00",
+  "optical": "event_260728_1526_dbright_2026-06-20_vs_2026-08-12.tif",
+  "scar_folder": "2026-07-28 Hubbard"},
+ {"name": "Iliamna", "lat": 60.0272, "lon": -153.061, "datetime": "2026-08-08T11:37:00",
+  "optical": "event_260808_1137_dbright_2026-07-10_vs_2026-08-29.tif",
+  "scar_folder": "2026-08-08 Illiamna"},
+ {"name": "Knik", "lat": 61.23935, "lon": -147.96508, "datetime": "2026-08-09T16:06:00",
+  "optical": "event_260809_1606_dbright_2026-08-01_vs_2026-08-13.tif",
+  "scar_folder": "2026-08-09 Knik–Barry Glacier"},
+ {"name": "Logan", "lat": 60.535, "lon": -140.283, "datetime": "2026-08-05T13:27:00",
+  "optical": "event_260805_1327_dbright_2026-08-04_vs_2026-08-24.tif",
+  "scar_folder": "2026-08-05 Mt. Logan"},
+ {"name": "Valdez", "lat": 61.433, "lon": -147.149, "datetime": "2026-08-04T12:03:00",
+  "optical": "event_260804_1203_dbright_2026-08-01_vs_2026-08-06.tif",
+  "scar_folder": "2026-08-04 Valdez (0.6Mm3)"}
+]
