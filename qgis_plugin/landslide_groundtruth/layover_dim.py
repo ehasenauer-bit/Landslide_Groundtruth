@@ -371,13 +371,20 @@ def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
                  lat_hint=None, dem_smooth=3, max_steps=400):
     """Boolean mask: True where terrain hides the pixel from the radar.
 
-    Radar shadow is the half of the terrain problem that a change detector gets
-    exactly backwards. A shadowed pixel sits at the noise floor in BOTH the pre
-    and the post scene, and a ratio of two noise samples is heavy-tailed — so it
-    produces a LARGE |log-ratio| and wins a "strongest anomaly wins" merge over
-    the geometry that actually saw the ground. (Layover is the opposite and
-    largely self-correcting: energy from several ground cells sums into one
-    pixel, so a real change is diluted there and loses the same contest.)
+    What shadow does to a change map is NOT what you might expect, and this was
+    built on the wrong expectation first. Measured on a quiet Iliamna pair
+    (2026-08-31 -> 09-12, same tracks, no slide), shadowed pixels are ~10x
+    QUIETER than lit ground, not noisier: after a 5x5 speckle filter 0.8-0.9% of
+    them read as a >=3 dB change against 5.7-14.5% of lit ground, and their
+    before-vs-after correlation (0.86-0.91) matches lit ground's. The noise
+    floor is steady from pass to pass on one track, so noise over noise is ~1,
+    not a heavy-tailed outlier. A shadowed sample therefore rarely wins the
+    merge's "strongest anomaly wins", and masking it does not reduce noise (the
+    merged background moved 17.91% -> 17.89%).
+
+    What the mask IS for is the merge's confidence label — see
+    sar_change.merge_geometries(masks=...). A shadowed pass has not "seen no
+    change"; it has not seen the ground at all, and the mask says so.
 
     Shadow is a deterministic function of terrain and look geometry, so it is
     PREDICTED from the DEM rather than inferred from the pixels — which is the

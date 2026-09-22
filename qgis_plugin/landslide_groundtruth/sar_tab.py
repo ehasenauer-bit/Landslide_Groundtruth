@@ -680,14 +680,15 @@ class SarTab(QWidget):
             "(common in this terrain — many areas lack both passes), it still runs "
             "but flags that the opposite-facing slopes, possibly the source "
             "headscarp, are unrecovered.\n\n"
-            "Radar SHADOW is masked out per geometry first, predicted from the "
-            "Copernicus DEM and the look direction — a shadowed pixel is noise "
-            "over noise, so its log-ratio is large and it would otherwise WIN "
-            "the merge against the orbit that actually saw the ground. Measured "
-            "on Iliamna / Valdez / Mt Logan at 17 km, that hands 1-4% of the AOI "
-            "from the blind orbit to the seeing one, and almost nothing is "
-            "shadowed in both. Needs a DEM; without one the merge just runs as "
-            "it used to.\n\n"
+            "Radar SHADOW is set aside per geometry first, predicted from the "
+            "Copernicus DEM and each scene's look direction and incidence. It "
+            "does not reduce noise — shadowed pixels are quiet, not noisy — "
+            "but it keeps the confidence honest: where one pass is in shadow and "
+            "the other sees a real change, that pixel counts as 'recovered' "
+            "instead of 'disagree', so the agreeing-only heat map keeps it. "
+            "Shadow covers roughly 1-4% of a mountain AOI, and almost none of it "
+            "is shadowed in both passes. Needs a DEM; without one the merge just "
+            "runs as it used to.\n\n"
             "Three layers come back per product. The heat map on top is "
             "AGREEING ONLY: pixels the two orbits contradict each other about "
             "(confidence class 3 — one orbit flags it and the other saw nothing "
@@ -2592,15 +2593,17 @@ class SarTab(QWidget):
         """One radar-shadow mask per geometry in `results`, or None if the DEM is
         unavailable (the merge then behaves exactly as it did before).
 
-        Shadow is the half of the terrain problem the merge cannot find on its
-        own: `sentinel-1-rtc` leaves a shadowed pixel finite and ordinary-looking,
-        so the merge reads it as good data, and because it is noise over noise its
-        |log-ratio| is large enough to WIN "strongest anomaly wins" against the
-        orbit that actually saw the ground. Predicting it from the DEM is the only
-        way to find it. See layover_dim.radar_shadow.
+        The merge cannot find shadow on its own: `sentinel-1-rtc` leaves a
+        shadowed pixel finite and QUIET, so the merge reads it as an orbit that
+        looked and "saw no change". Where the other pass saw a real change, that
+        turns the pixel into a disagreement (confidence 3), which the agreeing-
+        only heat map hides. The mask marks the shadowed pass as blind instead,
+        so the pixel is a recovery (confidence 1) and stays on the map. It is
+        not a noise filter — shadowed pixels were measured to be quieter than
+        lit ground. See layover_dim.radar_shadow.
 
-        Never fatal: a DEM fetch that fails costs the terrain recovery, not the
-        merge."""
+        Never fatal: a DEM fetch that fails costs the confidence correction, not
+        the merge."""
         r0 = results[0]
         gt, shape = r0["gt"], r0["shape"]
         try:

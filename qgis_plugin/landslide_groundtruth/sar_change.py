@@ -567,14 +567,18 @@ def merge_geometries(maps, kind, threshold, agree_min=2, masks=None):
     the geometry had no data there, before anything else runs, so the whole
     selection below is made from usable samples only.
 
-    This is what makes the merge actually recover terrain. Left to itself the
-    merge can only recover a pixel the other orbit records as NaN — which in
-    ``sentinel-1-rtc`` means a frame edge, not a mountain: shadow and layover
-    pixels are finite and look like ordinary data. Worse, a shadowed pixel is
-    noise over noise, so its |log-ratio| is large and it WINS the contest below
-    against the geometry that actually saw the ground. Handing in a shadow mask
-    turns "strongest anomaly wins" into "strongest anomaly a geometry could
-    legitimately see wins", and makes a confidence of 1 mean what it says.
+    What this changes is the CONFIDENCE, not (much) the merged values. Left to
+    itself the merge treats a pixel as "blind" only where the other orbit
+    records NaN — in ``sentinel-1-rtc`` that is a frame edge, never a mountain:
+    shadowed pixels are finite, and quiet (a shadowed sample's |log-ratio| is
+    usually SMALL — see layover_dim.radar_shadow). So where one pass is in
+    shadow and the other sees a real change, the quiet shadowed sample counts as
+    a valid orbit that "saw nothing", and the pixel is classed 3, disagree —
+    which the SAR tab's agreeing-only heat map then hides. Masked, the shadowed
+    pass is set aside as blind, the pixel becomes a 1 (recovered, other orbit
+    blind), and it stays on the map. The louder, unshadowed orbit usually won
+    the value anyway, so what the Fusion tab reads barely moves; measured on a
+    quiet Iliamna pair, the merged background went 17.91% -> 17.89%.
 
     Cross-geometry backscatter is NOT directly comparable, so values are never
     averaged across geometries. Per pixel the geometry with the STRONGEST anomaly

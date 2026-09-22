@@ -3,24 +3,25 @@
 Run with tests/run_all.sh, or directly:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_radar_shadow.py
 
-Shadow is the half of the terrain problem a change detector gets backwards. A
-shadowed pixel sits at the noise floor in BOTH scenes, so its log-ratio is noise
-over noise — heavy-tailed, and LARGE. merge_geometries picks the strongest
-anomaly per pixel, so before this the shadowed sample beat the geometry that
-actually saw the ground. (Layover is self-correcting under the same rule: energy
-from several ground cells sums into one pixel, a real change is diluted there,
-and it loses the contest.)
+Shadow cannot be found in the pixels: `sentinel-1-rtc` leaves shadowed pixels
+finite and ordinary-looking, never NoData, which is also why the merge's
+confidence-1 "recovered, other orbit blind" only ever fired on frame edges. So it
+is PREDICTED from the DEM and the look geometry, which is deterministic.
 
-It cannot be found in the pixels: `sentinel-1-rtc` leaves shadowed pixels finite
-and ordinary-looking, never NoData, which is also why the merge's confidence-1
-"recovered, other orbit blind" only ever fired on frame edges. So it is PREDICTED
-from the DEM and the look geometry, which is deterministic.
+It is not noise. This was first built on the belief that a shadowed pixel is
+noise over noise and so reads as a large, false change. On a quiet real Iliamna
+pair shadowed pixels were ~10x QUIETER than lit ground, and masking them moved
+the merged background 17.91% -> 17.89%. What the mask does change is the
+confidence: a quiet shadowed pass no longer counts as an orbit that looked and
+"saw nothing", so a real change the other pass saw is a recovery (1) rather than
+a disagreement (3) that the agreeing-only heat map would hide.
 
 What is pinned here: the shadow falls on the correct side of a ridge and is the
 right length, the self-shadow threshold is 90deg - incidence, ascending and
 descending are genuinely complementary on east/west slopes and genuinely
-identical on north/south ones, and a masked geometry loses the merge's contest
-instead of winning it.
+identical on north/south ones, the look direction and incidence match real
+footprints, and the merge sets a masked geometry aside — which, for the quiet
+shadow real data produces, turns a disagreement into a recovery.
 """
 import math, os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -133,17 +134,20 @@ m, _ = ld.radar_shadow(edge, GT, "DESCENDING", dem_smooth=0)  # lit from the eas
 check("descending: that same wall shadows the AOI to its west",
       m.mean() > 0.9, f"{m.mean():.0%}")
 
-print("\n=== 6. the merge stops losing its contest to a shadowed pixel ===")
-# Before the mask, the shadowed sample WINS: noise over noise is large, and the
-# merge takes the strongest anomaly. Each column below is one pixel.
+print("\n=== 6. what the mask changes in the merge ===")
+# Each column is one pixel. The loud shadowed values in cases 1-3 are MECHANISM
+# tests — whatever a masked sample holds, the merge must not use it. Real shadow
+# is quiet (measured ~10x quieter than lit ground), so case 5 is the one real
+# data produces, and it is where the mask earns its keep.
 N = np.nan
 THR = 3.0
 #        asc     desc    asc shadowed?  desc shadowed?
-CASES = [("clean both, asc louder",      -5.0, -4.0, False, False),
-         ("asc SHADOWED and noisy",      -8.0,  0.2, True,  False),
-         ("asc shadowed, desc sees scar", 9.0, -5.0, True,  False),
-         ("desc shadowed and noisy",      0.1,  7.0, False, True),
-         ("shadowed in BOTH geometries",  8.0, -8.0, True,  True)]
+CASES = [("clean both, asc louder",         -5.0, -4.0, False, False),
+         ("asc shadowed, loud (mechanism)", -8.0,  0.2, True,  False),
+         ("asc shadowed + loud, desc scar",  9.0, -5.0, True,  False),
+         ("desc shadowed, loud (mechanism)", 0.1,  7.0, False, True),
+         ("shadowed in BOTH geometries",     8.0, -8.0, True,  True),
+         ("asc shadowed QUIET, desc scar",   0.3, -5.0, True,  False)]
 asc = np.array([[c[1] for c in CASES]], dtype=np.float32)
 desc = np.array([[c[2] for c in CASES]], dtype=np.float32)
 m_asc = np.array([[c[3] for c in CASES]], dtype=bool)
@@ -158,7 +162,8 @@ WANT = [(-5.0, -5.0, 2.0),      # nothing shadowed: unchanged
         (-8.0,  0.2, 0.0),      # the spurious -8 dB goes; desc saw no change
         ( 9.0, -5.0, 1.0),      # the scar desc saw survives, as a real recovery
         ( 7.0,  0.1, 0.0),      # mirror case
-        ( 8.0,    N, N)]        # no geometry can see it: honest NoData
+        ( 8.0,    N, N),        # no geometry can see it: honest NoData
+        (-5.0, -5.0, 1.0)]      # value unchanged — but see the conf checks below
 for i, (name, *_rest) in enumerate(CASES):
     want_plain, want_masked, want_conf = WANT[i]
     got_p, got_m, got_c = float(plain[0, i]), float(masked[0, i]), float(cmask[0, i])
@@ -171,19 +176,26 @@ for i, (name, *_rest) in enumerate(CASES):
 
 check(f"it reports what the mask did ({mm['n_masked']} set aside, "
       f"{mm['n_mask_recovered']} recovered, {mm['n_mask_blind']} blind)",
-      (mm["n_masked"], mm["n_mask_recovered"], mm["n_mask_blind"]) == (5, 3, 1),
+      (mm["n_masked"], mm["n_mask_recovered"], mm["n_mask_blind"]) == (6, 4, 1),
       f"{mm['n_masked']}/{mm['n_mask_recovered']}/{mm['n_mask_blind']}")
-# the case that shows what changed: asc claims +9 dB from a shadowed pixel while
-# desc reports a real -5 dB scar. Unmasked the two are both over threshold with
-# opposite signs, so the merge calls it a sign conflict and hands over the
-# shadowed +9. Masked, desc is the only geometry that could see the ground, and
-# the pixel becomes what confidence 1 has always claimed to mean.
-check(f"unmasked, that pixel is a sign conflict (conf {cplain[0, 2]:.0f})",
-      float(cplain[0, 2]) == 3.0)
-check("masked, it is a TERRAIN recovery (conf 1) — not a frame edge, since asc "
-      "had perfectly finite data there",
-      float(cmask[0, 2]) == 1.0 and bool(np.isfinite(asc_before[0, 2])),
-      f"conf {cmask[0, 2]}")
+# Case 5, the one real data produces: the shadowed pass is quiet (+0.3 dB) and
+# desc sees a real -5 dB scar. The VALUE is -5 either way — desc was louder, so
+# it already won. What the mask changes is the label. Unmasked, the quiet asc
+# sample counts as an orbit that looked and saw nothing, so the pixel is a
+# disagreement (3), and the agreeing-only heat map hides a real scar. Masked,
+# asc is blind there, and the pixel is what confidence 1 claims: recovered.
+check(f"quiet shadow + real scar, unmasked: disagreement (conf {cplain[0, 5]:.0f}) "
+      "— hidden from the agreeing-only heat map", float(cplain[0, 5]) == 3.0)
+check("masked: a TERRAIN recovery (conf 1), kept on the map — not a frame edge, "
+      "since asc had perfectly finite data there",
+      float(cmask[0, 5]) == 1.0 and bool(np.isfinite(asc_before[0, 5])),
+      f"conf {cmask[0, 5]}")
+check("and the merged value — what Fusion reads — did not move",
+      float(plain[0, 5]) == float(masked[0, 5]) == -5.0)
+# the loud-shadow mechanism case: a sign conflict becomes a recovery the same way
+check(f"loud shadow vs real scar: sign conflict (conf {cplain[0, 2]:.0f}) -> "
+      f"recovery (conf {cmask[0, 2]:.0f})",
+      float(cplain[0, 2]) == 3.0 and float(cmask[0, 2]) == 1.0)
 check("the caller's change arrays are not mutated",
       np.array_equal(asc, asc_before, equal_nan=True)
       and np.array_equal(desc, desc_before, equal_nan=True),
