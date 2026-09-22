@@ -562,23 +562,28 @@ def merge_geometries(maps, kind, threshold, agree_min=2, masks=None):
     ``>`` cut for the unsigned correlation family.
 
     ``masks`` — optional, one per map (or None for a geometry with no mask):
-    True where that geometry's pixel is GEOMETRICALLY UNUSABLE, typically radar
-    shadow from ``layover_dim.radar_shadow``. Masked pixels are set aside as if
-    the geometry had no data there, before anything else runs, so the whole
-    selection below is made from usable samples only.
+    True where that geometry's pixel is GEOMETRICALLY UNUSABLE — radar shadow
+    OR layover, ``layover_dim.radar_shadow(...) | radar_layover(...)``. Masked
+    pixels are set aside as if the geometry had no data there, before anything
+    else runs, so the whole selection below is made from usable samples only.
 
     What this changes is the CONFIDENCE, not (much) the merged values. Left to
     itself the merge treats a pixel as "blind" only where the other orbit
     records NaN — in ``sentinel-1-rtc`` that is a frame edge, never a mountain:
-    shadowed pixels are finite, and quiet (a shadowed sample's |log-ratio| is
-    usually SMALL — see layover_dim.radar_shadow). So where one pass is in
-    shadow and the other sees a real change, the quiet shadowed sample counts as
-    a valid orbit that "saw nothing", and the pixel is classed 3, disagree —
-    which the SAR tab's agreeing-only heat map then hides. Masked, the shadowed
-    pass is set aside as blind, the pixel becomes a 1 (recovered, other orbit
-    blind), and it stays on the map. The louder, unshadowed orbit usually won
-    the value anyway, so what the Fusion tab reads barely moves; measured on a
-    quiet Iliamna pair, the merged background went 17.91% -> 17.89%.
+    shadowed and laid-over pixels are finite and look like ordinary data. So
+    where one pass could not see the ground and the other sees a real change,
+    the blind sample counts as a valid orbit that "saw nothing", and the pixel
+    is classed 3, disagree — which the SAR tab's agreeing-only heat map then
+    hides. Masked, the blind pass is set aside, the pixel becomes a 1
+    (recovered, other orbit blind), and it stays on the map; where BOTH passes
+    are masked it is NaN, because neither saw the ground. Measured on a quiet
+    Iliamna pair: ~10% of the AOI blind to one pass, ~2% to both. It also cuts
+    false change where it applies — on the pixels blind to one pass, from 8.7%
+    to 1.9% reading as a >=3 dB change, because the merge stops taking the
+    louder of a blind sample and a seeing one. Blind pixels are not noisier on
+    average (the ~2% that went NaN were quieter than the rest), and the ~88% of
+    the AOI both passes see is untouched, so the whole-AOI background moves
+    only 18.1% -> 17.5%.
 
     Cross-geometry backscatter is NOT directly comparable, so values are never
     averaged across geometries. Per pixel the geometry with the STRONGEST anomaly

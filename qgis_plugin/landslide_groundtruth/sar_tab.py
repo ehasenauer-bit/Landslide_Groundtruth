@@ -58,7 +58,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QDoubleSpinBox, QDateTimeEdit, QCheckBox,
     QProgressBar, QPlainTextEdit, QTableWidget, QTableWidgetItem, QSplitter,
-    QScrollArea, QGridLayout, QToolButton, QSlider,
+    QScrollArea, QGridLayout, QToolButton, QSlider, QApplication,
 )
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
@@ -680,15 +680,20 @@ class SarTab(QWidget):
             "(common in this terrain — many areas lack both passes), it still runs "
             "but flags that the opposite-facing slopes, possibly the source "
             "headscarp, are unrecovered.\n\n"
-            "Radar SHADOW is set aside per geometry first, predicted from the "
-            "Copernicus DEM and each scene's look direction and incidence. It "
-            "does not reduce noise — shadowed pixels are quiet, not noisy — "
-            "but it keeps the confidence honest: where one pass is in shadow and "
-            "the other sees a real change, that pixel counts as 'recovered' "
-            "instead of 'disagree', so the agreeing-only heat map keeps it. "
-            "Shadow covers roughly 1-4% of a mountain AOI, and almost none of it "
-            "is shadowed in both passes. Needs a DEM; without one the merge just "
-            "runs as it used to.\n\n"
+            "Radar SHADOW and LAYOVER are set aside per geometry first, "
+            "predicted from the Copernicus DEM and each scene's look direction "
+            "and incidence. Where one pass could not see the ground and the "
+            "other saw a real change, that pixel counts as 'recovered' instead "
+            "of 'disagree', so the agreeing-only heat map keeps it; and false "
+            "change on those pixels drops (8.7% to 1.9% on a quiet Iliamna "
+            "pair), because the blind pass no longer gets a vote. Most "
+            "background is on ground both passes see, which this does not "
+            "touch. On Iliamna ~10% "
+            "of the AOI is blind to one pass and filled by the other; ~2% — "
+            "steep east/west faces, shadowed from one side and laid over from "
+            "the other — is blind to both and becomes NoData. Adds a few "
+            "seconds and needs a DEM; without one the merge runs as it used "
+            "to.\n\n"
             "Three layers come back per product. The heat map on top is "
             "AGREEING ONLY: pixels the two orbits contradict each other about "
             "(confidence class 3 — one orbit flags it and the other saw nothing "
@@ -2589,21 +2594,34 @@ class SarTab(QWidget):
         except Exception as e:                       # noqa: BLE001
             self._append_log(f"  layover fade skipped: {type(e).__name__}: {e}")
 
-    def _shadow_masks(self, results, cache):
-        """One radar-shadow mask per geometry in `results`, or None if the DEM is
+    def _terrain_masks(self, results, cache):
+        """One mask per geometry in `results` — True where that pass could not
+        see the ground, radar SHADOW or LAYOVER — or None if the DEM is
         unavailable (the merge then behaves exactly as it did before).
 
-        The merge cannot find shadow on its own: `sentinel-1-rtc` leaves a
-        shadowed pixel finite and QUIET, so the merge reads it as an orbit that
-        looked and "saw no change". Where the other pass saw a real change, that
-        turns the pixel into a disagreement (confidence 3), which the agreeing-
-        only heat map hides. The mask marks the shadowed pass as blind instead,
-        so the pixel is a recovery (confidence 1) and stays on the map. It is
-        not a noise filter — shadowed pixels were measured to be quieter than
-        lit ground. See layover_dim.radar_shadow.
+        The merge cannot find either on its own: `sentinel-1-rtc` leaves both
+        finite and ordinary-looking, so the merge reads a blind pass as one that
+        looked. Where it "saw no change" and the other pass saw a real one, the
+        pixel is classed a disagreement (confidence 3), which the agreeing-only
+        heat map hides; masked, the blind pass is set aside and the pixel is a
+        recovery (confidence 1).
 
-        Never fatal: a DEM fetch that fails costs the confidence correction, not
-        the merge."""
+        The two have to go together. Measured on Iliamna, 97-98% of one pass's
+        shadow is LAYOVER in the other — a slope steep enough to face away past
+        90-θ faces the other look steeper than its θ — so a shadow mask alone
+        "recovers" pixels from a pass that folded them over. With both, those
+        become honest NoData (~2% of a mountain AOI, lost to Sentinel-1 from
+        either side), and the real recoveries are layover pixels the other pass
+        saw cleanly (77-85% of them). Blind pixels are no noisier than lit
+        ground on average, but setting the blind pass aside cuts false change
+        where it applies: on a quiet Iliamna pair, 8.7% -> 1.9% of the pixels
+        blind to one pass, because the merge stops taking the louder of a blind
+        and a seeing sample. The background left over is on ground both passes
+        see, which this does not touch. See layover_dim.
+
+        ~2-3 s per pass at a 17 km AOI, computed twice per Merge (once per
+        geometry) and cached. Never fatal: a failure costs the confidence
+        correction, not the merge."""
         r0 = results[0]
         gt, shape = r0["gt"], r0["shape"]
         try:
@@ -2634,17 +2652,27 @@ class SarTab(QWidget):
             key = (r["direction"], round(inc, 1),
                    tuple(round(float(v), 6) for v in gt), shape)
             if key not in cache:
+                # a few seconds per pass on the GUI thread: say so, at least
+                QApplication.setOverrideCursor(Qt.WaitCursor)
                 try:
-                    m, mmeta = layover_dim.radar_shadow(
+                    sh, smeta = layover_dim.radar_shadow(
+                        dem, gt, r["direction"], incidence_deg=inc,
+                        lat_hint=lat_c)
+                    lo, lmeta = layover_dim.radar_layover(
                         dem, gt, r["direction"], incidence_deg=inc,
                         lat_hint=lat_c)
                 except Exception as e:           # noqa: BLE001
                     self._append_log(
-                        f"  radar shadow skipped: {type(e).__name__}: {e}")
+                        f"  terrain masks skipped: {type(e).__name__}: {e}")
                     return None
-                cache[key] = m
-                self._append_log(f"  {r['direction'] or '?'} ({source}): "
-                                 f"{mmeta['note']}")
+                finally:
+                    QApplication.restoreOverrideCursor()
+                cache[key] = sh | lo
+                self._append_log(
+                    f"  {r['direction'] or '?'} ({source}): look azimuth "
+                    f"{smeta['range_azimuth']:.0f}°, {inc:.1f}° incidence — "
+                    f"layover {lmeta['frac_layover']:.1%}, shadow "
+                    f"{smeta['frac_shadow']:.1%} of the AOI")
             masks.append(cache[key])
         return masks
 
@@ -2677,9 +2705,9 @@ class SarTab(QWidget):
             sel.setdefault(gk, r)                  # first (newest) per geometry wins
         merge_group = None
         added = 0
-        # Radar shadow is a property of (grid, orbit direction) alone — the four
-        # detectors of one merge share both, so this is computed twice per Merge
-        # (once per geometry) rather than eight times.
+        # Shadow and layover are properties of (grid, orbit geometry) alone — the
+        # four detectors of one merge share both, so they are computed twice per
+        # Merge (once per geometry) rather than eight times.
         shadow_cache = {}
         for mkey, sel in by_prod.items():
             # sorted, not dict order: the durable filename below is built from
@@ -2703,7 +2731,7 @@ class SarTab(QWidget):
                     "reduction — recompute them with identical settings, then "
                     "merge. Skipped.")
                 continue
-            masks = self._shadow_masks(results, shadow_cache)
+            masks = self._terrain_masks(results, shadow_cache)
             try:
                 merged, conf, meta = sar_change.merge_geometries(
                     [r["out"] for r in results], mkey, results[0]["thr"],
@@ -2731,10 +2759,10 @@ class SarTab(QWidget):
                     f"disagree/suspect={meta['n_conflict']} px")
             if "n_masked" in meta:
                 self._append_log(
-                    f"  radar shadow: {meta['n_masked']} px set aside · "
+                    f"  shadow + layover: {meta['n_masked']} px set aside · "
                     f"{meta['n_mask_recovered']} px handed to the orbit that "
-                    f"could see them · {meta['n_mask_blind']} px shadowed in "
-                    f"every geometry (NoData)")
+                    f"could see them · {meta['n_mask_blind']} px blind in "
+                    f"every geometry (NoData — Sentinel-1 cannot see them)")
             # The tail mirrors a single-geometry layer's — "(t36 VV, 7×7)" — but
             # names EVERY track that went in, so the file becomes
             # S1_change_log-ratio_MERGED_..._to_<post>_t36+131_VV_7x7_….tif.

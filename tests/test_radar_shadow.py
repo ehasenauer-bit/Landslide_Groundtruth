@@ -1,4 +1,4 @@
-"""Radar shadow, and what handing it to the asc+desc merge changes.
+"""Radar shadow and layover, and what handing them to the asc+desc merge changes.
 
 Run with tests/run_all.sh, or directly:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_radar_shadow.py
@@ -22,6 +22,12 @@ descending are genuinely complementary on east/west slopes and genuinely
 identical on north/south ones, the look direction and incidence match real
 footprints, and the merge sets a masked geometry aside — which, for the quiet
 shadow real data produces, turns a disagreement into a recovery.
+
+Layover is the mirror (a radar-facing slope steeper than the incidence folds
+onto the ground in front of it), and it is the one that decides what the other
+pass can fill: at Iliamna 97-98% of each pass's shadow is layover in the other,
+so steep east/west faces are lost to Sentinel-1 from both sides, while 77-85%
+of layover is seen cleanly by the other pass. Sections 13-14 pin that.
 """
 import math, os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -382,17 +388,108 @@ rec = [k.arg for c in ast.walk(tree) if isinstance(c, ast.Call)
 check("_cd_results keeps the post scene's footprint", "footprint" in rec,
       "without it every merge falls back to the 39 deg constant, silently")
 helper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-               and n.name == "_shadow_masks"), None)
+               and n.name == "_terrain_masks"), None)
 calls = {c.func.attr for c in ast.walk(helper) if isinstance(c, ast.Call)
          and isinstance(c.func, ast.Attribute)} if helper else set()
-check("_shadow_masks estimates incidence per scene", "iw_incidence_deg" in calls)
+check("_terrain_masks estimates incidence per scene", "iw_incidence_deg" in calls)
+check("and masks shadow AND layover — never shadow alone",
+      {"radar_shadow", "radar_layover"} <= calls,
+      "97-98% of one pass's shadow is layover in the other: shadow alone "
+      "'recovers' pixels from a pass that folded them over")
 kw = {k.arg for c in ast.walk(helper) if isinstance(c, ast.Call)
       and getattr(c.func, "attr", "") == "radar_shadow" for k in c.keywords} if helper else set()
 check("and passes it, with the latitude, to radar_shadow",
       {"incidence_deg", "lat_hint"} <= kw, kw)
 
+print("\n=== 13. layover: a radar-facing slope folds onto the ground in front of it ===")
+# The mirror of shadow. Slant range grows with ground range as x.sin(t) - h.cos(t);
+# a nearer point a and a farther point b swap order when h_b - h_a > d.tan(t),
+# and then BOTH are mixed. On a wall that is the wall plus the ground on the
+# radar's side of it, out to H / tan(t) — the opposite side from its shadow.
+reach = math.floor(1000.0 / (20.0 * math.tan(math.radians(THETA))))   # 61 px
+wall2 = np.zeros((100, 150), dtype=np.float32)
+wall2[:, 75] = 1000.0
+for state, lo, hi, sh_side in (("DESCENDING", 75, 75 + reach, "west"),
+                               ("ASCENDING", 75 - reach, 75, "east")):
+    L, lmeta = ld.radar_layover(wall2, GT, state, dem_smooth=0)
+    cols = np.where(L[50])[0]
+    check(f"{state:11s} layover cols {cols.min()}..{cols.max()} — the radar's side, "
+          f"{reach} px ({reach * 20} m); its shadow falls {sh_side}",
+          cols.min() == lo and cols.max() == hi, f"expected {lo}..{hi}")
+
+up = lambda t, n=60: np.tile(np.arange(n) * 20.0 * math.tan(math.radians(t)),
+                             (n, 1)).astype(np.float32)   # rises to the east
+for tilt, want in ((THETA - 4, False), (THETA + 6, True)):
+    # rising to the east = facing WEST = facing an ascending look
+    L, _ = ld.radar_layover(up(tilt), GT, "ASCENDING", dem_smooth=0)
+    check(f"a {tilt:.0f}deg slope facing the radar is "
+          f"{'laid over' if L.mean() > 0.5 else 'clean'} (cut is the incidence, "
+          f"{THETA:.0f}deg)", (L.mean() > 0.5) == want, f"{L.mean():.0%}")
+L, _ = ld.radar_layover(up(42.0), GT, "ASCENDING", incidence_deg=46.0, dem_smooth=0)
+check("the cut moves with incidence: 42deg is clean at 46deg incidence",
+      not L.any(), f"{L.mean():.0%}")
+L, _ = ld.radar_layover(up(45.0), GT, "DESCENDING", dem_smooth=0)
+check("a slope facing AWAY from the radar never lays over", not L.any())
+L1, _ = ld.radar_layover(up(60.0).T, GT, "ASCENDING", dem_smooth=0)
+L2, _ = ld.radar_layover(up(60.0).T, GT, "DESCENDING", dem_smooth=0)
+check("north/south 60deg slope: no layover in either pass", not L1.any() and not L2.any())
+for state, why in (("", "no orbit"), ("sideways", "unrecognised orbit")):
+    L, meta = ld.radar_layover(wall2, GT, state, dem_smooth=0)
+    check(f"{why:18s} -> nothing masked", not L.any(), meta["note"])
+L, _ = ld.radar_layover(np.zeros((40, 40), np.float32), GT, "ASCENDING", dem_smooth=0)
+check("flat ground -> nothing masked", not L.any())
+edge2 = np.zeros((60, 60), dtype=np.float32)
+edge2[:, 0] = 3000.0                        # 3 km wall on the WESTERN edge
+L, _ = ld.radar_layover(edge2, GT, "DESCENDING", dem_smooth=0)   # lit from the east
+check("descending: a wall on the west edge lays over eastward, not around the "
+      "array", L[:, 1:].mean() > 0.9 and L[:, 0].all(), f"{L.mean():.0%}")
+L, _ = ld.radar_layover(edge2, GT, "ASCENDING", dem_smooth=0)    # lit from the west
+check("ascending: that wall's layover falls off the grid, nothing wraps",
+      not L[:, 2:].any(), f"{L[:, 2:].sum()} px wrapped")
+
+print("\n=== 14. what one pass loses the other fills — except steep east/west faces ===")
+# A slope steep enough to face AWAY from one look by more than 90 - t_a faces
+# the other look by more than t_b whenever t_a + t_b < 90 — true at Iliamna
+# (38.8 + 42.3) and for these defaults, NOT for two far-range passes (46 + 46).
+# So there, shadow in one pass is layover in the other: that face is lost to
+# Sentinel-1 from both sides. Measured on real Iliamna terrain, 97-98% of each
+# pass's shadow is layover in the other.
+dn = lambda t, n=60: up(t, n)[:, ::-1].copy()          # falls to the east
+for tilt in (50.0, 55.0, 60.0, 70.0, 80.0):
+    fa = dn(tilt)
+    a_sh, _ = ld.radar_shadow(fa, GT, "ascending", dem_smooth=0)
+    d_lo, _ = ld.radar_layover(fa, GT, "descending", dem_smooth=0)
+    if a_sh.mean() > 0.5:
+        check(f"{tilt:.0f}deg east-facing: shadowed to ascending AND laid over to "
+              f"descending — lost to both", d_lo.mean() > 0.5, f"{d_lo.mean():.0%}")
+    else:
+        check(f"{tilt:.0f}deg east-facing: lit for ascending, laid over for "
+              f"descending — ascending fills it", d_lo.mean() > 0.5)
+
+# the merge, with the tab's real mask (shadow | layover), on one pixel of each
+PIX = {"recoverable (45deg E-facing)": dn(45.0), "lost (60deg E-facing)": dn(60.0)}
+for name, fa in PIX.items():
+    blind = {st: ld.radar_shadow(fa, GT, st, dem_smooth=0)[0]
+             | ld.radar_layover(fa, GT, st, dem_smooth=0)[0]
+             for st in ("ascending", "descending")}
+    r, c = 30, 30
+    a_px = np.array([[-5.0]], np.float32)          # ascending sees a real scar
+    d_px = np.array([[0.4]], np.float32)           # descending "sees" nothing
+    mg, cf, _m = sar_change.merge_geometries(
+        [a_px, d_px], "logratio", THR,
+        masks=[blind["ascending"][r:r + 1, c:c + 1], blind["descending"][r:r + 1, c:c + 1]])
+    pl, cp, _p = sar_change.merge_geometries([a_px, d_px], "logratio", THR)
+    if name.startswith("recoverable"):
+        check(f"{name}: unmasked a disagreement (conf {cp[0, 0]:.0f}), masked a "
+              f"recovery (conf {cf[0, 0]:.0f}) keeping ascending's {mg[0, 0]:.1f} dB",
+              float(cp[0, 0]) == 3.0 and float(cf[0, 0]) == 1.0 and float(mg[0, 0]) == -5.0)
+    else:
+        check(f"{name}: blind to both passes -> NaN, not a guess "
+              f"(unmasked it would have claimed {pl[0, 0]:.1f} dB)",
+              bool(np.isnan(mg[0, 0])) and bool(np.isnan(cf[0, 0])))
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: " + "; ".join(fails))
     sys.exit(1)
-print("RADAR SHADOW + SHADOW-AWARE MERGE VERIFIED")
+print("RADAR SHADOW + LAYOVER + TERRAIN-AWARE MERGE VERIFIED")

@@ -25,7 +25,7 @@ import numpy as np
 
 __all__ = ["ground_heading_deg", "look_azimuth_deg", "illumination_aspect_deg",
            "range_azimuth_deg", "iw_incidence_deg", "slope_aspect_deg",
-           "metric_pixel_size", "layover_alpha", "radar_shadow",
+           "metric_pixel_size", "layover_alpha", "radar_shadow", "radar_layover",
            "IW_INCIDENCE_DEG", "IW_NEAR_DEG", "IW_FAR_DEG"]
 
 # Sentinel-1 IW incidence angle, mid-swath — now only the FALLBACK. The real
@@ -384,7 +384,10 @@ def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
 
     What the mask IS for is the merge's confidence label — see
     sar_change.merge_geometries(masks=...). A shadowed pass has not "seen no
-    change"; it has not seen the ground at all, and the mask says so.
+    change"; it has not seen the ground at all, and the mask says so. Use it
+    WITH radar_layover, never alone: 97-98% of one pass's shadow is layover in
+    the other (measured, Iliamna), so a shadow mask on its own hands those
+    pixels to a pass that folded them over and calls it a recovery.
 
     Shadow is a deterministic function of terrain and look geometry, so it is
     PREDICTED from the DEM rather than inferred from the pixels — which is the
@@ -455,6 +458,87 @@ def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
         "note": (f"look azimuth {az:.0f}°, {theta:.1f}° incidence (slopes "
                  f"tilted >{90.0 - theta:.0f}° away, plus cast shadow): "
                  f"{mask.mean():.1%} of the AOI"),
+    }
+
+
+def radar_layover(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
+                  lat_hint=None, dem_smooth=3, max_steps=600):
+    """Boolean mask: True where the pixel is mixed with other ground by layover.
+
+    Layover is the mirror of radar_shadow. A slope that faces the radar and
+    rises faster than the beam descends puts its upper part CLOSER in slant
+    range than its foot, so the radar receives the top before the bottom and
+    the returns from several places land in the same cells. In a geocoded
+    product that shows up in map space as the slope itself (active layover),
+    the ground in front of it and the ground just behind its crest (passive
+    layover): every pixel whose slant range falls inside the interval the slope
+    folded over.
+
+    Method: slant range grows with ground range x as x·sin(θ) - h·cos(θ), and
+    layover is exactly where that stops being monotonic. For two points on one
+    look line, a nearer one at height h_a and a farther one at h_b a ground
+    distance d apart, the order flips when h_b - h_a > d·tan(θ), and BOTH
+    points are then mixed. So the same one-pixel march as radar_shadow, with
+    tan(θ) where shadow has cot(θ), testing each pixel against its nearer and
+    its farther neighbours. Locally that is the familiar rule, a radar-facing
+    slope steeper than the incidence angle; the march adds the passive zones,
+    which a slope test alone misses. It stops once d·tan(θ) exceeds the AOI's
+    relief, beyond which no pair can flip.
+
+    Which geometry sees it: descending is lit from the east, so east-facing
+    slopes lay over there and are looked at from BEHIND by ascending — lit if
+    they are gentler than 90° - θ, shadowed if steeper. A steep east- or
+    west-facing face can therefore be lost to both passes (layover in one,
+    shadow in the other); north- and south-facing ones are seen the same way
+    by both.
+
+    Same conventions as radar_shadow: `dem` and `gt` share a grid, an unknown
+    orbit masks nothing, only terrain inside the DEM counts. Returns
+    (mask, meta).
+    """
+    dem = np.asarray(dem, dtype=np.float32)
+    mask = np.zeros(dem.shape, dtype=bool)
+    az = range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
+                           incidence_deg)
+    if az is None or not np.isfinite(dem).any():
+        return mask, {"orbit_state": str(orbit_state), "range_azimuth": az,
+                      "n_layover": 0, "n_steps": 0,
+                      "note": ("unknown orbit direction — nothing masked"
+                               if az is None else "no usable DEM — nothing masked")}
+    theta = float(incidence_deg)
+    if not 1.0 <= theta <= 89.0:
+        raise ValueError("incidence_deg must be between 1 and 89")
+    tan_t = float(np.tan(np.radians(theta)))
+
+    dem_s = _box_mean(dem, dem_smooth) if dem_smooth and dem_smooth > 1 else dem
+    lo = float(np.nanmin(dem_s))
+    ground = np.where(np.isfinite(dem_s), dem_s, lo).astype(np.float64)
+
+    dx, dy = metric_pixel_size(gt, dem.shape[0], lat_hint)
+    step = float(min(dx, dy))
+    a = np.radians(az)
+    east, north = -np.sin(a), -np.cos(a)          # unit vector TOWARD the radar
+    relief = float(ground.max() - ground.min())
+    n_steps = int(min(max_steps, max(1, np.ceil(relief / (tan_t * step)))))
+
+    for k in range(1, n_steps + 1):
+        d = k * step
+        drow = int(round(north * d / dy))
+        dcol = int(round(-east * d / dx))
+        # off-grid neighbours are filled so that they can never trigger
+        nearer = _shift(ground, drow, dcol, fill=np.inf)
+        farther = _shift(ground, -drow, -dcol, fill=-np.inf)
+        mask |= (ground - nearer) > d * tan_t     # this pixel folds onto nearer ground
+        mask |= (farther - ground) > d * tan_t    # farther ground folds onto this pixel
+
+    return mask, {
+        "orbit_state": str(orbit_state), "range_azimuth": az,
+        "incidence_deg": theta, "n_steps": n_steps,
+        "n_layover": int(mask.sum()),
+        "frac_layover": float(mask.mean()),
+        "note": (f"look azimuth {az:.0f}°, {theta:.1f}° incidence (radar-facing "
+                 f"slopes steeper than {theta:.0f}°, plus the ground they fold "
+                 f"onto): {mask.mean():.1%} of the AOI in layover"),
     }
 
 
