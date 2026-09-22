@@ -680,6 +680,14 @@ class SarTab(QWidget):
             "(common in this terrain — many areas lack both passes), it still runs "
             "but flags that the opposite-facing slopes, possibly the source "
             "headscarp, are unrecovered.\n\n"
+            "Radar SHADOW is masked out per geometry first, predicted from the "
+            "Copernicus DEM and the look direction — a shadowed pixel is noise "
+            "over noise, so its log-ratio is large and it would otherwise WIN "
+            "the merge against the orbit that actually saw the ground. Measured "
+            "on Iliamna / Valdez / Mt Logan at 17 km, that hands 1-4% of the AOI "
+            "from the blind orbit to the seeing one, and almost nothing is "
+            "shadowed in both. Needs a DEM; without one the merge just runs as "
+            "it used to.\n\n"
             "Three layers come back per product. The heat map on top is "
             "AGREEING ONLY: pixels the two orbits contradict each other about "
             "(confidence class 3 — one orbit flags it and the other saw nothing "
@@ -2264,6 +2272,10 @@ class SarTab(QWidget):
                 self._cd_results.append(dict(
                     mkey=mkey, track=track,
                     direction=(roles["post"].get("orbit_state") or ""),
+                    # the scene footprint is what fixes the incidence angle for
+                    # the merge's radar-shadow mask (layover_dim.iw_incidence_deg);
+                    # pre and post share a track, so either one's would do
+                    footprint=roles["post"].get("geometry"),
                     out=out, gt=gt, proj=proj, shape=out.shape,
                     thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
                     radius=meta.get("radius"), pre_d=pre_d, post_d=post_d,
@@ -2576,6 +2588,63 @@ class SarTab(QWidget):
         except Exception as e:                       # noqa: BLE001
             self._append_log(f"  layover fade skipped: {type(e).__name__}: {e}")
 
+    def _shadow_masks(self, results, cache):
+        """One radar-shadow mask per geometry in `results`, or None if the DEM is
+        unavailable (the merge then behaves exactly as it did before).
+
+        Shadow is the half of the terrain problem the merge cannot find on its
+        own: `sentinel-1-rtc` leaves a shadowed pixel finite and ordinary-looking,
+        so the merge reads it as good data, and because it is noise over noise its
+        |log-ratio| is large enough to WIN "strongest anomaly wins" against the
+        orbit that actually saw the ground. Predicting it from the DEM is the only
+        way to find it. See layover_dim.radar_shadow.
+
+        Never fatal: a DEM fetch that fails costs the terrain recovery, not the
+        merge."""
+        r0 = results[0]
+        gt, shape = r0["gt"], r0["shape"]
+        try:
+            dem = self._aoi_dem(gt, shape)
+        except Exception as e:                   # noqa: BLE001
+            self._append_log(f"  radar shadow skipped: {type(e).__name__}: {e}")
+            return None
+        if dem is None:
+            self._append_log("  radar shadow skipped: no DEM for this AOI, so "
+                             "shadowed pixels stay in the merge")
+            return None
+        # the AOI centre, where the incidence is evaluated. Across a 17 km-radius
+        # AOI the angle still drifts ~2 deg near-to-far range; the scar is usually
+        # near the centre, which is where this number is right.
+        lat_c = gt[3] + gt[5] * shape[0] / 2.0
+        lon_c = gt[0] + gt[1] * shape[1] / 2.0
+        masks = []
+        for r in results:
+            # The incidence comes from THIS scene's footprint: where the AOI sits
+            # across the swath swings the shadow cut from 61 deg slopes (near
+            # range) to 44 deg (far range). The 39 deg constant is only for a
+            # result recorded before footprints were kept, or an odd footprint.
+            inc = layover_dim.iw_incidence_deg(
+                r.get("footprint"), lon_c, lat_c, r["direction"])
+            source = "from the scene footprint"
+            if inc is None:
+                inc, source = layover_dim.IW_INCIDENCE_DEG, "mid-swath default"
+            key = (r["direction"], round(inc, 1),
+                   tuple(round(float(v), 6) for v in gt), shape)
+            if key not in cache:
+                try:
+                    m, mmeta = layover_dim.radar_shadow(
+                        dem, gt, r["direction"], incidence_deg=inc,
+                        lat_hint=lat_c)
+                except Exception as e:           # noqa: BLE001
+                    self._append_log(
+                        f"  radar shadow skipped: {type(e).__name__}: {e}")
+                    return None
+                cache[key] = m
+                self._append_log(f"  {r['direction'] or '?'} ({source}): "
+                                 f"{mmeta['note']}")
+            masks.append(cache[key])
+        return masks
+
     def _merge_geometries_action(self):
         """Merge the most recent ascending + descending change maps of each product
         so a scar lost to layover in one viewing geometry is recovered from the
@@ -2605,6 +2674,10 @@ class SarTab(QWidget):
             sel.setdefault(gk, r)                  # first (newest) per geometry wins
         merge_group = None
         added = 0
+        # Radar shadow is a property of (grid, orbit direction) alone — the four
+        # detectors of one merge share both, so this is computed twice per Merge
+        # (once per geometry) rather than eight times.
+        shadow_cache = {}
         for mkey, sel in by_prod.items():
             # sorted, not dict order: the durable filename below is built from
             # results[0], and iteration order here could otherwise differ between
@@ -2627,9 +2700,11 @@ class SarTab(QWidget):
                     "reduction — recompute them with identical settings, then "
                     "merge. Skipped.")
                 continue
+            masks = self._shadow_masks(results, shadow_cache)
             try:
                 merged, conf, meta = sar_change.merge_geometries(
-                    [r["out"] for r in results], mkey, results[0]["thr"])
+                    [r["out"] for r in results], mkey, results[0]["thr"],
+                    masks=masks)
             except Exception as e:               # noqa: BLE001 — surface, don't crash
                 self._warn(f"Merge ({NAME.get(mkey, mkey)}) failed: "
                            f"{type(e).__name__}: {e}")
@@ -2651,6 +2726,12 @@ class SarTab(QWidget):
                     f"  recovered (single-orbit, other blind)={meta['n_single']} px · "
                     f"agree (both orbits)={meta['n_agree']} px · "
                     f"disagree/suspect={meta['n_conflict']} px")
+            if "n_masked" in meta:
+                self._append_log(
+                    f"  radar shadow: {meta['n_masked']} px set aside · "
+                    f"{meta['n_mask_recovered']} px handed to the orbit that "
+                    f"could see them · {meta['n_mask_blind']} px shadowed in "
+                    f"every geometry (NoData)")
             # The tail mirrors a single-geometry layer's — "(t36 VV, 7×7)" — but
             # names EVERY track that went in, so the file becomes
             # S1_change_log-ratio_MERGED_..._to_<post>_t36+131_VV_7x7_….tif.

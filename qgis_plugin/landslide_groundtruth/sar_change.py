@@ -547,7 +547,7 @@ def split_tails(arr, kind, threshold, fill=np.nan):
 
 
 # ---------- dual-geometry merge (report rec #5) ----------
-def merge_geometries(maps, kind, threshold, agree_min=2):
+def merge_geometries(maps, kind, threshold, agree_min=2, masks=None):
     """Combine per-geometry change maps (ascending + descending) into one, so a
     scar pixel lost to layover in one viewing geometry is recovered from the other.
 
@@ -560,6 +560,21 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
 
     ``threshold`` — significance magnitude: dB or σ for the signed detectors, the
     ``>`` cut for the unsigned correlation family.
+
+    ``masks`` — optional, one per map (or None for a geometry with no mask):
+    True where that geometry's pixel is GEOMETRICALLY UNUSABLE, typically radar
+    shadow from ``layover_dim.radar_shadow``. Masked pixels are set aside as if
+    the geometry had no data there, before anything else runs, so the whole
+    selection below is made from usable samples only.
+
+    This is what makes the merge actually recover terrain. Left to itself the
+    merge can only recover a pixel the other orbit records as NaN — which in
+    ``sentinel-1-rtc`` means a frame edge, not a mountain: shadow and layover
+    pixels are finite and look like ordinary data. Worse, a shadowed pixel is
+    noise over noise, so its |log-ratio| is large and it WINS the contest below
+    against the geometry that actually saw the ground. Handing in a shadow mask
+    turns "strongest anomaly wins" into "strongest anomaly a geometry could
+    legitimately see wins", and makes a confidence of 1 mean what it says.
 
     Cross-geometry backscatter is NOT directly comparable, so values are never
     averaged across geometries. Per pixel the geometry with the STRONGEST anomaly
@@ -591,6 +606,36 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
     agree_min = max(2, int(agree_min))
     stack = np.stack(arrs)                       # (G, H, W)
     valid = np.isfinite(stack)
+
+    # Geometric masking comes FIRST: every count, contest and confidence class
+    # below has to be computed from the samples a geometry could legitimately
+    # see. np.where builds a new array rather than writing through — `maps` are
+    # the tab's live in-memory change arrays and must not be mutated.
+    mask_meta = {}
+    if masks is not None:
+        if len(masks) != len(arrs):
+            raise ValueError("masks must have one entry per map (None allowed)")
+        bad = np.zeros(stack.shape, dtype=bool)
+        for i, m in enumerate(masks):
+            if m is None:
+                continue
+            m = np.asarray(m, dtype=bool)
+            if m.shape != shape:
+                raise ValueError("a mask does not match the maps' shape")
+            bad[i] = m
+        before = valid.sum(0)
+        stack = np.where(bad, np.float32(np.nan), stack).astype(np.float32)
+        valid = np.isfinite(stack)
+        after = valid.sum(0)
+        mask_meta = dict(
+            n_masked=int((bad & (before > 0)[None]).sum()),
+            # the pixels the mask actually decided: one geometry silenced, the
+            # other left holding the pixel alone. This is the real layover/shadow
+            # recovery the merge could not do before.
+            n_mask_recovered=int(((after == 1) & (before > 1)).sum()),
+            # …and the pixels no geometry can see. Honest NoData, not a guess.
+            n_mask_blind=int(((after == 0) & (before > 0)).sum()),
+        )
     if signed:
         strength = np.where(valid, np.abs(stack), -np.inf)
         anom = valid & (np.abs(stack) >= thr)
@@ -648,6 +693,7 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
         n_agree=int((conf == 2).sum()),
         n_conflict=n_conflict,
         note=note,
+        **mask_meta,
     )
     return merged, conf.astype(np.float32), meta
 
