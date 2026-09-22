@@ -666,6 +666,46 @@ class SarTab(QWidget):
         self.cd_btn.clicked.connect(self._run_change_detection)
         form.addRow(self.cd_btn)
 
+        # How the two passes are combined. "Stronger" is the benchmarked default;
+        # "fill only" keeps one pass's background and borrows the other only
+        # where it was blind — measured 3x less false change on a quiet
+        # Iliamna pair, not yet benchmarked for finding the scar.
+        self.cd_merge_rule_combo = QComboBox()
+        self.cd_merge_rule_combo.addItem("Stronger pass per pixel (benchmarked)", "max")
+        self.cd_merge_rule_combo.addItem("Fill only: primary pass, gaps from the other",
+                                         "fill")
+        self.cd_merge_rule_combo.setToolTip(
+            "How Merge combines the ascending and descending change maps.\n\n"
+            "Stronger pass per pixel: at every pixel keep whichever pass shows the "
+            "larger change. Catches a slide either pass saw, but also inherits "
+            "BOTH passes' false change — on a quiet Iliamna pair it read 17.5% of "
+            "the AOI as change, where either pass alone read 5.7% or 14.3%. This "
+            "is the rule the six-event benchmark was run with.\n\n"
+            "Fill only: use ONE pass everywhere it could see, and the other only "
+            "where it could not (outside its frame, radar shadow, layover). The "
+            "false change stays at the primary's own level — 5.5% on that same "
+            "pair with ascending as primary. The price: a change the primary pass "
+            "looked at and missed is not rescued by the other. Not benchmarked "
+            "yet for finding the scar.")
+        self.cd_merge_primary_combo = QComboBox()
+        self.cd_merge_primary_combo.addItem("auto — the quieter pass", "auto")
+        self.cd_merge_primary_combo.addItem("ascending", "ascending")
+        self.cd_merge_primary_combo.addItem("descending", "descending")
+        self.cd_merge_primary_combo.setToolTip(
+            "Which pass leads a fill-only merge. It decides most of the result: "
+            "on the Iliamna pair, ascending as primary gave 5.5% false change and "
+            "descending 14.2%.\n\n"
+            "auto picks the QUIETER pass — the smaller median change on ground "
+            "both passes can see — among passes that see at least half the AOI "
+            "(a pass that mostly misses the AOI is quiet only because it is "
+            "missing). One primary is chosen for all four detectors, from the "
+            "log-ratio maps, so the Fusion tab never pools rasters led by "
+            "different passes. The choice and its numbers go to the Log.")
+        self.cd_merge_rule_combo.currentIndexChanged.connect(self._merge_rule_changed)
+        form.addRow("Merge rule", self.cd_merge_rule_combo)
+        form.addRow("Primary pass", self.cd_merge_primary_combo)
+        self._merge_rule_changed()
+
         # rec #5: merge the ascending + descending change maps so a scar lost to
         # layover in one geometry is recovered from the other. Workflow: compute
         # with an ascending after-scene, compute again with a descending one, then
@@ -2676,6 +2716,149 @@ class SarTab(QWidget):
             masks.append(cache[key])
         return masks
 
+    def _merge_rule_changed(self, *_args):
+        """The primary-pass choice only means something for a fill-only merge."""
+        self.cd_merge_primary_combo.setEnabled(
+            self.cd_merge_rule_combo.currentData() == "fill")
+
+    def _fill_primary(self, by_prod, NAME, cache):
+        """The geometry key ('ascending', 'descending', or 't<track>') that leads
+        EVERY detector of this fill-only merge, or None to lead with each
+        detector's first geometry.
+
+        Decided once, from the log-ratio maps when there are any (the benchmarked
+        detector), because the Fusion tab MAX-pools the four detectors: rasters
+        led by different passes would bring the cross-pass max — the very
+        inflation fill-only exists to avoid — back in at the pooling step."""
+        want = self.cd_merge_primary_combo.currentData() or "auto"
+        mkey = "logratio" if "logratio" in by_prod else next(iter(by_prod))
+        sel = by_prod[mkey]
+        results = [sel[gk] for gk in sorted(sel)]
+        keys = [r["direction"] or f"t{r['track']}" for r in results]
+        if want in ("ascending", "descending"):
+            for k in keys:
+                if k.lower().startswith(want[:3]):
+                    self._append_log(f"Fill-only: primary {k} (chosen by hand)")
+                    return k
+            self._warn(f"Fill-only: no {want} change map to lead with — choosing "
+                       "automatically instead.")
+        if len(results) < 2:
+            self._append_log(f"Fill-only: only {keys[0]} was computed; nothing to "
+                             "fill from")
+            return keys[0]
+        try:
+            masks = self._terrain_masks(results, cache)
+            idx, meta = sar_change.choose_primary(
+                [r["out"] for r in results], mkey, masks)
+        except Exception as e:                   # noqa: BLE001
+            self._append_log(f"Fill-only: could not compare the passes "
+                             f"({type(e).__name__}: {e}); leading with {keys[0]}")
+            return keys[0]
+        noise = ", ".join(
+            f"{k} {n:.2f}" for k, n in zip(keys, meta["noise"]) if n is not None)
+        cover = ", ".join(f"{k} {c:.0%}" for k, c in zip(keys, meta["coverage"]))
+        self._append_log(f"Fill-only: primary {keys[idx]} — {meta['reason']} "
+                         f"(median {NAME.get(mkey, mkey)} change: {noise or 'n/a'}; "
+                         f"coverage: {cover})")
+        return keys[idx]
+
+    def _emit_filled(self, mkey, results, masks, primary_key, NAME, group):
+        """Write and load one detector's fill-only merge: the filled change raster
+        (the heat map, and what the Fusion tab reads) and its source map.
+        Returns (group, added?).
+
+        Named "S1 change <det> FILLED <primary> from <other> ... fill-<primary>"
+        so the fill token sits in the tail _sar_siblings keys on: filled rasters
+        pool with each other (same primary, same settings) and never with the
+        strongest-wins MERGED rasters, whose pixels were chosen differently."""
+        keys = [r["direction"] or f"t{r['track']}" for r in results]
+        p = keys.index(primary_key) if primary_key in keys else 0
+        label_name = NAME.get(mkey, mkey)
+        try:
+            filled, source, fm = sar_change.fill_geometries(
+                [r["out"] for r in results], p, masks)
+        except Exception as e:                   # noqa: BLE001
+            self._warn(f"Fill ({label_name}) failed: {type(e).__name__}: {e}")
+            return group, False
+        rp = results[p]
+        # the primary's dates: nearly every pixel is its
+        gt, proj, pre_d, post_d = rp["gt"], rp["proj"], rp["pre_d"], rp["post_d"]
+        pdir = (rp["direction"] or f"t{rp['track']}")[:4]
+        odir = "+".join(sorted({(r["direction"] or f"t{r['track']}")[:4]
+                                for i, r in enumerate(results) if i != p})) or "none"
+        tracks = "+".join(str(t) for t in sorted(
+            {r["track"] for r in results if r.get("track") is not None}))
+        tail = f"(t{tracks or '?'} {rp['pol'].upper()} fill-{pdir}, {rp['k']}×{rp['k']})"
+        label = f"S1 change {label_name} FILLED {pdir} from {odir} {pre_d}→{post_d} {tail}"
+        slabel = f"S1 FILLED source {pdir} from {odir} {pre_d}→{post_d} {tail}"
+        total = max(1, filled.size)
+        self._append_log(
+            f"Fill {label_name} [primary {pdir}]: {fm['n_primary'] / total:.1%} of "
+            f"the AOI from {pdir} · {fm['n_filled'] / total:.1%} filled from {odir} "
+            f"· {fm['n_blind'] / total:.1%} blind to every pass (NoData)")
+        if len(results) < 2:
+            self._warn(f"Fill {label_name}: only one pass computed — nothing to "
+                       "fill its blind spots from.")
+        tag_meta = dict(radius=rp.get("radius"), eff_res=rp.get("eff_res"),
+                        res=rp.get("res"), speckle=rp.get("speckle"),
+                        radionorm=rp.get("radionorm"), min_area=rp.get("min_area"))
+        fpath = self._cd_export_float(label, filled, gt, proj, tag_meta)
+        spath = self._cd_export_float(slabel, source, gt, proj, tag_meta)
+        try:
+            if not fpath:                        # no Output/Project folder set
+                fd, fpath = tempfile.mkstemp(suffix=".tif", prefix="landslide_fill_")
+                os.close(fd)
+                sar_change.write_gtiff(fpath, filled, gt, proj)
+            if not spath:
+                fd, spath = tempfile.mkstemp(suffix=".tif", prefix="landslide_fsrc_")
+                os.close(fd)
+                sar_change.write_gtiff(spath, source, gt, proj)
+        except Exception as e:                   # noqa: BLE001
+            self._warn(f"Could not write filled {label_name}: {e}")
+            return group, False
+        flyr = QgsRasterLayer(fpath, label)
+        slyr = QgsRasterLayer(
+            spath, f"S1 FILLED source {pdir} from {odir} {pre_d}→{post_d}")
+        if not flyr.isValid() or not slyr.isValid():
+            self._warn(f"Filled {label_name}: raster failed to load.")
+            return group, False
+        self._style_cd_layer(flyr, mkey)
+        self._style_fill_source(slyr, pdir, odir)
+        if group is None:
+            group = lg.new_group(lg.name(
+                "SAR", lg.date_pair(pre_d, post_d), "change filled",
+                lg.radius_tag(rp.get("radius")),
+                lg.orbit_tag(*(r["direction"] for r in results))))
+        sub = lg.subgroup(group, label_name)
+        node = lg.add_to(slyr, sub)               # source map underneath, unticked
+        try:
+            node.setItemVisibilityChecked(False)
+        except (AttributeError, RuntimeError):
+            pass
+        lg.add_to(flyr, sub)                      # filled heat map on top
+        self._cd_last_layers += [slyr, flyr]
+        return group, True
+
+    def _style_fill_source(self, lyr, pdir, odir):
+        """Discrete style for a fill-only source map: 1 = the primary pass (left
+        clear, it is most of the AOI), 2 = filled from the other pass; NoData,
+        where no pass could see, stays transparent."""
+        stops = [(1.0, "#f7f7f7", 0, f"1  from {pdir} (primary)"),
+                 (2.0, "#fdae61", 200, f"2  filled from {odir}")]
+        items = []
+        for value, color, alpha, text in stops:
+            c = QColor(color)
+            c.setAlpha(alpha)
+            items.append(QgsColorRampShader.ColorRampItem(value, c, text))
+        fn = QgsColorRampShader(1.0, 2.0, None, QgsColorRampShader.Discrete)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
+        renderer.setClassificationMin(1.0)
+        renderer.setClassificationMax(2.0)
+        lyr.setRenderer(renderer)
+
     def _merge_geometries_action(self):
         """Merge the most recent ascending + descending change maps of each product
         so a scar lost to layover in one viewing geometry is recovered from the
@@ -2709,6 +2892,9 @@ class SarTab(QWidget):
         # four detectors of one merge share both, so they are computed twice per
         # Merge (once per geometry) rather than eight times.
         shadow_cache = {}
+        rule = self.cd_merge_rule_combo.currentData() or "max"
+        fill_primary = (self._fill_primary(by_prod, NAME, shadow_cache)
+                        if rule == "fill" else None)
         for mkey, sel in by_prod.items():
             # sorted, not dict order: the durable filename below is built from
             # results[0], and iteration order here could otherwise differ between
@@ -2732,6 +2918,11 @@ class SarTab(QWidget):
                     "merge. Skipped.")
                 continue
             masks = self._terrain_masks(results, shadow_cache)
+            if rule == "fill":
+                merge_group, ok = self._emit_filled(
+                    mkey, results, masks, fill_primary, NAME, merge_group)
+                added += int(ok)
+                continue
             try:
                 merged, conf, meta = sar_change.merge_geometries(
                     [r["out"] for r in results], mkey, results[0]["thr"],
@@ -2855,7 +3046,13 @@ class SarTab(QWidget):
                 f"hidden); the full raster is loaded unticked and is what the "
                 f"Fusion tab reads")
             added += 1
-        if added:
+        if added and rule == "fill":
+            self.iface.messageBar().pushInfo(
+                "SAR", f"Filled {added} product(s): one pass leads, the other only "
+                "fills where it was blind. The 'source' layer shows which pixels "
+                "came from where; the filled raster is the one the Fusion tab "
+                "reads.")
+        elif added:
             self.iface.messageBar().pushInfo(
                 "SAR", f"Merged {added} product(s) across geometries — read the "
                 "confidence layer: 2 = both orbits agree (strong), 1 = recovered "

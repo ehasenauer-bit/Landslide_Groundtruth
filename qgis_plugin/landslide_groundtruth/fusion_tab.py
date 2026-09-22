@@ -1627,6 +1627,14 @@ class FusionTab(QWidget):
                        "nothing else. Pick the 'S1 change … MERGED …' raster in "
                        "the same group.")
             return
+        # the fill-only merge's companion has the same trap: codes 1 (primary
+        # pass) and 2 (filled from the other), which clear any correlation floor
+        if sar_path and "filled_source" in os.path.basename(sar_path).lower():
+            self._warn("That is the fill-only merge's SOURCE map, not a change "
+                       "raster — its values say which pass each pixel came from. "
+                       "Pick the 'S1 change … FILLED …' raster in the same "
+                       "group.")
+            return
         for label, p in ([("Optical", opt_path)]
                          + ([("SAR", sar_path)] if sar_path else [])):
             ok, why = fusion_grid.describe_raster(p)

@@ -162,12 +162,12 @@ merged = lg.name("SAR", lg.date_pair("2026-08-30", "2026-09-01"), "change merged
 assert merged == "SAR 8-30/9-1 change merged 17km asc+desc", repr(merged)
 print(f"   {merged}")
 
-print("   all three SAR groups pass a direction")
+print("   all four SAR groups pass a direction")
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                         "qgis_plugin", "landslide_groundtruth",
                         "sar_tab.py")).read()
-assert src.count("lg.orbit_tag(") == 3, \
-    f"expected amplitude + change + merge to tag the direction, found " \
-    f"{src.count('lg.orbit_tag(')}"
+assert src.count("lg.orbit_tag(") == 4, \
+    f"expected amplitude + change + merged + filled to tag the direction, " \
+    f"found {src.count('lg.orbit_tag(')}"
 
 print("\nSAR CHANGE-RASTER NAMING VERIFIED")
