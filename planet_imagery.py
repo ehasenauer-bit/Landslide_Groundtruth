@@ -109,6 +109,7 @@ DOWNLOAD_TRIES = 4                   # passes at an order's files before giving 
 
 DEFAULT_MAX_CLOUD_PCT = 80.0         # whole-scene cloud cap when not overridden
 AUTO_WINDOW_MAX_CLOUD_PCT = 20.0     # stricter cap under --auto-window (nearest CLEAR scene)
+SEARCH_LIMIT = 60                    # scenes per side the free preview lists (see search_event)
 
 
 def _resolve_cloud_frac(max_cloud_pct, auto_window):
@@ -306,7 +307,13 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     point = _point_geojson(lat, lon)
     pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
     weight = None if auto_window else cloud_weight   # None = nearest-only (auto_window)
-    lim = 1 if auto_window else 6
+    # The preview LISTS scenes for you to judge by eye, so it shows far more than the
+    # 6 a Run composites (fetch_event). Six hid 306 scenes ≤20% cloud across the 6
+    # benchmark events, including 19 ≤50%-cloud scenes within 3 d of the event: the
+    # gap + cloud_weight*cloud cost ranks a clear scene 10 d out ahead of a
+    # partly-cloudy one 2 d out, and the whole-scene cloud can't say which is clear
+    # over the AOI. SEARCH_LIMIT keeps every scene within 3 d on those events.
+    lim = 1 if auto_window else SEARCH_LIMIT
     cloud = _resolve_cloud_frac(max_cloud_pct, auto_window)
     cover = point if require_point else None         # default: AOI overlap (Planet Explorer-like)
     pre_items = search_scenes(pl, aoi, pre0, pre1, event_time, max_cloud=cloud,

@@ -254,13 +254,17 @@ class PlanetTab(QWidget):
         # Cloud cover as a teal slider, echoing Planet Explorer's slider filters.
         self.cloud_slider = QSlider(Qt.Horizontal)
         self.cloud_slider.setRange(0, 100)
-        self.cloud_slider.setValue(80)
+        # 100 = no cap. The search only LISTS scenes for you to judge by eye, and the
+        # cap reads Planet's WHOLE-SCENE cloud_cover (a ~32x20 km strip), so it can't
+        # know a scene is clear over a 5 km AOI. At 80 it emptied Azumi's whole post
+        # window (all 4 scenes were 87-100% whole-scene cloud).
+        self.cloud_slider.setValue(100)
         self.cloud_slider.setToolTip(
-            "Maximum WHOLE-SCENE cloud cover to consider. Scene-wide metric, not "
-            "your AOI — per-pixel UDM2 masking still applies, so a high value "
-            "surfaces scenes clear over your point but cloudy elsewhere (what Planet "
-            "Explorer shows).")
-        self.cloud_lbl = QLabel("80%")
+            "Maximum WHOLE-SCENE cloud cover to list (100 = no cap, the default). "
+            "Planet's cloud_cover covers the full ~32x20 km strip, not your AOI, so a "
+            "scene 90% cloudy overall can still be clear over your point — lower this "
+            "only to thin a long list. Snow and ice are NOT counted as cloud.")
+        self.cloud_lbl = QLabel("100%")
         self.cloud_lbl.setFixedWidth(38)
         self.cloud_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.cloud_slider.valueChanged.connect(
@@ -273,7 +277,7 @@ class PlanetTab(QWidget):
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
         self.coverage_combo.addItem("Cover the exact epicentre (stricter)", "point")
-        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))  # default
+        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("aoi"))  # default, as run_single
         self.coverage_combo.setToolTip(
             "AOI overlap: accept any scene overlapping the search box — recovers "
             "partial-coverage scenes near the event date. Epicentre: require the "
