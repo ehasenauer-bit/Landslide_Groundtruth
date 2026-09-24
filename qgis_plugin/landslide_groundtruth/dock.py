@@ -9,7 +9,7 @@ import tempfile
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon
+from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon, QImage
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
@@ -29,7 +29,11 @@ from qgis.core import (
 from qgis.gui import (QgsDockWidget, QgsCollapsibleGroupBox,
                       QgsMapToolEmitPoint)
 
+import numpy as np
+from osgeo import gdal
+
 from .task import PipelineTask
+from . import hdr_render
 from . import layer_group as lg
 from .flow_layout import FlowRow
 
@@ -162,39 +166,41 @@ PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
 # Planetary Computer data API (public titiler; no SAS token needed — it signs
 # blob reads server-side, same service the rendered_preview thumbnails come from).
-# We use it to render BOTH the scene-preview PNG and the on-map AOI GeoTIFF from
+# We use it to fetch BOTH the scene-preview image and the on-map AOI GeoTIFF from
 # the raw surface-reflectance bands, so we control the stretch instead of
 # inheriting a pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
 #
-# The render reproduces the project's "Highlight Optimized Natural Color" look
-# (see review_package): a cube-root tone curve cbrt(0.6 * reflectance). In data-
-# API terms that's gamma 3 (output = input**(1/3)) applied to reflectance scaled
-# by 0.6. Same tone curve for every source; only the band names and the rescale
-# (because each collection stores reflectance differently) change per source.
+# Sentinel-2 comes back as RAW DN and is tone-mapped here by hdr_render — the same
+# HDR curve as the PlanetScope tab (rolloff + tapered shadow lift, white anchored
+# on the scene's bright tail), so shadowed slopes and sunlit snow both keep their
+# texture. It used to be the data API's cube-root "Highlight Optimized Natural
+# Color" formula, which on a same-day Denali pair kept ~30% less snow texture and
+# painted MPC's un-removed +1000 BOA offset (baseline 04.00+) as a grey haze over
+# every shadow. Landsat still uses that cube-root formula, server-side.
 PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
 _HIGHLIGHT_FORMULA = "gamma RGB 3.0, saturation 1.2"
 
-# Per-source highlight render config for the data API. `query` is the assets +
-# colour_formula + rescale (+ unscale for Landsat), percent-encoded ONCE here so
-# the call site appends it verbatim. PlanetScope is absent: it has no single
-# streamable COG, so it can't be rendered on the map / from the data API.
-#   Sentinel-2 L2A: SR is uint16 reflectance×10000 (no offset), so the rescale is
-#     in raw DN — 16667 = 10000 / 0.6 bakes in the 0.6 scale with white headroom.
+# Per-source render config for the data API; `query` is appended verbatim.
+# `hdr` True = the query returns raw uint16 bands (+ a mask band) as GeoTIFF and the
+# tone curve runs locally (hdr_render); False = the server renders a colour image.
+# PlanetScope is absent: it has no single streamable COG.
+#   Sentinel-2 L2A: uint16 DN = reflectance×10000, +1000 from baseline 04.00 on
+#     (hdr_render.s2_boa_offset removes it per scene).
 #   Landsat C2 L2: SR carries scale/offset (r = DN×2.75e-5 − 0.2); unscale=true so
-#     the rescale below is in reflectance units (0..1/0.6), mirroring S2. Tune the
-#     rescale here if Landsat scenes read too dark/bright.
+#     the rescale below is in reflectance units (0..1/0.6). Tune it if Landsat
+#     scenes read too dark/bright.
 HIGHLIGHT_RENDER = {
     "Sentinel-2": {
         "collection": "sentinel-2-l2a",
-        "query": ("assets=B04&assets=B03&assets=B02"
-                  f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
-                  "&rescale=0,16667&nodata=0"),
+        "query": "assets=B04&assets=B03&assets=B02&nodata=0",
+        "hdr": True,
     },
     "Landsat": {
         "collection": "landsat-c2-l2",
         "query": ("assets=red&assets=green&assets=blue&unscale=true"
                   f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
                   "&rescale=0,1.6667&nodata=0"),
+        "hdr": False,
     },
 }
 # sources renderable on the map / in the gallery via the data API (preview order)
@@ -266,6 +272,7 @@ class LandslideDock(QgsDockWidget):
         self._tif_replies = []       # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0        # AOI downloads still outstanding this preview
         self._tif_fallbacks = []     # (label, cog_url) whose AOI render failed
+        self._hdr_raw = []           # (label, raw_path, offset, cog_url) awaiting HDR
         self._preview_added = []     # raster layers added by the current preview
         self._preview_tmpfiles = []  # temp GeoTIFFs backing those layers (to unlink)
         self._preview_failed = []    # labels that failed to sign/load
@@ -894,8 +901,9 @@ class LandslideDock(QgsDockWidget):
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
-            "Render the TICKED scene(s) in Highlight Optimized Natural Color "
-            "straight onto the QGIS canvas (clipped to the AOI) — no download, no "
+            "Render the TICKED scene(s) in true colour — Sentinel-2 with the HDR "
+            "curve (shadow and snow detail both kept), Landsat in Highlight "
+            "Optimized Natural Color — straight onto the QGIS canvas (clipped to the AOI) — no download, no "
             "order. Tick the scenes you want in the table, or double-click a row to "
             "preview just that one; with nothing ticked the ★ best before & after "
             "scenes are used. Works for Sentinel-2 and Landsat; run Search / "
@@ -1895,15 +1903,16 @@ class LandslideDock(QgsDockWidget):
     def _preview_url_for(self, source, item_id, thumb_url, max_size=1024):
         """Browse-image URL for a scene, shared by the table preview and the gallery.
 
-        Sentinel-2 / Landsat: a data-API Highlight Optimized Natural Color render
-        from the raw SR bands (so ice keeps its texture instead of a 'visual' TCI's
-        blown-out white, and no SAS signing is needed). PlanetScope (and anything
-        with no data-API render): its baked rendered_preview/thumbnail, signed for
-        Planet. The colour_formula is percent-encoded once in HIGHLIGHT_RENDER, so
-        the query is appended verbatim here."""
+        Sentinel-2: the raw SR bands as a GeoTIFF, tone-mapped locally with the HDR
+        curve when it lands (see _pixmap_from). Landsat: a data-API Highlight
+        Optimized Natural Color PNG. Either way ice keeps its texture instead of a
+        'visual' TCI's blown-out white, and no SAS signing is needed. PlanetScope
+        (and anything with no data-API render): its baked rendered_preview/thumbnail,
+        signed for Planet."""
         cfg = HIGHLIGHT_RENDER.get(source)
         if cfg and item_id:
-            return (f"{PC_DATA_URL}/item/preview.png?collection={cfg['collection']}"
+            ext = "tif" if cfg.get("hdr") else "png"
+            return (f"{PC_DATA_URL}/item/preview.{ext}?collection={cfg['collection']}"
                     f"&item={item_id}&{cfg['query']}&max_size={max_size}")
         return self._auth_thumb_url(thumb_url, source) if thumb_url else None
 
@@ -1924,6 +1933,51 @@ class LandslideDock(QgsDockWidget):
                 url += ("&" if "?" in url else "?") + "api_key=" + key
         return url
 
+    def _s2_offset_for(self, item_id):
+        """BOA offset (DN) for a Sentinel-2 scene in the last search, by id."""
+        info = self._candidate_by_id(item_id)
+        return hdr_render.s2_boa_offset(info[1] if info else None)
+
+    @staticmethod
+    def _read_raw_rgb(ds, offset):
+        """Reflectance (3, H, W), NaN = nodata, from a raw data-API GeoTIFF: three
+        uint16 bands plus the mask band the API appends (0 = outside the scene)."""
+        dn = ds.ReadAsArray()
+        refl = hdr_render.s2_reflectance(dn[:3], offset)
+        if dn.shape[0] >= 4:
+            refl[:, dn[3] == 0] = np.nan
+        return refl
+
+    def _pixmap_from(self, data, qurl):
+        """QPixmap for a preview/gallery reply, or None if it won't decode.
+
+        A GeoTIFF is a raw Sentinel-2 band fetch (HIGHLIGHT_RENDER 'hdr'): tone-map it
+        with the HDR curve, per-scene white anchor. Anything else is an already-
+        rendered image (Landsat PNG, Planet thumbnail) and loads as-is."""
+        raw = bytes(data)
+        if raw[:4] not in (b"II*\x00", b"MM\x00*"):
+            pix = QPixmap()
+            return pix if pix.loadFromData(data) else None
+        item_id = QUrlQuery(qurl).queryItemValue("item")
+        vsi = f"/vsimem/landslide_preview_{id(raw)}.tif"
+        try:
+            gdal.FileFromMemBuffer(vsi, raw)
+            ds = gdal.Open(vsi)
+            if ds is None or ds.RasterCount < 3:
+                return None
+            refl = self._read_raw_rgb(ds, self._s2_offset_for(item_id))
+            ds = None
+        finally:
+            gdal.Unlink(vsi)
+        white, _ = hdr_render.hdr_white([refl])
+        rgb = hdr_render.hdr_rgb(refl, white)
+        h, w = rgb.shape[1:]
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = np.moveaxis(rgb, 0, -1)
+        rgba[..., 3] = np.where(np.any(rgb > 0, axis=0), 255, 0)
+        img = QImage(rgba.tobytes(), w, h, 4 * w, QImage.Format_RGBA8888)
+        return QPixmap.fromImage(img.copy())   # copy: detach from the bytes buffer
+
     def _fetch_preview(self, url, fallback=None):
         self._preview_pix = None
         self._preview_fallback = fallback
@@ -1941,8 +1995,8 @@ class LandslideDock(QgsDockWidget):
         ok = reply.error() == QNetworkReply.NoError
         data = reply.readAll()
         reply.deleteLater()
-        pix = QPixmap()
-        if not ok or data.isEmpty() or not pix.loadFromData(data):
+        pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
+        if pix is None:
             fb = self._preview_fallback
             if fb:  # render URL failed — fall back to the baked thumbnail once
                 self._preview_fallback = None
@@ -2089,8 +2143,8 @@ class LandslideDock(QgsDockWidget):
         ok = reply.error() == QNetworkReply.NoError
         data = reply.readAll()
         reply.deleteLater()
-        pix = QPixmap()
-        if ok and not data.isEmpty() and pix.loadFromData(data):
+        pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
+        if pix is not None:
             try:
                 tile.setIcon(QIcon(pix))
             except RuntimeError:
@@ -2296,7 +2350,7 @@ class LandslideDock(QgsDockWidget):
                 f"Drew {added} scene footprint(s) + AOI on the map. Select rows in "
                 f"the table to show only those scenes' footprints.")
 
-    # ---------- preview on map (Highlight Optimized Natural Color AOI render) ----------
+    # ---------- preview on map (true-colour AOI render) ----------
     def _best_streamable(self, side):
         """The scene Preview-on-map would lead with on `side` ('pre'/'post').
 
@@ -2406,10 +2460,11 @@ class LandslideDock(QgsDockWidget):
     def _render_picks(self, picks):
         """Render [(side, candidate, why), …] onto the canvas, clipped to the AOI.
 
-        Downloads a Highlight Optimized Natural Color GeoTIFF clipped to the search
-        box from the Planetary Computer data API (raw SR bands + our stretch — no
-        'visual' TCI white-out, no SAS signing) and loads each as a georeferenced
-        raster, then zooms to the AOI. Covers the AOI box only; Sentinel-2 falls
+        Downloads a GeoTIFF clipped to the search box from the Planetary Computer
+        data API (raw SR bands + our stretch — no 'visual' TCI white-out, no SAS
+        signing): raw Sentinel-2 DN tone-mapped here with the HDR curve, or Landsat
+        rendered server-side in Highlight Optimized Natural Color. Loads each as a
+        georeferenced raster, then zooms to the AOI. Covers the AOI box only; Sentinel-2 falls
         back to the signed visual COG if the render fails (Landsat has none)."""
         bbox = self._aoi_bbox()
         if bbox is None:
@@ -2429,8 +2484,9 @@ class LandslideDock(QgsDockWidget):
             scenes.append((f"{short} {side} {date}".strip(), c["id"],
                            c.get("cog_url"), c.get("source"), why))
         self._append_log(
-            f"Preview on map: rendering Highlight Optimized Natural Color over the "
-            f"AOI for {len(scenes)} scene(s)…")
+            f"Preview on map: rendering true colour over the AOI for {len(scenes)} "
+            f"scene(s) (Sentinel-2: HDR curve; Landsat: Highlight Optimized Natural "
+            f"Color)…")
         if off_point:
             # the render still covers the AOI box, but this scene has no pixels at
             # the epicentre — say so rather than leave the user reading a nodata gap
@@ -2450,6 +2506,9 @@ class LandslideDock(QgsDockWidget):
         self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
+        for _l, stale, _o, _c in self._hdr_raw:   # parked by an aborted batch
+            self._unlink_quiet(stale)
+        self._hdr_raw = []
         self._tif_pending = len(scenes)
         for label, item_id, cog_url, source, why in scenes:
             self._append_log(f"  {label} ({why})")
@@ -2492,7 +2551,7 @@ class LandslideDock(QgsDockWidget):
         return (lon - dlon, lat - dlat, lon + dlon, lat + dlat, radius)
 
     def _download_aoi_tif(self, label, item_id, cog_url, bbox, source):
-        """Fetch a Highlight Optimized Natural Color GeoTIFF clipped to the AOI.
+        """Fetch a true-colour (or raw Sentinel-2) GeoTIFF clipped to the AOI.
 
         Single async GET to the data API's bbox endpoint (same mechanism as the
         working scene-preview pane), using the per-source render config (collection
@@ -2512,10 +2571,14 @@ class LandslideDock(QgsDockWidget):
                f"&width={px}&height={px}")
         reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
         self._tif_replies.append(reply)
+        hdr = (self._s2_offset_for(item_id) if cfg.get("hdr") else None)
         reply.finished.connect(
-            lambda r=reply, l=label, cu=cog_url: self._tif_loaded(r, l, cu))
+            lambda r=reply, l=label, cu=cog_url, o=hdr: self._tif_loaded(r, l, cu, o))
 
-    def _tif_loaded(self, reply, label, cog_url):
+    def _tif_loaded(self, reply, label, cog_url, hdr_offset=None):
+        """One AOI download landed. A rendered image loads straight onto the map;
+        a raw Sentinel-2 fetch (`hdr_offset` not None) is parked in _hdr_raw until the
+        whole batch is in, so pre and post share one HDR white anchor."""
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
@@ -2528,6 +2591,12 @@ class LandslideDock(QgsDockWidget):
                 fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_preview_")
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
+                if hdr_offset is not None:
+                    self._hdr_raw.append((label, path, hdr_offset, cog_url))
+                    self._tif_pending -= 1
+                    if self._tif_pending <= 0:
+                        self._after_tif_downloads()
+                    return
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
                     lg.add_to_group(lyr, "Imagery preview")
@@ -2550,7 +2619,60 @@ class LandslideDock(QgsDockWidget):
         if self._tif_pending <= 0:
             self._after_tif_downloads()
 
+    def _render_hdr_batch(self):
+        """Tone-map every parked raw Sentinel-2 AOI GeoTIFF with ONE pooled white
+        anchor (hdr_render.hdr_white over the whole batch — a per-scene anchor would
+        put a brightness step between before and after that no change on the ground
+        made) and load each onto the map. A scene that won't read degrades to the
+        signed-COG fallback like a failed download."""
+        batch, self._hdr_raw = self._hdr_raw, []
+        refls = []
+        for label, path, offset, cog_url in batch:
+            ds = gdal.Open(path)
+            if ds is None or ds.RasterCount < 3:
+                refls.append(None)
+                continue
+            refls.append((self._read_raw_rgb(ds, offset), ds.GetGeoTransform(),
+                          ds.GetProjection()))
+            ds = None
+        white, note = hdr_render.hdr_white([r[0] for r in refls if r is not None])
+        if any(r is not None for r in refls):
+            self._append_log(f"  Sentinel-2 {note} (shared by the {len(batch)} scene(s))")
+        for (label, path, _offset, cog_url), r in zip(batch, refls):
+            self._unlink_quiet(path)
+            lyr = None
+            if r is not None:
+                refl, gt, proj = r
+                rgb = hdr_render.hdr_rgb(refl, white)
+                fd, out = tempfile.mkstemp(suffix=".tif", prefix="landslide_preview_")
+                os.close(fd)
+                dst = gdal.GetDriverByName("GTiff").Create(
+                    out, rgb.shape[2], rgb.shape[1], 3, gdal.GDT_Byte,
+                    options=["COMPRESS=DEFLATE", "PHOTOMETRIC=RGB"])
+                dst.SetGeoTransform(gt)
+                dst.SetProjection(proj)
+                for b in range(3):
+                    band = dst.GetRasterBand(b + 1)
+                    band.SetNoDataValue(0)   # BEFORE WriteArray (GDAL 3.12 drops
+                    band.WriteArray(rgb[b])  # all-zero blocks otherwise)
+                dst = None
+                lyr = QgsRasterLayer(out, label)
+                if lyr.isValid():
+                    lg.add_to_group(lyr, "Imagery preview")
+                    self._preview_added.append(lyr)
+                    self._preview_tmpfiles.append(out)
+                    self._append_log(f"  loaded {label} (AOI render, HDR)")
+                    continue
+                self._unlink_quiet(out)
+            if cog_url:
+                self._tif_fallbacks.append((label, cog_url))
+            else:
+                self._preview_failed.append(label)
+                self._append_log(f"  could not render {label}")
+
     def _after_tif_downloads(self):
+        if self._hdr_raw:
+            self._render_hdr_batch()
         if self._tif_fallbacks:
             self._append_log(f"  AOI render failed for {len(self._tif_fallbacks)} "
                              f"scene(s); falling back to signed COG stream")
@@ -2622,8 +2744,8 @@ class LandslideDock(QgsDockWidget):
         if self._preview_added:
             self._zoom_to_aoi()
             n = len(self._preview_added)
-            msg = (f"Loaded {n} scene(s) over the AOI (Highlight Optimized Natural "
-                   f"Color). Toggle the layers to compare before vs after.")
+            msg = (f"Loaded {n} scene(s) over the AOI (true colour). Toggle the "
+                   f"layers to compare before vs after.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("Landslide", msg)

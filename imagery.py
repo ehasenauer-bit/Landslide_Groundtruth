@@ -446,6 +446,8 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
 
     thumb_url is the item's free rendered preview / browse PNG (no download or
     order needed); the plugin can render it later for a visual preview.
+    boa_offset is the Sentinel-2 BOA offset in DN (see _s2_boa_offset), None for
+    other sources.
     cog_url is the true-colour COG (Sentinel-2 'visual'/TCI asset) for the
     on-map preview, stored UNSIGNED (query string stripped): Planetary Computer
     SAS tokens expire in ~30-60 min, so the plugin re-signs this fresh at
@@ -471,6 +473,9 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
                 aoi_cloud_method=aoi_cloud_method,
                 gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=source, thumb_url=thumb, cog_url=cog,
+                # DN offset the plugin's HDR preview adds before /10000 (Sentinel-2
+                # only; the plugin falls back to the date rule when this is absent)
+                boa_offset=_s2_boa_offset(item) if source == "Sentinel-2" else None,
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
 
 
