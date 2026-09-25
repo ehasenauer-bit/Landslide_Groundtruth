@@ -295,6 +295,9 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             sensors))
 
     pre, post, notes = [], [], []
+    # Sources whose search raised, so a caller can tell "searched, nothing matched" from
+    # "never searched" — the tab used to report a failed Planet search as 0 scenes found.
+    failed = [note for r, note in results if r is None and note]
     for r, note in results:
         if r is not None:
             pre += r["pre"]
@@ -309,7 +312,7 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             notes.append(note)
     pre.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
     post.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
-    return dict(pre=pre, post=post, notes=notes)
+    return dict(pre=pre, post=post, notes=notes, failed=failed)
 
 
 def _print_search_table(res: dict):
@@ -696,7 +699,8 @@ def main():
             res = _search_candidates(a.lat, a.lon, a.radius_km, a.when, args)
         except Exception as e:
             traceback.print_exc()
-            res = dict(pre=[], post=[], notes=[f"search failed: {e}"])
+            res = dict(pre=[], post=[], notes=[f"search failed: {e}"],
+                       failed=[f"search failed: {e}"])
         res.update(event_id=event_id, lat=a.lat, lon=a.lon,
                    datetime_utc=a.when.isoformat(),
                    params=dict(pre_days=a.pre_days, post_days=a.post_days,

@@ -1107,6 +1107,21 @@ class PlanetTab(QWidget):
                 f"{cached} PlanetScope order(s) here are already paid for — "
                 f"'Recall order (free)' loads them back onto the map without touching "
                 f"your quota.")
+        failed = result.get("failed") or []
+        if failed and not (npre or npost):
+            # The search itself raised (Planet didn't answer, key rejected, …), so nothing
+            # was searched. Saying "Found 0 scenes" here reads as an empty sky, and sends
+            # you off loosening filters that were never applied.
+            why = "; ".join(failed)
+            self._append_log(f"Search FAILED — no scenes are listed because none were "
+                             f"searched: {why}")
+            self.iface.messageBar().pushWarning(
+                "PlanetScope", f"Search failed, so no scenes are listed ({why}). Your "
+                "filters aren't the cause: press Search again, and if it keeps failing "
+                "check the Planet key/login."
+                + (f" Recall still works offline: {cached} paid order(s) here."
+                   if cached else ""))
+            return
         self.iface.messageBar().pushInfo(
             "PlanetScope", f"Found {npre} pre / {npost} post candidate scene(s) "
                            f"(no orders placed)."

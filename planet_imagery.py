@@ -127,6 +127,74 @@ def _resolve_cloud_frac(max_cloud_pct, auto_window):
     return pct / 100.0
 
 
+SPEC_URL = "https://api.planet.com/compute/ops/bundles/spec"   # what planet.specs fetches
+SPEC_TRIES = 3
+SPEC_TIMEOUT_S = 15.0
+
+
+def _prime_bundle_spec():
+    """Hand the Planet SDK its bundle spec before it goes to fetch it itself.
+
+    planet.specs downloads the Orders API bundle spec the first time anything checks
+    an item type — every data.search and every order does — with one bare httpx.get
+    (httpx's 5 s default timeout) tried twice, and each run_single call is a fresh
+    process with no copy. So a few seconds of Planet or network lag failed the whole
+    search as FetchBundlesSpecError, and the tab showed it as "0 scenes" (2026-09-25
+    13:31; the identical search minutes later found 60 pre / 13 post). Fetch it here
+    with a real timeout and a few tries, keep the last good copy in the order cache,
+    and fall back to that copy when Planet doesn't answer: the spec (bundle names per
+    item type) changes rarely, and a search only needs it to say PSScene exists. Any
+    surprise in the SDK's internals just leaves it to fetch as before."""
+    try:
+        from planet import specs
+        loader = specs.PRODUCT_BUNDLES
+    except Exception:
+        return
+    if getattr(loader, "cache", None) is not None:
+        return
+    import itertools
+    import httpx
+    copy = os.path.join(pc.cache_root(), "bundles_spec.json")
+    spec = None
+    for attempt in range(SPEC_TRIES):
+        try:
+            resp = httpx.get(SPEC_URL, timeout=SPEC_TIMEOUT_S)
+            resp.raise_for_status()
+            spec = resp.json()
+            spec["bundles"]                       # a body without it counts as a failure
+            break
+        except Exception:
+            spec = None
+            if attempt + 1 < SPEC_TRIES:
+                time.sleep(2 ** attempt)
+    if spec is not None:
+        try:
+            with open(copy + ".tmp", "w") as fh:
+                json.dump(spec, fh)
+            os.replace(copy + ".tmp", copy)
+        except OSError:
+            pass
+    else:
+        try:
+            with open(copy) as fh:
+                spec = json.load(fh)
+        except (OSError, ValueError):
+            return          # no copy to fall back on: the SDK tries, and says why it failed
+        saved = dt.datetime.fromtimestamp(os.path.getmtime(copy))
+        print(f"    [planet] Planet's bundle spec didn't answer after {SPEC_TRIES} tries; "
+              f"using the copy saved {saved:%Y-%m-%d %H:%M}")
+    try:
+        bundles = spec["bundles"]
+        loader.cache = {                           # the exact shape planet.specs builds
+            "bundles": bundles,
+            "bundle_names": bundles.keys(),
+            "item_types": set(itertools.chain.from_iterable(
+                bundles[b]["assets"].keys() for b in bundles)),
+        }
+    except (KeyError, TypeError, AttributeError):
+        pass
+
+
 def _client():
     """Planet client authenticated with the key the caller published via PL_API_KEY.
 
@@ -139,6 +207,7 @@ def _client():
     the SDK default (on-disk profile / `planet auth login`) only when it's unset."""
     import os
     import planet
+    _prime_bundle_spec()     # every search/order validates against it; see there
     key = os.environ.get("PL_API_KEY", "").strip()
     if key:
         return planet.Planet(session=planet.Session(auth=planet.Auth.from_key(key)))
