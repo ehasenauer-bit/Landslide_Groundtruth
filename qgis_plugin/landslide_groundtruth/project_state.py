@@ -40,11 +40,30 @@ from qgis.core import QgsProject
 # QgsProject custom-property scope ("plugin name") all our entries live under.
 SCOPE = "landslide_groundtruth"
 
-# Stamped alongside the values so a future key/meaning change can migrate an
-# older project instead of silently misreading it. Restore itself is
-# version-agnostic: a key that is absent simply falls back to its default.
+# Stamped alongside the values so a key/meaning change can migrate an older
+# project instead of silently misreading it. A key that is absent simply falls
+# back to its default; the one thing the version changes is RETIRED_DEFAULTS.
+# "1" = every project before 2026-09-25.
 VERSION_KEY = "state/version"
-VERSION = "1"
+VERSION = "2"
+
+# Values that USED to be a control's default, retired because they hid data. save()
+# writes every widget, untouched ones included, so a project saved under an old
+# default holds it exactly as if it had been chosen — and restore would bring it back
+# over the new default on every open, for good. So a project stamped with an older
+# VERSION has each of these exact values swapped for today's default, once, on open;
+# any other stored value is a real choice and is kept. Retiring another default for
+# that reason: add its old value under a new VERSION key and bump VERSION to match.
+RETIRED_DEFAULTS = {
+    "2": {
+        # PlanetScope scene filters. On 2026-09-25 the St. Elias project still restored
+        # all three a day after the defaults changed, and between them they emptied its
+        # post-event list (0 scenes where the current defaults list 23).
+        "planet/cloud_slider": "80",                                        # to 09-24
+        "planet/coverage_combo": "Cover the exact epicentre (stricter)",    # 08-25..09-24
+        "planet/quality_combo": "Standard quality only",                    # to 08-25
+    },
+}
 
 # never written to the project file — see module docstring
 SECRET_ATTRS = {
@@ -139,11 +158,19 @@ class ProjectState:
 
     def _restore_now(self):
         project = QgsProject.instance()
+        saved_version, _ = project.readEntry(SCOPE, VERSION_KEY, "")
+        retired = retired_since(saved_version)
+        migrated = []
         self._restoring = True
         try:
             for key, widget in self._widgets:
                 value, ok = project.readEntry(SCOPE, key, "")
-                if ok and not (value == "" and _is_global_path(key)):
+                if ok and key in retired and value == retired[key]:
+                    # an old default the project was saved under, not a choice
+                    # (see RETIRED_DEFAULTS): today's default instead
+                    _write_widget(widget, self._defaults.get(key, ""))
+                    migrated.append((key, widget))
+                elif ok and not (value == "" and _is_global_path(key)):
                     # the project's own value wins — including a deliberately
                     # empty field, so a cleared input comes back cleared
                     _write_widget(widget, value)
@@ -156,6 +183,17 @@ class ProjectState:
             pass
         finally:
             self._restoring = False
+        if migrated:
+            # Record the swap in the project NOW rather than leave it to save(): the
+            # writeProject slot can miss the file being serialised (module docstring),
+            # and the next edit stamps the new VERSION — after which the retired value,
+            # still stored, would be restored as a choice on every open.
+            try:
+                project.writeEntry(SCOPE, VERSION_KEY, VERSION)
+                for key, widget in migrated:
+                    project.writeEntry(SCOPE, key, _read_widget(widget))
+            except RuntimeError:
+                pass
 
     def clear(self):
         """Drop every plugin entry from the current project."""
@@ -163,6 +201,22 @@ class ProjectState:
         project.removeEntry(SCOPE, VERSION_KEY)
         for key, _ in self._widgets:
             project.removeEntry(SCOPE, key)
+
+
+def retired_since(saved_version):
+    """{key: retired default} for every default retired after `saved_version`.
+
+    A project that predates versioning, or holds something unparseable, counts as
+    version 0, so it gets every retirement — the same as the oldest project."""
+    try:
+        have = int(saved_version)
+    except (TypeError, ValueError):
+        have = 0
+    out = {}
+    for ver, values in sorted(RETIRED_DEFAULTS.items(), key=lambda kv: int(kv[0])):
+        if have < int(ver):
+            out.update(values)
+    return out
 
 
 def _is_global_path(key):

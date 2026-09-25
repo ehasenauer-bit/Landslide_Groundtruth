@@ -45,6 +45,7 @@ The runner also exports `PROJ_LIB` / `GDAL_DATA` from the bundle and clears
 | `test_dataloss.py` | The two operations that can destroy work: `Write to layer` applying to every row, and an export overwriting a figure that was already shared. |
 | `test_theme_and_limits.py` | Colours that vanish and grids that hang. **Recomputes every contrast ratio** against both QGIS themes (no single colour can clear 4.5:1 on both — the constraints are disjoint), and checks the grid guard admits a real 17 km AOI while refusing 50 km at 2 m. |
 | `test_footprint_pairing.py` | Fusing two rasters that describe different ground. The overlap test used to be one-directional, so a 20 km optical tile **inside** a 90 km SAR scene scored a perfect 100% and was auto-paired — pins the symmetric `min()` match that scores it 5%, and the extent fix that stops the coarser input from setting the output footprint. Real Mt Logan bboxes. |
+| `test_retired_defaults.py` | An old default frozen into a project forever. Every widget is saved, untouched ones included, so the St. Elias project kept restoring Max cloud 80 / "Cover the exact epicentre" / "Standard quality only" a day after those defaults changed — together they emptied its post-event list. Pins the one-time swap to AOI overlap + test quality + no cap in a pre-v2 project, **written into the project at once**, and that a choice made after it (or any value that was never a default) is kept. Seeded with the strings that project file holds. |
 
 ## Adding one
 

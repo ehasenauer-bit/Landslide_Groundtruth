@@ -353,12 +353,13 @@ def main():
                     help="PlanetScope coverage requirement: 'aoi' = any scene overlapping the "
                          "search box (matches Planet Explorer; default), 'point' = scene "
                          "footprint must contain the exact epicentre (stricter).")
-    ap.add_argument("--quality", choices=["standard", "any"], default="standard",
-                    help="PlanetScope quality: 'standard' = standard-quality scenes only "
-                         "(default), 'any' = also include 'test'-quality scenes. Near a fresh "
-                         "event the nearest/clearest scenes are often test-only (Planet Explorer "
-                         "shows them); test = looser geo/radiometric calibration, fine for the "
-                         "visual review.")
+    ap.add_argument("--quality", choices=["standard", "any"], default="any",
+                    help="PlanetScope quality: 'any' = also include 'test'-quality scenes "
+                         "(default, as Planet Explorer and the plugin tab do), 'standard' = "
+                         "standard-quality scenes only. 'standard' hides most of Alaska: over "
+                         "the 2026-08-18 St. Elias event 78%% of scenes since May, and 95%% "
+                         "since July, were test. Test = looser geo/radiometric calibration, "
+                         "fine for the visual review.")
     ap.add_argument("--scenes", default=None,
                     help="comma-separated review layers to download: true_color, "
                          "highlight_natural, false_color, ndvi, dndvi, dbright "
