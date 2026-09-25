@@ -33,6 +33,10 @@ class Stub:
     def _pick_python(self): pass
     def _pick_project(self): pass
     def _pick_out(self): pass
+    # the 'Results now go to' line reads QgsProject, which this bare test never sets
+    # up (first touching it here drops a symbology-style.db in the working folder);
+    # tests/test_results_follow_project.py covers it on a real dock
+    def _refresh_results_dir(self, *_): pass
 for m in ("_build_env_box","_env_ok","_refresh_env_status","env_gate"):
     setattr(Stub, m, getattr(D.LandslideDock, m))
 

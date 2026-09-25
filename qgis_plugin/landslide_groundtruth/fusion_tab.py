@@ -1536,31 +1536,31 @@ class FusionTab(QWidget):
 
     # ---------- paths ----------
     def _out_dir(self):
-        """Output folder, mirroring the other tabs:
-        <output or project/out/interactive>/fusion.
+        """Output folder, mirroring the other tabs: <results>/fusion, where
+        dock.results_dir is the project's own folder once it's saved.
 
-        Returns "" when neither Environment path is set. Both default to empty,
-        and os.path.join("", "out", "interactive") is the RELATIVE string
-        "out/interactive" — which would scatter output under whatever directory
-        QGIS happens to have been launched from."""
-        out = self.dock.out_edit.text().strip()
-        proj = self.dock.project_edit.text().strip()
-        if not out and not proj:
-            return ""
-        base = out or os.path.join(proj, "out", "interactive")
-        return os.path.join(base, "fusion")
+        Returns "" when there is nowhere to put it (an unsaved project and neither
+        Environment path set) — see dock.shared_dir for why that isn't the
+        relative "out/interactive"."""
+        base = self.dock.results_dir()
+        return os.path.join(base, "fusion") if base else ""
 
     def _glacier_cache_dir(self):
-        """Where the downloaded RGI archive is kept: <output>/glacier_outlines."""
-        base = self._out_dir()
-        return os.path.join(os.path.dirname(base), "glacier_outlines") if base else ""
+        """Where the downloaded RGI archive is kept: <shared>/glacier_outlines.
+
+        Deliberately NOT the project's folder: the archive is the same 67 MB for
+        every Alaska project and needs an Earthdata login to fetch, so it lives once
+        in dock.shared_dir (where earlier downloads already are) and is reused."""
+        base = self.dock.shared_dir()
+        return os.path.join(base, "glacier_outlines") if base else ""
 
     def _download_rgi(self):
         """Fetch and cache the RGI 7.0 Alaska complexes, then fill in the path."""
         cache = self._glacier_cache_dir()
         if not cache:
-            self._warn("Set the Output (or Project) folder in the Environment box "
-                       "first — that is where the outlines are cached.")
+            self._warn("Set the folder with the imagery tools (or 'Results (unsaved "
+                       "projects)') in the Environment box first — the outlines are "
+                       "cached there, once, for every project.")
             return
         self.rgi_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1642,9 +1642,10 @@ class FusionTab(QWidget):
                 self._warn(f"{label} input is not usable: {why}")
                 return
         if not self._out_dir():
-            self._warn("Set the Output (or Project) folder in the Environment "
-                       "box first — otherwise the fused raster would be written "
-                       "relative to whatever folder QGIS was started from.")
+            self._warn("Save the project (its results go beside the .qgz), or set "
+                       "the folder with the imagery tools in the Environment box — "
+                       "otherwise the fused raster would be written relative to "
+                       "whatever folder QGIS was started from.")
             return
         self.run_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)

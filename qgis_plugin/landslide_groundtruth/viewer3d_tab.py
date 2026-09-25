@@ -652,8 +652,7 @@ class Viewer3DTab(QWidget):
         lat, lon, radius = aoi
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "viewer3d")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
@@ -1019,8 +1018,7 @@ class Viewer3DTab(QWidget):
             return
         if msg:
             self._log(msg)
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            self.dock.project_edit.text().strip(), "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out_dir = os.path.join(base_out, "viewer3d")
         os.makedirs(out_dir, exist_ok=True)
         # source in the cache name so ArcticDEM and 3DEP at the same epsg/res don't
@@ -1698,8 +1696,7 @@ class Viewer3DTab(QWidget):
         return crs if crs.isValid() else None
 
     def _flip_cache_dir(self):
-        base = self.dock.out_edit.text().strip() or os.path.join(
-            self.dock.project_edit.text().strip(), "out", "interactive")
+        base = self.dock.results_dir()             # this project's folder once it's saved
         d = os.path.join(base, "viewer3d", "flip_cache")
         try:
             os.makedirs(d, exist_ok=True)
@@ -1988,8 +1985,7 @@ class Viewer3DTab(QWidget):
             self._warn(f"Web viewer export failed: {e}")
             return
         self._busy(False)
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            self.dock.project_edit.text().strip(), "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out_dir = os.path.join(base_out, "viewer3d", "web")
         try:
             os.makedirs(out_dir, exist_ok=True)

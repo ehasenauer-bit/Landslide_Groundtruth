@@ -1023,8 +1023,7 @@ class PlanetTab(QWidget):
             return None
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         # own output subdir so a Planet search.json never clashes with the
         # Sentinel tab's search.json in the shared output directory
         out = os.path.join(base_out, "planet")
@@ -1689,8 +1688,7 @@ class PlanetTab(QWidget):
             return
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
@@ -1971,8 +1969,11 @@ class PlanetTab(QWidget):
                 return
             aoi = self._recall_aoi()
             project = self.dock.project_edit.text().strip()
-            base_out = self.dock.out_edit.text().strip() or os.path.join(
-                project, "out", "interactive")
+            # the OLD shared results folder, not this project's: orders made before the
+            # shared cache existed can only be there (every order since lands in the
+            # cache), and walking a project folder on a network drive from the GUI
+            # thread would stall QGIS for nothing
+            base_out = self.dock.shared_dir()
             try:
                 # Pick up orders downloaded before the shared cache existed so they
                 # appear in the picker too. Scoped to the output dirs, NOT the whole
@@ -2024,8 +2025,7 @@ class PlanetTab(QWidget):
             return
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
@@ -2157,8 +2157,7 @@ class PlanetTab(QWidget):
             return
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):
@@ -2257,8 +2256,7 @@ class PlanetTab(QWidget):
             return
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
         script = os.path.join(project, "run_single.py")
         if not (python and os.path.exists(python)):

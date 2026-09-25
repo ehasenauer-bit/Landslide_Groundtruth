@@ -955,8 +955,7 @@ class SarTab(QWidget):
             return None
         python = self.dock.python_edit.text().strip()
         project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         # own output subdir so this search.json never clashes with the other tabs'
         out = os.path.join(base_out, "sar")
         script = os.path.join(project, "run_single.py")
@@ -1615,10 +1614,8 @@ class SarTab(QWidget):
 
     def _amp_out_dir(self):
         """Output folder for saved Run amplitude GeoTIFFs, mirroring _collect's
-        search dir: <output or project/out/interactive>/sar/amplitude."""
-        base = self.dock.out_edit.text().strip() or os.path.join(
-            self.dock.project_edit.text().strip(), "out", "interactive")
-        return os.path.join(base, "sar", "amplitude")
+        search dir: <results>/sar/amplitude (dock.results_dir: the project's folder)."""
+        return os.path.join(self.dock.results_dir(), "sar", "amplitude")
 
     def _amp_save_path(self, c, res):
         """Persistent path for a Run amplitude GeoTIFF. The filename encodes
@@ -2497,17 +2494,13 @@ class SarTab(QWidget):
 
     def _cd_out_dir(self):
         """Output folder for the durable float32 change rasters, mirroring
-        _amp_out_dir: <output or project/out/interactive>/sar/change.
+        _amp_out_dir: <results>/sar/change (dock.results_dir: the project's folder).
 
-        "" when neither Environment path is set — both default to empty, and
-        os.path.join("", "out", "interactive") is the RELATIVE "out/interactive",
-        which would drop rasters wherever QGIS happened to be launched from."""
-        out = self.dock.out_edit.text().strip()
-        proj = self.dock.project_edit.text().strip()
-        if not out and not proj:
-            return ""
-        base = out or os.path.join(proj, "out", "interactive")
-        return os.path.join(base, "sar", "change")
+        "" when there is nowhere to put them (an unsaved project and neither
+        Environment path set) — see dock.shared_dir for why that isn't the relative
+        "out/interactive"."""
+        base = self.dock.results_dir()
+        return os.path.join(base, "sar", "change") if base else ""
 
     @staticmethod
     def _safe_name(label):
@@ -2564,8 +2557,9 @@ class SarTab(QWidget):
         try:
             d = self._cd_out_dir()
             if not d:
-                self._append_log("  not saved: set the Output or Project folder "
-                                 "in the Environment box to keep change rasters")
+                self._append_log("  not saved: save the project (its results go "
+                                 "beside the .qgz), or set the folder with the imagery "
+                                 "tools in the Environment box, to keep change rasters")
                 return None
             os.makedirs(d, exist_ok=True)
             tag = self._cd_settings_tag(meta or {})

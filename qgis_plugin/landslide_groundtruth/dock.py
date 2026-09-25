@@ -288,6 +288,7 @@ class LandslideDock(QgsDockWidget):
         self._last_font_scale = None
         self.setWidget(self._wrap_scrollable(self._build_dock()))
         self._init_project_state()
+        self._init_results_dir()
 
     # ---------- per-project persistence ----------
     def _init_project_state(self):
@@ -390,11 +391,14 @@ class LandslideDock(QgsDockWidget):
              "…/landslide_groundtruth   (the folder containing run_single.py)",
              "The folder you downloaded the pipeline into. It must contain "
              "run_single.py."),
-            ("Where to save results", self.out_edit, self._pick_out,
-             "leave blank for <project folder>/out/interactive",
-             "Imagery, change rasters and the SAR change files the Fusion tab "
-             "reads. Leave blank to use out/interactive inside the project "
-             "folder."),
+            ("Results (unsaved projects)", self.out_edit, self._pick_out,
+             "leave blank for <tools folder>/out/interactive",
+             "A SAVED project keeps every tab's results — PlanetScope, Sentinel-2/"
+             "Landsat, SAR, Fusion, volume, 3D — in its own folder, beside its "
+             ".qgz, so switching projects switches the files with it. This folder "
+             "is used only until the project is saved, and for data every project "
+             "shares (the RGI glacier outlines). Leave blank for out/interactive "
+             "inside the tools folder."),
         ):
             edit.setPlaceholderText(placeholder)
             edit.setToolTip(tip)
@@ -406,6 +410,12 @@ class LandslideDock(QgsDockWidget):
             btn.clicked.connect(picker)
             row.addWidget(btn)
             ef.addRow(label, row)
+        # Where results land right now — this project's folder once it's saved (see
+        # results_dir), so the field above only matters until then.
+        self.results_label = QLabel()
+        self.results_label.setWordWrap(True)
+        self.results_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        ef.addRow("Results now go to", self.results_label)
         # live status: says whether what is typed actually works, instead of
         # making the user press Search to find out.
         self.env_status = QLabel()
@@ -444,6 +454,66 @@ class LandslideDock(QgsDockWidget):
         for edit in (self.python_edit, self.project_edit, self.out_edit):
             if edit.styleSheet() and edit.text().strip():
                 edit.setStyleSheet("")
+        self._refresh_results_dir()
+
+    # ---------- where results are saved ----------
+    def results_dir(self):
+        """Where every tab saves its results: the folder of the open QGIS project.
+
+        Each project then keeps its files beside its .qgz, and opening another
+        project moves new results with it. A project that hasn't been saved has no
+        folder yet, so it falls back to shared_dir(). Tabs add their own subfolder
+        (planet/, sar/, fusion/, viewer3d/ …) exactly as they did under
+        out/interactive."""
+        project = QgsProject.instance()
+        path = project.absolutePath()
+        if project.fileName() and path:
+            return path
+        return self.shared_dir()
+
+    def shared_dir(self):
+        """The Environment's 'Results (unsaved projects)' folder, else
+        <tools folder>/out/interactive: results of a project not saved yet, and data
+        every project reuses (the RGI glacier archive, which needs an Earthdata
+        login to fetch again). "" when neither path is set — os.path.join("", "out",
+        "interactive") is the RELATIVE "out/interactive", which would drop files
+        wherever QGIS happened to be launched from."""
+        out = self.out_edit.text().strip()
+        proj = self.project_edit.text().strip()
+        if out:
+            return out
+        return os.path.join(proj, "out", "interactive") if proj else ""
+
+    def _refresh_results_dir(self, *_):
+        """Say where results go right now (see results_dir)."""
+        label = getattr(self, "results_label", None)
+        if label is None:
+            return
+        try:
+            project = QgsProject.instance()
+            saved = bool(project.fileName() and project.absolutePath())
+            path = self.results_dir()
+        except RuntimeError:            # project/widgets torn down mid-signal
+            return
+        if saved:
+            label.setText(f"{path}\n(this project's folder — its results stay beside "
+                          f"its .qgz)")
+        elif path:
+            label.setText(f"{path}\n(the project isn't saved yet — save it to keep its "
+                          f"results in its own folder)")
+        else:
+            label.setText("— choose the folder with the imagery tools first")
+
+    def _init_results_dir(self):
+        """Keep 'Results now go to' in step with the project: opening one, saving it
+        under a new name, or starting a new one all move where results land."""
+        project = QgsProject.instance()
+        self._results_signals = ((project.readProject, self._refresh_results_dir),
+                                 (project.cleared, self._refresh_results_dir),
+                                 (project.fileNameChanged, self._refresh_results_dir))
+        for signal, slot in self._results_signals:
+            signal.connect(slot)
+        self._refresh_results_dir()
 
     def env_gate(self, edit=None):
         """Refuse an action that needs the Environment, and POINT AT IT.
@@ -1401,7 +1471,7 @@ class LandslideDock(QgsDockWidget):
             return None
         python = self.python_edit.text().strip()
         project = self.project_edit.text().strip()
-        out = self.out_edit.text().strip() or os.path.join(project, "out", "interactive")
+        out = self.results_dir()        # this project's folder once it's saved
         script = os.path.join(project, "run_single.py")
         # One shared, actionable refusal that opens the Environment box and marks
         # the offending field, instead of two dead-end strings naming a "venv".
@@ -3088,6 +3158,12 @@ class LandslideDock(QgsDockWidget):
                 except TypeError:
                     pass
             self.project_state = None
+        for signal, slot in getattr(self, "_results_signals", ()):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
+        self._results_signals = ()
         for attr in ("_preview_reply", "_ed_reply"):
             reply = getattr(self, attr, None)
             if reply is not None:

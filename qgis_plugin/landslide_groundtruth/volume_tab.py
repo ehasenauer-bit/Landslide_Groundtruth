@@ -1987,8 +1987,12 @@ class VolumeTab(QWidget):
             self._append_log(f"Differencing failed: {e}")
             return
 
-        out_dir = (self.dock.out_edit.text().strip()
-                   or self.dock.project_edit.text().strip())
+        out_dir = self.dock.results_dir()      # this project's folder once it's saved
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)   # <tools>/out/interactive may not exist yet
+            except OSError:
+                pass
         if not out_dir or not os.path.isdir(out_dir):
             import tempfile
             out_dir = tempfile.gettempdir()
@@ -2910,7 +2914,7 @@ class VolumeTab(QWidget):
         if not self._rows:
             self._append_log("Nothing to export — the results table is empty.")
             return
-        start = self.dock.out_edit.text().strip() or ""
+        start = self.dock.results_dir()        # start in this project's folder
         path, _ = QFileDialog.getSaveFileName(
             self, "Export volume results",
             os.path.join(start, "landslide_volumes.csv"), "CSV (*.csv)")
