@@ -699,8 +699,12 @@ def _composite(pairs, lat, lon, radius_km, epsg):
     return comp.rio.write_crs(epsg)
 
 
-def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
+def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None, scenes=None):
     """Wait on each {side: order_id}, download it, and composite that side.
+
+    scenes: optional dict, filled with {side: [scene ids]} parsed from the clips that
+    actually arrived — resume_preview's only way to know which scenes it rendered (it
+    is handed order ids, not scene ids), and run_single names the render file for them.
 
     Shared by render_preview (orders it just created) and resume_preview (orders an
     earlier render placed but didn't finish waiting on). Returns
@@ -732,6 +736,8 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
             # what this side actually is (DN/TOA vs SR), from the clips on disk — so a
             # caller differencing pre against post can tell they're the same product.
             products[side] = "toa" if _pairs_toa(pairs) else "sr"
+            if scenes is not None:
+                scenes[side] = _scene_ids(pairs)
             comps[side] = _composite(pairs, lat, lon, radius_km, epsg)
             if comps[side] is None:
                 notes.append(
@@ -1071,8 +1077,10 @@ def resume_preview(lat, lon, radius_km, orders, event_id=None):
     pl = _client()
     epsg = im._utm_epsg(lat, lon)
     orders = {s: o for s, o in (orders or {}).items() if o and s in ("pre", "post")}
+    scenes = {"pre": [], "post": []}
     comps, notes, pending, products = _finish_orders(pl, orders, lat, lon, radius_km,
-                                                     epsg, event_id=event_id)
+                                                     epsg, event_id=event_id,
+                                                     scenes=scenes)
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
                 pending=pending, reused={}, toa=(_order_bundle == TOA_BUNDLE),
-                product=products)
+                product=products, scenes=scenes)

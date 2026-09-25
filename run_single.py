@@ -56,6 +56,28 @@ def _adopt_legacy_orders(out_dir):
               f"are recallable now without re-ordering")
 
 
+def _scene_tag(ids):
+    """Filename tag for the PlanetScope scene(s) one side of a render composited.
+
+    One scene -> its id ('20260824_211813_10_2527'). Several -> the earliest id's date,
+    the count and a hash of the whole set ('20260813_2scenes_1a2b3c4d'), so two
+    different sets never share a name. '' when the ids aren't known, which keeps the
+    old event-only name."""
+    ids = sorted({str(i).strip() for i in (ids or []) if str(i).strip()})
+    if not ids:
+        return ""
+    if len(ids) == 1:
+        return ids[0]
+    import hashlib
+    digest = hashlib.sha1(",".join(ids).encode()).hexdigest()[:8]
+    return f"{ids[0][:8]}_{len(ids)}scenes_{digest}"
+
+
+def _tagged(base, *parts, toa=False):
+    """'<base>_<part>_…[_toa].tif', skipping empty parts."""
+    return "_".join([base] + [p for p in parts if p]) + ("_toa" if toa else "") + ".tif"
+
+
 def _write_render_json(a, event_id, r):
     """Render each side's true-colour GeoTIFF from the composites in `r` and write
     <out>/render.json (layer paths + notes + any pending order ids). Shared by
@@ -125,11 +147,22 @@ def _write_render_json(a, event_id, r):
             # what the pixels were actually rendered with, for the log and for reproducing it
             out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
         render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
+    # Name each side's GeoTIFF for the scene(s) in it and the product, not just the event
+    # and tone. Rendering OTHER scenes then writes a new file instead of overwriting the one
+    # an earlier render's layer is still showing — which is what lets downloaded scenes
+    # stay on the map side by side. Only the same scenes + tone + product reuse a path (a
+    # re-tone or recall of what's already there), and the plugin replaces that one layer.
+    scenes = r.get("scenes") or {
+        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
+        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
+    prod = r.get("product") or {}
+    tags = {s: _scene_tag(scenes.get(s)) for s in ("pre", "post")}
     for side in ("pre", "post"):
         comp = r.get(side)
         if comp is None:
             continue
-        path = f"{base}_{side}_planet_{a.planet_tone}.tif"
+        path = _tagged(base, side, tags[side], f"planet_{a.planet_tone}",
+                       toa=prod.get(side) == "toa")
         try:
             render(comp, path, comp.rio.crs, **tone)
             out[side] = path
@@ -144,7 +177,6 @@ def _write_render_json(a, event_id, r):
     # so the guard lives here where both sides meet. Derived from the raw composites, not
     # the tone curve, so it's identical on every path and costs only a subtraction.
     pre_c, post_c = r.get("pre"), r.get("post")
-    prod = r.get("product") or {}
     pre_p, post_p = prod.get("pre"), prod.get("post")
     if pre_c is not None and post_c is not None:
         if not (pre_p and post_p and pre_p == post_p):
@@ -157,7 +189,9 @@ def _write_render_json(a, event_id, r):
             import imagery as im
             try:
                 dbright = (im._brightness(post_c) - im._brightness(pre_c)).rename("dbright")
-                dpath = f"{base}_dbright.tif"
+                pair = (f"{tags['pre']}_vs_{tags['post']}"
+                        if tags["pre"] and tags["post"] else "")
+                dpath = _tagged(base, "dbright", pair, toa=pre_p == "toa")
                 # tiled + overviewed, same as every other package raster
                 rp._to_tif(dbright, dpath, pre_c.rio.crs)
                 out["dbright"] = dpath
@@ -167,9 +201,7 @@ def _write_render_json(a, event_id, r):
     out["toa"] = bool(r.get("toa"))   # DN/TOA render vs SR — the plugin labels the layer
     # scene ids actually composited per side, so the plugin can date the layers on ANY path
     # (render/recall/re-tone) — not just when it launched the render with the scenes ticked.
-    out["scenes"] = r.get("scenes") or {
-        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
-        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
+    out["scenes"] = scenes
     orders = r.get("pending") or {}
     if orders:
         out["pending"] = {"orders": orders, "lat": a.lat, "lon": a.lon,

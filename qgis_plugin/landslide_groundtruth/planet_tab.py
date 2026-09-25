@@ -158,7 +158,11 @@ class PlanetTab(QWidget):
         self._detail_labels = None       # side -> layer label for the pending SR render
         self._detail_dates = None        # side -> acquisition date for the pending SR render (folder name)
         self._preview_group = None       # layer-tree folder the tile preview loads into
-        self._preview_layers = []        # preview layers (XYZ tiles / SR GeoTIFFs) on the map
+        self._preview_layers = []        # free XYZ tile previews; each Preview on map replaces them
+        # SR detail layers (downloaded, paid-for renders) + their dBrightness. Kept apart
+        # from the tile previews so a preview can never take them off the map, and never
+        # cleared by a later render: another render adds beside them. See _on_detail_done.
+        self._detail_layers = []
         self._preview_extent = None      # union of previewed scene footprints (EPSG:4326)
         self._footprint_layers = []      # scene-footprint vector layers on the map
         self._gallery_replies = []       # in-flight quicklook-thumbnail requests
@@ -1539,7 +1543,8 @@ class PlanetTab(QWidget):
                     post = self._date_for("post", ids[0])
         self._preview_group = lg.name("Planet", lg.date_pair(pre, post),
                                       lg.radius_tag(self.radius_spin.value()), "preview")
-        self._clear_preview_layers()
+        self._clear_preview_layers()  # the previous TILE preview only — downloaded SR
+                                      # renders stay on the map (see _clear_preview_layers)
         self._abort_tile_replies()   # a re-entry (row double-click mid-request) must
                                      # not share this batch's _tile_pending counter
         self._preview_extent = None
@@ -1798,9 +1803,11 @@ class PlanetTab(QWidget):
         radius = (self._last_render or {}).get("radius", self.radius_spin.value())
         group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")),
                         lg.radius_tag(radius), product)
-        # replace whatever the previous preview (tiles or SR) put on the map
-        self._clear_preview_layers()
-        self._preview_extent = None
+        # Add BESIDE what is already on the map — never clear it first. The SR layers
+        # there are scenes already downloaded (paid for), and a render of other scenes
+        # writes other files (run_single names each for its scenes, tone and product), so
+        # every earlier render stays loaded. The only layer this replaces is one reading
+        # the very file being loaded again (see _drop_layers_reading).
         loaded = 0
         for side in ("pre", "post"):
             path = result.get(side)
@@ -1811,8 +1818,9 @@ class PlanetTab(QWidget):
             label += f" · SR detail ({tone_word})"
             lyr = QgsRasterLayer(path, label)
             if lyr.isValid():
+                self._drop_layers_reading(path)
                 lg.add_to_group(lyr, group)
-                self._preview_layers.append(lyr)
+                self._detail_layers.append(lyr)
                 loaded += 1
                 self._append_log(f"  loaded {label}")
             else:
@@ -1821,7 +1829,7 @@ class PlanetTab(QWidget):
         # (run_single writes it into render.json in that case) and the user asked for it.
         # Same run folder as the RGB, styled to show only darkening (reuses the S2/Landsat
         # tab's ramp). Not counted in `loaded` — it's a change raster, not an SR-detail
-        # tone layer — but tracked so the next render/preview clears it.
+        # tone layer — but kept like one: a later render or preview leaves it alone.
         dpath = result.get("dbright")
         if dpath and os.path.exists(dpath) and self.dbright_check.isChecked():
             dpair = lg.date_pair(dates.get("pre"), dates.get("post"))
@@ -1829,8 +1837,9 @@ class PlanetTab(QWidget):
             dlyr = QgsRasterLayer(dpath, dlabel)
             if dlyr.isValid():
                 self.dock._style_dbright(dlyr)
+                self._drop_layers_reading(dpath)
                 lg.add_to_group(dlyr, group)
-                self._preview_layers.append(dlyr)
+                self._detail_layers.append(dlyr)
                 self._append_log(f"  loaded {dlabel} (brightness decreases only)")
             else:
                 self._append_log("  could not open the dBrightness layer")
@@ -1845,6 +1854,11 @@ class PlanetTab(QWidget):
                 "the same product (one SR, one TOA). Re-render both sides with the same "
                 "'Raw TOA' setting to get a comparable brightness-change layer.")
         if loaded:
+            # The render supersedes the free tile preview it was chosen from, so that goes
+            # — tiles only; downloaded renders are never in _preview_layers. Only once
+            # something loaded, so a failed render doesn't blank the preview as well.
+            self._clear_preview_layers()
+            self._preview_extent = None
             # The GeoTIFFs are clipped to the AOI box, so framing the AOI frames the
             # render exactly (no per-layer extent bookkeeping needed).
             self.zoom_btn.setEnabled(True)
@@ -2314,11 +2328,55 @@ class PlanetTab(QWidget):
             self._preview_extent.combineExtentWith(rect)
 
     def _clear_preview_layers(self):
+        """Take the free tile previews off the map — and only those.
+
+        The SR detail layers are downloaded, paid-for renders. They are tracked apart,
+        in _detail_layers, precisely so that a new Preview on map (or the render that
+        supersedes a preview) can never remove them."""
         for lyr in self._preview_layers:
             lg.remove_layer(lyr)
         self._preview_layers = []
         if hasattr(self, "zoom_btn"):
-            self.zoom_btn.setEnabled(False)
+            # still something to frame while downloaded renders remain
+            self.zoom_btn.setEnabled(bool(self._live_detail_layers()))
+
+    def _live_detail_layers(self):
+        """_detail_layers minus any since removed from the project (by hand, or by
+        _drop_layers_reading); the list is pruned to match."""
+        project = QgsProject.instance()
+        live = []
+        for lyr in self._detail_layers:
+            try:
+                if project.mapLayer(lyr.id()) is not None:
+                    live.append(lyr)
+            except RuntimeError:          # the layer's C++ object is already gone
+                pass
+        self._detail_layers = live
+        return live
+
+    def _drop_layers_reading(self, path):
+        """Remove any layer already showing exactly the file `path`, before it loads again.
+
+        Only a render of the SAME scenes with the same tone and product writes the same
+        file — a Re-tone with a new stretch, or a Recall/Resume of an order already on
+        the map — and that write has just replaced the pixels under the old layer, so it
+        is a stale copy of the layer about to be added, not a different scene. Every
+        other layer, every other downloaded scene included, is left alone. Searches the
+        whole project rather than _detail_layers, so a copy loaded before a plugin
+        reload, or saved in the project, is caught too."""
+        target = os.path.normcase(os.path.realpath(path))
+        for lyr in list(QgsProject.instance().mapLayers().values()):
+            try:
+                if lyr.providerType() != "gdal":
+                    continue
+                src = lyr.source().split("|")[0]
+                name = lyr.name()
+            except (RuntimeError, AttributeError):
+                continue
+            if src and os.path.normcase(os.path.realpath(src)) == target:
+                lg.remove_layer(lyr)
+                self._append_log(f"  replaced the earlier copy of {name} "
+                                 f"(same scenes, same file)")
 
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
