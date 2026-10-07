@@ -55,13 +55,30 @@ PS_SR_SCALE = 1e-4                   # PlanetScope SR DN -> reflectance
 #
 # TOA does carry the atmosphere, though, and at a LOW sun angle develops a strong MAGENTA
 # cast: heavy blue path radiance plus red-weighted reflectance coefficients squeeze green.
-# It is a multiplicative colour imbalance, which a dark-object subtraction can't fix (and
-# DOS also crushes a snow scene, whose darkest pixel isn't a true dark object). Instead
-# _balance_cast white-balances it: clouds/snow are physically neutral, so scale the visible
-# bands to make the brightest pixels grey. It only scales bands UP (never darkens), is
-# clamped, and is skipped when there's no bright neutral anchor. The dark end / contrast is
-# left to the tone curve's auto-stretch, which already fits it per scene.
+# It is a multiplicative colour imbalance, which a dark-object subtraction can't fix.
+# Instead _balance_cast white-balances it: clouds/snow are physically neutral, so scale the
+# visible bands to make the brightest pixels grey. It only scales bands UP (never darkens),
+# is clamped, and is skipped when there's no bright neutral anchor.
+#
+# The path radiance itself is ADDITIVE, though, and the balance can't remove it — it
+# multiplies it. Left in, it puts a floor under every band (measured blue p0.1 0.04-0.16 TOA,
+# highest at low sun), the balance's blue gain (up to 1.74x) lifts that to ~0.27-0.30, and
+# the darkest shadow in the frame renders as mid-grey: the HDR curve's log lift is steepest
+# below ~0.05, where no pixel is left, so it lands on the shadows at roughly unity gain and
+# the whole render sits in DN ~90-220 (2024-09-11 Denali, sun 31 deg; 2026-09-02 Logan,
+# sun 37 deg). _dehaze subtracts that floor per band BEFORE the balance, which is the order
+# the physics has (additive term first, then the multiplicative one). It is a dark-object
+# subtraction, so it is GATED: an all-snow frame's darkest pixel isn't a dark object, and
+# subtracting it would crush the snow — when even the darkest visible band's floor is above
+# TOA_HAZE_MAX there is no dark object to trust, and the step is skipped. Measured on three
+# pre/post pairs: the darkest 1% moves 35-45 DN down, shadow texture +10-58% (zero only on
+# a cast shadow too dark to hold any), snow texture unchanged (within 2%).
 TOA_BUNDLE = "analytic_udm2"         # DN + UDM2 (no atmospheric correction)
+TOA_DEHAZE = True                    # subtract a TOA scene's path-radiance floor (False = skip)
+TOA_HAZE_PCT = 0.1                   # per-band percentile taken as the floor (the darkest pixels)
+TOA_HAZE_MARGIN = 0.10               # ... dropped this FRACTION lower, so real shadow keeps a toe
+TOA_HAZE_MAX = 0.15                  # skip when the darkest visible band's floor is above this
+TOA_HAZE_SAMPLE = 2_000_000          # target sample size for the percentile (strided read)
 TOA_BALANCE = True                   # white-balance a TOA scene's atmospheric cast (False = skip)
 TOA_BRIGHT_PCT = 85.0                # brightest (100-this)% of visible pixels = the neutral target
 TOA_MIN_ANCHOR = 0.50                # ... but only balance when that target is this bright (snow/cloud)
@@ -701,6 +718,43 @@ def _toa_from_dn(da, scene_path):
     return da * factors
 
 
+def _haze_floor(da):
+    """Per-band path-radiance floor of a TOA scene: (DataArray over `band`, or None, note).
+
+    TOA_HAZE_PCT of each band's valid pixels, dropped by TOA_HAZE_MARGIN so the darkest
+    real shadow keeps a little toe instead of all landing on exactly 0. None when the
+    darkest VISIBLE band's floor is above TOA_HAZE_MAX — no dark object in the frame (an
+    all-snow AOI), so the floor is surface, not atmosphere. Strided to TOA_HAZE_SAMPLE
+    pixels so it costs the same on any clip; `da` still carries rasterio's band coords."""
+    ny, nx = da.shape[-2], da.shape[-1]
+    step = max(1, int(np.sqrt(ny * nx / float(TOA_HAZE_SAMPLE))))
+    sub = np.asarray(da[:, ::step, ::step].values, dtype="float32")
+    floors = []
+    for b in range(sub.shape[0]):
+        v = sub[b]
+        v = v[np.isfinite(v) & (v > 0)]
+        if v.size == 0:
+            return None, "dehaze: off — a band has no valid pixels"
+        floors.append(float(np.percentile(v, TOA_HAZE_PCT)) * (1.0 - TOA_HAZE_MARGIN))
+    vis = [f for b, f in zip(da.band.values, floors) if b in (1, 2, 3)]
+    if vis and min(vis) > TOA_HAZE_MAX:
+        return None, (f"dehaze: off — darkest visible floor {min(vis):.3f} is above "
+                      f"{TOA_HAZE_MAX}, no dark object in the frame")
+    return (xr.DataArray(floors, coords={"band": da.band}, dims="band"),
+            "dehaze: floor " + ", ".join(f"{f:.3f}" for f in floors))
+
+
+def _dehaze(da):
+    """Subtract a TOA scene's additive path-radiance floor, per band (see TOA_DEHAZE).
+    Runs BEFORE _balance_cast so the balance gain is fitted to — and applied to — the
+    surface signal rather than multiplying the haze. Clipped at 0, never below; a frame
+    with no dark object (_haze_floor -> None) is returned untouched."""
+    floor, _ = _haze_floor(da)
+    if floor is None:
+        return da
+    return (da - floor).clip(0.0, None)
+
+
 def _balance_cast(da):
     """White-balance a TOA scene's atmospheric cast (see the TOA_* block above). Clouds and
     snow are physically neutral, so scale the visible bands (1,2,3 = blue,green,red) to make
@@ -710,8 +764,8 @@ def _balance_cast(da):
     Only scales bands UP (gain >= 1), so it neutralises without darkening; each gain is
     clamped to TOA_MAX_GAIN against a noisy estimate; and the whole step is skipped when the
     brightest pixels are below TOA_MIN_ANCHOR — i.e. there's no snow/cloud to trust as a
-    neutral reference, so a colourful terrain-only scene is left alone. The dark end and
-    contrast are the tone curve's auto-stretch's job, not this."""
+    neutral reference, so a colourful terrain-only scene is left alone. The additive haze
+    floor is _dehaze's job, run before this; the contrast is the tone curve's."""
     vis = [b for b in da.band.values if b in (1, 2, 3)]
     if not vis:
         return da
@@ -742,9 +796,12 @@ def _open_scene(sr_path, udm_path, epsg, transform, shape):
         da = da * PS_SR_SCALE            # SR DN -> surface reflectance
     else:
         # analytic (DN) product = the --planet-toa path: convert to TOA reflectance
-        # ourselves and white-balance its atmospheric cast, instead of Planet's SR
-        # correction (which over-corrects bright snow). See _toa_from_dn / _balance_cast.
+        # ourselves, remove its haze floor and white-balance its atmospheric cast, instead
+        # of Planet's SR correction (which over-corrects bright snow). See _toa_from_dn /
+        # _dehaze / _balance_cast.
         da = _toa_from_dn(da, sr_path)
+        if TOA_DEHAZE:
+            da = _dehaze(da)
         if TOA_BALANCE:
             da = _balance_cast(da)
     da = da.assign_coords(band=["blue", "green", "red", "nir"])
