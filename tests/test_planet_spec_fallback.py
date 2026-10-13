@@ -127,7 +127,7 @@ def boom(*a, **k):
 
 
 pi.search_event = boom
-args = Namespace(prefer="planet", pre_days=60, post_days=90, seasonal=False,
+args = Namespace(prefer="planet", pre_days=60, post_days=90,
                  auto_window=False, cloud_weight=0.5, max_cloud=100,
                  coverage="aoi", quality="any")
 import datetime as dt

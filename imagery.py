@@ -18,10 +18,8 @@ Strategy per event:
   `_composite`.
 
 Alaska caveats handled here:
-  - Winter/shoulder-season events: snow makes dNDVI useless. If --seasonal is
-    set, the pre window is shifted to the same calendar window one year earlier
-    and the post window to the first snow-reduced period after the event
-    (you can also just widen post_days to reach the next summer).
+  - Winter/shoulder-season events: snow makes dNDVI useless. Widen post_days
+    to reach the next snow-reduced period after the event, or use SAR.
   - Pre-2015 events fall back to Landsat automatically.
 """
 from __future__ import annotations
@@ -154,18 +152,15 @@ def _bbox(lat, lon, radius_km):
     return [lon - dlon, lat - dlat, lon + dlon, lat + dlat]
 
 
-def windows(event_time: dt.datetime, pre_days=60, post_days=60, seasonal=False):
+def windows(event_time: dt.datetime, pre_days=60, post_days=60):
     """Pre/post search windows (pre0, pre1, post0, post1) for an event.
 
     Shared by the optical and PlanetScope paths so the dry-run preview, the
     Sentinel-2/Landsat run, and the PlanetScope run all bound the same dates.
-    seasonal: winter event -> shift the pre window to the same calendar window
-    one year earlier (snow makes a same-season dNDVI useless)."""
-    if seasonal:
-        pre0 = event_time - dt.timedelta(days=365 + pre_days // 2)
-        pre1 = event_time - dt.timedelta(days=365 - pre_days // 2)
-    else:
-        pre0, pre1 = event_time - dt.timedelta(days=pre_days), event_time - dt.timedelta(days=1)
+    The pre window is always the pre_days before the event: the old --seasonal
+    shift to a year-earlier window was removed (it handed Mt. Logan 2026-10-06
+    only 2025 pre scenes, gap 336-394 d)."""
+    pre0, pre1 = event_time - dt.timedelta(days=pre_days), event_time - dt.timedelta(days=1)
     post0, post1 = event_time + dt.timedelta(days=1), event_time + dt.timedelta(days=post_days)
     return pre0, pre1, post0, post1
 
@@ -480,7 +475,7 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
-                 post_days=60, seasonal=False, auto_window=False, sensor="s2",
+                 post_days=60, auto_window=False, sensor="s2",
                  cloud_weight=0.5, max_cloud_pct=None):
     """Free dry-run: candidate Sentinel-2 OR Landsat scenes per side, no download.
 
@@ -509,7 +504,7 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     number the tile-wide cap can't give."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
-    pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days)
     # cloud_weight=None -> nearest day first, clearest as the tie-break: both what
     # auto_window's single pick needs (it is fetch_event's own rule there) and what
     # the browse listing wants.
@@ -704,7 +699,7 @@ def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
 
 
 def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
-                pre_days=60, post_days=60, seasonal=False, prefer="auto",
+                pre_days=60, post_days=60, prefer="auto",
                 workdir=None, auto_window=False, cloud_weight=0.5,
                 max_cloud_pct=None, require_point=False, allow_test_quality=False,
                 pre_ids=None, post_ids=None):
@@ -786,7 +781,7 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
     first = "s2" if use_s2 else "landsat"
     candidates = [first] + (["landsat"] if prefer == "auto" and first == "s2" else [])
 
-    pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days)
 
     # default: blend ranking (gap + cloud_weight*cloud) keeps the composite near
     # the event date. auto_window instead picks the single nearest scene on each

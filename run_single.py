@@ -14,7 +14,7 @@ Usage:
   python run_single.py --lat 60.465 --lon -142.10 \\
       --datetime "2023-08-07 11:19" --radius-km 3 \\
       --pre-days 60 --post-days 90 --prefer planet --out out/interactive
-  # optional: --event-id Bagley_test --seasonal --auto-window
+  # optional: --event-id Bagley_test --auto-window
   # preview only (no orders/downloads): add --search-only
 
 Already looked at this event? Don't order it again — Planet quota is spent at order
@@ -231,7 +231,7 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
         if s == "planet":
             import planet_imagery as pi
             r = pi.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window,
                                 cloud_weight=args.cloud_weight,
                                 max_cloud_pct=args.max_cloud,
@@ -240,17 +240,17 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
         elif s == "s1":
             import sar_imagery as si
             r = si.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window)
         elif s == "dem":
             import dem_imagery as di
             r = di.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window)
         else:
             import imagery as im
             r = im.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window, sensor=s,
                                 cloud_weight=args.cloud_weight,
                                 max_cloud_pct=args.max_cloud)
@@ -411,8 +411,6 @@ def main():
                          "run exports just that side's imagery and skips dNDVI / dNDSI / "
                          "dBrightness, which are pre->post differences. Useful for a "
                          "fresh event with no usable pre-scene yet.")
-    ap.add_argument("--seasonal", action="store_true",
-                    help="winter event: use prior-year pre window")
     ap.add_argument("--auto-window", action="store_true",
                     help="tightest window: use only the clear scene nearest the event on "
                          "each side; --pre-days/--post-days act as the max search range")
@@ -683,7 +681,7 @@ def main():
 
     # args namespace process_one() reads; radius_scale=1.0 so radius-km is literal
     args = Namespace(out=a.out, prefer=a.prefer,
-                     pre_days=a.pre_days, post_days=a.post_days, seasonal=a.seasonal,
+                     pre_days=a.pre_days, post_days=a.post_days,
                      radius_scale=1.0, auto_window=a.auto_window,
                      cloud_weight=a.cloud_weight, max_cloud=a.max_cloud,
                      coverage=a.coverage, quality=a.quality, scenes=a.scenes,
@@ -704,7 +702,7 @@ def main():
         res.update(event_id=event_id, lat=a.lat, lon=a.lon,
                    datetime_utc=a.when.isoformat(),
                    params=dict(pre_days=a.pre_days, post_days=a.post_days,
-                               seasonal=a.seasonal, auto_window=a.auto_window,
+                               auto_window=a.auto_window,
                                cloud_weight=a.cloud_weight, max_cloud=a.max_cloud,
                                coverage=a.coverage, quality=a.quality,
                                prefer=a.prefer, radius_km=a.radius_km))

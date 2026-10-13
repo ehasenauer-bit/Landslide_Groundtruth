@@ -1,4 +1,4 @@
-"""Download defaults, the --seasonal flag, and the future/winter window guard.
+"""Download defaults, no seasonal box in the dock, and the future/winter window guard.
 
 Run with tests/run_all.sh, or directly with QGIS's bundled python:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_defaults.py
@@ -36,7 +36,7 @@ class Stub:
         s.dt_edit=QDateTimeEdit(); s.dt_edit.setDateTime(QDateTime(when))
         s.post_slider=QSlider(Qt.Horizontal); s.post_slider.setRange(1,365); s.post_slider.setValue(post)
         s.lat_edit=QLineEdit(lat)
-        s.seasonal_check=QCheckBox(); s.window_warn=QLabel()
+        s.window_warn=QLabel()
 setattr(Stub,"_check_event_window",D.LandslideDock._check_event_window)
 now=datetime.utcnow()
 CASES=[
@@ -55,29 +55,12 @@ for name,when,post,lat,want in CASES:
     print(("   ok   " if ok else "   FAIL ")+f"{name:20s} -> {txt[:74] or '(no warning)'}")
     assert ok,(name,txt)
 
-print("\n=== 3. winter auto-ticks the seasonal box, once ===")
-s=Stub(datetime(now.year-2,2,4),90,"60.5")
-assert not s.seasonal_check.isChecked()
-s._check_event_window()
-assert s.seasonal_check.isChecked(), "winter must auto-tick"
-print("   auto-ticked:", s.seasonal_check.isChecked())
-s.seasonal_check.setChecked(False)          # user overrides
-s._check_event_window()
-assert not s.seasonal_check.isChecked(), "must NOT re-tick after the user clears it"
-print("   user override respected on re-check:", not s.seasonal_check.isChecked())
-
-print("\n=== 4. summer never ticks it ===")
-s2=Stub(datetime(now.year-2,7,15),90,"60.5"); s2._check_event_window()
-assert not s2.seasonal_check.isChecked()
-print("   summer -> unticked")
-
-print("\n=== 5. --seasonal reaches the CLI, and run_single accepts it ===")
-import subprocess
-rs=os.path.join(ROOT, "run_single.py")
-src=open(rs).read()
-assert '"--seasonal"' in src and '"--event-id"' in src
-print("   run_single.py declares --seasonal and --event-id")
+print("\n=== 3. the 'compare against last summer' box is gone ===")
 dsrc=open(os.path.join(PLUG, "dock.py")).read()
-assert 'args += ["--seasonal"]' in dsrc
-print("   dock.py now passes it")
-print("\nDEFAULTS + SEASONAL + GUARD VERIFIED")
+assert "seasonal_check" not in dsrc and '"--seasonal"' not in dsrc, \
+    "the winter box was removed on request: the dock must never shift the pre window"
+print("   dock.py has no seasonal box and never passes --seasonal")
+assert '"--seasonal"' not in open(os.path.join(ROOT, "run_single.py")).read(), \
+    "--seasonal was removed from the CLI too"
+print("   run_single.py no longer accepts --seasonal")
+print("\nDEFAULTS + GUARD VERIFIED")

@@ -58,8 +58,7 @@ python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
 Key flags: `--prefer {auto,planet,s2,landsat}` (source priority, default `auto`),
 `--pre-days`/`--post-days` (imagery windows), `--radius-km` (imagery
 search/footprint radius around the point, default 3),
-`--seasonal` (winter event — use the prior-year summer as the pre window so snow
-doesn't swamp the signal), `--auto-window` (tightest before/after gap: use only
+`--auto-window` (tightest before/after gap: use only
 the single clear scene nearest the event on each side), `--search-only` (free
 dry-run: list candidate scenes to `<out>/search.json`, no orders/downloads).
 
@@ -297,7 +296,7 @@ coefficients change.
 |------|------|
 | `planet_imagery.py` | **primary source.** Planet Data API search + Orders API clip/download of PlanetScope (~3 m) surface reflectance; UDM2 cloud-masked median composite; same return contract as `imagery.py`. Checks the order cache before ordering, and `recall_preview` loads earlier orders back for free |
 | `planet_cache.py` | shared cache + ledger of Planet orders already paid for, so a scene is ordered once. Pure stdlib (the QGIS plugin imports it directly) — see [Ordering a scene once](#ordering-a-scene-once-quota) |
-| `imagery.py` | the STAC sources (Sentinel-2, Landsat): median composites of the chosen scenes **as acquired** — only fill/nodata is dropped, never cloud — plus dNDVI, dNDSI, dBrightness (albedo change); falls back S2→Landsat; `--seasonal` for winter |
+| `imagery.py` | the STAC sources (Sentinel-2, Landsat): median composites of the chosen scenes **as acquired** — only fill/nodata is dropped, never cloud — plus dNDVI, dNDSI, dBrightness (albedo change); falls back S2→Landsat |
 | `review_package.py` | export the per-event QGIS review package (true/false-colour pre+post, dNDVI, dBrightness, predicted point) + `metadata.json` |
 | `run_groundtruth.py` | library module: `process_one(ev, args)`, the per-event pipeline (fetch imagery → export review package). Imported by `run_single.py`; no CLI of its own |
 | `run_single.py` | single-event entry point/CLI: takes `--lat/--lon/--datetime` directly, calls `run_groundtruth.process_one`, writes a `result.json` (or `search.json` with `--search-only`); used by the QGIS plugin |
@@ -320,8 +319,8 @@ so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.
   roughly 50 m across can only be confirmed present/absent. The `sensor` field
   in each `metadata.json` (and the plugin's **SATELLITE USED** banner) tells you
   which source was used.
-- **Snow and clouds.** Alaska coastal/winter events are the hard case. Use
-  `--seasonal`, widen `--post-days` to reach the next clear/snow-free window,
+- **Snow and clouds.** Alaska coastal/winter events are the hard case. Widen
+  `--post-days` to reach the next clear/snow-free window,
   and always do the QGIS visual check.
 - **`--auto-window` and scene coverage.** Auto-window uses the single scene
   nearest the event date on each side. A Sentinel-2 scene can be returned by the

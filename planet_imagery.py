@@ -363,7 +363,7 @@ def _candidate(item, event_time, aoi_cloud_pct=None):
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
-                 post_days=60, seasonal=False, auto_window=False, cloud_weight=0.5,
+                 post_days=60, auto_window=False, cloud_weight=0.5,
                  max_cloud_pct=None, require_point=False, allow_test_quality=False):
     """Free dry-run: candidate PlanetScope scenes per side, NO orders placed.
 
@@ -400,7 +400,7 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
-    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days)
     weight = None if auto_window else cloud_weight   # None = nearest-only (auto_window)
     # The preview LISTS scenes for you to judge by eye, so it shows far more than
     # search_scenes' default 6. Six hid 306 scenes ≤20% cloud across the 6

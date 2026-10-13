@@ -35,7 +35,6 @@ Options
   --radius-km R   AOI half-width in km (default 10)
   --max-cloud P   whole-tile cloud cap for the STAC query (default 100 = no cap,
                   so you can see clearer scenes the plugin's 60% cap would hide)
-  --seasonal      shift the pre window one year earlier (snow-season events)
   --landsat       also list Landsat C2 L2 scenes (adds dates Sentinel-2 missed)
   --tile-only     skip the per-AOI band read (much faster; tile cloud only)
   --urls          print each scene's browse-preview URL under its row
@@ -177,7 +176,6 @@ def main():
     ap.add_argument("--radius-km", type=float, default=10.0)
     ap.add_argument("--max-cloud", type=float, default=100.0,
                     help="whole-tile cloud cap for the STAC query (default 100)")
-    ap.add_argument("--seasonal", action="store_true")
     ap.add_argument("--landsat", action="store_true",
                     help="also list Landsat C2 L2 scenes")
     ap.add_argument("--tile-only", action="store_true",
@@ -188,7 +186,7 @@ def main():
 
     event_time = dt.datetime.strptime(args.event_date, "%Y-%m-%d")
     pre0, pre1, post0, post1 = imagery.windows(
-        event_time, args.pre_days, args.post_days, args.seasonal)
+        event_time, args.pre_days, args.post_days)
 
     sensors = [("s2", "sentinel-2-l2a", "Sentinel-2")]
     if args.landsat:

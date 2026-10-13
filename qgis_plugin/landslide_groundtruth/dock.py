@@ -871,22 +871,6 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Days after", self._slider_row(self.post_slider, self.post_lbl))
         self._update_day_labels()
 
-        # run_single.py has accepted --seasonal since the beginning and the README
-        # calls it the fix for a winter event, but nothing in the UI could set it:
-        # the flag was reachable only from the command line. For a February event
-        # at 60 N the "before" window is dark and snow-covered, and the honest
-        # comparison is against the PREVIOUS SUMMER, not against three weeks
-        # earlier.
-        self.seasonal_check = QCheckBox(
-            "Winter event — compare against last summer instead")
-        self.seasonal_check.setToolTip(
-            "For an event in the dark, snow-covered months, use the previous "
-            "summer as the 'before' imagery so snow cover does not swamp the "
-            "change signal. Ticked automatically when the event date falls "
-            "between October and March; you can override it.")
-        self.seasonal_check.setChecked(False)
-        form.addRow("", self.seasonal_check)
-
         # Warn as soon as the date makes the run impossible or pointless, rather
         # than after a download that returns nothing.
         self.window_warn = QLabel()
@@ -1318,8 +1302,8 @@ class LandslideDock(QgsDockWidget):
 
         Two cases actually bite. The event time defaults to NOW, so an untouched
         form asks for imagery from the future and comes back empty with no
-        explanation. And a winter event at these latitudes needs the seasonal
-        comparison, which the analyst has no way of knowing to tick."""
+        explanation. And a winter event at these latitudes gets dark,
+        snow-covered optical imagery, which is worth saying up front."""
         from datetime import datetime, timedelta
         msgs = []
         try:
@@ -1343,13 +1327,8 @@ class LandslideDock(QgsDockWidget):
             lat = 0.0
         if when.month in (10, 11, 12, 1, 2, 3) and lat >= 55.0:
             msgs.append("A winter event this far north: optical imagery will be "
-                        "dark and snow-covered. Tick the winter box above, and "
-                        "consider the SAR tab, which sees through cloud and "
-                        "darkness.")
-            if not self.seasonal_check.isChecked() and not getattr(
-                    self, "_seasonal_touched", False):
-                self.seasonal_check.setChecked(True)
-                self._seasonal_touched = True
+                        "dark and snow-covered. Consider the SAR tab, which "
+                        "sees through cloud and darkness.")
         self.window_warn.setText("  ".join(msgs))
         self.window_warn.setVisible(bool(msgs))
 
@@ -1506,8 +1485,6 @@ class LandslideDock(QgsDockWidget):
         det = getattr(self, "detection", None)
         if det is not None and det.event_id:
             args += ["--event-id", det.event_id]
-        if self.seasonal_check.isChecked():
-            args += ["--seasonal"]
         return python, script, project, out, args
 
     def _busy(self, on):

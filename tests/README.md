@@ -38,7 +38,7 @@ The runner also exports `PROJ_LIB` / `GDAL_DATA` from the bundle and clears
 | `test_env.py` | The Environment box going back to being a silent gate — it must open itself when unconfigured, validate progressively, and mark the field that is actually wrong. |
 | `test_fail.py` | Error messages that cry wolf. 14 real failure signatures must be recognised **and 7 ordinary log lines must not be** — a bare `401` matches every PlanetScope scene from 1 April (`20240401_…`). |
 | `test_pick.py` | The map picker's CRS transform (round-trips through UTM 7N to six decimals) and the pasted `lat, lon` pair, which a validator used to swallow silently. |
-| `test_defaults.py` | Shipping defaults that cannot answer the question: the change rasters must be on, `--seasonal` must reach the CLI, and a future or mid-winter window must warn. |
+| `test_defaults.py` | Shipping defaults that cannot answer the question: the change rasters must be on, the dock must not shift the pre window to last summer (that box was removed), and a future or mid-winter window must warn. |
 | `test_style.py` | Change rasters loading as grey. Filename→product mapping (including `dndsi` vs `dndvi`), ascending ramp stops, a fully transparent zero, and the **dBright ramp staying exactly `-0.30 / -0.15 / -0.05`** — it is validated, do not drift it. |
 | `test_verdict.py` | The volume cross-check losing its meaning, and the CSV letting the three volumes share a column. |
 | `test_fit.py` | Reading `v_best` blindly. Under the `ddem` fit it holds the **net** volume, so treating it as the Larsen estimate compares a seismic inversion against a near-zero number. |
