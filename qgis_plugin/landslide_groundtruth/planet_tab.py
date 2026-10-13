@@ -21,7 +21,8 @@ explicit account login (email/password -> the account's api_key) or a key pasted
 the field (both saved to QgsSettings 'landslide/planet_api_key'), and only then the
 PL_API_KEY env var as a fallback -- so signing in always overrides a stray ambient
 key. The search subprocess authenticates the same way (the effective key is exported
-as PL_API_KEY before it runs).
+as PL_API_KEY before it runs). The password only ever goes to the login POST and is
+never saved: the key it recovers is all a later session needs.
 """
 import base64
 import json
@@ -775,10 +776,11 @@ class PlanetTab(QWidget):
         self.user_edit.returnPressed.connect(self._planet_login)
         form.addRow("Email", self.user_edit)
 
-        # Prefill from the last successful login so credentials survive between
-        # sessions (stored in QgsSettings, same plaintext store as the API key).
-        self.pass_edit = QLineEdit(
-            self.settings.value("landslide/planet_pass", "", type=str))
+        # Never prefilled and never saved: signing in trades the password for the
+        # account's API key, and the key alone keeps you signed in. Builds before
+        # 2026-10-13 saved it in plain text in QGIS3.ini, so drop any copy they left.
+        self.settings.remove("landslide/planet_pass")
+        self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.Password)
         self.pass_edit.setPlaceholderText("password")
         self.pass_edit.returnPressed.connect(self._planet_login)
@@ -896,13 +898,13 @@ class PlanetTab(QWidget):
                 "Signed in, but no API key came back — try pasting a key.", "error")
             return
         self.key_edit.setText(api_key)
-        # Persist the whole login (email + password + recovered key) so the next
-        # session comes back signed in without re-entering anything. Tag the source as
-        # 'account' so this key outranks any ambient PL_API_KEY env var.
+        # Persist the email + recovered key so the next session comes back signed in.
+        # The password has done its job: drop it (a re-login asks for it again). Tag
+        # the source as 'account' so this key outranks any ambient PL_API_KEY env var.
         self.settings.setValue("landslide/planet_api_key", api_key)
         self.settings.setValue("landslide/planet_auth_source", "account")
         self.settings.setValue("landslide/planet_user", user)
-        self.settings.setValue("landslide/planet_pass", self.pass_edit.text())
+        self.pass_edit.clear()
         os.environ["PL_API_KEY"] = api_key
         self._set_login_status(f"✓ Signed in as {user}.", "success")
         self._refresh_login_state()
@@ -940,7 +942,6 @@ class PlanetTab(QWidget):
         self.pass_edit.clear()
         self.settings.remove("landslide/planet_api_key")
         self.settings.remove("landslide/planet_auth_source")
-        self.settings.remove("landslide/planet_pass")
         os.environ.pop("PL_API_KEY", None)
         # If a PL_API_KEY env var is set outside this process (e.g. via launchctl /
         # the shell), it reappears on the next QGIS launch and becomes the fallback
