@@ -152,7 +152,7 @@ def render(pre=None, post=None, dbright=None, scenes=None, tone="hdr"):
 
 
 def tile_preview(name="PlanetScope after 2026-08-26"):
-    tab._add_tile_layer(name, "0123abcd", "test-key")   # the real tile-layer builder
+    tab._add_tile_layer(name, "0123abcd")   # the real tile-layer builder
     return tab._preview_layers[-1] if tab._preview_layers else None
 
 

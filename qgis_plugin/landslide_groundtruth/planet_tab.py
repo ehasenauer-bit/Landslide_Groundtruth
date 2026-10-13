@@ -9,8 +9,9 @@ straight on the QGIS canvas with no order and zero quota — is done in-process 
 Planet's Data API tile service (the same one Planet Explorer uses):
 
   1. POST the scene ids to https://tiles.planet.com/data/v1/layers  -> a tile hash
-  2. add https://tiles{0-3}.planet.com/data/v1/layers/<hash>/{z}/{x}/{y}?api_key=…
-     as an XYZ raster layer.
+     (the one call that needs the API key)
+  2. add https://tiles{0-3}.planet.com/data/v1/layers/<hash>/{z}/{x}/{y} as an XYZ
+     raster layer -- with NO key in it: the layer source is saved into the project.
 
 v1 scope is BROWSE + MAP PREVIEW only (no ordering/download yet); ordering the
 AOI-clipped SR+UDM2 bundle into the review package comes in a later pass.
@@ -1572,11 +1573,9 @@ class PlanetTab(QWidget):
     def _request_tile_layer(self, name, ids, key):
         """POST scene ids -> tile hash, then add the XYZ layer (async, off the GUI).
 
-        Authenticate with the api_key as a QUERY PARAM, the way the rest of the tile
-        service does (the XYZ tile GETs, the browse thumbnails) and Planet's own
-        qgis-planet-plugin does: tiles.planet.com/data/v1/layers rejects HTTP Basic
-        auth with a 401. The Basic header is kept as a harmless belt-and-suspenders
-        fallback (the Data API accepts it)."""
+        The only tile-service call that needs the key, and it is never saved. It goes
+        both as a query param (as Planet's own qgis-planet-plugin sends it) and as HTTP
+        Basic; on 2026-10-13 each one alone got a 201 here."""
         item_type_ids = [f"{ITEM_TYPE}:{i}" for i in ids]
         body = QByteArray(("ids=" + quote(",".join(item_type_ids))).encode())
         req = QNetworkRequest(QUrl(TILE_HASH_URL + "?api_key=" + quote(key)))
@@ -1586,10 +1585,9 @@ class PlanetTab(QWidget):
         req.setRawHeader(b"Authorization", ("Basic " + token).encode())
         reply = QgsNetworkAccessManager.instance().post(req, body)
         self._tile_replies.append(reply)
-        reply.finished.connect(
-            lambda r=reply, n=name, k=key: self._tile_hash_ready(r, n, k))
+        reply.finished.connect(lambda r=reply, n=name: self._tile_hash_ready(r, n))
 
-    def _tile_hash_ready(self, reply, name, key):
+    def _tile_hash_ready(self, reply, name):
         if reply in self._tile_replies:
             self._tile_replies.remove(reply)
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
@@ -1625,7 +1623,7 @@ class PlanetTab(QWidget):
             self._append_log(f"    tile request failed for {name} (HTTP {status})"
                              f"{f': {detail}' if detail else ''}{hint}")
         else:
-            self._add_tile_layer(name, tile_hash, key)
+            self._add_tile_layer(name, tile_hash)
             self._grow_preview_extent(bounds)
         self._tile_pending -= 1
         if self._tile_pending <= 0:
@@ -2301,7 +2299,7 @@ class PlanetTab(QWidget):
         self.task.taskTerminated.connect(self._on_detail_done)
         QgsApplication.taskManager().addTask(self.task)
 
-    def _add_tile_layer(self, name, tile_hash, key):
+    def _add_tile_layer(self, name, tile_hash):
         # Build the XYZ datasource URI exactly like Planet's own qgis-planet-plugin
         # (planet_api/p_client.tile_service_url + pe_utils.tile_service_data_src_uri):
         # a RAW, unencoded tile URL placed last, with {z}/{x}/{y} kept as literal
@@ -2315,8 +2313,15 @@ class PlanetTab(QWidget):
         # layer.extent() desyncs it from that grid and the tiles stop rendering. That
         # is why QGIS's own 'Zoom to Layer' zooms to the whole Earth for these layers
         # — use the tab's "Zoom to scene" button to frame the scene instead.
-        tile_url = (TILE_XYZ_URL.format(shard=random.randint(0, 3), hash=tile_hash)
-                    + f"?api_key={key}")
+        #
+        # And NO api_key in the url. QGIS saves every layer source into the project,
+        # so a key here sat in plain text in 22 of the 61 projects on the shared drive.
+        # Planet doesn't need it: the tile hash is the credential. Tiles came back
+        # byte-identical with no key, a bogus key and the real one (checked live
+        # 2026-10-13); only the POST in _request_tile_layer is authenticated. If Planet
+        # ever starts refusing keyless tiles, send the key as a request header (a
+        # QgsNetworkAccessManager request preprocessor), never back in this uri.
+        tile_url = TILE_XYZ_URL.format(shard=random.randint(0, 3), hash=tile_hash)
         uri = f"type=xyz&crs=EPSG:3857&format=&url={tile_url}"
         lyr = QgsRasterLayer(uri, name, "wms")
         if not lyr.isValid():
