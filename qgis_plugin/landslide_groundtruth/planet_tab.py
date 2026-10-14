@@ -18,11 +18,13 @@ AOI-clipped SR+UDM2 bundle into the review package comes in a later pass.
 
 Auth: the tile POST + browse thumbnails need a Planet API key. Priority is an
 explicit account login (email/password -> the account's api_key) or a key pasted in
-the field (both saved to QgsSettings 'landslide/planet_api_key'), and only then the
-PL_API_KEY env var as a fallback -- so signing in always overrides a stray ambient
-key. The search subprocess authenticates the same way (the effective key is exported
-as PL_API_KEY before it runs). The password only ever goes to the login POST and is
-never saved: the key it recovers is all a later session needs.
+the field, and only then the PL_API_KEY env var as a fallback -- so signing in always
+overrides a stray ambient key. The search subprocess authenticates the same way (the
+effective key is exported as PL_API_KEY before it runs). The password only ever goes
+to the login POST and is never saved: the key it recovers is all a later session
+needs. The key is saved in the QGIS password store when there is a master password,
+else in QgsSettings, and read back only when a request first needs it; see
+planet_keystore.py.
 """
 import base64
 import json
@@ -51,6 +53,7 @@ from qgis.PyQt.QtCore import QVariant
 from .task import PipelineTask
 from .flow_layout import FlowRow
 from . import layer_group as lg
+from . import planet_keystore
 
 # Planet's Data API tile service (undocumented, but stable — it's what Planet
 # Explorer's "Add preview to map" relies on). POST scene ids to get a tile hash,
@@ -154,6 +157,7 @@ class PlanetTab(QWidget):
         self.task = None
         self._search_result = None       # last search.json (candidates + params)
         self._login_reply = None         # in-flight Planet login POST
+        self._saved_key = ""             # the key last read from / written to the store
         self._preview_reply = None       # in-flight browse-thumbnail request
         self._preview_pix = None         # last loaded thumbnail, kept for rescaling
         self._tile_replies = []          # in-flight tile-hash POSTs
@@ -749,14 +753,14 @@ class PlanetTab(QWidget):
         """A collapsible 'Planet account' panel modelled on the official
         qgis-planet-plugin login tab: sign in with your Planet email + password
         (which exchanges them for your API key), or paste an API key directly. The
-        recovered key flows into the SAME PL_API_KEY / QgsSettings path everything
+        recovered key flows into the SAME PL_API_KEY / saved-key path everything
         else on this tab already uses, so login is just a friendlier front door to
         the existing key field."""
         box = QgsCollapsibleGroupBox("Planet Labs account")
         box.setSaveCollapsedState(False)
         # start collapsed only when actually signed in (an explicit account/pasted
         # key); a bare PL_API_KEY env var leaves the box open to prompt sign-in
-        box.setCollapsed(bool(self._stored_key()))
+        box.setCollapsed(self._has_stored_key())
         self.login_box = box
         form = QFormLayout(box)
 
@@ -798,28 +802,26 @@ class PlanetTab(QWidget):
 
         # API key: the manual alternative to email/password, and where a successful
         # login drops the recovered key. This is the field _api_key()/_collect() read.
-        # Seed from the *stored* key only (not the env var) so an account login takes
-        # priority over any ambient PL_API_KEY.
-        self.key_edit = QLineEdit(
-            self.settings.value("landslide/planet_api_key", "", type=str))
+        # Starts empty even when a key is saved: _stored_key() fills it the first time
+        # a request needs the key, because reading the password store can ask for the
+        # master password and the plugin must never do that at startup.
+        self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
-        self.key_edit.setPlaceholderText("Planet API key (or set PL_API_KEY)")
         self.key_edit.setToolTip(
             "Needed for the full-res map preview and browse thumbnails, and passed "
-            "to the search subprocess. Filled in automatically when you log in; "
-            "saved to QGIS settings. An account login or a key typed here takes "
-            "priority over the PL_API_KEY environment variable, which is only used "
-            "as a fallback when you haven't signed in.")
+            "to the search subprocess. Filled in automatically when you log in. "
+            "Saved in the QGIS password store when you have a QGIS master password, "
+            "otherwise in QGIS settings (plain text), and read back the first time "
+            "it is needed. An account login or a key typed here takes priority over "
+            "the PL_API_KEY environment variable, which is only used as a fallback "
+            "when you haven't signed in.")
         self.key_edit.textEdited.connect(self._mark_manual_key)
         form.addRow("API key", self.key_edit)
 
-        # If we came back signed in, immediately override any ambient PL_API_KEY in
-        # this process so every consumer (previews, thumbnails, the search subprocess)
-        # uses the signed-in account's key rather than a stray env key inherited at
-        # launch — without this, an early consumer could read the env key first.
-        stored = self._stored_key()
-        if stored:
-            os.environ["PL_API_KEY"] = stored
+        # A saved key is NOT exported to PL_API_KEY here: that would mean reading the
+        # password store at startup. It still outranks an ambient PL_API_KEY, because
+        # every consumer asks _api_key() (dock._auth_thumb_url too) and every subprocess
+        # launch goes through _apply_key_to_env(self._api_key()) first.
 
         self.login_status = QLabel()
         self.login_status.setWordWrap(True)
@@ -843,7 +845,11 @@ class PlanetTab(QWidget):
         src = self._auth_source()
         user = self.settings.value("landslide/planet_user", "", type=str)
         # Log out only makes sense for an explicit stored key, not the env fallback.
-        self.logout_btn.setEnabled(bool(self._stored_key()))
+        self.logout_btn.setEnabled(self._has_stored_key())
+        self.key_edit.setPlaceholderText(
+            "saved — read when first needed"
+            if planet_keystore.has_key(self.settings)
+            else "Planet API key (or set PL_API_KEY)")
         if src == "account":
             self.login_box.setTitle(
                 f"Planet Labs account — signed in{f' ({user})' if user else ''}")
@@ -864,6 +870,7 @@ class PlanetTab(QWidget):
             self._set_login_status(
                 "Enter your Planet email and password (or paste an API key).", "warn")
             return
+        planet_keystore.reset_refusal()  # pressing Log in may ask for the master password again
         self._set_login_status("Signing in…", "info")
         self.login_btn.setEnabled(False)
         body = QByteArray(json.dumps({"email": user, "password": pw}).encode())
@@ -901,12 +908,21 @@ class PlanetTab(QWidget):
         # Persist the email + recovered key so the next session comes back signed in.
         # The password has done its job: drop it (a re-login asks for it again). Tag
         # the source as 'account' so this key outranks any ambient PL_API_KEY env var.
-        self.settings.setValue("landslide/planet_api_key", api_key)
+        where = planet_keystore.save(self.settings, api_key)
+        self._saved_key = api_key
         self.settings.setValue("landslide/planet_auth_source", "account")
         self.settings.setValue("landslide/planet_user", user)
         self.pass_edit.clear()
         os.environ["PL_API_KEY"] = api_key
-        self._set_login_status(f"✓ Signed in as {user}.", "success")
+        note, tone = {
+            "vault": (" Key saved in the QGIS password store.", "success"),
+            "settings": (" Key saved in QGIS settings, as plain text. Set a QGIS "
+                         "master password (Settings ▸ Options ▸ Authentication) and "
+                         "log in again to keep it encrypted instead.", "success"),
+            "session": (" The QGIS password store stayed locked, so the key is kept "
+                        "for this session only.", "warn"),
+        }.get(where, ("", "success"))
+        self._set_login_status(f"✓ Signed in as {user}.{note}", tone)
         self._refresh_login_state()
         self.login_box.setCollapsed(True)
 
@@ -940,7 +956,8 @@ class PlanetTab(QWidget):
     def _planet_logout(self):
         self.key_edit.clear()
         self.pass_edit.clear()
-        self.settings.remove("landslide/planet_api_key")
+        planet_keystore.forget(self.settings)   # never prompts
+        self._saved_key = ""
         self.settings.remove("landslide/planet_auth_source")
         os.environ.pop("PL_API_KEY", None)
         # If a PL_API_KEY env var is set outside this process (e.g. via launchctl /
@@ -963,13 +980,50 @@ class PlanetTab(QWidget):
 
     def _stored_key(self):
         """An *explicit* Planet API key the user provided — recovered from an account
-        login or pasted by hand, and persisted to QgsSettings. Deliberately excludes
+        login or pasted by hand, and persisted (planet_keystore). Deliberately excludes
         the ambient PL_API_KEY env var so an account login takes priority over a stray
-        environment key."""
+        environment key.
+
+        The first call in a session reads the saved key, which may show QGIS's
+        master-password prompt, and keeps it in the field so later calls don't.
+        Only for the moment a request needs the key; for "is there one?" use
+        _has_stored_key()."""
         field = getattr(self, "key_edit", None)
         if field is not None and field.text().strip():
             return field.text().strip()
-        return self.settings.value("landslide/planet_api_key", "", type=str)
+        if not planet_keystore.has_key(self.settings):
+            return ""
+        key = planet_keystore.load(self.settings)
+        if key:
+            self._saved_key = key
+            if field is not None:
+                field.setText(key)
+        else:
+            self._report_store_problem()
+        return key
+
+    def _has_stored_key(self):
+        """Whether there is an explicit key, typed or saved, WITHOUT reading it, so
+        never a master-password prompt. Drives the panel's signed-in state."""
+        field = getattr(self, "key_edit", None)
+        if field is not None and field.text().strip():
+            return True
+        return planet_keystore.has_key(self.settings)
+
+    def _report_store_problem(self):
+        """Say why a saved key could not be read (planet_keystore.load came back empty)."""
+        if getattr(self, "login_status", None) is None:
+            return
+        why = planet_keystore.problem()
+        if why == "locked":
+            self._set_login_status(
+                "Your saved Planet key is in the QGIS password store, which stayed "
+                "locked. Press Log in to be asked for the master password again.", "warn")
+        elif why == "missing":
+            self._set_login_status(
+                "Your saved Planet key is no longer in the QGIS password store. "
+                "Log in again.", "warn")
+        self._refresh_login_state()
 
     def _env_key(self):
         """The ambient PL_API_KEY environment variable — used only as a fallback."""
@@ -984,7 +1038,7 @@ class PlanetTab(QWidget):
         """How the effective key was obtained: 'account' (email/password login),
         'manual' (pasted key), 'env' (PL_API_KEY fallback), or '' (nothing yet)."""
         src = self.settings.value("landslide/planet_auth_source", "", type=str)
-        if self._stored_key():
+        if self._has_stored_key():
             # a stored key with no recorded source is a pre-existing paste
             return src if src in ("account", "manual") else "manual"
         if self._env_key():
@@ -993,13 +1047,15 @@ class PlanetTab(QWidget):
 
     def _apply_key_to_env(self, key):
         """Publish `key` to the child subprocess + in-process SDK via PL_API_KEY, and
-        persist it to QgsSettings — but only when it's an explicit account/pasted key,
-        never promoting the ambient env var into the stored (account) slot."""
+        persist it (planet_keystore) — but only when it's an explicit account/pasted
+        key, never promoting the ambient env var into the stored (account) slot, and
+        only when it changed, so a search doesn't rewrite the store every time."""
         if not key:
             return
         os.environ["PL_API_KEY"] = key
-        if self._auth_source() != "env":
-            self.settings.setValue("landslide/planet_api_key", key)
+        if self._auth_source() != "env" and key != self._saved_key:
+            planet_keystore.save(self.settings, key)
+            self._saved_key = key
 
     def _mark_manual_key(self, text):
         """User is typing an API key by hand → record the source as a manual paste so

@@ -1971,11 +1971,11 @@ class LandslideDock(QgsDockWidget):
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
-        # Prefer the stored (account/pasted) key over the ambient PL_API_KEY env var,
-        # matching the PlanetScope tab so a signed-in account outranks a stray env key.
+        # Ask the PlanetScope tab, which owns the key and where it is saved: its
+        # account/pasted key outranks a stray PL_API_KEY env var, as it does there.
         if source == "PlanetScope" and "api_key=" not in url:
-            key = (self.settings.value("landslide/planet_api_key", "", type=str)
-                   or os.environ.get("PL_API_KEY"))
+            tab = getattr(self, "planet_tab", None)
+            key = tab._api_key() if tab is not None else os.environ.get("PL_API_KEY")
             if key:
                 url += ("&" if "?" in url else "?") + "api_key=" + key
         return url

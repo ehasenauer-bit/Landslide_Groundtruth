@@ -193,7 +193,8 @@ dock = LandslideDock(FakeIface())
 tab = dock.planet_tab
 check("it comes back signed in from the account", tab._auth_source() == "account")
 check("the account key outranks the PL_API_KEY env var", tab._api_key() == KEY)
-check("... and replaces it in this process's environment",
+tab._apply_key_to_env(tab._api_key())    # what every search/render launch does
+check("... and replaces it in the environment a search subprocess inherits",
       os.environ.get("PL_API_KEY") == KEY)
 check("the thumbnail auth on the main tab uses the account key too",
       ("api_key=" + KEY) in dock._auth_thumb_url("https://example.org/thumb", "PlanetScope"))
