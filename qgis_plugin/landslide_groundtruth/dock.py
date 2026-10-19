@@ -330,6 +330,7 @@ class LandslideDock(QgsDockWidget):
         Data/Orders/Tiles system). Environment (venv/project/out) is shared because
         both tabs launch the SAME venv subprocess."""
         from .fusion_tab import FusionTab
+        from .gegd_tab import GegdTab
         from .planet_tab import PlanetTab
         from .sar_tab import SarTab
         from .viewer3d_tab import Viewer3DTab
@@ -344,6 +345,10 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
         self.planet_tab = PlanetTab(self)
         tabs.addTab(self.planet_tab, "PlanetScope")
+        # Maxar/Vantor VHR through NGA's GEGD Pro: catalog search + streamed strips,
+        # keyed by the user's own API key (gegd_auth), so no venv subprocess.
+        self.gegd_tab = GegdTab(self)
+        tabs.addTab(self.gegd_tab, "Maxar VHR (GEGD)")
         self.sar_tab = SarTab(self)
         tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
         # Consumes the two tabs above rather than searching for imagery itself:
@@ -635,8 +640,8 @@ class LandslideDock(QgsDockWidget):
         f = self.det_apply_btn.font(); f.setBold(True); self.det_apply_btn.setFont(f)
         self.det_apply_btn.setToolTip(
             "Copy the epicentre, the event time and a radius covering the "
-            "location error into the Sentinel-2, PlanetScope, SAR and 3D tabs, "
-            "so they cannot drift apart.")
+            "location error into the Sentinel-2, PlanetScope, Maxar VHR, SAR and 3D "
+            "tabs, so they cannot drift apart.")
         self.det_apply_btn.clicked.connect(self._apply_detection)
         clear_btn = QPushButton("Clear")
         clear_btn.setToolTip("Forget the current detection.")
@@ -762,7 +767,7 @@ class LandslideDock(QgsDockWidget):
             when = QDateTime.fromString(
                 det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
         targets = [self]
-        for name in ("planet_tab", "sar_tab", "viewer3d_tab"):
+        for name in ("planet_tab", "gegd_tab", "sar_tab", "viewer3d_tab"):
             t = getattr(self, name, None)
             if t is not None:
                 targets.append(t)
@@ -3161,6 +3166,8 @@ class LandslideDock(QgsDockWidget):
             self.task.cancel()
         if getattr(self, "planet_tab", None) is not None:
             self.planet_tab.teardown()
+        if getattr(self, "gegd_tab", None) is not None:
+            self.gegd_tab.teardown()
         if getattr(self, "sar_tab", None) is not None:
             self.sar_tab.teardown()
         if getattr(self, "fusion_tab", None) is not None:

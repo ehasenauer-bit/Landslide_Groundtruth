@@ -69,12 +69,13 @@ iface=FakeIface()
 dock=LandslideDock(iface)
 print("   dock built:", dock.windowTitle())
 
-print("\nSTEP 3 — all six tabs present")
+print("\nSTEP 3 — all seven tabs present")
 from qgis.PyQt.QtWidgets import QTabWidget
 tabs=dock.findChild(QTabWidget)
 names=[tabs.tabText(i) for i in range(tabs.count())]
 print("   tabs:", names)
-assert len(names)==6, names
+assert len(names)==7, names
+assert names.index("Maxar VHR (GEGD)")==names.index("PlanetScope")+1, names
 
 print("\nSTEP 4 — the new boxes are on screen")
 from qgis.PyQt.QtWidgets import QGroupBox

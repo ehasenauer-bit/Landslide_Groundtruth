@@ -106,6 +106,7 @@ def outs():
             ("SAR amplitude", dock.sar_tab._amp_out_dir()),
             ("SAR change", dock.sar_tab._cd_out_dir()),
             ("Fusion", dock.fusion_tab._out_dir()),
+            ("Maxar VHR (GEGD)", dock.gegd_tab._out_dir()),
             ("3D flip cache", dock.viewer3d_tab._flip_cache_dir())]
     web = getattr(dock.viewer3d_tab, "_web_out_dir", None)   # newer 3D tab only
     if web is not None:

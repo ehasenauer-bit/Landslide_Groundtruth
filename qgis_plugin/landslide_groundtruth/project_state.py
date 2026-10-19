@@ -77,6 +77,7 @@ GLOBAL_PATH_ATTRS = {"python_edit", "project_edit", "out_edit"}
 OWNERS = (
     ("", ""),
     ("planet_tab", "planet"),
+    ("gegd_tab", "gegd"),
     ("sar_tab", "sar"),
     ("fusion_tab", "fusion"),
     ("viewer3d_tab", "viewer3d"),

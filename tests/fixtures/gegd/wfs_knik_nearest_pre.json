@@ -1,0 +1,97 @@
+{
+ "_synthetic": true,
+ "_generator": "tests/fixtures/gegd/make_fixtures.py",
+ "_note": "SYNTHETIC test fixture: made-up values in the real GEGD schema. Not a captured response.",
+ "_event": {
+  "name": "Knik-shaped (synthetic)",
+  "lat": 61.15,
+  "lon": -148.25,
+  "origin_utc": "2026-08-09T09:30:00Z",
+  "r_km": 5.0,
+  "pre_days": 60,
+  "post_days": 90
+ },
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "id": "f56d1f15-f276-5054-951c-de25e344c44f",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -148.432448,
+       61.0152533
+      ],
+      [
+       -148.432448,
+       61.2847467
+      ],
+      [
+       -148.1047863,
+       61.2847467
+      ],
+      [
+       -148.1047863,
+       61.0152533
+      ],
+      [
+       -148.432448,
+       61.0152533
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "f56d1f15-f276-5054-951c-de25e344c44f",
+    "cloudCover": 0,
+    "offNadirAngle": 38.5,
+    "groundSampleDistance": 0.596,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV01",
+    "sensorName": "WV01",
+    "sensorCode": "WV01",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-148.26861715,61.15]}",
+    "bandConfiguration": "P",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-05-02T21:30:05Z",
+    "resolutionX": 5.353935e-06,
+    "resolutionY": 5.353935e-06,
+    "createdDate": "2026-05-02T23:47:05Z",
+    "lastModifiedDate": "2026-05-03T00:12:05.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-05-02T21:30:05.000000Z",
+    "processingLevel": "LV2A",
+    "sensorType": "Optical",
+    "sunAzimuth": 175.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-05-02T21:30:05.000000Z",
+    "isPrivate": false,
+    "demCorrection": "Coarse DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "NONE",
+    "productType": "Ortho",
+    "sunElevation": 40.0,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F2000000000502",
+    "ce90Accuracy": 0.0014
+   }
+  }
+ ],
+ "totalFeatures": "unknown",
+ "numberReturned": 1,
+ "timeStamp": "2026-10-13T00:00:00.000Z",
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "urn:ogc:def:crs:EPSG::4326"
+  }
+ }
+}
