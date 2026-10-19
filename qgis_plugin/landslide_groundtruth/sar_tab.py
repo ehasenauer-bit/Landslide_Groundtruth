@@ -44,6 +44,20 @@ the same direction; comparing ascending vs descending scenes shows geometry
 differences, not ground change. The default pairing therefore picks the post
 scene nearest the event, then the nearest pre scene from the SAME track (the
 'Pair by' control can relax this).
+
+NISAR (L-band, from Oct 2025): when the search window reaches NISAR's archive
+the same Search also lists NISAR GCOV scenes (nisar_imagery.py, NASA CMR), in
+the same table with a Radar column. They are a second radar, not more
+Sentinel-1: pairing, "same track" and the asc+desc merge never cross the two,
+since a NISAR track number shares nothing with the Sentinel-1 track of the same
+number and L-band HH is not C-band VV. Their pixels are read remotely from the
+6 GB HDF5 behind NASA Earthdata Login (nisar_read.py, on a background task —
+nisar_task.py) onto the same AOI grid the Planetary Computer render returns, so
+the detectors below take them unchanged. Quicklooks are ASF's static browse
+images. NISAR looks LEFT, so the layover fade and the merge's shadow/layover
+masks — Sentinel-1 right-looking geometry — are not applied to it. Every NISAR
+layer is named "NISAR …" and its detector settings are the C-band ones: one
+event (Iliamna) says they transfer, which is not a validation.
 """
 import math
 import os
@@ -71,12 +85,17 @@ from qgis.gui import QgsCollapsibleGroupBox
 from . import sar_change
 from . import sar_pairing
 from . import layover_dim
+from . import nisar_read
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .task import PipelineTask
+from .nisar_task import NisarReadTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
 
 COLLECTION = "sentinel-1-rtc"
+# the two radars a search can return, as candidate["source"] spells them
+S1 = "Sentinel-1"
+NISAR = "NISAR"
 PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
 # Requesting a SAS token for the collection is the cheapest authenticated call —
 # 200 = the subscription key works, 401/403 = it doesn't. Used by 'Test & save'.
@@ -184,6 +203,38 @@ CD_WINDOWS = [
     ("11×11 (smoothest)", 11),
 ]
 
+# which radar feeds Compute change map — one at a time: the detectors difference
+# pixels of ONE sensor's same-track stack
+CD_RADARS = [
+    ("Sentinel-1 — C-band VV (benchmarked)", S1),
+    ("NISAR — L-band HH (experimental: one event)", NISAR),
+]
+
+
+def _sensor(c):
+    """The radar a candidate came from: NISAR, or Sentinel-1 for everything
+    else (search results from before NISAR carry source='Sentinel-1')."""
+    return NISAR if (c or {}).get("source") == NISAR else S1
+
+
+def _tag(c):
+    """Layer-name prefix: 'S1' / 'NISAR'. Every downstream name match keys on it
+    — the Fusion tab pools 'S1_change_*' files only — so NISAR rasters can
+    never be pooled with, or mistaken for, the benchmarked C-band ones."""
+    return "NISAR" if _sensor(c) == NISAR else "S1"
+
+
+def _match_pol(want, pols):
+    """`want` if the scene has it, else the same KIND (co-pol VV<->HH, cross-pol
+    VH<->HV), else the scene's first. Sentinel-1 over Alaska is VV/VH and NISAR
+    HH/HV, so 'VV (recommended)' means co-pol for both radars."""
+    pols = [p.lower() for p in (pols or [])]
+    if not pols or want in pols:
+        return want
+    kind = {"vv": "co", "hh": "co", "vh": "x", "hv": "x"}
+    same = [p for p in pols if kind.get(p) == kind.get(want)]
+    return same[0] if same else pols[0]
+
 
 class SarTab(QWidget):
     def __init__(self, dock):
@@ -219,6 +270,15 @@ class SarTab(QWidget):
         self._cd_results = []
         # AOI-grid Copernicus DEM cache for the layover fade, keyed by (gt, shape)
         self._dem_cache = {}
+        # NISAR reads run on background tasks (nisar_task); each batch is
+        # numbered so the answers of an abandoned one are recognised and dropped
+        self._nisar_batch = 0            # last batch number handed out
+        self._nisar_amp_batch = -1       # the amplitude batch still listened to
+        self._nisar_cd_batch = -1        # the change-detection batch still listened to
+        self._nisar_amp_task = None      # amplitude preview/Run reads in flight
+        self._nisar_amp_jobs = {}        # job key -> (label, candidate)
+        self._nisar_cd_task = None       # change-detection reads in flight
+        self._nisar_alive = []           # every NISAR task QGIS has not finished yet
         self._build_ui()
 
     # ---------- UI ----------
@@ -227,9 +287,10 @@ class SarTab(QWidget):
         root.setSpacing(8)
 
         intro = QLabel(
-            "Sentinel-1 radar amplitude (10 m grayscale, terrain-corrected). "
-            "Sees through cloud — compare pre/post brightness and texture to "
-            "spot a slide when optical scenes are clouded out.")
+            "Sentinel-1 radar amplitude (10 m grayscale, terrain-corrected), "
+            "plus NISAR L-band for events from October 2025 on. Sees through "
+            "cloud — compare pre/post brightness and texture to spot a slide "
+            "when optical scenes are clouded out.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         root.addWidget(intro)
@@ -286,6 +347,24 @@ class SarTab(QWidget):
         days.addWidget(self.post_slider, 1)
         days.addWidget(self.post_lbl)
         form.addRow("Window", self._wrap(days))
+
+        self.nisar_check = QCheckBox("Also search NISAR L-band (events from Oct 2025)")
+        self.nisar_check.setChecked(True)
+        self.nisar_check.setToolTip(
+            "Add NISAR GCOV scenes (NASA-ISRO, L-band ~24 cm, 12-day repeat, HH/HV) "
+            "to the same table when the window reaches NISAR's archive — science "
+            "acquisitions began 2025-10-17, so older events search Sentinel-1 "
+            "only and say so in the Log.\n\n"
+            "L-band sees through dry snow and firn that C-band reflects off, so "
+            "it can catch a deposit Sentinel-1 misses — measured once, on "
+            "Iliamna 2026-08-08, where HH log-ratio peaked 0.1 km from the "
+            "seismic point. One event is not a validation: NISAR layers are "
+            "named 'NISAR …' and the Fusion tab never picks them for you.\n\n"
+            "Searching is free; previews and change maps read the pixels from "
+            "NASA Earthdata (log in once in the Environment header's 'NASA "
+            "Earthdata Login' box). Expect 5–15 s per NISAR scene, in the "
+            "background.")
+        form.addRow("", self.nisar_check)
         root.addLayout(form)
 
         # --- collapsible option drop-downs (keep the tab compact) ---
@@ -299,9 +378,10 @@ class SarTab(QWidget):
         btn_row = FlowRow()
         self.search_btn = QPushButton("Search (free)")
         self.search_btn.setToolTip(
-            "Free STAC search for candidate before/after Sentinel-1 RTC scenes. "
-            "Nothing is downloaded; no cloud filter is needed (radar sees through "
-            "cloud).")
+            "Free STAC search for candidate before/after Sentinel-1 RTC scenes "
+            "(and NISAR GCOV granules from NASA CMR, when ticked and the window "
+            "reaches its archive). Nothing is downloaded; no cloud filter is "
+            "needed (radar sees through cloud).")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map (quick)")
         self.map_preview_btn.setToolTip(
@@ -368,9 +448,10 @@ class SarTab(QWidget):
         self.pair_summary.setVisible(False)
         self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
         tl.addWidget(self.pair_summary)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Side", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %", "Scene ID"])
+            ["Side", "Radar", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %",
+             "Scene ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -585,6 +666,29 @@ class SarTab(QWidget):
         info.setStyleSheet("QLabel { color: palette(mid); }")
         form.addRow(info)
 
+        # One radar per run: the detectors difference ONE sensor's same-track
+        # stack. Enabled once a search has returned NISAR scenes at all.
+        self.cd_radar_combo = QComboBox()
+        for label, value in CD_RADARS:
+            self.cd_radar_combo.addItem(label, value)
+        self.cd_radar_combo.setEnabled(False)
+        self.cd_radar_combo.setToolTip(
+            "Which radar's scenes feed the change map. Only one at a time — "
+            "'same track' only means anything within one sensor.\n\n"
+            "Sentinel-1: C-band VV, the configuration every threshold, filter "
+            "and the six-event benchmark was tuned on.\n\n"
+            "NISAR: L-band HH (cross-pol HV if you pick VH). Same detectors, same "
+            "thresholds, unchanged — measured to work on ONE event (Iliamna "
+            "2026-08-08: log-ratio peak 13.2 dB at 0.1 km from the seismic "
+            "point, ~3x the scene background). Its 12-day repeat means fewer "
+            "before-dates per track, so the 3-scene texture map often needs a "
+            "wider before window. The layover fade and the merge's terrain "
+            "masks are Sentinel-1 geometry and are not applied (NISAR looks "
+            "left). Layers are named 'NISAR change …'.\n\n"
+            "Enabled when the last search returned NISAR scenes. Ticked rows of "
+            "the other radar are ignored by the change map (they still preview).")
+        form.addRow("Radar", self.cd_radar_combo)
+
         # one checkbox per detector — tick which change maps to compute. Each
         # ticked product adds its own layer; the two defaults fail in opposite
         # ways and are meant to be read together.
@@ -744,7 +848,7 @@ class SarTab(QWidget):
             "scores, and it deliberately keeps the disagreements: over six "
             "truthed events they are enriched inside the scar, and dropping them "
             "from the fused score made detection worse.")
-        self.cd_merge_btn.clicked.connect(self._merge_geometries_action)
+        self.cd_merge_btn.clicked.connect(self._merge_clicked)
         form.addRow(self.cd_merge_btn)
         return box
 
@@ -942,8 +1046,8 @@ class SarTab(QWidget):
 
     def _collect(self):
         """Validate inputs and build the run_single.py CLI args for a Sentinel-1
-        search-only dry-run, or return None. Reuses the shared Environment fields
-        (venv python / project / output) from the dock."""
+        (+ NISAR, when ticked) search-only dry-run, or return None. Reuses the
+        shared Environment fields (venv python / project / output) from the dock."""
         try:
             lat = float(self.lat_edit.text().strip())
             lon = float(self.lon_edit.text().strip())
@@ -980,7 +1084,10 @@ class SarTab(QWidget):
             "--datetime", when, "--radius-km", f"{self.radius_spin.value():.2f}",
             "--pre-days", str(self.pre_slider.value()),
             "--post-days", str(self.post_slider.value()),
-            "--prefer", "s1", "--search-only", "--out", out,
+            # 'sar' = Sentinel-1 + NISAR; run_single drops NISAR itself when the
+            # window ends before its archive starts, and says so in the notes
+            "--prefer", "sar" if self.nisar_check.isChecked() else "s1",
+            "--search-only", "--out", out,
         ]
         return python, script, project, out, args
 
@@ -997,6 +1104,7 @@ class SarTab(QWidget):
         # so the asc+desc merge can never combine rasters from different ground
         self._cd_results = []
         self.cd_merge_btn.setEnabled(False)
+        self._cancel_nisar(forget=True)
         self._preview_pix = None
         self.preview.setText("Search, then select a scene to preview it.")
         self._clear_gallery()
@@ -1012,6 +1120,24 @@ class SarTab(QWidget):
     def _cancel(self):
         if self.task is not None:
             self.task.cancel()
+        self._cancel_nisar()
+
+    def _cancel_nisar(self, forget=False):
+        """Stop any NISAR reads in flight. Their remaining jobs still answer
+        (with 'cancelled'), so the pending counters reach zero and the buttons
+        come back. `forget` (a new search) also stops listening to those
+        batches, so whatever they still say about the OLD scenes is dropped."""
+        for attr in ("_nisar_amp_task", "_nisar_cd_task"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    t.cancel()
+                except RuntimeError:
+                    pass                  # task already deleted by the manager
+        if forget:
+            self._nisar_amp_batch = self._nisar_cd_batch = -1
+            self._nisar_amp_task = self._nisar_cd_task = None
+            self._nisar_amp_jobs = {}
 
     def _on_search_done(self):
         self._busy(False)
@@ -1031,8 +1157,24 @@ class SarTab(QWidget):
         self.map_preview_btn.setEnabled(bool(npre or npost))
         self.run_btn.setEnabled(bool(npre or npost))
         self.cd_btn.setEnabled(bool(npre and npost))
+        counts, has_nisar = [], False
+        for radar in (S1, NISAR):
+            a = sum(1 for c in result.get("pre", []) if _sensor(c) == radar)
+            b = sum(1 for c in result.get("post", []) if _sensor(c) == radar)
+            has_nisar |= radar == NISAR and bool(a or b)
+            if radar == S1 or a or b:
+                counts.append(f"{a} pre / {b} post {radar}")
+        # the Radar choice only means something once there is NISAR to choose
+        self.cd_radar_combo.setEnabled(has_nisar)
+        if not has_nisar:
+            self.cd_radar_combo.setCurrentIndex(0)
+        if has_nisar:
+            how, detail = nisar_read.credentials()
+            self._append_log(
+                f"NISAR pixels will be read with your {detail}." if how else
+                f"note: NISAR scenes found, but their pixels need a login — {detail}")
         self.iface.messageBar().pushInfo(
-            "SAR", f"Found {npre} pre / {npost} post Sentinel-1 scene(s) "
+            "SAR", f"Found {' + '.join(counts)} scene(s) "
                    f"(no cloud filter — radar sees through cloud).")
 
     # ---------- default pre/post pairing (same viewing geometry) ----------
@@ -1127,10 +1269,26 @@ class SarTab(QWidget):
         'Both geometries' previews the best same-track pair on EACH orbit
         direction (four layers): slopes lost to layover in one geometry read
         cleanly in the other, and real change should show up in both pairs. The
-        other modes give a single pre/post pair (see _pair_for)."""
+        other modes give a single pre/post pair (see _pair_for).
+
+        One default PER RADAR: with NISAR in the search, the Sentinel-1 pair and
+        the NISAR pair are both starred, so a bare Preview shows C-band and
+        L-band side by side. Pairs never cross radars — a NISAR track number
+        shares nothing with the Sentinel-1 track of the same number."""
         result = self._search_result or {}
-        pre_all = result.get("pre", [])
-        post_all = result.get("post", [])
+        every = result.get("pre", []) + result.get("post", [])
+        radars = [r for r in (S1, NISAR) if any(_sensor(c) == r for c in every)]
+        picks, notes = [], []
+        for radar in radars:
+            p, n = self._default_picks_for(
+                [c for c in result.get("pre", []) if _sensor(c) == radar],
+                [c for c in result.get("post", []) if _sensor(c) == radar])
+            picks += p
+            notes += [f"{radar}: {x}" if len(radars) > 1 else x for x in n]
+        return picks, notes
+
+    def _default_picks_for(self, pre_all, post_all):
+        """_default_picks for ONE radar's candidates."""
         notes = []
         # only frames that image the event point are comparable candidates —
         # adjacent same-track frames cover different ground (see _covers_event)
@@ -1203,7 +1361,8 @@ class SarTab(QWidget):
             cover_frac = self._aoi_coverage(c)
             cover = f"{cover_frac*100:.0f}" if cover_frac > 0 else "—"
             marker = "★ " if is_star else "  "
-            cells = [marker + side, date, gap, orbit, track, cover, cid or ""]
+            radar = "NISAR L" if _sensor(c) == NISAR else "S1 C"
+            cells = [marker + side, radar, date, gap, orbit, track, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_star:
                 bg = bg.darker(112)
@@ -1216,21 +1375,29 @@ class SarTab(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.table.setItem(r, col, item)
-            # "AOI %" tooltip (col 5): the fraction of the search box with pixels,
+            # "AOI %" tooltip (col 6): the fraction of the search box with pixels,
             # with a flag when the frame clips the box but leaves the event point
             # itself outside its footprint (the pairing already demotes those).
             covers_pt = self._covers_event(c)
             cover_tip = (
                 f"Footprint covers {cover}% of your search box — how much of the "
                 f"AOI this frame images (radar has no cloud, so this is coverage, "
-                f"not clarity). Sentinel-1 IW frames are ~250 km wide, so this is "
-                f"usually 100%; a lower value means an along-track edge frame that "
-                f"clips the box."
+                f"not clarity). Sentinel-1 IW and NISAR frames are ~250 km wide, "
+                f"so this is usually 100%; a lower value means an along-track edge "
+                f"frame that clips the box."
                 if cover_frac > 0 else
                 "No footprint geometry reported for this scene — coverage unknown.")
             if not covers_pt:
                 cover_tip += "\n⚠ Does NOT cover the event point itself."
-            self.table.item(r, 5).setToolTip(cover_tip)
+            self.table.item(r, 6).setToolTip(cover_tip)
+            self.table.item(r, 1).setToolTip(
+                "NISAR — L-band (~24 cm), HH/HV, 12-day repeat; read from NASA "
+                "Earthdata. Experimental here: one validated event."
+                + (f"\nProduct: {c.get('product')}, frame {c.get('frame')}, "
+                   f"mode {c.get('mode')}" if c.get("product") else "")
+                if _sensor(c) == NISAR else
+                "Sentinel-1 — C-band (~5.5 cm), VV/VH; Microsoft Planetary "
+                "Computer RTC. The benchmarked radar.")
             head = self.table.item(r, 0)
             head.setData(Qt.UserRole, c.get("thumb_url"))
             head.setData(Qt.UserRole + 1, cid)
@@ -1251,13 +1418,9 @@ class SarTab(QWidget):
     # ---------- render URLs ----------
     def _pol_for(self, cand_pols):
         """The polarization asset to render for a scene: the combo's pick when the
-        scene carries it, else the scene's first available (e.g. HH at high
-        latitudes)."""
-        want = self.pol_combo.currentData()
-        pols = [p.lower() for p in (cand_pols or [])]
-        if not pols or want in pols:
-            return want
-        return pols[0]
+        scene carries it, else the same kind — co-pol VV<->HH, cross-pol VH<->HV
+        (NISAR is HH/HV over Alaska) — else the scene's first (see _match_pol)."""
+        return _match_pol(self.pol_combo.currentData(), cand_pols)
 
     def _render_query(self, cand_pols, tif=False):
         """assets/expression + stretch query for the data API. Grayscale colormap
@@ -1294,6 +1457,16 @@ class SarTab(QWidget):
         return url
 
     def _preview_url(self, cid, cand_pols, max_size=1024):
+        _side, c = self._candidate_by_id(cid)
+        if _sensor(c) == NISAR:
+            # ASF's static browse images: anonymous, whole frame, fixed stretch —
+            # there is no render service for NISAR, so the Display controls apply
+            # to its map layers (rendered locally) but not to these quicklooks.
+            # 100 px thumbnail for gallery tiles, the north-up browse otherwise.
+            c = c or {}
+            if max_size <= 512:
+                return c.get("thumb_url") or c.get("browse_url")
+            return c.get("browse_url") or c.get("thumb_url")
         return self._with_key(
             f"{PC_DATA_URL}/item/preview.png?collection={COLLECTION}&item={cid}"
             f"&{self._render_query(cand_pols)}&max_size={max_size}")
@@ -1339,14 +1512,20 @@ class SarTab(QWidget):
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
-        tile.setText(f"{date}\n{orbit} {track} · {gap}")
+        radar = "NISAR " if _sensor(c) == NISAR else ""
+        tile.setText(f"{date}\n{radar}{orbit} {track} · {gap}")
         cover_frac = self._aoi_coverage(c)
         cover = f"AOI coverage {cover_frac*100:.0f}%" if cover_frac > 0 else "AOI coverage —"
-        tile.setToolTip(f"{cid}\n{date}  {orbit} track {track}  {gap}\n{cover}")
+        tip = f"{cid}\n{date}  {radar}{orbit} track {track}  {gap}\n{cover}"
+        if radar:
+            tip += ("\nQuicklook: ASF's browse image of the whole NISAR frame "
+                    "(fixed stretch). Preview on map renders the AOI itself.")
+        tile.setToolTip(tip)
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
-        if cid:
-            url = self._preview_url(cid, c.get("polarizations"), max_size=512)
-            baked = self._with_key(c["thumb_url"]) if c.get("thumb_url") else None
+        url = self._preview_url(cid, c.get("polarizations"), max_size=512) if cid else None
+        if url:
+            baked = (self._with_key(c["thumb_url"])
+                     if c.get("thumb_url") and not radar else None)
             fb = baked if (baked and baked != url) else None
             self._fetch_tile_thumb(tile, url, fallback=fb)
         else:
@@ -1401,7 +1580,14 @@ class SarTab(QWidget):
             return
         url = self._preview_url(head.data(Qt.UserRole + 1),
                                 head.data(Qt.UserRole + 3), max_size=1024)
-        baked = self._with_key(head.data(Qt.UserRole)) if head.data(Qt.UserRole) else None
+        if not url:
+            self._preview_pix = None
+            self.preview.setText("No quicklook for this scene — Preview on map "
+                                 "renders it over the AOI.")
+            return
+        _side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+        baked = (self._with_key(head.data(Qt.UserRole))
+                 if head.data(Qt.UserRole) and _sensor(c) != NISAR else None)
         self._preview_fallback = baked if (baked and baked != url) else None
         self._fetch_preview(url)
 
@@ -1460,7 +1646,7 @@ class SarTab(QWidget):
             orbit = (c.get("orbit_state") or "")[:4]
             track = c.get("relative_orbit")
             pol = self._pol_for(c.get("polarizations")).upper()
-            label = (f"S1 {'before' if side == 'pre' else 'after'} {date} "
+            label = (f"{_tag(c)} {'before' if side == 'pre' else 'after'} {date} "
                      f"({orbit} t{track}, {pol})")
             out.append((label, c))
         return out
@@ -1508,14 +1694,14 @@ class SarTab(QWidget):
     def _preview_on_map(self):
         picks = self._preview_picks()
         if not picks:
-            self._warn("Run Search first — no Sentinel-1 scene to preview.")
+            self._warn("Run Search first — no SAR scene to preview.")
             return
         self._render_scenes(picks, mode="preview")
 
     def _run_full(self):
         picks = self._preview_picks()
         if not picks:
-            self._warn("Run Search first — no Sentinel-1 scene to render.")
+            self._warn("Run Search first — no SAR scene to render.")
             return
         self._render_scenes(picks, mode="run")
 
@@ -1544,10 +1730,15 @@ class SarTab(QWidget):
         survives the session. Both land in the same
         "SAR <pre>/<post> amplitude <radius>km" folder — the radius comes from the
         same search AOI either way — so a Run replaces the quick preview (and
-        vice versa)."""
+        vice versa).
+
+        NISAR picks take the other road: no render service exists, so their
+        pixels are read from the HDF5 on a background task (_start_nisar_amp)
+        and stretched locally with the same Display settings. Both roads count
+        down the one _tif_pending, so the batch finishes once."""
         bbox = self._aoi_bbox()
         if bbox is None:
-            self._warn("Run Search first — no Sentinel-1 scene to preview.")
+            self._warn("Run Search first — no SAR scene to preview.")
             return
         self.dock._ensure_network_timeout()   # AOI renders can be slow when cold
         # Folder for the amplitude layers: "SAR <pre>/<post> amplitude <radius>km"
@@ -1570,7 +1761,9 @@ class SarTab(QWidget):
         # picking the wrong one of those is a mismatch you cannot see from the
         # tree.
         minx, miny, maxx, maxy, radius = bbox
-        self._amp_group = lg.name("SAR", lg.date_pair(pre, post), "amplitude",
+        only_nisar = all(_sensor(c) == NISAR for _label, c in picks)
+        self._amp_group = lg.name("NISAR" if only_nisar else "SAR",
+                                  lg.date_pair(pre, post), "amplitude",
                                   lg.radius_tag(radius),
                                   lg.orbit_tag(*(c.get("orbit_state")
                                                  for _label, c in picks)))
@@ -1598,10 +1791,14 @@ class SarTab(QWidget):
         self.run_btn.setEnabled(False)
         self._abort_tif_replies()    # a re-entry (row double-click while a render is
                                      # in flight) must not share this batch's counter
+        self._abort_nisar_amp()
         self._preview_failed = []
         self._tif_pending = len(picks)
+        nisar_picks = [(label, c) for label, c in picks if _sensor(c) == NISAR]
         for label, c in picks:
             self._append_log(f"  {label}")
+            if _sensor(c) == NISAR:
+                continue
             url = self._with_key(
                 f"{PC_DATA_URL}/item/bbox/{minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}.tif"
                 f"?collection={COLLECTION}&item={c['id']}"
@@ -1611,6 +1808,120 @@ class SarTab(QWidget):
             self._tif_replies.append(reply)
             reply.finished.connect(
                 lambda r=reply, l=label, cand=c: self._tif_loaded(r, l, cand))
+        if nisar_picks:
+            self._start_nisar_amp(nisar_picks, (minx, miny, maxx, maxy), px)
+
+    # ---------- NISAR amplitude (background reads) ----------
+    @staticmethod
+    def _nisar_cache_dir():
+        """Native-window cache for NISAR reads (nisar_read.read_aoi): one remote
+        read per granule, polarization and AOI, however often the Pixel size or
+        change-detection window changes. Raw radar data, not a result, so it
+        lives in the temp dir rather than beside the project."""
+        return os.path.join(tempfile.gettempdir(), "landslide_nisar_cache")
+
+    def _nisar_auth(self, cands):
+        """Point GDAL at Earthdata Login for these granules' host(s). Returns
+        (how, None) or (None, why-not)."""
+        how = None
+        try:
+            for c in cands:
+                how = nisar_read.configure_auth(c.get("h5_url") or "")
+        except PermissionError as e:
+            return None, str(e)
+        except Exception as e:                       # noqa: BLE001
+            return None, f"{type(e).__name__}: {e}"
+        return how, None
+
+    def _keep_task(self, task):
+        """Hold a Python reference to a running NISAR task until QGIS reports it
+        over. Its run() is Python, and a QgsTask subclass collected while the
+        manager still drives it is a known way to take QGIS down."""
+        self._nisar_alive.append(task)
+
+        def drop(*_args, t=task):
+            if t in self._nisar_alive:
+                self._nisar_alive.remove(t)
+        task.taskCompleted.connect(drop)
+        task.taskTerminated.connect(drop)
+
+    def _abort_nisar_amp(self):
+        """Abandon the amplitude reads of a previous Preview/Run (see
+        _abort_tif_replies): cancel the task and stop listening to its batch."""
+        if self._nisar_amp_task is not None:
+            try:
+                self._nisar_amp_task.cancel()
+            except RuntimeError:
+                pass
+        self._nisar_amp_task = None
+        self._nisar_amp_batch = -1
+        self._nisar_amp_jobs = {}
+
+    def _start_nisar_amp(self, picks, bbox, px):
+        """Queue the NISAR half of a Preview/Run: each scene is read onto the
+        AOI grid at `px`, stretched with the Display panel's settings into a
+        byte GeoTIFF (saved like a Sentinel-1 Run, or a temp file for Preview),
+        then loaded by _nisar_amp_done exactly like a downloaded render."""
+        bad = [(label, c) for label, c in picks if not c.get("h5_url")]
+        picks = [(label, c) for label, c in picks if c.get("h5_url")]
+        for label, _c in bad:
+            self._amp_failed(label, "the search listed no HTTPS file for it")
+        if not picks:
+            return
+        how, why = self._nisar_auth([c for _l, c in picks])
+        if how is None:
+            self._warn("NISAR preview: " + why)
+            for label, _c in picks:
+                self._amp_failed(label, "no Earthdata login")
+            return
+        self._nisar_batch += 1
+        batch = self._nisar_amp_batch = self._nisar_batch
+        jobs, self._nisar_amp_jobs = [], {}
+        for i, (label, c) in enumerate(picks):
+            key = f"amp{i}"
+            if self._preview_mode == "run":
+                path = self._amp_save_path(c, self._preview_res)
+            else:
+                fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_nisar_")
+                os.close(fd)
+            self._nisar_amp_jobs[key] = (label, c)
+            jobs.append(dict(
+                key=key, url=c["h5_url"], pol=self._pol_for(c.get("polarizations")),
+                bbox=bbox, px=px, out_path=path, kind="display",
+                cache_dir=self._nisar_cache_dir(),
+                scale=self.scale_combo.currentData(), lo=self.db_min.value(),
+                hi=self.db_max.value(), stretch=self.stretch_spin.value()))
+        self._append_log(
+            f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
+            f"the background — ~5–15 s each the first time over this AOI, "
+            f"instant after that")
+        task = NisarReadTask(batch, jobs, "NISAR L-band amplitude")
+        task.logLine.connect(self._append_log)
+        task.jobDone.connect(self._nisar_amp_done)
+        self._nisar_amp_task = task
+        self._keep_task(task)
+        QgsApplication.taskManager().addTask(task)
+
+    def _nisar_amp_done(self, batch, key, path, err):
+        if batch != self._nisar_amp_batch:
+            return                        # an abandoned Preview/Run still reporting
+        label, cand = self._nisar_amp_jobs.pop(key, (key, {}))
+        if not self._nisar_amp_jobs:
+            self._nisar_amp_task = None
+        if path and self._amp_file_ready(path, label, cand):
+            self._amp_one_done()
+        else:
+            self._amp_failed(label, err or "could not load the result")
+
+    def _amp_failed(self, label, why):
+        self._preview_failed.append(label)
+        self._append_log(f"  could not render {label}: {why}")
+        self._amp_one_done()
+
+    def _amp_one_done(self):
+        self._tif_pending -= 1
+        if self._tif_pending <= 0:
+            self._finish_map_preview()
 
     def _amp_out_dir(self):
         """Output folder for saved Run amplitude GeoTIFFs, mirroring _collect's
@@ -1627,7 +1938,7 @@ class SarTab(QWidget):
         orbit = (c.get("orbit_state") or "")[:4] or "orb"
         track = c.get("relative_orbit")
         pol = self._pol_for(c.get("polarizations")).upper()
-        return os.path.join(out, f"S1_{date}_{orbit}_t{track}_{pol}_{res}m.tif")
+        return os.path.join(out, f"{_tag(c)}_{date}_{orbit}_t{track}_{pol}_{res}m.tif")
 
     def _tif_loaded(self, reply, label, cand):
         if reply in self._tif_replies:
@@ -1636,7 +1947,7 @@ class SarTab(QWidget):
         ok = reply.error() == QNetworkReply.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
-        added = False
+        path = None
         if ok and data:
             try:
                 # Run saves a persistent GeoTIFF in the output folder; Preview
@@ -1650,31 +1961,39 @@ class SarTab(QWidget):
                                                 prefix="landslide_sar_")
                     with os.fdopen(fd, "wb") as f:
                         f.write(data)
-                k = self._preview_smooth
-                if k:
-                    self._apply_median(path, k)
-                # optionally dim the layover-facing slopes (rewrites path as RGBA)
-                self._apply_layover_amplitude(path, cand)
-                lyr = QgsRasterLayer(path, label)
-                if lyr.isValid():
-                    lg.add_to_group(lyr, self._amp_group)
-                    self._preview_added.append(lyr)
-                    if self._preview_mode == "run":
-                        self._preview_saved.append(path)
-                        self._append_log(
-                            f"  loaded {label} → saved {os.path.basename(path)}")
-                    else:
-                        self._append_log(f"  loaded {label}")
-                    added = True
             except OSError as e:
                 self._append_log(f"  write failed for {label}: {e}")
-        if not added:
-            self._preview_failed.append(label)
-            hint = " (HTTP 401/403 — check the key)" if status in (401, 403) else ""
-            self._append_log(f"  could not render {label} (HTTP {status}){hint}")
-        self._tif_pending -= 1
-        if self._tif_pending <= 0:
-            self._finish_map_preview()
+                path = None
+        if path and self._amp_file_ready(path, label, cand):
+            self._amp_one_done()
+            return
+        hint = " — check the key" if status in (401, 403) else ""
+        self._amp_failed(label, f"HTTP {status}{hint}")
+
+    def _amp_file_ready(self, path, label, cand):
+        """Load one amplitude GeoTIFF — a Planetary Computer render or a NISAR
+        read, same from here on: optional median, optional layover fade, layer
+        into the amplitude folder. True if the layer was added."""
+        try:
+            k = self._preview_smooth
+            if k:
+                self._apply_median(path, k)
+            # optionally dim the layover-facing slopes (rewrites path as RGBA)
+            self._apply_layover_amplitude(path, cand)
+            lyr = QgsRasterLayer(path, label)
+            if not lyr.isValid():
+                return False
+            lg.add_to_group(lyr, self._amp_group)
+            self._preview_added.append(lyr)
+            if self._preview_mode == "run":
+                self._preview_saved.append(path)
+                self._append_log(f"  loaded {label} → saved {os.path.basename(path)}")
+            else:
+                self._append_log(f"  loaded {label}")
+            return True
+        except OSError as e:
+            self._append_log(f"  write failed for {label}: {e}")
+            return False
 
     def _apply_median(self, path, k):
         """k×k median-filter band 1 of the downloaded AOI GeoTIFF, in place.
@@ -1800,21 +2119,37 @@ class SarTab(QWidget):
         Each requested product is kept only if enough same-track before-scenes
         exist for it (texture needs 3, brightness/norm-diff 2, log-ratio 1);
         the rest are skipped with a note naming a lower-requirement product.
-        Returns None only if NONE of the ticked products can run."""
+        Returns None only if NONE of the ticked products can run.
+
+        Only the Radar combo's sensor is considered — every list below, ticks
+        included, is that radar's alone (see _cd_radar)."""
         result = self._search_result or {}
-        pre_all, post_all = result.get("pre", []), result.get("post", [])
-        ticked_pre, ticked_post = [], []
+        radar = self._cd_radar()
+        pre_all = [c for c in result.get("pre", []) if _sensor(c) == radar]
+        post_all = [c for c in result.get("post", []) if _sensor(c) == radar]
+        ticked_pre, ticked_post, other = [], [], 0
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
             if head is None or head.checkState() != Qt.Checked:
                 continue
             side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
-            if c:
+            if c and _sensor(c) != radar:
+                other += 1
+            elif c:
                 (ticked_pre if side == "pre" else ticked_post).append(c)
+        if other:
+            self._append_log(
+                f"note: {other} ticked row(s) of the other radar left out — the "
+                f"change map uses {radar} only (Radar, in this panel)")
         post_pool = ticked_post or post_all
         if not post_pool:
-            self._warn("Change detection needs a scene AFTER the event — none "
-                       "in the search window.")
+            elsewhere = [c for c in result.get("post", []) if _sensor(c) != radar]
+            self._warn(
+                f"Change detection needs a {radar} scene AFTER the event — none in "
+                f"the search window." +
+                (f" The search has {len(elsewhere)} {_sensor(elsewhere[0])} "
+                 f"after-scene(s): switch Radar in the Change detection panel."
+                 if elsewhere else ""))
             return None
         # frames must image the event point: adjacent frames of one pass share
         # the track number but cover different ground — an off-event frame can
@@ -1991,16 +2326,23 @@ class SarTab(QWidget):
                              f"duplicate {what} — one scene per acquisition day")
         return out
 
+    def _cd_radar(self):
+        """The radar Compute change map runs on: the Radar combo's choice once a
+        search has offered NISAR, Sentinel-1 otherwise."""
+        if not self.cd_radar_combo.isEnabled():
+            return S1
+        return self.cd_radar_combo.currentData() or S1
+
     def _cd_pol(self, cands):
         """One polarization present in EVERY scene — ratio/correlation must
-        compare like with like. The display combo's choice when possible."""
+        compare like with like. The display combo's choice when possible, else
+        the same kind of polarization (co-pol VV -> HH for NISAR)."""
         sets = [set(p.lower() for p in (c.get("polarizations") or []))
                 for c in cands]
         common = set.intersection(*sets) if sets else set()
         if not common:            # metadata absent — trust the combo choice
             return self.pol_combo.currentData()
-        want = self.pol_combo.currentData()
-        return want if want in common else sorted(common)[0]
+        return _match_pol(self.pol_combo.currentData(), sorted(common))
 
     def _checked_products(self):
         """Ticked change-product keys, in CD_PRODUCTS order (texture first)."""
@@ -2059,8 +2401,11 @@ class SarTab(QWidget):
         self._cd_pending = len(roles)
         self._cd_last_layers = []
         self.cd_btn.setEnabled(False)
+        radar = _sensor(post)
         self._append_log(
-            "Change detection (" + " + ".join(CD_NAMES[m] for m in products) +
+            ("Change detection — NISAR L-band, experimental (" if radar == NISAR
+             else "Change detection (") +
+            " + ".join(CD_NAMES[m] for m in products) +
             f", {pol.upper()}, {k}×{k} window at {eff_res:.3g} m px):")
         if capped:
             self._warn(
@@ -2090,6 +2435,15 @@ class SarTab(QWidget):
             self._append_log(
                 f"  note: {base} days between the compared scenes — snow-state "
                 "or seasonal drift over that span can read as change")
+        products_seen = {c.get("product") for c in roles.values() if c.get("product")}
+        if len(products_seen) > 1:
+            self._append_log(
+                "  note: this stack mixes NISAR " + " and ".join(sorted(products_seen))
+                + " products, which are calibrated differently — a radiometric "
+                "offset between them can read as change")
+        if radar == NISAR:
+            self._start_nisar_cd(roles, (minx, miny, maxx, maxy), px, pol)
+            return
         # raw float32 gamma-naught: same bbox endpoint as the visual preview but
         # WITHOUT rescale/colormap, so pixel values are data, not display bytes
         for role, c in roles.items():
@@ -2103,6 +2457,55 @@ class SarTab(QWidget):
             self._cd_replies.append(reply)
             reply.finished.connect(
                 lambda r=reply, ro=role: self._cd_tif_loaded(r, ro))
+
+    def _start_nisar_cd(self, roles, bbox, px, pol):
+        """The NISAR road to _cd_compute: read every role's raw gamma-naught onto
+        the AOI grid on a background task and record it in _cd_paths, exactly
+        where a Planetary Computer download would have put it."""
+        how, why = self._nisar_auth(list(roles.values()))
+        if how is None:
+            self._warn("NISAR change detection: " + why)
+            self.cd_btn.setEnabled(True)
+            return
+        self._nisar_batch += 1
+        batch = self._nisar_cd_batch = self._nisar_batch
+        jobs = []
+        for role, c in roles.items():
+            if not c.get("h5_url"):
+                self._cd_role_done(role, "", "the search listed no HTTPS file for it")
+                continue
+            fd, path = tempfile.mkstemp(suffix=".tif", prefix=f"landslide_cd_{role}_")
+            os.close(fd)
+            jobs.append(dict(key=role, url=c["h5_url"], pol=pol, bbox=bbox, px=px,
+                             out_path=path, kind="float",
+                             cache_dir=self._nisar_cache_dir()))
+        if not jobs:
+            return
+        self._append_log(
+            f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
+            f"the background — ~5–15 s each the first time over this AOI")
+        task = NisarReadTask(batch, jobs, "NISAR L-band change detection")
+        task.logLine.connect(self._append_log)
+        task.jobDone.connect(self._nisar_cd_done)
+        self._nisar_cd_task = task
+        self._keep_task(task)
+        QgsApplication.taskManager().addTask(task)
+
+    def _nisar_cd_done(self, batch, role, path, err):
+        if batch != self._nisar_cd_batch:
+            return                        # a search replaced this stack meanwhile
+        self._cd_role_done(role, path, err)
+
+    def _cd_role_done(self, role, path, err):
+        """One NISAR role read (or failed); the last one starts the compute."""
+        if path:
+            self._cd_paths[role] = path
+        else:
+            self._append_log(f"  could not read the {role} scene: {err}")
+        self._cd_pending -= 1
+        if self._cd_pending <= 0:
+            self._nisar_cd_task = None
+            self._cd_compute()
 
     def _cd_tif_loaded(self, reply, role):
         if reply in self._cd_replies:
@@ -2212,6 +2615,10 @@ class SarTab(QWidget):
         pre_d = (roles[pre_roles[0]].get("date") or "")[:10]
         post_d = (roles["post"].get("date") or "")[:10]
         tail = f"(t{track} {pol}, {k}×{k})"
+        # 'S1' / 'NISAR' leads every name: the Fusion tab pools S1_change_* only,
+        # so a NISAR map can be fused by hand but never pooled with C-band ones
+        radar = _sensor(roles["post"])
+        tg = _tag(roles["post"])
         # short product tag per change metric, for the layer-tree subfolder name
         CD_PRODUCT = {"logratio": "Log-ratio", "intcorr": "Int-corr",
                       "tsint": "Brightness-z", "mtcorr": "MT-corr"}
@@ -2219,15 +2626,15 @@ class SarTab(QWidget):
         added = computed = 0
         for mkey, out in outs:
             if mkey == "logratio":
-                label = f"S1 change log-ratio {pre_d}→{post_d} {tail}"
+                label = f"{tg} change log-ratio {pre_d}→{post_d} {tail}"
             elif mkey == "intcorr":
                 pre2_d = (roles[pre_roles[1]].get("date") or "")[:10]
-                label = f"S1 change int-corr {pre2_d}+{pre_d}→{post_d} {tail}"
+                label = f"{tg} change int-corr {pre2_d}+{pre_d}→{post_d} {tail}"
             elif mkey == "tsint":
-                label = (f"S1 change brightness z {len(pre_roles)}×pre→"
+                label = (f"{tg} change brightness z {len(pre_roles)}×pre→"
                          f"{post_d} {tail}")
             else:
-                label = (f"S1 change MT int-corr {len(pre_roles)}×pre→"
+                label = (f"{tg} change MT int-corr {len(pre_roles)}×pre→"
                          f"{post_d} {tail}")
 
             # Gap 3: radiometric normalization — recenter the unchanged
@@ -2277,7 +2684,8 @@ class SarTab(QWidget):
                     os.close(fd)
                     faded = self._write_change_with_fade(
                         opath, out, gt, proj,
-                        roles["post"].get("orbit_state"), SIG[mkey][1], mkey)
+                        roles["post"].get("orbit_state"), SIG[mkey][1], mkey,
+                        radar=radar)
                 except Exception as e:               # noqa: BLE001
                     self._warn(f"Could not write {label}: {e}")
                     continue
@@ -2298,7 +2706,8 @@ class SarTab(QWidget):
                     self._style_cd_layer(lyr, mkey)
                 if cd_group is None:
                     cd_group = lg.new_group(
-                        lg.name("SAR", lg.date_pair(pre_d, post_d), "change",
+                        lg.name("NISAR" if radar == NISAR else "SAR",
+                                lg.date_pair(pre_d, post_d), "change",
                                 lg.radius_tag(meta.get("radius")),
                                 lg.orbit_tag(roles["post"].get("orbit_state"))))
                 sub = lg.subgroup(cd_group, CD_PRODUCT.get(mkey, mkey))
@@ -2313,7 +2722,7 @@ class SarTab(QWidget):
             # shape/gt (same AOI grid) and k/pol/res (same detector settings).
             if not stats_only:
                 self._cd_results.append(dict(
-                    mkey=mkey, track=track,
+                    mkey=mkey, track=track, radar=radar,
                     direction=(roles["post"].get("orbit_state") or ""),
                     # the scene footprint is what fixes the incidence angle for
                     # the merge's radar-shadow mask (layover_dim.iw_incidence_deg);
@@ -2572,14 +2981,18 @@ class SarTab(QWidget):
                              f"{type(e).__name__}: {e}")
             return None
 
-    def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey):
+    def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey,
+                                radar=S1):
         """Write a change raster. If the layover fade is on and a DEM is available,
         bake the pseudocolor ramp into an RGBA raster whose alpha dims the layover-
         facing steep high-anomaly pixels (QGIS renders RGBA alpha reliably, unlike a
         single-band renderer's alpha band). Returns True if an RGBA raster was
         written — the caller then does NOT apply the pseudocolor renderer."""
         import numpy as np
-        if self.layover_check.isChecked():
+        if self.layover_check.isChecked() and radar == NISAR:
+            self._append_log("  layover fade: not applied to NISAR — it looks LEFT, "
+                             "and the fade models Sentinel-1's right-looking geometry")
+        elif self.layover_check.isChecked():
             dem = self._aoi_dem(gt, out.shape)
             if dem is not None:
                 try:
@@ -2607,6 +3020,10 @@ class SarTab(QWidget):
         the layover-facing steep bright pixels (QGIS honors the alpha band). No-op
         unless the fade is on and a DEM is available."""
         if not self.layover_check.isChecked():
+            return
+        if _sensor(cand) == NISAR:
+            self._append_log("  layover fade: not applied to NISAR — it looks LEFT, "
+                             "and the fade models Sentinel-1's right-looking geometry")
             return
         import numpy as np
         try:
@@ -2657,6 +3074,12 @@ class SarTab(QWidget):
         geometry) and cached. Never fatal: a failure costs the confidence
         correction, not the merge."""
         r0 = results[0]
+        if r0.get("radar") == NISAR:
+            self._append_log(
+                "  shadow + layover masks: not applied to NISAR — they model "
+                "Sentinel-1's right-looking orbit, and NISAR looks left; its "
+                "merge runs unmasked")
+            return None
         gt, shape = r0["gt"], r0["shape"]
         try:
             dem = self._aoi_dem(gt, shape)
@@ -2783,8 +3206,9 @@ class SarTab(QWidget):
         tracks = "+".join(str(t) for t in sorted(
             {r["track"] for r in results if r.get("track") is not None}))
         tail = f"(t{tracks or '?'} {rp['pol'].upper()} fill-{pdir}, {rp['k']}×{rp['k']})"
-        label = f"S1 change {label_name} FILLED {pdir} from {odir} {pre_d}→{post_d} {tail}"
-        slabel = f"S1 FILLED source {pdir} from {odir} {pre_d}→{post_d} {tail}"
+        tg = "NISAR" if rp.get("radar") == NISAR else "S1"
+        label = f"{tg} change {label_name} FILLED {pdir} from {odir} {pre_d}→{post_d} {tail}"
+        slabel = f"{tg} FILLED source {pdir} from {odir} {pre_d}→{post_d} {tail}"
         total = max(1, filled.size)
         self._append_log(
             f"Fill {label_name} [primary {pdir}]: {fm['n_primary'] / total:.1%} of "
@@ -2812,7 +3236,7 @@ class SarTab(QWidget):
             return group, False
         flyr = QgsRasterLayer(fpath, label)
         slyr = QgsRasterLayer(
-            spath, f"S1 FILLED source {pdir} from {odir} {pre_d}→{post_d}")
+            spath, f"{tg} FILLED source {pdir} from {odir} {pre_d}→{post_d}")
         if not flyr.isValid() or not slyr.isValid():
             self._warn(f"Filled {label_name}: raster failed to load.")
             return group, False
@@ -2820,7 +3244,8 @@ class SarTab(QWidget):
         self._style_fill_source(slyr, pdir, odir)
         if group is None:
             group = lg.new_group(lg.name(
-                "SAR", lg.date_pair(pre_d, post_d), "change filled",
+                "NISAR" if rp.get("radar") == NISAR else "SAR",
+                lg.date_pair(pre_d, post_d), "change filled",
                 lg.radius_tag(rp.get("radius")),
                 lg.orbit_tag(*(r["direction"] for r in results))))
         sub = lg.subgroup(group, label_name)
@@ -2853,17 +3278,51 @@ class SarTab(QWidget):
         renderer.setClassificationMax(2.0)
         lyr.setRenderer(renderer)
 
-    def _merge_geometries_action(self):
+    def _merge_clicked(self):
         """Merge the most recent ascending + descending change maps of each product
         so a scar lost to layover in one viewing geometry is recovered from the
         other (report rec #5). Reads the in-memory computed arrays (true signed
         values, not read_band's γ⁰>0 validity). Degrades honestly to one geometry
-        where only one pass was computed — common in this steep terrain."""
+        where only one pass was computed — common in this steep terrain.
+
+        One radar at a time: Sentinel-1 maps merge with Sentinel-1 maps and
+        NISAR with NISAR (_merge_geometries_action), never across — different
+        wavelength, polarization and look direction, so 'the stronger pass'
+        would be comparing two instruments, not two views."""
         if not self._cd_results:
             self._warn("Compute a change map first — ideally once with an "
                        "ascending after-scene and once with a descending one — "
                        "then Merge.")
             return
+        rule = self.cd_merge_rule_combo.currentData() or "max"
+        radars = []
+        for r in reversed(self._cd_results):            # newest radar first
+            if r.get("radar", S1) not in radars:
+                radars.append(r.get("radar", S1))
+        added = 0
+        for radar in radars:
+            added += self._merge_geometries_action(
+                [r for r in self._cd_results if r.get("radar", S1) == radar],
+                radar, rule)
+        if added and rule == "fill":
+            self.iface.messageBar().pushInfo(
+                "SAR", f"Filled {added} product(s): one pass leads, the other only "
+                "fills where it was blind. The 'source' layer shows which pixels "
+                "came from where; the filled raster is the one the Fusion tab "
+                "reads.")
+        elif added:
+            self.iface.messageBar().pushInfo(
+                "SAR", f"Merged {added} product(s) across geometries — read the "
+                "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
+                "from one orbit (other blind), 3 = orbits disagree and are left "
+                "out of the heat map on top (the full raster is loaded unticked "
+                "beneath it, and is the one the Fusion tab reads).")
+
+    def _merge_geometries_action(self, cd_results, radar, rule):
+        """One radar's merge (see _merge_clicked): every product's newest asc and
+        desc maps, strongest-wins or fill-only per `rule`. Returns how many
+        products were merged (or filled)."""
+        tg = "NISAR" if radar == NISAR else "S1"
         # EXACTLY the spellings _cd_compute uses for the single-geometry layers.
         # They used to read "brightness-z" / "MT-corr" here, which no other part
         # of the plugin says: the Fusion tab's measure auto-detect knows
@@ -2874,7 +3333,7 @@ class SarTab(QWidget):
                 "tsint": "brightness z", "mtcorr": "MT int-corr"}
         # group by product, newest first; keep the latest result per orbit direction
         by_prod = {}
-        for r in reversed(self._cd_results):
+        for r in reversed(cd_results):
             sel = by_prod.setdefault(r["mkey"], {})
             # group by orbit direction; if the scene lacked orbit_state, fall back
             # to the track so two real geometries aren't collapsed under one key
@@ -2886,7 +3345,6 @@ class SarTab(QWidget):
         # four detectors of one merge share both, so they are computed twice per
         # Merge (once per geometry) rather than eight times.
         shadow_cache = {}
-        rule = self.cd_merge_rule_combo.currentData() or "max"
         fill_primary = (self._fill_primary(by_prod, NAME, shadow_cache)
                         if rule == "fill" else None)
         for mkey, sel in by_prod.items():
@@ -2957,7 +3415,7 @@ class SarTab(QWidget):
             tracks = "+".join(str(t) for t in sorted(
                 {r["track"] for r in results if r.get("track") is not None}))
             tail = f"(t{tracks or '?'} {r0['pol'].upper()}, {r0['k']}×{r0['k']})"
-            label = (f"S1 change {NAME.get(mkey, mkey)} MERGED {dirs} "
+            label = (f"{tg} change {NAME.get(mkey, mkey)} MERGED {dirs} "
                      f"{pre_d}→{post_d} {tail}")
             # Durable float32 export FIRST, exactly as a single-geometry compute
             # does it. A merged raster used to exist only as a tempfile, so the
@@ -2970,7 +3428,7 @@ class SarTab(QWidget):
                             min_area=r0.get("min_area"))
             mpath = self._cd_export_float(label, merged, gt, proj, tag_meta)
             cpath = self._cd_export_float(
-                f"S1 MERGED confidence {dirs} {pre_d}→{post_d} {tail}",
+                f"{tg} MERGED confidence {dirs} {pre_d}→{post_d} {tail}",
                 conf, gt, proj, tag_meta)
             # The heat map you READ is the agreeing-only copy: "strongest anomaly
             # wins" paints a conf-3 contradiction exactly like a real detection,
@@ -2985,7 +3443,7 @@ class SarTab(QWidget):
             # as a change raster it would be pooled with the very raster it is a
             # filtered view of — the merged log-ratio MAX-pooled with itself minus
             # its disagreements — which is both meaningless and invisible.
-            dlabel = (f"S1 MERGED agreeing only {NAME.get(mkey, mkey)} "
+            dlabel = (f"{tg} MERGED agreeing only {NAME.get(mkey, mkey)} "
                       f"{dirs} {pre_d}→{post_d} {tail}")
             dpath = self._cd_export_float(dlabel, shown, gt, proj, tag_meta)
             try:
@@ -3009,7 +3467,7 @@ class SarTab(QWidget):
                 continue
             mlyr = QgsRasterLayer(mpath, label)
             clyr = QgsRasterLayer(
-                cpath, f"S1 MERGED confidence {dirs} {pre_d}→{post_d}")
+                cpath, f"{tg} MERGED confidence {dirs} {pre_d}→{post_d}")
             dlyr = QgsRasterLayer(dpath, dlabel)
             if not mlyr.isValid() or not clyr.isValid() or not dlyr.isValid():
                 self._warn(f"Merged {NAME.get(mkey, mkey)}: raster failed to load.")
@@ -3019,7 +3477,8 @@ class SarTab(QWidget):
             self._style_cd_confidence(clyr)
             if merge_group is None:
                 merge_group = lg.new_group(
-                    lg.name("SAR", lg.date_pair(pre_d, post_d), "change merged",
+                    lg.name("NISAR" if radar == NISAR else "SAR",
+                            lg.date_pair(pre_d, post_d), "change merged",
                             lg.radius_tag(results[0].get("radius")),
                             lg.orbit_tag(*(r["direction"] for r in results))))
             sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
@@ -3040,19 +3499,7 @@ class SarTab(QWidget):
                 f"hidden); the full raster is loaded unticked and is what the "
                 f"Fusion tab reads")
             added += 1
-        if added and rule == "fill":
-            self.iface.messageBar().pushInfo(
-                "SAR", f"Filled {added} product(s): one pass leads, the other only "
-                "fills where it was blind. The 'source' layer shows which pixels "
-                "came from where; the filled raster is the one the Fusion tab "
-                "reads.")
-        elif added:
-            self.iface.messageBar().pushInfo(
-                "SAR", f"Merged {added} product(s) across geometries — read the "
-                "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
-                "from one orbit (other blind), 3 = orbits disagree and are left "
-                "out of the heat map on top (the full raster is loaded unticked "
-                "beneath it, and is the one the Fusion tab reads).")
+        return added
 
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
@@ -3087,13 +3534,18 @@ class SarTab(QWidget):
         if not result:
             return
         sel = self._selected_ids()
-        for side, outline in (("pre", "0,90,200"), ("post", "0,150,60")):
+        # one layer per radar and side, so NISAR's frames can be switched off
+        # without losing Sentinel-1's; NISAR outlines dashed
+        for (side, outline), radar in [(so, r) for r in (S1, NISAR)
+                                       for so in (("pre", "0,90,200"),
+                                                  ("post", "0,150,60"))]:
             cands = [c for c in result.get(side, []) if c.get("geometry")
+                     and _sensor(c) == radar
                      and (not sel or c.get("id") in sel)]
             if not cands:
                 continue
             lyr = QgsVectorLayer("Polygon?crs=EPSG:4326",
-                                 f"Sentinel-1 footprints — {side}", "memory")
+                                 f"{radar} footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
                 QgsField("scene_id", QVariant.String),
@@ -3118,7 +3570,8 @@ class SarTab(QWidget):
             pr.addFeatures(feats)
             lyr.updateExtents()
             sym = QgsFillSymbol.createSimple({
-                "style": "no", "outline_color": outline, "outline_width": "0.6"})
+                "style": "no", "outline_color": outline, "outline_width": "0.6",
+                "outline_style": "dash" if radar == NISAR else "solid"})
             lyr.renderer().setSymbol(sym)
             QgsProject.instance().addMapLayer(lyr)
             self._footprint_layers.append(lyr)
@@ -3134,9 +3587,10 @@ class SarTab(QWidget):
         self.map_preview_btn.setEnabled((not on) and have)
         self.run_btn.setEnabled((not on) and have)
         self.cd_btn.setEnabled(
-            (not on) and bool(self._search_result and
-                              self._search_result.get("pre") and
-                              self._search_result.get("post")))
+            (not on) and self._nisar_cd_task is None
+            and bool(self._search_result and
+                     self._search_result.get("pre") and
+                     self._search_result.get("post")))
         # merge is available only when idle and at least one geometry is recorded
         self.cd_merge_btn.setEnabled((not on) and bool(self._cd_results))
 
@@ -3165,3 +3619,4 @@ class SarTab(QWidget):
         self._cd_replies = []
         if self.task is not None:
             self.task.cancel()
+        self._cancel_nisar(forget=True)

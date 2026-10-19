@@ -83,8 +83,11 @@ OPTICAL_EXCLUDE = ("s1 ", "log-ratio", "logratio", "int-corr", "mt-corr",
 # area detected 90.0% -> 80.5% and the worst candidate rank 3 -> 7 (see
 # sar_change.agreeing_only), so it must never be chosen for you. It stays
 # selectable by hand, and _fuse says so in the log when it is.
+# "nisar": the SAR tab's L-band maps carry the same detector names, but every
+# floor and weight here was tuned on Sentinel-1 C-band VV, and L-band HH has been
+# measured on one event. Selectable by hand; never chosen for you.
 SAR_EXCLUDE = ("dndsi", "dbright", "dndvi", "ndvi", "agreeing only",
-               "agreeing_only")
+               "agreeing_only", "nisar")
 
 # Two different questions about a candidate pair, deliberately kept apart. One
 # threshold tried to answer both, and answered each one wrong in a different

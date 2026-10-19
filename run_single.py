@@ -242,6 +242,11 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
             r = si.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
                                 post_days=args.post_days,
                                 auto_window=args.auto_window)
+        elif s == "nisar":
+            import nisar_imagery as ni
+            r = ni.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
+                                post_days=args.post_days,
+                                auto_window=args.auto_window)
         elif s == "dem":
             import dem_imagery as di
             r = di.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
@@ -278,11 +283,24 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
 
     sensors = {"auto": ["s2", "landsat"], "planet": ["planet"],
                "s2": ["s2"], "landsat": ["landsat"], "s1": ["s1"],
+               "sar": ["s1", "nisar"], "nisar": ["nisar"],
                "dem": ["dem"]}[args.prefer]
     if "s2" in sensors and when < dt.datetime(2016, 1, 1):
         sensors = [s for s in sensors if s != "s2"]
         if "landsat" not in sensors:
             sensors.append("landsat")
+    # NISAR only where the window can reach its archive (science from 2025-10-17).
+    # The date is the permissive floor only — whether data exists is the granule
+    # search's job, see nisar_imagery.applicable — so this drops nothing real.
+    skipped = []
+    if "nisar" in sensors:
+        import nisar_imagery as ni
+        if not ni.applicable(when, args.pre_days, args.post_days):
+            sensors = [s for s in sensors if s != "nisar"]
+            skipped.append(f"NISAR not searched: this window ends before its first "
+                           f"science acquisition ({ni.FIRST_SCIENCE:%Y-%m-%d})")
+    if not sensors:
+        return dict(pre=[], post=[], notes=skipped, failed=[])
 
     # The per-source searches are independent network-bound calls, so fan them out
     # across threads: the preview then returns in ~the slowest single source
@@ -294,7 +312,7 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             lambda s: _search_one_source(s, lat, lon, radius_km, when, args),
             sensors))
 
-    pre, post, notes = [], [], []
+    pre, post, notes = [], [], list(skipped)
     # Sources whose search raised, so a caller can tell "searched, nothing matched" from
     # "never searched" — the tab used to report a failed Planet search as 0 scenes found.
     failed = [note for r, note in results if r is None and note]
@@ -355,13 +373,17 @@ def main():
     ap.add_argument("--event-id", default=None,
                     help="label for the output files (default: derived from time)")
     ap.add_argument("--prefer", default="auto",
-                    choices=["auto", "planet", "s2", "landsat", "s1", "dem"],
+                    choices=["auto", "planet", "s2", "landsat", "s1", "sar",
+                             "nisar", "dem"],
                     help="imagery source; 'auto' = Sentinel-2 -> Landsat (STAC). "
                          "'planet' searches PlanetScope only and is used by the "
                          "plugin's PlanetScope tab (search/preview; runs need a "
                          "PlanetScope order flow, added separately). 's1' searches "
                          "Sentinel-1 RTC (SAR amplitude) and is used by the plugin's "
                          "SAR tab — search/preview only (--search-only required). "
+                         "'nisar' searches NISAR L-band GCOV (ASF, via NASA CMR) and "
+                         "'sar' both radars, NISAR only when the window reaches its "
+                         "archive (2025-10-17 on) — also search/preview only. "
                          "'dem' searches PGC ArcticDEM/EarthDEM/REMA time-stamped DEM "
                          "strips and is used by the plugin's DEM differencing tab — "
                          "also search/preview only.")
@@ -539,7 +561,7 @@ def main():
                     help="Planet order id for the POST side to resume.")
     a = ap.parse_args()
 
-    if a.prefer in ("s1", "dem") and not a.search_only:
+    if a.prefer in ("s1", "sar", "nisar", "dem") and not a.search_only:
         print(f"--prefer {a.prefer} is search/preview only "
               "(no composite Run pipeline); add --search-only")
         return 1
