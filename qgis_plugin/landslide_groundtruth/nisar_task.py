@@ -1,6 +1,6 @@
 """Background task: read NISAR GCOV scenes onto the SAR tab's AOI grid.
 
-A NISAR read is 5-15 s of blocking network I/O per scene (nisar_read), and
+A NISAR read is 10-25 s of blocking network I/O per scene (nisar_read), and
 change detection needs up to seven scenes. On the GUI thread that freezes QGIS
 in a way that looks exactly like a crash — the failure limits.py exists to
 prevent — so the reads run here, one after another on QgsTask's worker thread.
@@ -13,7 +13,10 @@ Every job reports back through jobDone, carrying the batch number it was
 started with, so the tab can drop the answers of a batch it has already
 abandoned (a row double-click can start a new preview while an old one is
 still reading). Every job reports exactly once — including the ones a cancel
-skips — so the tab's pending counter always reaches zero.
+skips — so the tab's pending counter always reaches zero. A successful job also
+hands back the scene's look geometry (nisar_read's look_azimuth_deg /
+incidence_deg), which the tab's layover fade and terrain masks need because
+NISAR looks the other way from Sentinel-1.
 """
 from qgis.PyQt.QtCore import pyqtSignal
 from qgis.core import QgsTask
@@ -22,8 +25,10 @@ from . import nisar_read
 
 
 class NisarReadTask(QgsTask):
-    # batch, job key, output path ('' on failure), error ('' on success)
-    jobDone = pyqtSignal(int, str, str, str)
+    # batch, job key, output path ('' on failure), error ('' on success), and
+    # the look geometry: dict(look_azimuth_deg, incidence_deg, geometry_note),
+    # {} on failure
+    jobDone = pyqtSignal(int, str, str, str, object)
     logLine = pyqtSignal(str)
 
     def __init__(self, batch, jobs, description="NISAR L-band read"):
@@ -55,19 +60,26 @@ class NisarReadTask(QgsTask):
                             gt, wkt)
                     else:
                         nisar_read.write_float(job["out_path"], out, gt, wkt)
+                    geom = {k: info.get(k) for k in
+                            ("look_azimuth_deg", "incidence_deg", "geometry_note")}
                     self.logLine.emit(
                         f"    {job['key']}: {info['valid_frac']:.0%} of the AOI valid"
                         f" (EPSG:{info['epsg']}, {info['native_res']:g} m native"
                         + (f", read every {info['step']}th pixel" if info["step"] > 1
-                           else "") + ")")
-                    self.jobDone.emit(self.batch, job["key"], job["out_path"], "")
+                           else "")
+                        + (f"; looks {geom['look_azimuth_deg']:.0f}° at "
+                           f"{geom['incidence_deg']:.1f}° incidence"
+                           if geom["look_azimuth_deg"] is not None else
+                           f"; no look geometry: {geom['geometry_note']}") + ")")
+                    self.jobDone.emit(self.batch, job["key"], job["out_path"], "",
+                                      geom)
                 except Exception as e:      # noqa: BLE001 — report, never kill QGIS
                     self.jobDone.emit(self.batch, job["key"], "",
-                                      f"{type(e).__name__}: {e}")
+                                      f"{type(e).__name__}: {e}", {})
                 done += 1
         finally:
             # skipped by a cancel (or an unexpected escape): still answer, so the
             # tab's counter reaches zero and its buttons come back
             for job in self.jobs[done:]:
-                self.jobDone.emit(self.batch, job["key"], "", "cancelled")
+                self.jobDone.emit(self.batch, job["key"], "", "cancelled", {})
         return not self.isCanceled()

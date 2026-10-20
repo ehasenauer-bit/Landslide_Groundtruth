@@ -488,6 +488,109 @@ for name, fa in PIX.items():
               f"(unmasked it would have claimed {pl[0, 0]:.1f} dB)",
               bool(np.isnan(mg[0, 0])) and bool(np.isnan(cf[0, 0])))
 
+print("\n=== 15. another radar's measured look replaces the Sentinel-1 model ===")
+# NISAR looks LEFT: on an ascending pass at Iliamna it looks 241.4 deg (WSW,
+# measured from the granule), so it is lit from the ENE — the side a DESCENDING
+# Sentinel-1 pass is lit from, and the opposite of an ascending one. Passing
+# the look explicitly must (a) decide the side whatever orbit_state says,
+# (b) leave every Sentinel-1 call that does not pass it exactly as it was.
+NISAR_ASC = 241.4
+for st in ("ascending", "descending", None):
+    m_none, _ = ld.radar_shadow(wall, GT, st, dem_smooth=0)
+    m_kw, _ = ld.radar_shadow(wall, GT, st, dem_smooth=0, look_azimuth=None)
+    l_none, _ = ld.radar_layover(wall, GT, st, dem_smooth=0, lat_hint=LAT)
+    l_kw, _ = ld.radar_layover(wall, GT, st, dem_smooth=0, lat_hint=LAT,
+                               look_azimuth=None)
+    check(f"{st}: look_azimuth=None is the Sentinel-1 call, unchanged",
+          np.array_equal(m_none, m_kw) and np.array_equal(l_none, l_kw))
+s1_look = ld.look_azimuth_deg("ascending", LAT)
+for fn in (ld.radar_shadow, ld.radar_layover):
+    a, _ = fn(ramp(60.0), GT, "ascending", lat_hint=LAT, dem_smooth=0)
+    b, _ = fn(ramp(60.0), GT, "ascending", lat_hint=LAT, dem_smooth=0,
+              look_azimuth=s1_look)
+    check(f"{fn.__name__}: passing the model's own look gives the same mask "
+          "(the override goes where the model went, nothing else moves)",
+          np.array_equal(a, b))
+
+# (a): the measured look decides the side; orbit_state is ignored
+nis = {st: ld.radar_shadow(wall, GT, st, dem_smooth=0, look_azimuth=NISAR_ASC)
+       for st in ("ascending", "descending", None)}
+check("radar_shadow: the same mask for any orbit_state once the look is given",
+      all(np.array_equal(nis["ascending"][0], v[0]) for v in nis.values()))
+check(f"  and it reports the look it was given ({nis[None][1]['range_azimuth']:.1f})",
+      abs(nis[None][1]["range_azimuth"] - NISAR_ASC) < 1e-9)
+cols = np.where(nis[None][0][50])[0]
+s1_asc_cols = np.where(ld.radar_shadow(wall, GT, "ascending", dem_smooth=0)[0][50])[0]
+check(f"NISAR ascending (lit from the ENE) shadows WEST of the ridge: cols "
+      f"{cols.min()}..{cols.max()}, where Sentinel-1 ascending shadows the EAST "
+      f"({s1_asc_cols.min()}..{s1_asc_cols.max()})",
+      cols.max() < 50 < s1_asc_cols.min())
+# layover: a slope falling to the east FACES the ENE-lit NISAR pass
+east_face = ramp(60.0)                         # falls to the east, aspect 90
+west_face = ramp(60.0, down_east=False)        # falls to the west, aspect 270
+le, _ = ld.radar_layover(east_face, GT, "ascending", dem_smooth=0,
+                         look_azimuth=NISAR_ASC)
+lw, _ = ld.radar_layover(west_face, GT, "ascending", dem_smooth=0,
+                         look_azimuth=NISAR_ASC)
+s1e, _ = ld.radar_layover(east_face, GT, "ascending", lat_hint=LAT, dem_smooth=0)
+check(f"radar_layover: NISAR asc folds the east-facing 60deg slope "
+      f"({le.mean():.0%}) and not the west-facing one ({lw.mean():.0%}) — "
+      f"Sentinel-1 ascending does not fold the east face ({s1e.mean():.0%})",
+      le.mean() > 0.5 and lw.mean() == 0.0 and s1e.mean() == 0.0)
+check("illumination_aspect_deg: the look turned around, orbit ignored",
+      abs(ld.illumination_aspect_deg("ascending", LAT, look_azimuth=NISAR_ASC)
+          - 61.4) < 1e-9 and ld.illumination_aspect_deg(
+              None, look_azimuth=NISAR_ASC) is not None)
+check("  and without it, exactly the Sentinel-1 model",
+      ld.illumination_aspect_deg("ascending", LAT)
+      == ld.illumination_aspect_deg("ascending", LAT, look_azimuth=None))
+
+# the fade: same three-way comparison on amplitude
+vals = np.ones((60, 60), np.float32)
+ok = np.ones((60, 60), bool)
+fe, me = ld.layover_alpha(vals, ok, east_face, GT, "ascending",
+                          high_percentile=0.0, look_azimuth=NISAR_ASC)
+fw, mw = ld.layover_alpha(vals, ok, west_face, GT, "ascending",
+                          high_percentile=0.0, look_azimuth=NISAR_ASC)
+fs, ms = ld.layover_alpha(vals, ok, east_face, GT, "ascending", lat_hint=LAT,
+                          high_percentile=0.0)
+check(f"layover_alpha: NISAR asc dims the east face ({me['n_dimmed']} px), "
+      f"not the west face ({mw['n_dimmed']} px); Sentinel-1 asc leaves the east "
+      f"face alone ({ms['n_dimmed']} px)",
+      me["n_dimmed"] > 0.9 * vals.size and mw["n_dimmed"] == 0
+      and ms["n_dimmed"] == 0)
+check(f"  layover aspect {me['layover_aspect']:.1f} deg (ENE)",
+      abs(me["layover_aspect"] - 61.4) < 1e-9)
+fn_, mn_ = ld.layover_alpha(vals, ok, east_face, GT, None, high_percentile=0.0,
+                            look_azimuth=NISAR_ASC)
+check("  a measured look needs no orbit_state at all",
+      mn_["n_dimmed"] == me["n_dimmed"])
+for bad in (float("nan"), float("inf")):
+    try:
+        ld.radar_shadow(wall, GT, "ascending", look_azimuth=bad)
+        check(f"a non-finite look ({bad}) is refused", False)
+    except ValueError:
+        check(f"a non-finite look ({bad}) is refused, never read as 'use the "
+              "Sentinel-1 model'", True)
+
+# and the tab passes it on at every call site
+calls_kw = {}
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name in (
+            "_terrain_masks", "_write_change_with_fade", "_apply_layover_amplitude"):
+        for c in ast.walk(node):
+            if isinstance(c, ast.Call) and getattr(c.func, "attr", "") in (
+                    "radar_shadow", "radar_layover", "layover_alpha"):
+                calls_kw.setdefault((node.name, c.func.attr), set()).update(
+                    k.arg for k in c.keywords)
+want_sites = {("_terrain_masks", "radar_shadow"), ("_terrain_masks", "radar_layover"),
+              ("_write_change_with_fade", "layover_alpha"),
+              ("_apply_layover_amplitude", "layover_alpha")}
+check("the SAR tab hands the measured look to all four layover_dim calls",
+      set(calls_kw) == want_sites
+      and all("look_azimuth" in kw for kw in calls_kw.values()),
+      {k: sorted(v) for k, v in calls_kw.items()})
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: " + "; ".join(fails))

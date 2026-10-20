@@ -16,6 +16,14 @@ target is ~10° off it (the tilted ground track, minus the meridian convergence
 between nadir and the target), and every function here that is given a latitude
 uses the true geometry (look_azimuth_deg) instead.
 
+All of that is a model of Sentinel-1 alone. Another radar passes its own look
+direction instead — `look_azimuth=` on illumination_aspect_deg, layover_alpha,
+radar_shadow and radar_layover — and the orbit model is skipped. NISAR does: it
+looks LEFT (so an ascending NISAR pass is lit from the east, like a DESCENDING
+Sentinel-1 one), flies a different orbit and swath, and its GCOV granule ships
+the true line of sight at the target (nisar_read reads it). Without the
+argument nothing changes, so Sentinel-1 output stays byte-identical.
+
 A pixel is dimmed only when it is (a) on a slope FACING the illumination, (b)
 STEEP enough to actually foreshorten/lay over (flat ground of any aspect is
 left alone), and (c) HIGH-valued (the actual layover pile-up / strong change),
@@ -125,14 +133,31 @@ def look_azimuth_deg(orbit_state, lat=None, incidence_deg=None):
     return float((along + 90.0) % 360.0)
 
 
-def illumination_aspect_deg(orbit_state, lat=None, incidence_deg=None):
+def _explicit_look(look_azimuth):
+    """A caller's measured look azimuth, normalised to [0, 360). Non-finite is
+    an error, not 'unknown': a radar whose geometry could not be read must pass
+    None and be skipped by its caller, never fall through to the Sentinel-1
+    model, which would put a left-looking radar's layover on the wrong side."""
+    v = float(look_azimuth)
+    if not np.isfinite(v):
+        raise ValueError(f"look_azimuth must be finite, got {look_azimuth!r}")
+    return v % 360.0
+
+
+def illumination_aspect_deg(orbit_state, lat=None, incidence_deg=None,
+                            look_azimuth=None):
     """Compass aspect (deg, 0=N 90=E 180=S 270=W) of the slopes that FACE the
     radar and therefore lay over — the look azimuth turned around. None if
     unknown, and the caller then does not dim anything (no reliable geometry).
 
     Descending is lit from the east and ascending from the west; with a latitude
-    that becomes ~101° / ~259° at 60°N rather than exactly 90° / 270°."""
-    look = look_azimuth_deg(orbit_state, lat, incidence_deg)
+    that becomes ~101° / ~259° at 60°N rather than exactly 90° / 270°.
+
+    `look_azimuth` (compass deg, sensor out across the ground) replaces the
+    Sentinel-1 model with a measured direction, and orbit_state / lat /
+    incidence_deg are then ignored — what NISAR passes."""
+    look = (_explicit_look(look_azimuth) if look_azimuth is not None
+            else look_azimuth_deg(orbit_state, lat, incidence_deg))
     return None if look is None else (look + 180.0) % 360.0
 
 
@@ -296,7 +321,7 @@ def _box_mean(a, k):
 def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
                   mode="amplitude", thr=None, high_percentile=75.0,
                   dim=0.25, slope_min_deg=12.0, aspect_tol_deg=55.0,
-                  dem_smooth=3, feather=5):
+                  dem_smooth=3, feather=5, look_azimuth=None):
     """Per-pixel opacity in [dim, 1] (float32): `dim` where a pixel is layover-
     facing AND steep AND high-valued, else 1.0.
 
@@ -304,6 +329,8 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
     aspect; if it is unknown the whole array is opaque (no dimming). `mode`:
       'amplitude' → high = value ≥ its `high_percentile` among valid pixels
       'change'    → high = |value| ≥ `thr` (the detector's significance cut)
+    `look_azimuth` overrides the Sentinel-1 orbit model with a measured look
+    direction (see illumination_aspect_deg).
     Returns (alpha, meta). meta reports the layover aspect and dimmed-pixel count.
     """
     value = np.asarray(value, dtype=np.float32)
@@ -311,7 +338,8 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
     alpha = np.ones(value.shape, dtype=np.float32)
 
     lay_aspect = illumination_aspect_deg(
-        orbit_state, _grid_lat(gt, value.shape[0], lat_hint))
+        orbit_state, _grid_lat(gt, value.shape[0], lat_hint),
+        look_azimuth=look_azimuth)
     if lay_aspect is None:
         return alpha, {"orbit_state": orbit_state, "layover_aspect": None,
                        "n_dimmed": 0, "note": "unknown orbit — not dimmed"}
@@ -368,7 +396,7 @@ def _shift(a, drow, dcol, fill):
 
 
 def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
-                 lat_hint=None, dem_smooth=3, max_steps=400):
+                 lat_hint=None, dem_smooth=3, max_steps=400, look_azimuth=None):
     """Boolean mask: True where terrain hides the pixel from the radar.
 
     What shadow does to a change map is NOT what you might expect, and this was
@@ -405,15 +433,18 @@ def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
 
     `dem` and `gt` must describe the same grid; `orbit_state` picks the look
     direction, and an unknown one masks nothing (no reliable geometry) rather
-    than guessing. Returns (mask, meta).
+    than guessing. `look_azimuth` (compass deg) replaces that Sentinel-1 model
+    with a measured look direction — NISAR's, read from its granule — and then
+    `incidence_deg` should be that radar's too. Returns (mask, meta).
 
     Known limit: only terrain INSIDE the DEM can cast a shadow, so a ridge just
     outside the AOI is not seen. Pure numpy, like the rest of this module.
     """
     dem = np.asarray(dem, dtype=np.float32)
     mask = np.zeros(dem.shape, dtype=bool)
-    az = range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
-                           incidence_deg)
+    az = (_explicit_look(look_azimuth) if look_azimuth is not None else
+          range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
+                            incidence_deg))
     finite = np.isfinite(dem)
     if az is None or not finite.any():
         return mask, {"orbit_state": str(orbit_state), "range_azimuth": az,
@@ -462,7 +493,7 @@ def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
 
 
 def radar_layover(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
-                  lat_hint=None, dem_smooth=3, max_steps=600):
+                  lat_hint=None, dem_smooth=3, max_steps=600, look_azimuth=None):
     """Boolean mask: True where the pixel is mixed with other ground by layover.
 
     Layover is the mirror of radar_shadow. A slope that faces the radar and
@@ -493,13 +524,14 @@ def radar_layover(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
     by both.
 
     Same conventions as radar_shadow: `dem` and `gt` share a grid, an unknown
-    orbit masks nothing, only terrain inside the DEM counts. Returns
-    (mask, meta).
+    orbit masks nothing, `look_azimuth` overrides the Sentinel-1 look model,
+    only terrain inside the DEM counts. Returns (mask, meta).
     """
     dem = np.asarray(dem, dtype=np.float32)
     mask = np.zeros(dem.shape, dtype=bool)
-    az = range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
-                           incidence_deg)
+    az = (_explicit_look(look_azimuth) if look_azimuth is not None else
+          range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
+                            incidence_deg))
     if az is None or not np.isfinite(dem).any():
         return mask, {"orbit_state": str(orbit_state), "range_azimuth": az,
                       "n_layover": 0, "n_steps": 0,

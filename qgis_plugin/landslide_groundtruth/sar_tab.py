@@ -55,7 +55,9 @@ number and L-band HH is not C-band VV. Their pixels are read remotely from the
 nisar_task.py) onto the same AOI grid the Planetary Computer render returns, so
 the detectors below take them unchanged. Quicklooks are ASF's static browse
 images. NISAR looks LEFT, so the layover fade and the merge's shadow/layover
-masks — Sentinel-1 right-looking geometry — are not applied to it. Every NISAR
+masks cannot use the Sentinel-1 right-looking orbit model: they use the look
+azimuth and incidence nisar_read measures from each granule's own radarGrid,
+and are skipped for a scene whose geometry could not be read. Every NISAR
 layer is named "NISAR …" and its detector settings are the C-band ones: one
 event (Iliamna) says they transfer, which is not a validation.
 """
@@ -224,6 +226,28 @@ def _tag(c):
     return "NISAR" if _sensor(c) == NISAR else "S1"
 
 
+# the keys nisar_read measures from a granule's radarGrid and the NISAR read
+# task hands back; copied onto the candidate / _cd_results entry they describe
+NISAR_GEOM_KEYS = ("look_azimuth_deg", "incidence_deg", "geometry_note")
+
+
+def _nisar_look(c):
+    """(look azimuth, incidence, why-not) for a NISAR scene, as nisar_read
+    measured them from the granule's own radarGrid at the AOI centre.
+
+    The azimuth is None, with the reason, when there is no measured geometry —
+    the scene has not been read yet, or its cube was missing or failed the
+    reader's cross-checks. The callers then SKIP the layover fade and terrain
+    masks rather than fall back to the Sentinel-1 orbit model: NISAR looks
+    LEFT, so that model would fade and mask the opposite slopes."""
+    c = c or {}
+    az, inc = c.get("look_azimuth_deg"), c.get("incidence_deg")
+    if az is None or inc is None:
+        return None, None, (c.get("geometry_note")
+                            or "its look geometry was not read from the granule")
+    return float(az), float(inc), None
+
+
 def _match_pol(want, pols):
     """`want` if the scene has it, else the same KIND (co-pol VV<->HH, cross-pol
     VH<->HV), else the scene's first. Sentinel-1 over Alaska is VV/VH and NISAR
@@ -362,7 +386,7 @@ class SarTab(QWidget):
             "named 'NISAR …' and the Fusion tab never picks them for you.\n\n"
             "Searching is free; previews and change maps read the pixels from "
             "NASA Earthdata (log in once in the Environment header's 'NASA "
-            "Earthdata Login' box). Expect 5–15 s per NISAR scene, in the "
+            "Earthdata Login' box). Expect 10–25 s per NISAR scene, in the "
             "background.")
         form.addRow("", self.nisar_check)
         root.addLayout(form)
@@ -682,9 +706,10 @@ class SarTab(QWidget):
             "2026-08-08: log-ratio peak 13.2 dB at 0.1 km from the seismic "
             "point, ~3x the scene background). Its 12-day repeat means fewer "
             "before-dates per track, so the 3-scene texture map often needs a "
-            "wider before window. The layover fade and the merge's terrain "
-            "masks are Sentinel-1 geometry and are not applied (NISAR looks "
-            "left). Layers are named 'NISAR change …'.\n\n"
+            "wider before window. NISAR looks LEFT, so the layover fade and "
+            "the merge's terrain masks use each granule's own look direction "
+            "and incidence (read from the file), not Sentinel-1's. Layers are "
+            "named 'NISAR change …'.\n\n"
             "Enabled when the last search returned NISAR scenes. Ticked rows of "
             "the other radar are ignored by the change map (they still preview).")
         form.addRow("Radar", self.cd_radar_combo)
@@ -887,7 +912,10 @@ class SarTab(QWidget):
             "25% opacity on BOTH the amplitude preview and the change maps, from "
             "slope aspect off a Copernicus GLO-30 DEM fetched over the AOI. Only "
             "high-value pixels are dimmed; flat ground and the well-imaged slopes "
-            "are untouched. The DEM downloads once per AOI the first time.")
+            "are untouched. The DEM downloads once per AOI the first time.\n\n"
+            "NISAR looks LEFT — an ascending NISAR pass is lit from the east, "
+            "like a descending Sentinel-1 one — so for NISAR scenes the side is "
+            "taken from the granule's own line of sight instead.")
         form.addRow(self.layover_check)
 
         self.speckle_cd_combo = QComboBox()
@@ -1893,7 +1921,7 @@ class SarTab(QWidget):
                 hi=self.db_max.value(), stretch=self.stretch_spin.value()))
         self._append_log(
             f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
-            f"the background — ~5–15 s each the first time over this AOI, "
+            f"the background — ~10–25 s each the first time over this AOI, "
             f"instant after that")
         task = NisarReadTask(batch, jobs, "NISAR L-band amplitude")
         task.logLine.connect(self._append_log)
@@ -1902,10 +1930,14 @@ class SarTab(QWidget):
         self._keep_task(task)
         QgsApplication.taskManager().addTask(task)
 
-    def _nisar_amp_done(self, batch, key, path, err):
+    def _nisar_amp_done(self, batch, key, path, err, geom=None):
         if batch != self._nisar_amp_batch:
             return                        # an abandoned Preview/Run still reporting
         label, cand = self._nisar_amp_jobs.pop(key, (key, {}))
+        if geom:
+            # a copy, so the layover fade sees this read's measured geometry
+            # without the search result itself changing underneath the table
+            cand = dict(cand, **{k: geom.get(k) for k in NISAR_GEOM_KEYS})
         if not self._nisar_amp_jobs:
             self._nisar_amp_task = None
         if path and self._amp_file_ready(path, label, cand):
@@ -2483,7 +2515,7 @@ class SarTab(QWidget):
             return
         self._append_log(
             f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
-            f"the background — ~5–15 s each the first time over this AOI")
+            f"the background — ~10–25 s each the first time over this AOI")
         task = NisarReadTask(batch, jobs, "NISAR L-band change detection")
         task.logLine.connect(self._append_log)
         task.jobDone.connect(self._nisar_cd_done)
@@ -2491,9 +2523,16 @@ class SarTab(QWidget):
         self._keep_task(task)
         QgsApplication.taskManager().addTask(task)
 
-    def _nisar_cd_done(self, batch, role, path, err):
+    def _nisar_cd_done(self, batch, role, path, err, geom=None):
         if batch != self._nisar_cd_batch:
             return                        # a search replaced this stack meanwhile
+        roles = (self._cd_meta or {}).get("roles") or {}
+        if path and geom and role in roles:
+            # onto this compute's own copy of the role, which is where
+            # _cd_compute reads the post scene's geometry for the fade and the
+            # _cd_results entry the merge's terrain masks use
+            roles[role] = dict(roles[role],
+                               **{k: geom.get(k) for k in NISAR_GEOM_KEYS})
         self._cd_role_done(role, path, err)
 
     def _cd_role_done(self, role, path, err):
@@ -2685,7 +2724,7 @@ class SarTab(QWidget):
                     faded = self._write_change_with_fade(
                         opath, out, gt, proj,
                         roles["post"].get("orbit_state"), SIG[mkey][1], mkey,
-                        radar=radar)
+                        radar=radar, geom=roles["post"])
                 except Exception as e:               # noqa: BLE001
                     self._warn(f"Could not write {label}: {e}")
                     continue
@@ -2728,6 +2767,10 @@ class SarTab(QWidget):
                     # the merge's radar-shadow mask (layover_dim.iw_incidence_deg);
                     # pre and post share a track, so either one's would do
                     footprint=roles["post"].get("geometry"),
+                    # NISAR only: the look direction and incidence measured
+                    # from the granule, which replace the footprint model
+                    # above (None for Sentinel-1, and for an unread NISAR cube)
+                    **{k: roles["post"].get(k) for k in NISAR_GEOM_KEYS},
                     out=out, gt=gt, proj=proj, shape=out.shape,
                     thr=float(SIG[mkey][1]), k=k, pol=pol, res=meta.get("res"),
                     radius=meta.get("radius"), pre_d=pre_d, post_d=post_d,
@@ -2982,24 +3025,33 @@ class SarTab(QWidget):
             return None
 
     def _write_change_with_fade(self, opath, out, gt, proj, orbit_state, thr, mkey,
-                                radar=S1):
+                                radar=S1, geom=None):
         """Write a change raster. If the layover fade is on and a DEM is available,
         bake the pseudocolor ramp into an RGBA raster whose alpha dims the layover-
         facing steep high-anomaly pixels (QGIS renders RGBA alpha reliably, unlike a
         single-band renderer's alpha band). Returns True if an RGBA raster was
-        written — the caller then does NOT apply the pseudocolor renderer."""
+        written — the caller then does NOT apply the pseudocolor renderer.
+
+        For NISAR the side comes from `geom` (the post scene, carrying what
+        nisar_read measured — see _nisar_look); without it the fade is skipped."""
         import numpy as np
-        if self.layover_check.isChecked() and radar == NISAR:
-            self._append_log("  layover fade: not applied to NISAR — it looks LEFT, "
-                             "and the fade models Sentinel-1's right-looking geometry")
-        elif self.layover_check.isChecked():
+        fade, look_az = self.layover_check.isChecked(), None
+        if fade and radar == NISAR:
+            look_az, _inc, why = _nisar_look(geom)
+            if look_az is None:
+                fade = False
+                self._append_log(
+                    f"  layover fade: not applied to this NISAR scene — {why}. "
+                    "NISAR looks LEFT, so Sentinel-1's orbit model would fade "
+                    "the opposite slopes")
+        if fade:
             dem = self._aoi_dem(gt, out.shape)
             if dem is not None:
                 try:
                     a, meta = layover_dim.layover_alpha(
                         out, np.isfinite(out), dem, gt, orbit_state,
                         lat_hint=gt[3] + gt[5] * out.shape[0] / 2.0,
-                        mode="change", thr=thr, dim=0.25)
+                        mode="change", thr=thr, dim=0.25, look_azimuth=look_az)
                     if meta["n_dimmed"]:
                         lo, hi, stops = CD_RAMP.get(mkey, CD_RAMP["mtcorr"])
                         rgba = sar_change.colorize(out, lo, hi, stops)
@@ -3018,13 +3070,19 @@ class SarTab(QWidget):
     def _apply_layover_amplitude(self, path, cand):
         """In place, rewrite a grayscale amplitude GeoTIFF as RGBA whose alpha dims
         the layover-facing steep bright pixels (QGIS honors the alpha band). No-op
-        unless the fade is on and a DEM is available."""
+        unless the fade is on and a DEM is available. A NISAR scene uses the look
+        direction its read measured (see _nisar_look), or is left unfaded."""
         if not self.layover_check.isChecked():
             return
+        look_az = None
         if _sensor(cand) == NISAR:
-            self._append_log("  layover fade: not applied to NISAR — it looks LEFT, "
-                             "and the fade models Sentinel-1's right-looking geometry")
-            return
+            look_az, _inc, why = _nisar_look(cand)
+            if look_az is None:
+                self._append_log(
+                    f"  layover fade: not applied to this NISAR scene — {why}. "
+                    "NISAR looks LEFT, so Sentinel-1's orbit model would fade "
+                    "the opposite slopes")
+                return
         import numpy as np
         try:
             gray, gt, proj = sar_change.read_raster(path)
@@ -3035,7 +3093,8 @@ class SarTab(QWidget):
             a, meta = layover_dim.layover_alpha(
                 gray, valid, dem, gt, cand.get("orbit_state"),
                 lat_hint=gt[3] + gt[5] * gray.shape[0] / 2.0,
-                mode="amplitude", high_percentile=75.0, dim=0.25)
+                mode="amplitude", high_percentile=75.0, dim=0.25,
+                look_azimuth=look_az)
             if not meta["n_dimmed"]:
                 return
             gray_u8 = np.clip(np.nan_to_num(gray, nan=0.0), 0, 255).astype("uint8")
@@ -3072,14 +3131,24 @@ class SarTab(QWidget):
 
         ~2-3 s per pass at a 17 km AOI, computed twice per Merge (once per
         geometry) and cached. Never fatal: a failure costs the confidence
-        correction, not the merge."""
+        correction, not the merge.
+
+        NISAR maps carry the look azimuth and incidence nisar_read measured
+        from each granule (see _nisar_look), which replace the Sentinel-1
+        orbit and footprint model; if any of the merged passes lacks them the
+        whole merge runs unmasked, as one blind-but-unmasked pass would skew
+        the confidence labels anyway."""
         r0 = results[0]
-        if r0.get("radar") == NISAR:
-            self._append_log(
-                "  shadow + layover masks: not applied to NISAR — they model "
-                "Sentinel-1's right-looking orbit, and NISAR looks left; its "
-                "merge runs unmasked")
-            return None
+        nisar = r0.get("radar") == NISAR
+        if nisar:
+            why = next((_nisar_look(r)[2] for r in results
+                        if _nisar_look(r)[0] is None), None)
+            if why:
+                self._append_log(
+                    f"  shadow + layover masks: not applied to NISAR — {why}. "
+                    "NISAR looks LEFT, so Sentinel-1's orbit model would mask "
+                    "the opposite slopes; this merge runs unmasked")
+                return None
         gt, shape = r0["gt"], r0["shape"]
         try:
             dem = self._aoi_dem(gt, shape)
@@ -3097,16 +3166,26 @@ class SarTab(QWidget):
         lon_c = gt[0] + gt[1] * shape[1] / 2.0
         masks = []
         for r in results:
-            # The incidence comes from THIS scene's footprint: where the AOI sits
-            # across the swath swings the shadow cut from 61 deg slopes (near
-            # range) to 44 deg (far range). The 39 deg constant is only for a
-            # result recorded before footprints were kept, or an odd footprint.
-            inc = layover_dim.iw_incidence_deg(
-                r.get("footprint"), lon_c, lat_c, r["direction"])
-            source = "from the scene footprint"
-            if inc is None:
-                inc, source = layover_dim.IW_INCIDENCE_DEG, "mid-swath default"
+            if nisar:
+                # measured at the AOI centre from the granule's radarGrid
+                az, inc, _why = _nisar_look(r)
+                source = "from the granule's radar grid"
+            else:
+                # The incidence comes from THIS scene's footprint: where the AOI
+                # sits across the swath swings the shadow cut from 61 deg slopes
+                # (near range) to 44 deg (far range). The 39 deg constant is only
+                # for a result recorded before footprints were kept, or an odd
+                # footprint.
+                az = None
+                inc = layover_dim.iw_incidence_deg(
+                    r.get("footprint"), lon_c, lat_c, r["direction"])
+                source = "from the scene footprint"
+                if inc is None:
+                    inc, source = layover_dim.IW_INCIDENCE_DEG, "mid-swath default"
+            # the look azimuth is in the key: a NISAR and a Sentinel-1 pass can
+            # share a direction and an incidence while looking opposite ways
             key = (r["direction"], round(inc, 1),
+                   None if az is None else round(az, 1),
                    tuple(round(float(v), 6) for v in gt), shape)
             if key not in cache:
                 # a few seconds per pass on the GUI thread: say so, at least
@@ -3114,10 +3193,10 @@ class SarTab(QWidget):
                 try:
                     sh, smeta = layover_dim.radar_shadow(
                         dem, gt, r["direction"], incidence_deg=inc,
-                        lat_hint=lat_c)
+                        lat_hint=lat_c, look_azimuth=az)
                     lo, lmeta = layover_dim.radar_layover(
                         dem, gt, r["direction"], incidence_deg=inc,
-                        lat_hint=lat_c)
+                        lat_hint=lat_c, look_azimuth=az)
                 except Exception as e:           # noqa: BLE001
                     self._append_log(
                         f"  terrain masks skipped: {type(e).__name__}: {e}")

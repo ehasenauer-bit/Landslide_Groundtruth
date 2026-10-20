@@ -17,6 +17,10 @@ What it protects:
   * the AOI grid is exactly the Planetary Computer render's, so a NISAR scene
     and a Sentinel-1 scene of one AOI line up pixel for pixel;
   * the product's own subswath mask (0 and 255) becomes NaN, not dark ground;
+  * the look geometry for the layover fade / terrain masks comes from the
+    granule's radarGrid cube: LOS read as local east/north (NOT the 3413 grid's
+    axes, ~108 deg apart here), bilinear at the AOI centre on the 2 km layer,
+    refused when it contradicts lookDirection, and cached with the window;
   * the display stretch matches the Sentinel-1 one, with 0 kept for nodata;
   * the raw-float output is what sar_change.read_band expects.
 """
@@ -78,13 +82,32 @@ MASK = np.ones((N, N), np.uint8)
 MASK[:, :200] = 0                       # 2 km wide: reaches into the rotated AOI
 MASK[:20, :] = 255
 
+# The radarGrid look-geometry cube, shaped like the real one (heights x y x x on
+# the granule's EPSG grid, 500 m spacing, y decreasing). Its nodes are offset
+# from the AOI centre (170 m east, 120 m south of a node), so only a true
+# bilinear read lands on the field's centre value. The LOS is ENU, target ->
+# sensor, for the Iliamna track-150 geometry measured 2026-10-19: looks 241.4
+# deg (WSW), along-track 331.4 deg, i.e. LEFT-looking on an ascending pass.
+LOOK, ALONG = 241.4, 331.4
+RG_X = CX - 3000.0 + 170.0 + np.arange(13) * 500.0
+RG_Y = CY + 3000.0 - 120.0 - np.arange(13) * 500.0
+RG_H = np.array([-1000.0, 0.0, 2000.0, 4000.0, 9000.0])
+_hh, _yy, _xx = np.meshgrid(RG_H, RG_Y, RG_X, indexing="ij")
+# incidence varies across the cube in x, y AND height: at the AOI centre on
+# the 2 km layer it is 45 + 0.5 x 2 = 46.0 exactly; a nearest-node read is 0.2
+# deg off, the 0 m layer 1.0 deg, and an average over every layer 0.4 deg
+RG_INC = (45.0 + 0.002 * (_xx - CX) + 0.001 * (_yy - CY)
+          + 0.5 * _hh / 1000.0).astype(np.float32)
+WANT_INC = 46.0
 
-def build(path):
+
+def build(path, radar_grid=True, look_dir="Left", los_sign=1.0):
     with gdal.ExceptionMgr(useExceptions=True):
         ds = gdal.GetDriverByName("netCDF").CreateMultiDimensional(path)
         science = ds.GetRootGroup().CreateGroup("science")
         lsar = science.CreateGroup("LSAR")
-        g = lsar.CreateGroup("GCOV").CreateGroup("grids").CreateGroup("frequencyA")
+        gcov = lsar.CreateGroup("GCOV")
+        g = gcov.CreateGroup("grids").CreateGroup("frequencyA")
         dy = g.CreateDimension("yCoordinates", None, None, N)
         dx = g.CreateDimension("xCoordinates", None, None, N)
         f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
@@ -102,9 +125,31 @@ def build(path):
         ident = lsar.CreateGroup("identification")
         sd = gdal.ExtendedDataType.CreateString()
         try:
-            ident.CreateMDArray("lookDirection", [], sd).Write(["Left"])
+            ident.CreateMDArray("lookDirection", [], sd).Write([look_dir])
         except Exception:                    # noqa: BLE001 — metadata is a bonus
             pass
+        if not radar_grid:
+            return
+        rg = gcov.CreateGroup("metadata").CreateGroup("radarGrid")
+        dh = rg.CreateDimension("heightAboveEllipsoid", None, None, RG_H.size)
+        ry = rg.CreateDimension("yCoordinates", None, None, RG_Y.size)
+        rx = rg.CreateDimension("xCoordinates", None, None, RG_X.size)
+        rg.CreateMDArray("xCoordinates", [rx], f64).Write(RG_X)
+        rg.CreateMDArray("yCoordinates", [ry], f64).Write(RG_Y)
+        rg.CreateMDArray("heightAboveEllipsoid", [dh], f64).Write(RG_H)
+        s_inc = np.sin(np.radians(RG_INC))
+        a = np.radians(LOOK)
+        cube = {"incidenceAngle": RG_INC,
+                # target -> sensor: the horizontal part points BACK along the look
+                "losUnitVectorX": los_sign * -np.sin(a) * s_inc,
+                "losUnitVectorY": los_sign * -np.cos(a) * s_inc,
+                "alongTrackUnitVectorX": np.full(RG_INC.shape, np.sin(np.radians(ALONG))),
+                "alongTrackUnitVectorY": np.full(RG_INC.shape, np.cos(np.radians(ALONG)))}
+        for name, v in cube.items():
+            rg.CreateMDArray(name, [dh, ry, rx], f32).Write(v.astype(np.float32))
+        rp = rg.CreateMDArray("projection", [], i32)
+        rp.Write(np.array(3413, dtype=np.int32))
+        rp.CreateAttribute("epsg_code", [], i32).Write(3413)
 
 
 SRC = os.path.join(TMP, "synthetic_gcov.nc")
@@ -179,13 +224,82 @@ hole = at_grid(510, 510)
 check("a NaN in the product stays NaN", hole is None or np.isnan(hole))
 check("valid fraction reported below 1", i2["valid_frac"] < 1.0)
 
+print("\n=== the look geometry comes from the granule's own radarGrid ===")
+# NISAR looks LEFT, so the SAR tab's Sentinel-1 orbit model would put layover on
+# the opposite slopes; the fade and the merge masks use these numbers instead.
+check("look direction 'Left' read from identification", info["look"] == "Left")
+az = info["look_azimuth_deg"]
+check(f"look azimuth {az}: the LOS read as local EAST/NORTH, turned around "
+      f"(want {LOOK})", az is not None and abs(az - LOOK) < 0.05)
+# the trap: the cube sits on the EPSG:3413 grid, which at 153 W is rotated
+# ~108 deg from north — reading the LOS as grid components would put the look
+# here instead, and the layover on slopes facing the wrong way entirely
+s3413, s4326 = osr.SpatialReference(), osr.SpatialReference()
+s3413.ImportFromEPSG(3413)
+s4326.ImportFromEPSG(4326)
+for s_ in (s3413, s4326):
+    s_.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+_ct = osr.CoordinateTransformation(s3413, s4326)
+_e = -math.sin(math.radians(LOOK + 180.0)) * 1000.0
+_n = -math.cos(math.radians(LOOK + 180.0)) * 1000.0
+_l0, _p0, _ = _ct.TransformPoint(CX, CY)
+_l1, _p1, _ = _ct.TransformPoint(CX + _e, CY + _n)
+grid_reading = math.degrees(math.atan2(
+    (_l1 - _l0) * math.cos(math.radians(_p0)), _p1 - _p0)) % 360.0
+check(f"  and NOT as grid components ({grid_reading:.0f} deg: 3413 is rotated "
+      f"~108 deg here)", az is not None and abs((az - grid_reading + 180) % 360 - 180) > 90)
+inc = info["incidence_deg"]
+check(f"incidence {inc}: bilinear at the AOI centre, on the 2 km layer only "
+      f"(want {WANT_INC})", inc is not None and abs(inc - WANT_INC) < 0.01)
+check("the note says where it came from and which way it looks",
+      "radarGrid" in (info["geometry_note"] or "")
+      and "Left-looking" in (info["geometry_note"] or ""))
+with gdal.ExceptionMgr(useExceptions=True):
+    _ds = gdal.OpenEx(SRC, gdal.OF_MULTIDIM_RASTER, allowed_drivers=["HDF5"])
+    _root = _ds.GetRootGroup()
+    with nr._HDF5_LOCK:
+        far = nr.look_geometry(_root, (10.0, 10.0, 10.1, 10.1), "Left", 3413)
+    del _root, _ds
+check("an AOI centre off the cube -> no geometry, said so",
+      far[0] is None and "outside" in far[2])
+
+NOGEOM = os.path.join(TMP, "synthetic_gcov_no_radargrid.nc")
+build(NOGEOM, radar_grid=False)
+o5, _g5, _w5, i5 = nr.read_aoi(NOGEOM, "hh", bbox, px)
+check("a granule without a radarGrid: no geometry, the reason given",
+      i5["look_azimuth_deg"] is None and i5["incidence_deg"] is None
+      and "radarGrid" in (i5["geometry_note"] or ""))
+check("  and the pixels still read (geometry never fails the read)",
+      o5.shape == (px, px) and np.isfinite(o5).any())
+
+FLIP = os.path.join(TMP, "synthetic_gcov_flipped_los.nc")
+build(FLIP, los_sign=-1.0)                # LOS stored sensor -> target
+i6 = nr.read_aoi(FLIP, "hh", bbox, px)[3]
+check("an LOS that contradicts lookDirection (sensor->target convention) is "
+      f"refused, not trusted: {i6['geometry_note']}",
+      i6["look_azimuth_deg"] is None and "Right" in (i6["geometry_note"] or ""))
+
 print("\n=== cache: one remote read per granule/pol/AOI ===")
 cache = os.path.join(TMP, "cache")
 logs = []
 a1, *_ = nr.read_aoi(SRC, "hh", bbox, 120, cache_dir=cache, log=logs.append)
-a2, *_ = nr.read_aoi(SRC, "hh", bbox, 120, cache_dir=cache, log=logs.append)
+a2, _g2, _w2, ic = nr.read_aoi(SRC, "hh", bbox, 120, cache_dir=cache, log=logs.append)
 check("second read comes from the cache", any("cached window" in m for m in logs))
 check("  and is the same pixels", np.allclose(a1, a2, equal_nan=True))
+check("  and carries the same look geometry, exactly",
+      ic["look_azimuth_deg"] == info["look_azimuth_deg"]
+      and ic["incidence_deg"] == info["incidence_deg"]
+      and ic["geometry_note"] == info["geometry_note"])
+# the key the cache used before the look geometry existed: a window stored
+# under it has no geometry metadata, and finding it would answer "no geometry"
+# for that scene forever, so the new key must never collide with it
+import hashlib  # noqa: E402
+_legacy = "|".join([os.path.basename(SRC), "hh", ",".join(f"{v:.5f}" for v in bbox),
+                    str(nr.MAX_SIDE)])
+_legacy = os.path.join(cache, hashlib.sha1(_legacy.encode()).hexdigest()[:20] + ".tif")
+check("  under a new key: a window cached before the geometry existed is "
+      "re-read, not trusted to have none",
+      nr._cache_path(cache, SRC, "hh", bbox, nr.MAX_SIDE) != _legacy)
 a3, *_ = nr.read_aoi(SRC, "hh", bbox, 60, cache_dir=cache, log=logs.append)
 check("  a new Pixel size reuses the cached window too",
       a3.shape == (60, 60) and sum("cached window" in m for m in logs) == 2)
