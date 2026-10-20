@@ -37,8 +37,10 @@ imports, so it unit-tests against a synthetic GCOV-shaped file.
 """
 import hashlib
 import os
+import re
 import tempfile
 import threading
+import time
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -146,15 +148,164 @@ def configure_auth(url, cookie_jar=None):
     return how
 
 
-def _auth_hint(err):
-    """An Earthdata rejection reads as a bare HDF5 open failure; say what it is."""
-    s = str(err)
-    if any(t in s for t in ("401", "403", "Unauthorized", "Forbidden", EDL_HOST)):
-        return (f"{s} — Earthdata Login refused the read. Log in again in the "
-                "'NASA Earthdata Login' box (Environment header), and make sure "
-                "your Earthdata profile has approved the 'Alaska Satellite "
-                "Facility Data Access' application.")
-    return s
+_LOGIN_FIX = ("Log in again in the 'NASA Earthdata Login' box (Environment header), "
+              "and check that your Earthdata profile has approved the 'Alaska "
+              "Satellite Facility Data Access' application.")
+RETRY_PAUSE_S = 3.0
+_STATUS_RE = re.compile(r"CURL_INFO_HEADER_IN: HTTP/[\d.]+ (\d{3})[ \t]*([^\r\n]*)")
+# the host a request went to: its own Host: header (only that token is read —
+# never the Authorization/Cookie lines in the same message), or curl's
+# connection notes when a trace has no request headers
+_HOST_OUT_RE = re.compile(r"(?im)^host:[ \t]*([\w.-]+)")
+_HOST_TXT_RE = re.compile(r"(?:Established connection to|Connected to|"
+                          r"Re-?using existing \w+: connection with host) ([\w.-]+)")
+_CTYPE_RE = re.compile(r"(?i)CURL_INFO_HEADER_IN: content-type:[ \t]*([^;\s]+)")
+_LOOP_RE = re.compile(r"(?i)maximum \(\d+\) redirects followed")
+_NET_ERR_RE = re.compile(r"(?i)(could not resolve host[^.\n]*|connection timed out|"
+                         r"operation timed out[^\n]{0,60}|connection refused|"
+                         r"ssl[^\n]{0,40}error[^\n]{0,60})")
+
+
+def explain_http(messages, head=None):
+    """Plain-language reason a remote GCOV open failed, from GDAL's curl trace.
+
+    GDAL's own error for ANY failed /vsicurl open is "does not exist in the file
+    system, and is not recognized as a supported dataset name" — an Earthdata
+    refusal, an ASF outage, a login web page served with HTTP 200 and a missing
+    file all read the same. `messages` are the CPLDebug lines of one traced
+    attempt (CPL_CURL_VERBOSE); `head` the first bytes it got back. Only status
+    codes, host names and content types are read: the credential and cookie
+    lines in the same messages are never looked at, let alone returned.
+
+    Returns (reason, retry_worth_it). One detour is normal and not a failure:
+    ASF answers GDAL's anonymous size probe with a HEAD-only CloudFront link,
+    GDAL tries it for the first range read, gets 403, and goes back to ASF."""
+    chain, host, ctype, net, loop = [], None, None, None, False
+    for m in messages:
+        if m.startswith("CURL_INFO_HEADER_OUT"):
+            h = _HOST_OUT_RE.search(m)
+            if h:
+                host = h.group(1)
+            continue                              # request lines: nothing else read
+        h = _HOST_TXT_RE.search(m)
+        if h:
+            host = h.group(1)
+        st = _STATUS_RE.search(m)
+        if st:
+            chain.append((host or "?", int(st.group(1)), st.group(2).strip()))
+        ct = _CTYPE_RE.search(m)
+        if ct:
+            ctype = ct.group(1).lower()
+        loop = loop or bool(_LOOP_RE.search(m))
+        ne = _NET_ERR_RE.search(m)
+        if ne and net is None:
+            net = ne.group(1).strip()
+    short = [(h.split(".")[0] if h.endswith("cloudfront.net") else h, c)
+             for h, c, _r in chain]
+    path = " → ".join(f"{h} {c}" for h, c in short[-6:])
+    trail = f" (ASF said: {path})" if path else ""
+    head = bytes(head or b"")
+    if head.startswith(b"\x89HDF"):
+        return "the file reads fine now — ASF was briefly unavailable" + trail, True
+    codes = [c for _h, c, _r in chain]
+    final = codes[-1] if codes else None
+    if any(c >= 500 for c in codes):
+        h, c, r = next(x for x in chain if x[1] >= 500)
+        return (f"ASF's server is failing (HTTP {c}{' ' + r if r else ''} from {h}) "
+                f"— nothing is wrong on your side; try again in a few minutes"
+                + trail), True
+    if final == 404:
+        return ("ASF has no file at that address (HTTP 404) — the search listed a "
+                "granule that is not published (yet); pick another scene" + trail), False
+    if 401 in codes:
+        return ("Earthdata Login refused the credentials (HTTP 401). " + _LOGIN_FIX
+                + trail), False
+    if loop or sum(1 for c in codes if 300 <= c < 400) >= 10:
+        return ("Earthdata Login kept redirecting without letting the read through — "
+                "the login is not being accepted. " + _LOGIN_FIX + trail), False
+    if ctype == "text/html" or head.lstrip()[:1] == b"<":
+        return ("a web page came back instead of the file — Earthdata's sign-in "
+                "page, so the login was not accepted. " + _LOGIN_FIX + trail), False
+    real403 = [x for i, x in enumerate(chain) if x[1] == 403
+               and not ("cloudfront" in x[0] and i + 1 < len(chain))]
+    if real403:
+        return ("access refused (HTTP 403). " + _LOGIN_FIX + " If it persists, "
+                "delete landslide_edl_cookies.txt in the temp folder to drop a "
+                "stale session." + trail), False
+    if net:
+        return f"could not reach ASF: {net} — check the network connection" + trail, True
+    if not chain:
+        return "no answer from ASF at all — check the network connection", True
+    return "the read failed" + trail, True
+
+
+def _traced_probe(vsi_path):
+    """Read the first bytes of a remote granule with curl tracing on, for THIS
+    thread only, and return (messages, head). Thread-local config options and a
+    thread-local error handler, so a trace never leaks into QGIS's own logging
+    or into another task's reads."""
+    from osgeo import gdal
+    msgs, head = [], None
+    gdal.VSICurlPartialClearCache(vsi_path)
+    gdal.SetThreadLocalConfigOption("CPL_DEBUG", "ON")
+    gdal.SetThreadLocalConfigOption("CPL_CURL_VERBOSE", "YES")
+    gdal.PushErrorHandler(lambda _cls, _no, msg: msgs.append(str(msg)))
+    try:
+        f = gdal.VSIFOpenL(vsi_path, "rb")
+        if f is not None:
+            try:
+                head = gdal.VSIFReadL(1, 8, f)
+            finally:
+                gdal.VSIFCloseL(f)
+    except Exception as e:                       # noqa: BLE001 — diagnosis only
+        msgs.append(str(e))
+    finally:
+        gdal.PopErrorHandler()
+        gdal.SetThreadLocalConfigOption("CPL_DEBUG", None)
+        gdal.SetThreadLocalConfigOption("CPL_CURL_VERBOSE", None)
+    return msgs, head
+
+
+def _open_granule(url):
+    """gdal.OpenEx on a GCOV granule, once more after a pause if it fails, and
+    with a real reason attached if it still does.
+
+    GDAL caches what it learned about a /vsicurl file for the life of the
+    process, so each retry first clears that file's entry; the second attempt
+    also starts a fresh Earthdata cookie jar, in case a stale session is what
+    is being refused. Caller holds _HDF5_LOCK and gdal.ExceptionMgr."""
+    from osgeo import gdal
+    path = _vsi(url)
+
+    def attempt():
+        return gdal.OpenEx(path, gdal.OF_MULTIDIM_RASTER, allowed_drivers=["HDF5"])
+
+    try:
+        return attempt()
+    except RuntimeError:
+        if "://" not in url:
+            raise                                # a local file: nothing to retry
+    gdal.VSICurlPartialClearCache(path)
+    jar = gdal.GetPathSpecificOption(path, "GDAL_HTTP_COOKIEJAR")
+    if jar and os.path.exists(jar):
+        try:
+            os.remove(jar)
+        except OSError:
+            pass
+    time.sleep(RETRY_PAUSE_S)
+    try:
+        return attempt()
+    except RuntimeError:
+        pass
+    reason, worth = explain_http(*_traced_probe(path))
+    if worth and reason.startswith("the file reads fine now"):
+        gdal.VSICurlPartialClearCache(path)
+        try:
+            return attempt()
+        except RuntimeError:
+            reason = "the file answers, but GDAL still cannot open it as HDF5"
+    raise RuntimeError(f"could not open {os.path.basename(urlsplit(url).path)}: "
+                       f"{reason}")
 
 
 # ---------------------------------------------------------------- geometry
@@ -374,11 +525,7 @@ def read_native(url, pol, bbox, max_side=MAX_SIDE):
     from osgeo import gdal
     term = covariance_term(pol)
     with _HDF5_LOCK, gdal.ExceptionMgr(useExceptions=True):
-        try:
-            ds = gdal.OpenEx(_vsi(url), gdal.OF_MULTIDIM_RASTER,
-                             allowed_drivers=["HDF5"])
-        except RuntimeError as e:
-            raise RuntimeError(_auth_hint(e)) from None
+        ds = _open_granule(url)
         root = ds.GetRootGroup()
         grp = root.OpenGroupFromFullname(GRID)
         if grp is None:

@@ -356,6 +356,104 @@ try:
 except LookupError as e:
     check("an AOI off the grid raises", "does not reach" in str(e))
 
+print("\n=== a failed remote open says WHY, not 'does not exist' ===")
+# GDAL words every failed /vsicurl open the same way. Seen 2026-10-19 on four
+# Seaward granules that read fine minutes later: the analyst could not tell an
+# ASF outage from a refused login from a missing file. Synthetic curl traces,
+# shaped like real CPL_CURL_VERBOSE output (checked against live ones).
+SECRET = "Basic dGVzdC11c2VyOm5vdC1hLXBhc3N3b3Jk"   # test-user:not-a-password
+COOKIE = "asf-urs=FAKE-SESSION-COOKIE-VALUE"
+
+
+def req(host, method="GET"):
+    return (f"CURL_INFO_HEADER_OUT: {method} /NISAR/x.h5 HTTP/1.1\r\nHost: {host}\r\n"
+            f"Authorization: {SECRET}\r\nCookie: {COOKIE}\r\n")
+
+
+def resp(code, reason, ctype=None):
+    m = [f"CURL_INFO_HEADER_IN: HTTP/1.1 {code} {reason}\r\n"]
+    if ctype:
+        m.append(f"CURL_INFO_HEADER_IN: Content-Type: {ctype}\r\n")
+    m.append(f"CURL_INFO_HEADER_IN: Set-Cookie: {COOKIE}; Path=/\r\n")
+    return m
+
+
+ASF, CF, URS = ("nisar.asf.earthdatacloud.nasa.gov", "d1mv8zhcvry6x4.cloudfront.net",
+                "urs.earthdata.nasa.gov")
+cases = {
+    "ASF outage (503)": ([req(ASF, "HEAD")] + resp(503, "Service Unavailable"), b"",
+                         "server is failing", True),
+    "login refused (401)": ([req(ASF), *resp(302, "Found"), req(URS),
+                             *resp(401, "Unauthorized")], b"", "refused the credentials", False),
+    "sign-in page served with 200": ([req(ASF), *resp(302, "Found"), req(URS),
+                                      *resp(200, "OK", "text/html; charset=utf-8")],
+                                     b"<!DOCTYPE", "web page came back", False),
+    "missing file, even with an HTML 404 body": ([req(ASF), *resp(404, "Not Found", "text/html")],
+                                                 b"<html>", "no file at that address", False),
+    "redirect loop": ([m for _ in range(6) for m in [req(ASF), *resp(302, "Found"),
+                                                     req(URS), *resp(302, "Found")]],
+                      b"", "kept redirecting", False),
+    "DNS failure": (["CURL_INFO_TEXT: Could not resolve host: nisar.asf.earthdatacloud.nasa.gov"],
+                    b"", "could not reach ASF", True),
+    "no answer at all": ([], None, "no answer from ASF", True),
+    "the normal HEAD-link detour, file fine now": (
+        [req(ASF, "HEAD"), *resp(303, "See Other"), req(CF, "HEAD"), *resp(200, "OK"),
+         req(CF), *resp(403, "Forbidden"), req(ASF), *resp(303, "See Other"), req(CF),
+         *resp(206, "Partial Content")], b"\x89HDF\r\n\x1a\n", "reads fine now", True),
+}
+for name, (msgs, head, want, worth) in cases.items():
+    reason, w = nr.explain_http(msgs, head)
+    check(f"{name} -> '{want}'" + ("" if want in reason else f" (got: {reason[:80]})"),
+          want in reason and w == worth)
+    check(f"  and no credential or cookie leaks into the message",
+          SECRET not in reason and "FAKE-SESSION" not in reason and "Basic" not in reason)
+reason, _w = nr.explain_http(cases["login refused (401)"][0])
+check("the hosts are named, so the analyst sees WHO refused",
+      ASF in reason and URS in reason)
+
+print("\n=== a failed open is retried once, after clearing GDAL's cache ===")
+import osgeo.gdal as _g  # noqa: E402
+real_open, calls = _g.OpenEx, []
+
+
+def flaky(path, *a, **k):
+    calls.append(path)
+    if len(calls) == 1:
+        raise RuntimeError("`" + path + "' does not exist in the file system")
+    return real_open(SRC, *a, **k)
+
+
+nr.RETRY_PAUSE_S = 0.0
+_g.OpenEx = flaky
+try:
+    with _g.ExceptionMgr(useExceptions=True):
+        ds = nr._open_granule("https://nisar.example.test/NISAR/x.h5")
+    check("a one-off failure is absorbed by the retry", ds is not None and len(calls) == 2)
+    ds = None
+    calls.clear()
+    _g.OpenEx = lambda path, *a, **k: (_ for _ in ()).throw(RuntimeError("nope"))
+    real_probe = nr._traced_probe
+    nr._traced_probe = lambda path: (cases["ASF outage (503)"][0], b"")
+    try:
+        with _g.ExceptionMgr(useExceptions=True):
+            nr._open_granule("https://nisar.example.test/NISAR/x.h5")
+        check("a lasting failure raises", False)
+    except RuntimeError as e:
+        check("a lasting failure raises with the diagnosis, naming the file",
+              "x.h5" in str(e) and "server is failing" in str(e))
+    finally:
+        nr._traced_probe = real_probe
+    _g.OpenEx = flaky
+    calls.clear()
+    try:
+        with _g.ExceptionMgr(useExceptions=True):
+            nr._open_granule("/no/such/local/file.h5")
+    except RuntimeError:
+        pass
+    check("a LOCAL file is not retried (no network to wait for)", len(calls) == 1)
+finally:
+    _g.OpenEx = real_open
+
 print("\n=== outputs ===")
 fpath = os.path.join(TMP, "float.tif")
 nr.write_float(fpath, out, ogt, wkt)
