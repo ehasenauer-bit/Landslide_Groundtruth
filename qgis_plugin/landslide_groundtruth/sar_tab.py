@@ -710,8 +710,11 @@ class SarTab(QWidget):
             "the merge's terrain masks use each granule's own look direction "
             "and incidence (read from the file), not Sentinel-1's. Layers are "
             "named 'NISAR change …'.\n\n"
-            "Enabled when the last search returned NISAR scenes. Ticked rows of "
-            "the other radar are ignored by the change map (they still preview).")
+            "Your ticks decide first: tick after-scenes of ONE radar and that "
+            "radar is used (this box switches to match). This box only breaks "
+            "the tie when both radars' after-scenes are ticked — as the default "
+            "★ pairs are — or none are. Enabled when the last search returned "
+            "NISAR scenes.")
         form.addRow("Radar", self.cd_radar_combo)
 
         # one checkbox per detector — tick which change maps to compute. Each
@@ -2153,10 +2156,20 @@ class SarTab(QWidget):
         the rest are skipped with a note naming a lower-requirement product.
         Returns None only if NONE of the ticked products can run.
 
-        Only the Radar combo's sensor is considered — every list below, ticks
-        included, is that radar's alone (see _cd_radar)."""
+        Only one radar's scenes are considered — every list below, ticks
+        included, is that radar's alone (see _cd_radar for which)."""
         result = self._search_result or {}
         radar = self._cd_radar()
+        if (self.cd_radar_combo.isEnabled()
+                and radar != self.cd_radar_combo.currentData()):
+            # the ticks chose the other radar: say so, and let the box show it
+            self._append_log(
+                f"note: using {radar} — every ticked after-scene is {radar} "
+                f"(the Radar box said {self.cd_radar_combo.currentData()}; "
+                f"switched to match)")
+            i = self.cd_radar_combo.findData(radar)
+            if i >= 0:
+                self.cd_radar_combo.setCurrentIndex(i)
         pre_all = [c for c in result.get("pre", []) if _sensor(c) == radar]
         post_all = [c for c in result.get("post", []) if _sensor(c) == radar]
         ticked_pre, ticked_post, other = [], [], 0
@@ -2359,10 +2372,27 @@ class SarTab(QWidget):
         return out
 
     def _cd_radar(self):
-        """The radar Compute change map runs on: the Radar combo's choice once a
-        search has offered NISAR, Sentinel-1 otherwise."""
+        """The radar Compute change map runs on.
+
+        Ticks first, as for every other pick in this panel: when the ticked
+        AFTER-scenes are all one radar, that radar. Measured trap (Seaward,
+        2026-10-19): with the Radar box left on NISAR, unticking every NISAR row
+        still ran NISAR, and its reads failing read as 'change detection is
+        broken' when Sentinel-1 was right there and ticked. The Radar box only
+        breaks the tie — both radars' after-scenes ticked (the default ★ pairs)
+        or none — and is Sentinel-1 until a search has offered NISAR."""
         if not self.cd_radar_combo.isEnabled():
             return S1
+        posts = set()
+        for r in range(self.table.rowCount()):
+            head = self.table.item(r, 0)
+            if head is None or head.checkState() != Qt.Checked:
+                continue
+            side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+            if c and side == "post":
+                posts.add(_sensor(c))
+        if len(posts) == 1:
+            return posts.pop()
         return self.cd_radar_combo.currentData() or S1
 
     def _cd_pol(self, cands):
@@ -2577,8 +2607,17 @@ class SarTab(QWidget):
         roles = meta.get("roles", {})
         self.cd_btn.setEnabled(True)
         if len(self._cd_paths) < len(roles):
-            self._warn("Change detection: could not download every scene — "
-                       "see the log.")
+            radar = _sensor(roles.get("post"))
+            missing = len(roles) - len(self._cd_paths)
+            if radar == NISAR:
+                self._warn(
+                    f"Change detection: {missing} of {len(roles)} NISAR scene(s) "
+                    f"could not be read — the log says why. To use Sentinel-1 "
+                    f"instead, tick a Sentinel-1 after-scene (and no NISAR one), "
+                    f"or set Radar to Sentinel-1 in this panel.")
+            else:
+                self._warn(f"Change detection: {missing} of {len(roles)} Sentinel-1 "
+                           f"scene(s) could not be downloaded — see the log.")
             return
         k = meta["k"]
         pre_roles = meta.get("pre_roles") or []

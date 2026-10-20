@@ -84,6 +84,15 @@ class Combo:
     def isEnabled(self):
         return self.enabled
 
+    def findData(self, value):
+        return 0 if value in (S1, NISAR) else -1
+
+    def setCurrentIndex(self, _i):
+        pass                                 # the tab sets it via findData's radar
+
+    def setTo(self, radar):
+        self.data = radar
+
 
 class Head:
     def __init__(self, cid, ticked):
@@ -197,11 +206,25 @@ check("Radar=Sentinel-1 -> S1 after + S1 before, though NISAR's after is nearer"
       got and got[1]["id"] == "s1_post_t150"
       and [c["id"] for c in got[2]] == ["s1_pre_t150"])
 LOG.clear(), WARN.clear()
+# The Seaward trap (2026-10-19): Radar box left on NISAR, every NISAR row
+# unticked, only Sentinel-1 ticked — that must run Sentinel-1, not NISAR.
 got = make_tab(BOTH, radar=NISAR, ticked=("s1_post_t150", "s1_pre_t150"))._cd_pick(
     ["logratio"])
-check("ticked Sentinel-1 rows are left out of a NISAR run",
+check("only Sentinel-1 ticked + Radar box on NISAR -> a Sentinel-1 run",
+      got and got[1]["source"] == S1 and all(c["source"] == S1 for c in got[2]))
+check("  and the log says the ticks overrode the box",
+      any("every ticked after-scene is Sentinel-1" in m for m in LOG))
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, ticked=("n_post_t150",))._cd_pick(["logratio"])
+check("only a NISAR after-scene ticked + box on Sentinel-1 -> a NISAR run",
+      got and got[1]["id"] == "n_post_t150")
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=NISAR, ticked=("s1_post_t150", "n_post_t150",
+                                          "s1_pre_t150"))._cd_pick(["logratio"])
+check("both radars' after-scenes ticked (the default stars) -> the box decides",
       got and got[1]["source"] == NISAR and all(c["source"] == NISAR for c in got[2]))
-check("  and the log says so", any("other radar left out" in m for m in LOG))
+check("  and the other radar's ticked rows are left out, logged",
+      any("other radar left out" in m for m in LOG))
 LOG.clear(), WARN.clear()
 got = make_tab(dict(pre=PRE, post=[POST[0]]), radar=S1)._cd_pick(["logratio"])
 check("no S1 after-scene -> stops, and points at the Radar switch",
