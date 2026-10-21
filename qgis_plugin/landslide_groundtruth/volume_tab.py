@@ -1512,6 +1512,10 @@ class VolumeTab(QWidget):
             "no DEM. V = the outline's plan area × mean thickness. Pick the "
             "setting that matches the deposit: it fills the mean, low and high, "
             "which you can still edit (the setting then reads Custom).\n\n"
+            "Near date / far date is when the imagery you outlined was taken. Soon "
+            "after the event the deposit still holds the snow and ice it picked "
+            "up, as a seismic volume does; after a melt season (far date) only "
+            "the rock is left.\n\n"
             "These are means over the deposit. The total outline also holds the "
             "source scar and track — Bessette-Kirton & Coe (2020) take the deposit "
             "as ~80% of it — so the volume reads somewhat high; the low end covers "
@@ -1525,6 +1529,9 @@ class VolumeTab(QWidget):
         self._thick_setting_combo = QComboBox()
         for label, key, *_rest in volume_calc.THICKNESS_SETTINGS:
             self._thick_setting_combo.addItem(label, key)
+            # the closed combo elides (below), so the full label rides along
+            self._thick_setting_combo.setItemData(
+                self._thick_setting_combo.count() - 1, label, Qt.ToolTipRole)
         self._thick_setting_combo.addItem("Custom — your own values", "custom")
         self._thick_setting_combo.setToolTip(
             "What kind of deposit the outline is. Fills the mean thickness and "
@@ -1804,8 +1811,9 @@ class VolumeTab(QWidget):
                 self._append_log(
                     "Enter a mean deposit thickness (m) in the “Deposit "
                     "thickness” box below — the volume is area × thickness. "
-                    "~2.5 m (1.5–3.5 m) is typical for a rock avalanche on a "
-                    "glacier; ~1.5 m for an ice-rich, Iliamna-type one.")
+                    "Pick a Setting there: ~2.5 m (1.5–3.5 m) for a rock "
+                    "avalanche on a glacier seen after the ice melted, ~3.5 m "
+                    "(3–5 m) soon after the event.")
                 return
             v_best, v_low, v_high, calc = volume_calc.volume_thickness(
                 conv_area, t, t_low=t_lo, t_high=t_hi)
@@ -1909,11 +1917,12 @@ class VolumeTab(QWidget):
                     "thickness below to bracket the volume.")
             setting = volume_calc.thickness_setting(*self._thickness_values())
             key = setting[1] if setting else "custom"
-            if key == "ice_rich":
+            if key == "ice_rich_far":
                 self._append_log(
-                    "Ice-rich setting: this is the ROCK sheet. ~60% of what failed "
-                    "at Red Glacier was ice, so the failed volume can be 2–3× this "
-                    "— check which one a seismic volume means before comparing.")
+                    "Far-date ice-rich setting: this is the rock left after the ice "
+                    "melted. Over half of what failed at Red Glacier was ice, so the "
+                    "failed volume can be 2–3× this — use the near-date setting to "
+                    "compare with a seismic volume.")
             if key == "scar" and conv_role == "total":
                 self._append_log(
                     "The Source-scar setting is a detachment depth, but the TOTAL "
