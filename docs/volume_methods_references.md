@@ -269,7 +269,7 @@ and is independently confirmed by the one supraglacial sheet that was actually
 
 ### How far 1.5 m generalises — read this before trusting a small event
 
-`deposit_thickness_card.html` §3 claims the mean stays ~1.5–1.7 m "fairly
+The former `deposit_thickness_card.html` (retired 2026-10-21) claimed in §3 that the mean stays ~1.5–1.7 m "fairly
 independent of volume" across ~1–15 Mm³. **That is not supported by the sources
 cited there**, and an earlier draft of this file repeated it. What those sources
 actually give is two points, both near 10 Mm³:
@@ -351,8 +351,12 @@ confined events run thicker — Lamplugh several m, Taan Fiord variable:
 Well below ~10 Mm³ there is no published support for 1.5 m. Carry a much wider
 low/high there, and say so in the verdict rather than printing a tight range.
 
-The ready-reckoner is [`deposit_thickness_card.html`](deposit_thickness_card.html),
-with the caveat above.
+The ready-reckoner card that used to sit beside this file was retired on
+2026-10-21: it was built on a 1.5 m default, and the Volume tab now defaults to
+2.5 m (1.5–3.5 m), the measured Alaska mean for a rock avalanche on a glacier
+(Deline et al. 2015, Table 9.1). The per-situation values — 1.5 m for an
+ice-rich, Iliamna-type sheet among them — are the tab's Setting drop-down
+(`volume_calc.THICKNESS_SETTINGS`).
 
 ### Why it is here
 
@@ -397,6 +401,10 @@ so the plugin's reference set is complete.
 ---
 
 ## 6. Discrepancies found while compiling this
+
+Kept for the record: the card these point at was retired on 2026-10-21, and
+the 2.5 m (1.5–3.5 m) default since then is written the same way in the Volume
+tab and `volume_calc`, which settles item 4.
 
 Three small things in existing files, none of which change a computed number:
 
