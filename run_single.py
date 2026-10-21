@@ -109,12 +109,22 @@ def _write_render_json(a, event_id, r):
         out["stretch"] = dict(tone)
         render = rp._linear
     elif a.planet_tone == "hdr":
-        # HDR (exposure fusion): renders and fuses its own spread of exposures
-        # (rp.HDR_WHITES), so there is no single white point and no auto-stretch — the fusion
-        # IS the dynamic-range fit. Honours knee + contrast; the manual white/black don't apply.
+        # HDR: ONE global curve — the rolloff shoulder plus a log shadow lift (rp.HDR_LIFT)
+        # — fitted to the scene's own bright tail. Honours knee + contrast; --planet-white
+        # is honoured as the anchor when given, otherwise it is fitted ONCE from both sides
+        # (rp.hdr_white) so the before/after pair stays comparable under the swipe tool.
+        # --planet-black doesn't apply: the curve's whole point is not to clip the dark end.
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None else rp.CONTRAST,
                     knee=a.planet_knee if a.planet_knee is not None else rp.KNEE)
-        out["stretch"] = {"hdr": "adaptive exposures"}   # per-scene, see review_package._hdr_whites
+        if a.planet_white is not None:
+            tone["white"] = a.planet_white
+            out["notes"].append(f"hdr: white {a.planet_white:.3f} from --planet-white")
+        else:
+            comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
+            white_used, note = rp.hdr_white(comps)
+            tone["white"] = white_used
+            out["notes"].append(note)
+        out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
         render = rp._highlight_hdr
     else:
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
@@ -420,9 +430,16 @@ def main():
                          "fine for the visual review.")
     ap.add_argument("--scenes", default=None,
                     help="comma-separated review layers to download: true_color, "
-                         "highlight_natural, false_color, ndvi, dndvi, dbright "
-                         "(default: all). The predicted-point layer is always written. "
-                         "Ignored with --search-only.")
+                         "highlight_natural, highlight_hdr, false_color, "
+                         "swir_falsecolor, ndvi, dndvi, dndsi, dbright (default: all; "
+                         "see review_package.SCENE_KEYS). The swir_falsecolor and dndsi "
+                         "layers need SWIR and so skip on PlanetScope. highlight_hdr is "
+                         "the same curve as --planet-tone hdr — one global curve fitted "
+                         "to the scene, which clips at neither end — and holds the whole "
+                         "AOI in float, so it is the one product that can run a large AOI "
+                         "out of memory; it skips with a line in the log rather than "
+                         "failing the package. The predicted-point layer is always "
+                         "written. Ignored with --search-only.")
     ap.add_argument("--pre-scene-ids", default=None,
                     help="comma-separated scene IDs to composite for the PRE side, "
                          "overriding the automatic scene ranking (Sentinel-2 / Landsat "
@@ -512,11 +529,12 @@ def main():
                          "never does. See review_package.TONE_MODES. 'knee' additionally "
                          "fits its black/white points to a frame that is all snow/ice — see "
                          "--planet-no-auto-stretch; 'linear' honours --planet-white/"
-                         "--planet-black but never auto-fits. 'hdr' = exposure fusion: "
-                         "renders the knee curve at several exposures and fuses them "
-                         "(Mertens) so deep shadow AND blown snow both keep detail in one "
-                         "image; it fits its own dynamic range, so white/black/auto-stretch "
-                         "don't apply (see review_package._highlight_hdr).")
+                         "--planet-black but never auto-fits. 'hdr' = one global curve: "
+                         "the knee curve plus a log shadow lift, so deep shadow AND sunlit "
+                         "snow both keep detail in one image and nothing clips at either "
+                         "end. Its white point is fitted from the scene unless "
+                         "--planet-white says otherwise; --planet-black doesn't apply "
+                         "(see review_package._highlight_hdr).")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "

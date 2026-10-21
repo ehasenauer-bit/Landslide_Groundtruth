@@ -328,7 +328,7 @@ class PlanetTab(QWidget):
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
         self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
-        self.tone_combo.addItem("HDR (exposure fusion) — shadow AND snow detail at once",
+        self.tone_combo.addItem("HDR (one global curve) — shadow AND snow detail at once",
                                 "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
@@ -348,12 +348,13 @@ class PlanetTab(QWidget):
             "Bright ice clips to flat white, exactly as a naive stretch would — the point "
             "is to see the un-toned pixels. Honours the Manual stretch below, but not "
             "Auto-stretch or Contrast (neither applies).\n"
-            "• HDR (exposure fusion) — renders the rolloff curve at several exposures and "
-            "fuses them (Mertens exposure fusion), so a scene with deep shadow AND blown "
-            "snow keeps detail at BOTH ends in one image. It fits its own dynamic range, so "
-            "the white point / Auto-stretch / Manual stretch don't apply. Slower to render "
-            "(a few exposures + the fusion), the local-tone-map answer when a single white "
-            "point can't hold the scene.\n"
+            "• HDR (one global curve) — the rolloff curve with a log shadow lift on top, "
+            "fitted to the scene's own bright tail, so a frame with deep shadow AND sunlit "
+            "snow keeps detail at BOTH ends in one image. Nothing in the chain clips: no "
+            "pixel comes out pure black or pure white, on any scene. The white point is "
+            "fitted from the scene unless you set it in Manual stretch; Auto-stretch and "
+            "the black point don't apply. The cost is global contrast — holding both ends "
+            "reads flatter than the rolloff does.\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
             "once; pick None to check what the raw reflectance looks like unshaped. rolloff "

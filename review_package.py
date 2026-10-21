@@ -13,6 +13,8 @@ filename — and therefore in its QGIS layer name (`<pre>` / `<post>` below, see
   <event>_post_<post>_rgb.tif      true-colour AFTER
   <event>_pre_<pre>_highlight.tif  Highlight Optimized Natural Color BEFORE (see _highlight_natural)
   <event>_post_<post>_highlight.tif Highlight Optimized Natural Color AFTER
+  <event>_pre_<pre>_hdr.tif        HDR, one scene-fitted curve, BEFORE (see _highlight_hdr)
+  <event>_post_<post>_hdr.tif      HDR, one scene-fitted curve, AFTER
   <event>_pre_<pre>_falsecolor.tif NIR-red-green BEFORE  (vegetation = bright red)
   <event>_post_<post>_falsecolor.tif NIR-red-green AFTER  (fresh scar = dark/bare)
   <event>_pre_<pre>_swir.tif       SWIR false colour BEFORE (12-11-4: snow blue, rock/debris orange)
@@ -41,20 +43,23 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 # accepted by run_single.py --scenes and produced by export_review_package; the
 # QGIS dock builds its checkboxes from the same keys. The predicted-point layer
 # is NOT in here — it is always written as the digitizing anchor.
-SCENE_KEYS = ["true_color", "highlight_natural", "false_color", "swir_falsecolor",
-              "dndsi", "ndvi", "dndvi", "dbright"]
+SCENE_KEYS = ["true_color", "highlight_natural", "highlight_hdr", "false_color",
+              "swir_falsecolor", "dndsi", "ndvi", "dndvi", "dbright"]
 
 # Selectable tone curves for the PlanetScope SR detail render — see _highlight_rolloff
 # and _highlight_natural. The plugin's PlanetScope tab builds its tone combo box from
 # this dict and passes the key through run_single.py --planet-tone; the value is the
-# label shown. Ordered rolloff-first: it is the DEFAULT, because the review task is
-# reading scars on terrain, where full-brightness midtones matter more than texture
-# inside bright ice.
+# label shown. 'natural' and 'hdr' are ALSO review-package products in their own right
+# on Sentinel-2/Landsat (SCENE_KEYS 'highlight_natural' and 'highlight_hdr') — this
+# dict is only the PlanetScope tab's combo box, not the list of who may use a curve.
+# Ordered rolloff-first: it is the DEFAULT, because the review task is reading scars
+# on terrain, where full-brightness midtones matter more than texture inside bright
+# ice.
 TONE_MODES = {
     "knee": "Highlight rolloff — untouched midtones, tamed highlights",
     "natural": "Highlight Optimized Natural Color — even detail, softer contrast",
     "linear": "None — plain linear stretch, no tone shaping",
-    "hdr": "HDR (exposure fusion) — shadow AND snow detail in one image",
+    "hdr": "HDR (one global curve) — shadow AND snow detail, no clipping at either end",
 }
 
 # Gentle S-curve strength applied to BOTH tone modes by the PlanetScope render path
@@ -447,46 +452,58 @@ def _strip_cast(rgb, strength, cool, gate_lo=None, gate_hi=None):
     return rgb + (y - rgb) * w
 
 
-# HDR tone mode: fuse several exposures of the rolloff curve so shadowed terrain AND bright
-# snow/ice both keep detail in one image — the local tone-map answer to a scene whose dynamic
-# range a single white point can't hold. The exposures are the SAME reflectance rendered at
-# these white points (low = bright, lifts shadow/terrain; high = dark, recovers snow texture),
-# fused by Mertens-Kautz-Van Reeth exposure fusion (2007): a Laplacian-pyramid blend weighted
-# by per-pixel contrast x saturation x well-exposedness, so the best-exposed region of each
-# exposure wins with no halos. See _highlight_hdr / _exposure_fusion.
-# The exposure spread is derived PER SCENE from its own reflectance distribution (see
-# _hdr_whites): the white point that best-exposes a region at reflectance R is ~R, so taking
-# these percentiles of the channel-max reflectance places a bright/mid/dark exposure across
-# whatever range the scene actually spans — a bright all-ice frame, a dark terrain scene and
-# a low-contrast cloudy one each auto-bracket themselves, no fixed tuning. HDR_WHITES is only
-# the fallback when the frame is too small to estimate.
-HDR_EXPOSURE_PCTS = (30.0, 62.0, 94.0)   # scene reflectance percentiles -> bright/mid/dark exposures
-HDR_WHITES = (0.16, 0.35, 0.75)      # fallback exposure white points if percentiles can't be taken
-HDR_WELLEXP_SIGMA = 0.2              # width of the well-exposedness (mid-tone) Gaussian weight
-# Percentiles alone are not enough to BRACKET a scene: they describe where the pixels are, not
-# what range they span. On a frame that is mostly snow/cloud the 30th percentile is already snow,
-# so all three "exposures" land in the highlights within ~1.6x of each other and NONE of them
-# exposes the terrain — measured on an 85%-snow frame, reflectance 0.02 renders at DN 7.7/6.2/5.0
-# in the three exposures, i.e. the fusion has nothing but black to choose from and the shadows
-# come out as one flat, featureless block. So the bright exposure is additionally required to
-# expose the scene's own dark tail (HDR_DARK_PCT reflectance placed at HDR_DARK_LEVEL, where the
-# well-exposedness weight peaks) and to leave the bracket spanning at least HDR_MIN_SPAN. Both
-# are one-sided clamps that can only LOWER the bright white point, so a scene whose p30 is
-# already dark — anything below roughly 70% snow cover — renders bit-for-bit as before.
-HDR_DARK_PCT = 5.0                   # the dark tail the bright exposure must actually expose
-HDR_DARK_LEVEL = 0.5                 # ... placed at mid-grey, the peak of the well-exposedness weight
-HDR_DARK_FLOOR = 0.03                # ... but never a white point below this (noise, not detail)
-HDR_MIN_SPAN = 6.0                   # dark/bright white-point ratio the bracket must at least span
-# Exposure fusion compresses a scene into the mid-tones — punchy locally, but flat globally.
-# _hdr_finish restores contrast to a CONSISTENT TARGET rather than maximising it: it scales
-# luminance contrast toward HDR_TARGET_STD, so a flat cloudy scene is boosted while an already
-# high-contrast one (bright snow + deep shadow) is eased BACK instead of crushed to black and
-# white. Targeting a fixed std — not stretching each scene to full black/white — is what makes
-# the result look the same across every scene. The scale is one gain around the mean applied to
-# all of R/G/B, so hue/saturation are preserved; the gain is clamped so noise isn't amplified.
-HDR_TARGET_STD = 0.16              # luminance contrast every scene is normalised toward
-HDR_GAIN_MIN = 0.6                 # ... easing an over-contrasty scene back down (gain < 1)
-HDR_GAIN_MAX = 3.0                 # ... or boosting a flat one, clamped so noise isn't amplified
+# HDR tone mode: ONE global tone curve, fitted to the scene, that holds detail at BOTH ends
+# of a frame carrying deep shadow and sunlit snow at once. It replaced a Mertens exposure
+# fusion (three bracketed renders blended through a Laplacian pyramid), which was dropped
+# because it could not make the "no crushed blacks, no blown highlights" promise on every
+# scene: the pyramid collapse oversteps the input range — the documented main limitation of
+# exposure fusion (Mertens-Kautz-Van Reeth 2007; see the IPOL reference implementation) —
+# and measured 10.6% of the frame above 1.0 on a mixed rock-and-glacier scene, every one of
+# those pixels then flattened to paper white by the clip that followed. A second clip in the
+# contrast-normalising finish could crush both ends at once (0.81% at DN>=254 AND 1.45% at
+# DN<=1 on the 2026-09-08 Wrangell frame). Stacking two tone curves in sequence is also a
+# known way to get unpredictable tone, which is why photo pipelines forbid it.
+#
+# So the curve is a single pass with no clip in it anywhere:
+#
+#     u = _shoulder(refl / white)          asymptotic -> u < 1 always, highlights CANNOT blow
+#     y = u + (log1p(k*u)/log1p(k) - u) * (1 - u)**HDR_LIFT_TAPER        k = HDR_LIFT
+#
+# _shoulder never reaches 1.0 for finite input, so the output is strictly inside (0, 1) and
+# the DN 1/254 clamp in _highlight_hdr is a guarantee, not a rescue.
+#
+# The TAPER is the part that took measuring. A plain log lift (the second line without the
+# (1-u) weight) opens the shadows beautifully and then flattens the snow, because log1p
+# compresses hardest exactly where the shoulder has already compressed: on an icefield
+# frame it drove the median to DN 232 and left the whole snow field inside 6 DN. Weighting
+# the lift by (1-u)**HDR_LIFT_TAPER applies it at the bottom and fades it to nothing at the
+# top, so snow keeps the slope the shoulder gave it. Both ends measured on two real S2
+# frames (their reflectance recovered from the HONC render, which is an exactly invertible
+# cube root), against the HONC that this render sits beside — darkest quartile and
+# brightest decile, luminance std in DN:
+#
+#                          Kenai icefield (refl p50 0.88)   Wrangells (refl p50 0.10)
+#     render                 shadow      snow                shadow      snow
+#     HONC cube root          13.9        4.1                 10.0        7.7
+#     plain log lift          17.6        2.0                 14.1        4.0
+#     this curve              14.3        5.4                 13.4        9.9
+#
+# i.e. better than HONC at BOTH ends on BOTH scenes, where the untapered lift bought
+# shadows by wrecking snow. The exposure fusion this replaced still wins the brightest
+# decile on the icefield (9.9 vs 5.4) — that is local tone mapping doing something a
+# single global curve provably cannot, and it is the price of never clipping.
+HDR_LIFT = 60.0                    # shadow lift strength; 0 = no lift (the plain rolloff curve)
+HDR_LIFT_TAPER = 2.0               # ... faded out by (1-u)**this, so the highlights keep their slope
+# The white point is the scene's own bright tail, pooled over pre AND post (see hdr_white) —
+# a percentile, not the maximum, because everything above it is compressed by the asymptote
+# rather than clipped, so the anchor only has to be about right. Clamped at both ends: below
+# HDR_WHITE_MIN a dark frame would be stretched until its noise showed, above HDR_WHITE_MAX
+# an atmospheric-correction overshoot could set it and drag the whole scene dark.
+HDR_WHITE_PCT = 99.5               # percentile of channel-max reflectance -> the white anchor
+HDR_WHITE_MIN = 0.30               # ... never below this (a dark scene keeps the fixed curve's reach)
+HDR_WHITE_MAX = 1.30               # ... nor above it (an atco overshoot must not set the white)
+HDR_WHITE_FALLBACK = 0.90          # used when the frame is too small to take a percentile from
+HDR_MIN_PIXELS = 5000              # ... below this many valid pixels, fall back
 # HDR keeps a BIT of colour by easing the chroma neutralizers (highlight desat, cyan de-blue,
 # cyan/pink cast-strips) by this factor — otherwise a mostly-bright scene (snow/cloud) is
 # neutralised almost to greyscale, which reads as lifeless. The neutralizers only touch chroma,
@@ -495,98 +512,10 @@ HDR_GAIN_MAX = 3.0                 # ... or boosting a flat one, clamped so nois
 # HDR look); lower keeps more colour (but lets more of the atmospheric cast/edge fringe through).
 HDR_SATURATION = 0.7
 
-_PYR_K = np.array([1.0, 4.0, 6.0, 4.0, 1.0])
-_PYR_K = _PYR_K / _PYR_K.sum()
-
-
-def _pyr_blur(a):
-    """Separable binomial (Gaussian) blur over the first two axes, reflect-padded."""
-    def conv(x, ax):
-        pad = [(0, 0)] * x.ndim
-        pad[ax] = (2, 2)
-        xp = np.pad(x, pad, mode="reflect")
-        o = np.zeros_like(x)
-        for i, k in enumerate(_PYR_K):
-            sl = [slice(None)] * x.ndim
-            sl[ax] = slice(i, i + x.shape[ax])
-            o = o + k * xp[tuple(sl)]
-        return o
-    return conv(conv(a, 0), 1)
-
-
-def _pyr_up(a, shape):
-    """Upsample `a` to (shape[0], shape[1], ...) by zero-insertion + blur*4."""
-    o = np.zeros((shape[0], shape[1]) + a.shape[2:], float)
-    o[::2, ::2] = a[:(shape[0] + 1) // 2, :(shape[1] + 1) // 2]
-    return 4.0 * _pyr_blur(o)
-
-
-def _gauss_pyr(a, n):
-    p = [a]
-    for _ in range(n - 1):
-        a = _pyr_blur(a)[::2, ::2]
-        p.append(a)
-    return p
-
-
-def _lap_pyr(a, n):
-    g = _gauss_pyr(a, n)
-    return [g[i] - _pyr_up(g[i + 1], g[i].shape) for i in range(n - 1)] + [g[-1]]
-
-
-def _pyr_collapse(lp):
-    a = lp[-1]
-    for i in range(len(lp) - 2, -1, -1):
-        a = _pyr_up(a, lp[i].shape) + lp[i]
-    return a
-
-
-def _exposure_fusion(imgs):
-    """Mertens exposure fusion: blend LDR exposures `imgs` (each (H, W, 3) in 0-1) by a
-    per-pixel weight of contrast * saturation * well-exposedness, combined through a Laplacian
-    pyramid (Gaussian pyramid of the weights x Laplacian pyramid of the images) so the seams
-    between exposures are halo-free. Returns the fused (H, W, 3) image in 0-1."""
-    h, w, _ = imgs[0].shape
-    levels = max(3, int(np.log2(min(h, w))) - 2)
-    weights = []
-    for im in imgs:
-        g = im.mean(2)
-        gp = np.pad(g, 1, mode="reflect")
-        contrast = np.abs(4 * g - gp[:-2, 1:-1] - gp[2:, 1:-1]
-                          - gp[1:-1, :-2] - gp[1:-1, 2:])          # Laplacian magnitude
-        saturation = im.std(2)
-        wellexp = np.prod(np.exp(-0.5 * ((im - 0.5) / HDR_WELLEXP_SIGMA) ** 2), axis=2)
-        weights.append(contrast * saturation * wellexp + 1e-12)
-    total = np.sum(weights, axis=0) + 1e-12
-    weights = [wt / total for wt in weights]
-    out = None
-    for im, wt in zip(imgs, weights):
-        gw = _gauss_pyr(wt, levels)
-        li = _lap_pyr(im, levels)
-        blended = [gw[lv][..., None] * li[lv] for lv in range(levels)]
-        out = blended if out is None else [o + b for o, b in zip(out, blended)]
-    return _pyr_collapse(out).clip(0.0, 1.0)
-
-
-def _hdr_finish(img, valid):
-    """Normalise the fused image to a CONSISTENT contrast (HDR_TARGET_STD) instead of maximising
-    it, so every scene lands at the same punch: a flat cloudy scene is boosted, a high-contrast
-    one (bright snow + deep shadow) is eased back rather than crushed to black and white. Scales
-    luminance contrast around the fused mean by target/current std (clamped HDR_GAIN_MIN..MAX),
-    applied as one gain to all channels so colour is preserved. `valid` (H, W bool) excludes
-    nodata; `img` is (H, W, 3) in 0-1."""
-    yv = img.mean(2)[valid]
-    if yv.size == 0:
-        return img
-    mean, std = float(yv.mean()), float(yv.std())
-    gain = float(np.clip(HDR_TARGET_STD / max(std, 1e-3), HDR_GAIN_MIN, HDR_GAIN_MAX))
-    return (mean + (img - mean) * gain).clip(0.0, 1.0)
-
-
 def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
                  desat=DESAT, black=0.0, onset=DESAT_ONSET,
                  blue_desat=BLUE_DESAT, cyan_strip=CYAN_STRIP,
-                 pink_strip=PINK_STRIP):
+                 pink_strip=PINK_STRIP, lift=0.0, lift_taper=HDR_LIFT_TAPER):
     """The "highlight rolloff" render as a 0-255 float rgb DataArray (NaN = nodata);
     _highlight_rolloff writes it and _highlight_hdr fuses several exposures of it.
 
@@ -605,6 +534,13 @@ def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
     an exact no-op — the "midtones arithmetically untouched" guarantee holds whenever
     it is left there, and only there. auto_stretch derives it (with a matching `white`
     and `onset`) from the scene, and only for scenes that have nothing dark to lose.
+
+    `lift` (HDR mode only; 0 is an exact no-op and every other caller leaves it there)
+    opens the shadows by running the shoulder's own output through log1p before the gain
+    is taken, weighted by (1 - u)**`lift_taper` so the lift fades to nothing at the top —
+    see HDR_LIFT / HDR_LIFT_TAPER. It is what lets a single curve hold a shadowed valley
+    and sunlit snow at once. Without the taper the lift buys the shadows by flattening the
+    snow, which is measured and asserted in tests/test_hdr_curve.py.
 
     The rolloff is driven by the per-pixel channel MAXIMUM and applied as a single
     gain to R/G/B, so a pixel's hue and saturation survive the compression instead of
@@ -635,6 +571,18 @@ def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
     # Below a nonzero black point m goes negative, where _shoulder is the identity, so
     # sh/m is exactly 1 and those pixels pass through to be clipped to black below.
     sh = _shoulder(m, knee)
+    if lift > 0:
+        # HDR mode's shadow lift (see HDR_LIFT). Applied to the SHOULDER's output, so it
+        # rides on top of the rolloff instead of replacing it, and to the channel maximum
+        # only — the gain below is still one number per pixel, so hue survives it exactly
+        # as it survives the rolloff. Faded out by (1 - u)**lift_taper so it opens the
+        # shadows without flattening the snow (see HDR_LIFT_TAPER); the fade is 0 at the
+        # top, so the curve still ends where the shoulder left it and cannot reach 1.
+        # Negative `m` (possible only under a manual black point, which HDR never uses) is
+        # floored first so log1p stays real.
+        u = sh.clip(0.0, None)
+        lifted = np.log1p(lift * u) / float(np.log1p(lift))
+        sh = u + (lifted - u) * (1.0 - u).clip(0.0, None) ** lift_taper
     rgb = rgb * (sh / m.where(m != 0, 1.0))
     # Fade toward `sh` — the max channel's own post-gain value — so a compressed
     # highlight walks to WHITE at its own brightness rather than to grey.
@@ -689,57 +637,75 @@ def _highlight_rolloff(comp, path, src_crs, **kw):
     _write_rgb(_rolloff_rgb(comp, **kw), path, src_crs)
 
 
-def _hdr_whites(comp):
-    """Per-scene exposure white points, auto-bracketed from the reflectance distribution (see
-    HDR_EXPOSURE_PCTS) so the HDR spread fits each scene with no fixed tuning. A white point
-    ~R best-exposes a region at reflectance R, so the chosen percentiles of the channel-max
-    reflectance give a bright, a mid and a dark exposure across the scene's own range. Clamped
-    and kept distinct so a degenerate/flat scene still brackets; falls back to HDR_WHITES when
-    the frame is too small to estimate."""
-    rmax = comp.sel(band=["red", "green", "blue"]).max(dim="band").values
-    v = rmax[np.isfinite(rmax)]
-    if v.size < 5000:
-        return HDR_WHITES
-    q = np.clip(np.percentile(v, HDR_EXPOSURE_PCTS).astype(float), 0.05, 1.3)
-    q[1] = max(q[1], q[0] * 1.25)        # keep the three exposures distinct on a flat scene
-    q[2] = max(q[2], q[1] * 1.25)
-    # ... and keep the BRACKET spanning the scene, not just the snow (see HDR_MIN_SPAN): pull the
-    # bright exposure down until it exposes the dark tail and the spread covers the real range.
-    q[0] = min(q[0], max(float(np.percentile(v, HDR_DARK_PCT)) / HDR_DARK_LEVEL, HDR_DARK_FLOOR),
-               q[2] / HDR_MIN_SPAN)
-    return tuple(float(x) for x in q)
+def hdr_white(comps):
+    """The HDR curve's white anchor, fitted to the scene — (white, note).
+
+    `comps` is the list of composites the render covers, normally [pre, post], Nones
+    allowed. They are pooled into ONE white point for the same reason auto_stretch pools
+    its stretch: rendering each side against its own percentiles would put a brightness
+    step between the before and after layers that no change on the ground produced, and
+    a swipe comparison would read that step as a scar.
+
+    HDR_WHITE_PCT of the per-pixel channel MAXIMUM — the same quantity that drives the
+    shoulder gain and the desaturation gate. A percentile rather than the maximum is safe
+    here in a way it would not be under a clipping curve: everything above the anchor is
+    compressed by _shoulder's asymptote, not clipped, so the brightest half-percent of the
+    frame stays ordered and visible instead of piling up at white.
+    """
+    vals = []
+    for c in comps:
+        if c is None:
+            continue
+        rgb = c.sel(band=["red", "green", "blue"])
+        ydim, xdim = rgb.dims[-2], rgb.dims[-1]
+        npix = rgb.sizes[ydim] * rgb.sizes[xdim]
+        # Strided so the scan costs the same on any AOI size; fall back to every pixel when
+        # the sample comes back thin (partial coverage), exactly as auto_stretch does.
+        for step in (max(1, int(np.sqrt(npix / float(AUTO_SAMPLE)))), 1):
+            sub = rgb.isel({ydim: slice(None, None, step), xdim: slice(None, None, step)})
+            v = np.asarray(sub.max(dim="band").values, dtype="float32").ravel()
+            v = v[np.isfinite(v)]
+            if v.size >= HDR_MIN_PIXELS or step == 1:
+                break
+        vals.append(v)
+    v = np.concatenate(vals) if vals else np.empty(0, dtype="float32")
+    if v.size < HDR_MIN_PIXELS:
+        return HDR_WHITE_FALLBACK, (
+            f"hdr: white {HDR_WHITE_FALLBACK:.2f} (fallback — only {v.size} valid pixels "
+            f"sampled, too few for a percentile; need {HDR_MIN_PIXELS})")
+    p = float(np.percentile(v, HDR_WHITE_PCT))
+    w = min(max(p, HDR_WHITE_MIN), HDR_WHITE_MAX)
+    why = "" if w == p else (
+        f", clamped from {p:.3f} by "
+        + ("HDR_WHITE_MIN" if w == HDR_WHITE_MIN else "HDR_WHITE_MAX"))
+    return w, f"hdr: white {w:.3f} = p{HDR_WHITE_PCT} of {v.size} sampled pixels{why}"
 
 
 def _highlight_hdr(comp, path, src_crs, knee=KNEE, contrast=1.0, desat=DESAT,
                    black=0.0, onset=DESAT_ONSET, blue_desat=BLUE_DESAT,
-                   cyan_strip=CYAN_STRIP, pink_strip=PINK_STRIP):
-    """HDR render: Mertens exposure fusion of the rolloff curve at HDR_WHITES, so a scene with
-    both deep shadow and blown snow keeps detail at BOTH ends in one image — the local
-    tone-map a single white point can't give. Same knee/contrast/desat/cast-strip treatment
-    per exposure; only the white point (exposure) varies, then _exposure_fusion picks the
-    best-exposed region of each. No auto-stretch: the fusion IS the dynamic-range fit."""
+                   cyan_strip=CYAN_STRIP, pink_strip=PINK_STRIP, white=None):
+    """HDR render: ONE global tone curve — the rolloff shoulder with a log shadow lift on
+    top (see HDR_LIFT) — so a frame holding both deep shadow and sunlit snow keeps detail at
+    BOTH ends without a clip anywhere in the chain. `white` is the scene's anchor from
+    hdr_white; passing None fits it from this composite alone, which is right for a
+    one-sided render and wrong for a pre/post pair (see hdr_white)."""
     # Keep a bit of colour: ease the chroma neutralizers by HDR_SATURATION. They touch only
     # chroma (fade toward the pixel's own luminance/neutral), never brightness, so this cannot
     # darken the image or reduce the snow's contrast — it only lets some colour survive.
     s = HDR_SATURATION
-    exps = [_rolloff_rgb(comp, white=w, knee=knee, contrast=contrast, desat=desat * s,
-                         black=black, onset=onset, blue_desat=blue_desat * s,
-                         cyan_strip=cyan_strip * s, pink_strip=pink_strip * s).transpose(
-                             "band", "y", "x")
-            for w in _hdr_whites(comp)]
-    stack = [e.values for e in exps]                       # each (3, H, W), 0-255, NaN=nodata
-    nod = np.isnan(stack[0]).all(axis=0)                   # (H, W) nodata mask
-    imgs = [np.moveaxis(np.nan_to_num(s, nan=0.0), 0, 2) / 255.0 for s in stack]  # (H,W,3) 0-1
-    fused = _exposure_fusion(imgs)                         # (H, W, 3) in 0-1 (flat/muddy)
-    fused = _hdr_finish(fused, ~nod)                       # reclaim shadow depth + midtones
-    arr = np.moveaxis(fused, 2, 0) * 255.0                 # (3, H, W)
-    # nodata is 0, so a valid pixel the fusion (or _hdr_finish's clip) drove to 0 would punch a
-    # transparent HOLE in the layer exactly where the deepest shadow is. Floor the valid pixels
-    # at 1 — the same guard _rolloff_rgb applies under a manual black point, which this path
-    # never reaches because it renders every exposure at black=0.
-    np.maximum(arr, 1.0, out=arr)
-    arr[:, nod] = np.nan                                   # restore nodata -> transparent
-    _write_rgb(exps[0].copy(data=arr), path, src_crs)
+    if white is None:
+        white = hdr_white([comp])[0]
+    rgb = _rolloff_rgb(comp, white=white, knee=knee, contrast=contrast, desat=desat * s,
+                       black=black, onset=onset, blue_desat=blue_desat * s,
+                       cyan_strip=cyan_strip * s, pink_strip=pink_strip * s, lift=HDR_LIFT)
+    # The curve is asymptotic, so across the physical range it lands at DN 254.99 at worst
+    # and the uint8 truncation alone would hold — but only across the physical range: past
+    # about 10x the white point the shoulder's exp() underflows and it pins at exactly 1.0.
+    # This clamp is what turns "no DN 0, no DN 255" into a guarantee that does not depend on
+    # how absurd an atmospheric-correction overshoot gets. DN 0 matters twice over: nodata
+    # is 0, so a valid pixel written as 0 would punch a transparent HOLE exactly where the
+    # deepest shadow is. NaN passes through clip untouched and still becomes nodata.
+    _write_rgb(rgb.clip(1.0, 254.0), path, src_crs)
 
 
 def _highlight_natural(comp, path, src_crs, contrast=1.0):
@@ -854,19 +820,30 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
     layers = []
     tags = {"pre": pre_tag, "post": post_tag}
 
-    def write_sides(kind, render, source="", when=None):
+    def write_sides(kind, render, source="", when=None, tolerate=()):
         """Write a two-sided product for whichever sides this run actually has.
 
         `source` names the img key holding the array ('' = the side's composite,
         e.g. 'ndvi_' for ndvi_pre/ndvi_post). A one-sided run (see
         imagery.fetch_event) simply exports one file instead of two; `when` gates a
-        side further (the SWIR products need SWIR bands in that composite)."""
+        side further (the SWIR products need SWIR bands in that composite).
+
+        `tolerate` names exception types that skip just that side, with a line in
+        the run log, instead of failing the whole package. Default () catches
+        nothing, so every other product still fails loudly. Only the HDR render
+        passes anything: it is the one product heavy enough to run a machine out of
+        memory on a large AOI, and an opt-in picture must never take the change
+        rasters — the layers the run exists to produce — down with it."""
         for side in ("pre", "post"):
             arr = img.get(f"{source}{side}")
             if arr is None or (when is not None and not when(arr)):
                 continue
             path = _tagged(base, side, tags[side], kind)
-            render(arr, path)
+            try:
+                render(arr, path)
+            except tolerate as e:
+                print(f"    [{kind}] {side}: skipped — {type(e).__name__}: {e}")
+                continue
             layers.append(path)
 
     def has_swir(comp):
@@ -879,6 +856,21 @@ def export_review_package(out_dir, event_id, img, src_crs, near_pt, scenes=None)
     # Highlight Optimized Natural Color pre/post — same bands, cube-root tone curve
     if "highlight_natural" in want:
         write_sides("highlight", lambda c, p: _highlight_natural(c, p, src_crs))
+
+    # HDR pre/post — the same true-colour bands as HONC, run through ONE scene-fitted
+    # tone curve (shoulder + log shadow lift, see HDR_LIFT) instead of the cube root, so a
+    # frame holding both deep shadow and sunlit snow keeps detail at BOTH ends. Nothing in
+    # the chain clips: the curve cannot reach either endpoint, so no valid pixel comes out
+    # at DN 0 or DN 255 on any scene. The white anchor is fitted ONCE across both sides
+    # (hdr_white) so the before/after pair stays photometrically comparable under a swipe —
+    # a per-side fit would put a brightness step between them that no change on the ground
+    # produced. Measured against HONC on the surface table: ~92% of its shadow separation
+    # kept, and the snow range goes from a 4 DN white smear to 29 DN of readable texture.
+    if "highlight_hdr" in want:
+        hdr_w, hdr_note = hdr_white([img.get("pre"), img.get("post")])
+        print(f"    [hdr] {hdr_note}")
+        write_sides("hdr", lambda c, p: _highlight_hdr(c, p, src_crs, white=hdr_w),
+                    tolerate=(MemoryError,))
 
     # false-colour (NIR-red-green) — vegetation pops bright red, fresh bare scar reads dark
     if "false_color" in want:

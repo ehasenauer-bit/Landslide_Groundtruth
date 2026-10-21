@@ -21,14 +21,46 @@ print("=== 1. default download set ===")
 print("   DEFAULT_SCENES =", D.DEFAULT_SCENES)
 keys=[k for k,_l,_t in D.SCENES]
 for k in D.DEFAULT_SCENES: assert k in keys, k
-change={"dndvi","dndsi","dbright"}
-assert change <= set(D.DEFAULT_SCENES), "the change layers must be on by default"
+# Chosen 2026-10-21: HDR as the picture, dBright as the change evidence. A
+# default run must still carry change evidence, or it cannot answer the
+# question the plugin exists to answer.
+assert set(D.DEFAULT_SCENES)=={"highlight_hdr","dbright"}, D.DEFAULT_SCENES
 assert "swir_falsecolor" not in D.DEFAULT_SCENES, \
     "SWIR false colour is a single-date composite, not a change detector, and PlanetScope has none"
 off=[k for k in keys if k not in D.DEFAULT_SCENES]
 print("   on :", list(D.DEFAULT_SCENES))
 print("   off:", off)
-assert set(off)=={"true_color","false_color","ndvi","swir_falsecolor"}, off
+assert set(off)=={"true_color","highlight_natural","false_color","ndvi","swir_falsecolor",
+                  "dndvi","dndsi"}, off
+
+print("\n=== 1b. every dock checkbox is a real review_package scene ===")
+# The dock can't import the project (different interpreter), so the two lists are
+# duplicated by hand and have to be checked at the source level — the same trick
+# section 5 uses for run_single.py. A checkbox whose token review_package doesn't
+# know is silently ignored by the export: the user ticks it and no layer appears.
+rp_src=open(os.path.join(ROOT,"review_package.py")).read()
+block=rp_src.split("SCENE_KEYS = [",1)[1].split("]",1)[0]
+rp_keys={t.strip().strip('"\'') for t in block.split(",") if t.strip()}
+print("   review_package.SCENE_KEYS =", sorted(rp_keys))
+assert set(keys)==rp_keys, (sorted(set(keys)^rp_keys),)
+print("   dock SCENES match, both ways:", len(keys), "keys")
+
+print("\n=== 1c. a failing HDR cannot take the change rasters with it ===")
+# highlight_hdr holds the whole AOI in float through one scene-fitted curve —
+# several GB on a 20 km AOI, so MemoryError is a realistic outcome on a machine
+# that is merely busy. Now that it is ON by default, every large-AOI run is
+# exposed to that; dBright/dNDSI are the layers the run exists to produce, and
+# losing the whole package to the picture would be the worst possible trade, so
+# the HDR write is the one product allowed to fail softly. Source-level because
+# review_package needs rioxarray, which QGIS's own python does not carry (the
+# venv runs it end-to-end instead).
+assert "tolerate=(MemoryError,)" in rp_src, \
+    "the HDR write must tolerate MemoryError so the default picture can't lose the run"
+assert 'def write_sides(kind, render, source="", when=None, tolerate=()):' in rp_src, \
+    "write_sides must default to tolerating NOTHING — every other product fails loudly"
+hdr_branch=rp_src.split('if "highlight_hdr" in want:',1)[1].split("\n\n",1)[0]
+assert "tolerate=(MemoryError,)" in hdr_branch, hdr_branch
+print("   HDR tolerates MemoryError; every other product still fails loudly")
 
 print("\n=== 2. the window guard ===")
 class Stub:

@@ -47,21 +47,16 @@ SOURCES = [
 ]
 
 # Downloadable review "scenes": (--scenes token, checkbox label, tooltip).
-# Keys must match review_package.SCENE_KEYS. Only HONC (highlight_natural) is
-# ticked by default — the one layer wanted on nearly every run — so a Run stays
-# light; tick more products before running to download the rest.
-# What a run downloads unless the user says otherwise. It used to be
-# highlight_natural ALONE — one attractive picture and not a single piece of
-# change evidence, so the default run could not answer the question the plugin
-# exists to answer, and the layers that do answer it were an opt-in the user had
-# to know to look for.
+# Keys must match review_package.SCENE_KEYS.
 #
-# The set is the three CHANGE rasters plus one context image. dNDSI and
-# dBright are the validated detectors — fusion_core scores an event as
-# mean(dNDSI, dBright, SAR), benchmarked across Iliamna/Hubbard/Valdez, and
-# carries a floor for each (0.10, 0.05). dNDVI is the weakest of the three
-# above the treeline but is the one that works for the vegetated coastal
-# events, and it is a rendering of bands already fetched.
+# What a run downloads unless the user says otherwise: one picture and one
+# change raster (chosen 2026-10-21). HDR is the picture — it keeps detail in
+# deep shadow AND sunlit snow, where HONC's cube root flattens most of a glacier
+# frame — and dBright is the change evidence, the optical measure Fusion
+# recommends and preselects. Before this it was HONC + dNDVI + dNDSI + dBright,
+# and before that HONC alone, which could not answer the question the plugin
+# exists to answer. dNDSI and dNDVI stay one tick away: dNDSI for snow and ice
+# that dBright misses, dNDVI for the vegetated coastal events.
 #
 # swir_falsecolor is deliberately NOT here despite being excellent to look at.
 # It is a single-date 3-band composite, not a change detector: Fusion never
@@ -69,7 +64,7 @@ SOURCES = [
 # has no SWIR bands at all, so defaulting it on does nothing on a Planet run.
 # It stays one tick away for interpreting a scene by eye.
 DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
-DEFAULT_SCENES = ("highlight_natural", "dndvi", "dndsi", "dbright")
+DEFAULT_SCENES = ("highlight_hdr", "dbright")
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
@@ -80,6 +75,17 @@ SCENES = [
      "detail and tames blown-out snow/cloud so one stretch reads across the whole "
      "scene. Sentinel Hub custom script by Marko Repše, CC BY-SA 4.0 — not a "
      "separate download, just a second rendering of the same scene."),
+    ("highlight_hdr", "HDR (one global curve)",
+     "The same true-colour bands as HONC, but pushed through a curve fitted to the "
+     "scene — a highlight rolloff with a log shadow lift — so a frame with both "
+     "deep shadow and sunlit snow keeps detail at BOTH ends, and no pixel comes out "
+     "pure black or pure white on any scene. On glacier scenes it "
+     "resolves noticeably more terrain than HONC inside the bright zone where the "
+     "cube-root curve flattens out — which is most of the frame. It does NOT make "
+     "a scar easier to spot than HONC; it makes the ground around one readable. "
+     "Memory-hungry — it holds the whole AOI in float, several GB on a 20 km one — "
+     "so it is the one layer that skips itself rather than failing the run when "
+     "it can't fit."),
     ("false_color", "False colour (NIR-R-G)",
      "NIR-red-green: vegetation pops bright red, fresh bare scar reads dark."),
     ("swir_falsecolor", "SWIR false colour (12-11-4)",
@@ -114,7 +120,7 @@ SENSOR_TAG = {"planet": "PlanetScope", "s2": "S2", "landsat": "Landsat"}
 # The value becomes the folder's product suffix, e.g. "S2 7-20/7-21 NDVI".
 CORE_PRODUCTS = [
     ("dndvi", "dNDVI"), ("dndsi", "dNDSI"), ("dbright", "dBright"),
-    ("highlight", "HONC"), ("falsecolor", "False-color"),
+    ("highlight", "HONC"), ("hdr", "HDR"), ("falsecolor", "False-color"),
     ("swir", "SWIR"), ("ndvi", "NDVI"), ("rgb", "TC"),
 ]
 
@@ -932,8 +938,9 @@ class LandslideDock(QgsDockWidget):
         # --- which review layers to export ---
         # These are OUTPUT products (renderings), not satellite acquisitions — the
         # "scene" word is reserved for the Candidate scenes table below. Each checked
-        # product is written by the run; only HONC is ticked by default, so tick the
-        # extra products you want before running. The predicted-epicentre point layer
+        # product is written by the run; HDR and dBright are ticked by default
+        # (DEFAULT_SCENES), so tick the extra products you want before running.
+        # The predicted-epicentre point layer
         # is always included. Expanded by default so the choice is visible (a primary
         # control).
         scenes_box = QgsCollapsibleGroupBox("Layers to export")
