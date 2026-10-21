@@ -1509,22 +1509,9 @@ class VolumeTab(QWidget):
         v = QVBoxLayout(box)
         note = QLabel(
             "For the “Deposit area × thickness” fit — a volume estimate that needs "
-            "no DEM. V = the outline's plan area × mean thickness. The default, "
-            "2.5 m (1.5–3.5 m), is for a rock avalanche spread over glacier ice. "
-            "The measured Alaska sheets of ~2–70 Mm³ (Sherman 1964, the 2002 "
-            "Denali Fault avalanches, West Fork Robertson, Lamplugh 2016) average "
-            "1.5–3.2 m, median ~2.5 m (Deline et al. 2015, Table 9.1), and above "
-            "~1 Mm³ the thickness barely grows with size.\n\n"
-            "Change it for:\n"
-            "• Ice-rich, Iliamna-type (Red Glacier): 1.5 m (1–2 m), as Toney et "
-            "al. 2021 use. That is the ROCK sheet — ~60% of what failed there was "
-            "ice, so the failed volume can be 2–3× the result.\n"
-            "• Very small, under ~0.2 Mm³: 0.4–1 m (Mueller, Jarvis, "
-            "Brenndalsbreen).\n"
-            "• Confined in a valley, or not on a glacier: 5–10 m (Kshwan 5 m, "
-            "Morsárjökull 5.5 m, Aoraki 5–10 m by radar).\n"
-            "• The SOURCE scar instead of the deposit: that wants a detachment "
-            "depth (~5–30 m), not a deposit thickness.\n\n"
+            "no DEM. V = the outline's plan area × mean thickness. Pick the "
+            "setting that matches the deposit: it fills the mean, low and high, "
+            "which you can still edit (the setting then reads Custom).\n\n"
             "These are means over the deposit. The total outline also holds the "
             "source scar and track — Bessette-Kirton & Coe (2020) take the deposit "
             "as ~80% of it — so the volume reads somewhat high; the low end covers "
@@ -1533,23 +1520,90 @@ class VolumeTab(QWidget):
         note.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(note)
         form = QFormLayout()
-        self.thick_best_edit = QLineEdit("2.5")
+        # Underscored so project_state does not store it: the setting is read back
+        # off the three numbers (_sync_thickness_setting), which ARE stored.
+        self._thick_setting_combo = QComboBox()
+        for label, key, *_rest in volume_calc.THICKNESS_SETTINGS:
+            self._thick_setting_combo.addItem(label, key)
+        self._thick_setting_combo.addItem("Custom — your own values", "custom")
+        self._thick_setting_combo.setToolTip(
+            "What kind of deposit the outline is. Fills the mean thickness and "
+            "its low/high from the published values for that setting; edit any "
+            "of them and this reads Custom.")
+        # The labels carry their numbers, so the longest would set the dock's
+        # minimum width; let the closed combo elide instead (the list still opens
+        # full width).
+        self._thick_setting_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._thick_setting_combo.setMinimumContentsLength(12)
+        self._thick_setting_combo.activated.connect(self._apply_thickness_setting)
+        form.addRow("Setting", self._thick_setting_combo)
+        self._thick_note_lbl = QLabel()
+        self._thick_note_lbl.setWordWrap(True)
+        self._thick_note_lbl.setStyleSheet("QLabel { color: palette(mid); }")
+        form.addRow(self._thick_note_lbl)     # spans both columns: it is prose
+        _label, _key, best, low, high, _note = volume_calc.THICKNESS_SETTINGS[0]
+        self.thick_best_edit = QLineEdit(f"{best:g}")
         self.thick_best_edit.setToolTip(
             "Mean deposit thickness in metres, averaged over the whole outline "
             "(thick in the source/deposit, thin along the track).")
         form.addRow("Mean thickness (m)", self.thick_best_edit)
-        self.thick_low_edit = QLineEdit("1.5")
+        self.thick_low_edit = QLineEdit(f"{low:g}")
         self.thick_low_edit.setToolTip(
             "Low thickness → low volume. Must be less than the mean; blank for no "
             "lower bound.")
         form.addRow("Low (m)", self.thick_low_edit)
-        self.thick_high_edit = QLineEdit("3.5")
+        self.thick_high_edit = QLineEdit(f"{high:g}")
         self.thick_high_edit.setToolTip(
             "High thickness → high volume. Must be greater than the mean; blank "
             "for no upper bound.")
         form.addRow("High (m)", self.thick_high_edit)
         v.addLayout(form)
+        for edit in (self.thick_best_edit, self.thick_low_edit,
+                     self.thick_high_edit):
+            edit.textChanged.connect(self._sync_thickness_setting)
+        self._sync_thickness_setting()
         return box
+
+    def _apply_thickness_setting(self, index):
+        """Fill mean/low/high from the setting picked at `index`.
+
+        Wired to the combo's `activated` — a user's pick only — so the
+        programmatic moves made by _sync_thickness_setting never refill the
+        numbers. Custom leaves them for the analyst to type."""
+        key = self._thick_setting_combo.itemData(index)
+        entry = next((s for s in volume_calc.THICKNESS_SETTINGS if s[1] == key),
+                     None)
+        if entry is None:
+            self._show_thickness_note()
+            self.thick_best_edit.setFocus()
+            return
+        _label, _key, best, low, high, _note = entry
+        for edit, val in ((self.thick_best_edit, best), (self.thick_low_edit, low),
+                          (self.thick_high_edit, high)):
+            edit.setText(f"{val:g}")
+        # setText only signals a CHANGE, so sync once more for a pick whose
+        # numbers were already in the fields (Custom, then the same setting).
+        self._sync_thickness_setting()
+
+    def _sync_thickness_setting(self, *_args):
+        """Point the Setting combo at whichever setting the three numbers are, or
+        Custom when they are none of them. Runs on every edit and on project
+        restore, which is why the combo itself never needs storing."""
+        entry = volume_calc.thickness_setting(*self._thickness_values())
+        combo = self._thick_setting_combo
+        combo.setCurrentIndex(combo.findData(entry[1] if entry else "custom"))
+        self._show_thickness_note()
+
+    def _show_thickness_note(self):
+        """The selected setting's evidence, under the combo."""
+        key = self._thick_setting_combo.currentData()
+        entry = next((s for s in volume_calc.THICKNESS_SETTINGS if s[1] == key),
+                     None)
+        self._thick_note_lbl.setText(
+            entry[5] if entry else
+            "Your own mean/low/high — none of the settings above. Pick a setting "
+            "to fill them from the published values again.")
 
     def _thickness_values(self):
         """(t_best, t_low, t_high) in metres from the thickness fields, or
@@ -1853,6 +1907,23 @@ class VolumeTab(QWidget):
                 self._append_log(
                     "Single thickness given, so no range — set a low and high "
                     "thickness below to bracket the volume.")
+            setting = volume_calc.thickness_setting(*self._thickness_values())
+            key = setting[1] if setting else "custom"
+            if key == "ice_rich":
+                self._append_log(
+                    "Ice-rich setting: this is the ROCK sheet. ~60% of what failed "
+                    "at Red Glacier was ice, so the failed volume can be 2–3× this "
+                    "— check which one a seismic volume means before comparing.")
+            if key == "scar" and conv_role == "total":
+                self._append_log(
+                    "The Source-scar setting is a detachment depth, but the TOTAL "
+                    "outline was converted — that reads several times too high. "
+                    "Pick a deposit setting, or measure the scar outline alone.")
+            elif key not in ("scar", "custom") and conv_role == "source":
+                self._append_log(
+                    "No total outline, so the SOURCE scar was converted with a "
+                    "deposit thickness — that reads low. Assign the deposit "
+                    "outline, or pick the Source-scar setting.")
         elif conv_role == "source" and conv_low is not None and conv_high is not None:
             self._append_log(
                 "Range combines the published fit uncertainty with the source "

@@ -92,12 +92,56 @@ FIT_OUTLINE = {
              "reported separately. Needs a Δh raster assigned below."),
     "thickness": ("Outline the DEPOSIT / total affected area — this fit is just "
                   "its plan area × a mean thickness (no DEM needed), the Toney "
-                  "et al. (2021) estimate for a rock/ice avalanche. Set the mean "
-                  "thickness and its low/high below. ~2.5 m (1.5–3.5 m) is the "
-                  "measured mean for an Alaska rock avalanche spread over a "
-                  "glacier; use ~1.5 m for an ice-rich Iliamna-type sheet, under "
-                  "1 m below ~0.2 Mm³, and 5–10 m when confined or off the ice."),
+                  "et al. (2021) estimate for a rock/ice avalanche. Pick the "
+                  "deposit's setting below (it fills the mean thickness and its "
+                  "low/high): ~2.5 m (1.5–3.5 m) is the measured mean for an Alaska "
+                  "rock avalanche spread over a glacier."),
 }
+
+# Mean deposit thickness by setting, for the area × thickness fit, in the order the
+# tab's Setting combo offers them — the FIRST entry is the default and must match
+# the thickness fields' construction values. Each is (label, key, mean, low, high,
+# note), thickness in metres. The ranges are the published ones (Deline et al.
+# 2015, "Rock avalanches onto glaciers", Table 9.1 and pp. 283–284; Toney et al.
+# 2021); where a source gives only a range, the mean is its rounded middle.
+#
+# The combo is not stored in the project. It is read back off the three numbers
+# (thickness_setting), so an older project shows whichever setting its values are,
+# and an edit away from every setting reads as Custom.
+THICKNESS_SETTINGS = [
+    ("Rock avalanche on a glacier — 2.5 m (1.5–3.5)", "glacier", 2.5, 1.5, 3.5,
+     "Measured Alaska sheets of ~2–70 Mm³ (Sherman 1964, the 2002 Denali Fault "
+     "avalanches, West Fork Robertson, Lamplugh 2016) average 1.5–3.2 m, median "
+     "~2.5 m (Deline et al. 2015, Table 9.1). Above ~1 Mm³ the thickness barely "
+     "grows with size."),
+    ("Ice-rich, Iliamna-type — 1.5 m (1–2)", "ice_rich", 1.5, 1.0, 2.0,
+     "Red Glacier deposits are 1–2 m (Deline et al. 2015, Table 9.1; Toney et al. "
+     "2021 use 1.5 ± 1 m). That is the ROCK sheet: ~60% of what failed there was "
+     "ice, so the failed volume can be 2–3× the result."),
+    ("Very small, under ~0.2 Mm³ — 0.7 m (0.4–1)", "small", 0.7, 0.4, 1.0,
+     "Mueller Glacier 0.5–1 m and Jarvis Glacier under 0.5 m (Deline et al. 2015, "
+     "pp. 283–284); Brenndalsbreen 2010 came out near 0.4 m."),
+    ("Confined, or not on a glacier — 7 m (5–10)", "confined", 7.0, 5.0, 10.0,
+     "Kshwan 5 m, Morsárjökull 5.5 m, Aoraki 5–10 m by radar (Deline et al. 2015, "
+     "Table 9.1 and p. 284). Off the ice, deposits run about ten times thicker "
+     "than the thin sheets on it."),
+    ("Source scar, not the deposit — 12 m (5–30)", "scar", 12.0, 5.0, 30.0,
+     "A detachment depth, for an outline of the evacuated source scar alone — "
+     "not a deposit thickness."),
+]
+
+
+def thickness_setting(t_best, t_low, t_high):
+    """The THICKNESS_SETTINGS entry whose mean/low/high these are, or None.
+
+    Compared as numbers, so "1", "1.0" and "1.00" are all the same setting."""
+    def _same(a, b):
+        return a is not None and math.isclose(a, b, rel_tol=0, abs_tol=1e-9)
+    for entry in THICKNESS_SETTINGS:
+        _label, _key, best, low, high, _note = entry
+        if _same(t_best, best) and _same(t_low, low) and _same(t_high, high):
+            return entry
+    return None
 
 
 def _fallback_volume_source(A_best, A_low=None, A_high=None, type="bedrock"):
@@ -228,10 +272,14 @@ def volume_thickness(area, t_best, t_low=None, t_high=None):
     thickness. Unlike the Larsen fits there is no fitted coefficient — the range
     is just the low/high thickness carried straight through, because the mean
     thickness IS the dominant uncertainty. `area` in m², thickness in m, V in m³.
-    A low ≥ best or high ≤ best is treated as 'not given' (no range on that side)."""
+    A low ≥ best or high ≤ best is treated as 'not given' (no range on that side).
+    The label names the THICKNESS_SETTINGS entry the three values are, if any, so
+    the results row records which setting the volume assumed."""
     V = area * t_best
     Vlow = area * t_low if (t_low is not None and t_low < t_best) else None
     Vhigh = area * t_high if (t_high is not None and t_high > t_best) else None
     rng = (f", {t_low:g}–{t_high:g}"
            if (Vlow is not None and Vhigh is not None) else "")
-    return V, Vlow, Vhigh, f"deposit area × thickness ({t_best:g} m{rng})"
+    setting = thickness_setting(t_best, t_low, t_high)
+    named = f"; {setting[0].split(' — ')[0]}" if setting else ""
+    return V, Vlow, Vhigh, f"deposit area × thickness ({t_best:g} m{rng}{named})"
