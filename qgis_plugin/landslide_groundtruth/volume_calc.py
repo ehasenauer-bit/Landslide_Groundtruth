@@ -93,10 +93,10 @@ FIT_OUTLINE = {
     "thickness": ("Outline the DEPOSIT / total affected area — this fit is just "
                   "its plan area × a mean thickness (no DEM needed), the Toney "
                   "et al. (2021) estimate for a rock/ice avalanche. Set the mean "
-                  "thickness and its low/high below. ~1.5 m (0.5–2.5 m) is the "
-                  "published figure for an Iliamna-class sheet (~10 Mm³); it is an "
-                  "anchor at that size, not a constant — widen the range a long "
-                  "way for a much smaller deposit."),
+                  "thickness and its low/high below. ~2.5 m (1.5–3.5 m) is the "
+                  "measured mean for an Alaska rock avalanche spread over a "
+                  "glacier; use ~1.5 m for an ice-rich Iliamna-type sheet, under "
+                  "1 m below ~0.2 Mm³, and 5–10 m when confined or off the ice."),
 }
 
 

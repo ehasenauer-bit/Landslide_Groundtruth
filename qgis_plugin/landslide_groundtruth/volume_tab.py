@@ -1435,33 +1435,41 @@ class VolumeTab(QWidget):
         v = QVBoxLayout(box)
         note = QLabel(
             "For the “Deposit area × thickness” fit — a volume estimate that needs "
-            "no DEM. V = the outline's plan area × mean thickness. Start at "
-            "~1.5 m, bracket 0.5–2.5 m (Toney et al. 2021 use 1.5 ± 1 m at "
-            "Iliamna).\n\n"
-            "Treat 1.5 m as an ANCHOR AT ~10 Mm³, not a constant. It rests on one "
-            "measured sheet (Sherman, 1.65 m over 8.25 km²) and one assumed value "
-            "(Iliamna), both at about that size. Well below ~10 Mm³ nothing "
-            "published supports it — the only measured small supraglacial deposit, "
-            "Brenndalsbreen 2010 at 0.13 Mm³, came out near 0.4 m — so widen the "
-            "low/high a long way there instead of printing a tight range.\n\n"
-            "Go higher (2–5 m) for a blocky, confined, non-glacier deposit. "
-            "Outlining the SOURCE scar instead? That wants a detachment depth "
-            "(~5–30 m), not a deposit thickness. Low/high sets the volume range.")
+            "no DEM. V = the outline's plan area × mean thickness. The default, "
+            "2.5 m (1.5–3.5 m), is for a rock avalanche spread over glacier ice. "
+            "The measured Alaska sheets of ~2–70 Mm³ (Sherman 1964, the 2002 "
+            "Denali Fault avalanches, West Fork Robertson, Lamplugh 2016) average "
+            "1.5–3.2 m, median ~2.5 m (Deline et al. 2015, Table 9.1), and above "
+            "~1 Mm³ the thickness barely grows with size.\n\n"
+            "Change it for:\n"
+            "• Ice-rich, Iliamna-type (Red Glacier): 1.5 m (1–2 m), as Toney et "
+            "al. 2021 use. That is the ROCK sheet — ~60% of what failed there was "
+            "ice, so the failed volume can be 2–3× the result.\n"
+            "• Very small, under ~0.2 Mm³: 0.4–1 m (Mueller, Jarvis, "
+            "Brenndalsbreen).\n"
+            "• Confined in a valley, or not on a glacier: 5–10 m (Kshwan 5 m, "
+            "Morsárjökull 5.5 m, Aoraki 5–10 m by radar).\n"
+            "• The SOURCE scar instead of the deposit: that wants a detachment "
+            "depth (~5–30 m), not a deposit thickness.\n\n"
+            "These are means over the deposit. The total outline also holds the "
+            "source scar and track — Bessette-Kirton & Coe (2020) take the deposit "
+            "as ~80% of it — so the volume reads somewhat high; the low end covers "
+            "that. Low/high sets the volume range.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(note)
         form = QFormLayout()
-        self.thick_best_edit = QLineEdit("1.5")
+        self.thick_best_edit = QLineEdit("2.5")
         self.thick_best_edit.setToolTip(
             "Mean deposit thickness in metres, averaged over the whole outline "
             "(thick in the source/deposit, thin along the track).")
         form.addRow("Mean thickness (m)", self.thick_best_edit)
-        self.thick_low_edit = QLineEdit("1.0")
+        self.thick_low_edit = QLineEdit("1.5")
         self.thick_low_edit.setToolTip(
             "Low thickness → low volume. Must be less than the mean; blank for no "
             "lower bound.")
         form.addRow("Low (m)", self.thick_low_edit)
-        self.thick_high_edit = QLineEdit("2.5")
+        self.thick_high_edit = QLineEdit("3.5")
         self.thick_high_edit.setToolTip(
             "High thickness → high volume. Must be greater than the mean; blank "
             "for no upper bound.")
@@ -1668,7 +1676,8 @@ class VolumeTab(QWidget):
                 self._append_log(
                     "Enter a mean deposit thickness (m) in the “Deposit "
                     "thickness” box below — the volume is area × thickness. "
-                    "~1.5 m (0.5–3 m) is typical for a rock/ice avalanche.")
+                    "~2.5 m (1.5–3.5 m) is typical for a rock avalanche on a "
+                    "glacier; ~1.5 m for an ice-rich, Iliamna-type one.")
                 return
             v_best, v_low, v_high, calc = volume_calc.volume_thickness(
                 conv_area, t, t_low=t_lo, t_high=t_hi)

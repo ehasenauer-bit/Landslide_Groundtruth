@@ -11,6 +11,9 @@ and between them they emptied its post-event list — the scene Planet Explorer
 showed never came back. RETIRED_DEFAULTS swaps exactly those stored values for
 today's defaults, once, in any project stamped before VERSION 2. The seeded
 strings below are the ones that project file actually holds.
+
+VERSION 3 retires the Volume tab's 1.5 / 1.0 / 2.5 m deposit thickness the same
+way, for the measured 2.5 / 1.5 / 3.5 m.
 """
 import os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -140,9 +143,40 @@ check("nothing retired -> the project is left as it was (still v1, not dirtied)"
 seed(None, {"planet/quality_combo": "Standard quality only"})
 check(f"an unstamped project counts as the oldest version (got {filters()})",
       filters()[2] == "any")
-check("retired_since('2') is empty, retired_since('1') has all three",
-      ps.retired_since("2") == {} and len(ps.retired_since("1")) == 3)
-check("retired_since tolerates garbage", len(ps.retired_since("x")) == 3)
+check(f"retired_since('{ps.VERSION}') is empty, '2' has the three thicknesses, "
+      "'1' has all six",
+      ps.retired_since(ps.VERSION) == {} and len(ps.retired_since("2")) == 3
+      and len(ps.retired_since("1")) == 6)
+check("retired_since tolerates garbage", len(ps.retired_since("x")) == 6)
+
+print("\n=== Volume: the old 1.5 / 1.0 / 2.5 m thickness opens on 2.5 / 1.5 / 3.5 ===")
+vol = dock.volume_tab
+
+
+def thickness():
+    return (vol.thick_best_edit.text(), vol.thick_low_edit.text(),
+            vol.thick_high_edit.text())
+
+
+project.clear(); state._restore_now()
+check(f"a new project opens on 2.5 / 1.5 / 3.5 (got {thickness()})",
+      thickness() == ("2.5", "1.5", "3.5"))
+OLD_THICK = {"volume/thick_best_edit": "1.5", "volume/thick_low_edit": "1.0",
+             "volume/thick_high_edit": "2.5"}
+seed("2", OLD_THICK)
+check(f"a v2 project on the old defaults -> 2.5 / 1.5 / 3.5 (got {thickness()})",
+      thickness() == ("2.5", "1.5", "3.5"))
+ver, _ = project.readEntry(SCOPE, ps.VERSION_KEY, "")
+best, _ = project.readEntry(SCOPE, "volume/thick_best_edit", "")
+check(f"the swap is written at once, stamped v{ps.VERSION} (got v{ver}, {best})",
+      ver == ps.VERSION and best == "2.5")
+seed("2", {"volume/thick_best_edit": "4", "volume/thick_low_edit": "3",
+           "volume/thick_high_edit": "8"})
+check(f"a v2 project that chose 4 / 3 / 8 m keeps them (got {thickness()})",
+      thickness() == ("4", "3", "8"))
+seed(ps.VERSION, OLD_THICK)
+check(f"a v{ps.VERSION} project that CHOSE 1.5 / 1.0 / 2.5 (Iliamna) keeps them "
+      f"(got {thickness()})", thickness() == ("1.5", "1.0", "2.5"))
 
 project.clear()
 dock.teardown()

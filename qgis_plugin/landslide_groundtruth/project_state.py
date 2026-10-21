@@ -43,9 +43,9 @@ SCOPE = "landslide_groundtruth"
 # Stamped alongside the values so a key/meaning change can migrate an older
 # project instead of silently misreading it. A key that is absent simply falls
 # back to its default; the one thing the version changes is RETIRED_DEFAULTS.
-# "1" = every project before 2026-09-25.
+# "1" = every project before 2026-09-25; "2" = 2026-09-25 to 2026-10-21.
 VERSION_KEY = "state/version"
-VERSION = "2"
+VERSION = "3"
 
 # Values that USED to be a control's default, retired because they hid data. save()
 # writes every widget, untouched ones included, so a project saved under an old
@@ -62,6 +62,16 @@ RETIRED_DEFAULTS = {
         "planet/cloud_slider": "80",                                        # to 09-24
         "planet/coverage_combo": "Cover the exact epicentre (stricter)",    # 08-25..09-24
         "planet/quality_combo": "Standard quality only",                    # to 08-25
+    },
+    "3": {
+        # Deposit thickness for the area × thickness fit, to 2026-10-21: Toney et al.'s
+        # Iliamna 1.5 m. Measured Alaska rock avalanches on glaciers average 2–3 m
+        # (Deline et al. 2015, Table 9.1), so the default became 2.5 / 1.5 / 3.5 m. An
+        # Iliamna project that meant 1.5 m can't be told apart from the old default and
+        # opens on 2.5 m too; re-enter 1.5 there.
+        "volume/thick_best_edit": "1.5",
+        "volume/thick_low_edit": "1.0",
+        "volume/thick_high_edit": "2.5",
     },
 }
 
