@@ -1,7 +1,6 @@
 """The dock panel: location pick, date, pre/post sliders, source preference, run."""
 import base64
 import json
-import re
 import math
 import os
 import platform
@@ -33,6 +32,7 @@ import numpy as np
 from osgeo import gdal
 
 from .task import PipelineTask
+from . import coord_paste
 from . import hdr_render
 from . import layer_group as lg
 from .flow_layout import FlowRow
@@ -596,6 +596,7 @@ class LandslideDock(QgsDockWidget):
         self.det_lat_edit.setPlaceholderText("60.50")
         self.det_lon_edit = QLineEdit()
         self.det_lon_edit.setPlaceholderText("-140.60   (negative in Alaska/Yukon)")
+        coord_paste.link_pair(self.det_lat_edit, self.det_lon_edit)
         form.addRow("Latitude", self.det_lat_edit)
         form.addRow("Longitude", self.det_lon_edit)
 
@@ -805,14 +806,16 @@ class LandslideDock(QgsDockWidget):
         # No QDoubleValidator here on purpose. It rejected any string containing a
         # separator, and Qt drops a rejected paste SILENTLY — so pasting a
         # "lat, lon" pair from a detection record, a spreadsheet or a map site
-        # left the box empty with no message at all. The pair is split below and
-        # the value is validated in _collect, which can explain what is wrong.
-        self.lat_edit.textChanged.connect(self._split_pasted_pair)
+        # left the box empty with no message at all. The pair is split by
+        # coord_paste and the value is validated in _collect, which can explain
+        # what is wrong.
         form.addRow("Latitude", self.lat_edit)
 
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
         form.addRow("Longitude", self.lon_edit)
+        coord_paste.link_pair(self.lat_edit, self.lon_edit,
+                              on_split=self._log_pasted_pair)
 
         # Pick the epicentre off the canvas. The docs have promised this since
         # the first release (metadata.txt, both READMEs) and it was never
@@ -1338,28 +1341,8 @@ class LandslideDock(QgsDockWidget):
         self.window_warn.setVisible(bool(msgs))
 
     # ---------- picking the epicentre off the canvas ----------
-    def _split_pasted_pair(self, text):
-        """Accept a whole 'lat, lon' pair pasted into the Latitude box.
-
-        Coordinates travel as a pair everywhere the analyst gets them, so
-        requiring two separate paste actions (and silently discarding the pair if
-        they try one) is friction for nothing."""
-        t = (text or "").strip()
-        if not t or not any(c in t for c in ",;\t"):
-            return
-        parts = [p for p in re.split(r"[,;\t]+", t) if p.strip()]
-        if len(parts) != 2:
-            return
-        try:
-            lat, lon = float(parts[0].strip()), float(parts[1].strip())
-        except ValueError:
-            return
-        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            return
-        self.lat_edit.blockSignals(True)          # avoid re-entering on setText
-        self.lat_edit.setText(f"{lat:.6f}")
-        self.lat_edit.blockSignals(False)
-        self.lon_edit.setText(f"{lon:.6f}")
+    def _log_pasted_pair(self, lat, lon):
+        """coord_paste split a pasted 'lat, lon' pair across the two boxes."""
         self._append_log(f"Pasted coordinate pair split: {lat:.6f}, {lon:.6f}")
 
 

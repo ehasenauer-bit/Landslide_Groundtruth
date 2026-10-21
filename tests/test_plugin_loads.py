@@ -97,9 +97,20 @@ assert dock.radius_spin.value()==17.0
 print("   env status:", dock.env_status.text()[:70])
 print("   env_gate() with no setup:", dock.env_gate())
 assert dock.env_gate() is False
-dock.lat_edit.setText("59.9, -149.8")
-print("   pasted pair split ->", dock.lat_edit.text(), dock.lon_edit.text())
-assert dock.lon_edit.text()=="-149.800000"
+# Every Latitude/Longitude pair in the dock takes a pasted "lat, lon", in either
+# box. insert() is what a paste does (setText never emits textEdited).
+pairs={"S2 / Landsat":dock, "PlanetScope":dock.planet_tab, "Maxar VHR":dock.gegd_tab,
+       "SAR":dock.sar_tab, "3D viewer":dock.viewer3d_tab}
+for name,t in pairs.items():
+    for box in (t.lat_edit, t.lon_edit):
+        t.lat_edit.clear(); t.lon_edit.clear()
+        box.insert("59.9, -149.8")
+        got=(t.lat_edit.text(), t.lon_edit.text())
+        assert got==("59.900000","-149.800000"), (name, box is t.lat_edit, got)
+    print(f"   pasted pair split on {name:12s} ->", *got)
+dock.det_lon_edit.selectAll(); dock.det_lon_edit.insert("60.50, -140.60")
+print("   pasted pair split on Detection    ->", dock.det_lat_edit.text(), dock.det_lon_edit.text())
+assert (dock.detection.lat, dock.detection.lon)==(60.5,-140.6)
 print("   default scenes ticked:", sorted(k for k,cb in dock.scene_checks.items() if cb.isChecked()))
 print("   window warning:", dock.window_warn.text()[:80] or "(none)")
 

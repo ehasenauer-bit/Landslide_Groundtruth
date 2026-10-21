@@ -51,6 +51,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsCollapsibleGroupBox, QgsCheckableComboBox
 
+from . import coord_paste
 from . import dem_diff
 from . import layer_group as lg
 from .task import PipelineTask
@@ -197,7 +198,10 @@ class Viewer3DTab(QWidget):
         # --- event AOI (own copy; button pulls from the Sentinel tab) ---
         form = QFormLayout()
         self.lat_edit = QLineEdit()
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
+        self.lon_edit.setPlaceholderText("e.g. -149.823317")
+        coord_paste.link_pair(self.lat_edit, self.lon_edit)
         self.radius_spin = QDoubleSpinBox()
         self.radius_spin.setRange(0.2, 50.0)
         self.radius_spin.setSingleStep(0.5)

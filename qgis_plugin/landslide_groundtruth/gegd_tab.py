@@ -66,6 +66,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
+from . import coord_paste
 from . import gegd_api as api
 from . import gegd_auth
 from . import gegd_layers as gl
@@ -455,7 +456,7 @@ class GegdTab(QWidget):
         self.lat_edit.setPlaceholderText("e.g. 60.0265   (or paste '60.0265, -153.0559')")
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -153.0559   (negative in Alaska/Yukon)")
-        self.lat_edit.textEdited.connect(self._split_pair)
+        coord_paste.link_pair(self.lat_edit, self.lon_edit)
         form.addRow("Latitude", self.lat_edit)
         form.addRow("Longitude", self.lon_edit)
 
@@ -966,18 +967,6 @@ class GegdTab(QWidget):
         self._archive_note.setStyleSheet(status_css("warn"))
         self._archive_note.setVisible(bool(notes))
         self._update_buttons()
-
-    def _split_pair(self, text):
-        """'60.0265, -153.0559' pasted into Latitude fills both fields."""
-        parts = [p for p in re.split(r"[,;\s]+", (text or "").strip()) if p]
-        if len(parts) != 2:
-            return
-        try:
-            lat, lon = float(parts[0]), float(parts[1])
-        except ValueError:
-            return
-        self.lat_edit.setText(f"{lat:.6f}")
-        self.lon_edit.setText(f"{lon:.6f}")
 
     def _copy_from_main(self):
         """Location, radius and time from the Sentinel-2 / Landsat tab (not the

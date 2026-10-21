@@ -52,6 +52,7 @@ from qgis.PyQt.QtCore import QVariant
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from . import coord_paste
 from . import layer_group as lg
 from . import planet_keystore
 
@@ -206,9 +207,10 @@ class PlanetTab(QWidget):
         # "and", not "&": a group-box title takes & as a mnemonic marker too
         form = self._options_group(root, "Event location and time", collapsed=False)
         self.lat_edit = QLineEdit()
-        self.lat_edit.setPlaceholderText("e.g. 59.906992")
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
+        coord_paste.link_pair(self.lat_edit, self.lon_edit)
         form.addRow("Latitude", self.lat_edit)
         form.addRow("Longitude", self.lon_edit)
 

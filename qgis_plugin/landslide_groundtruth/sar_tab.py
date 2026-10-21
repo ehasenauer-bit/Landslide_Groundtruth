@@ -84,6 +84,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
+from . import coord_paste
 from . import sar_change
 from . import sar_pairing
 from . import layover_dim
@@ -324,9 +325,10 @@ class SarTab(QWidget):
         # --- event inputs (own copy; button pulls from the Sentinel tab) ---
         form = QFormLayout()
         self.lat_edit = QLineEdit()
-        self.lat_edit.setPlaceholderText("e.g. 59.906992")
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
+        coord_paste.link_pair(self.lat_edit, self.lon_edit)
         form.addRow("Latitude", self.lat_edit)
         form.addRow("Longitude", self.lon_edit)
 
