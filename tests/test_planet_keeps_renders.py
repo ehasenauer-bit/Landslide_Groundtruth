@@ -201,6 +201,26 @@ check("every downloaded layer survives a render that loaded nothing",
 check("... and so does the tile preview (nothing replaced it)",
       t3_id is not None and QgsProject.instance().mapLayer(t3_id) is not None)
 
+print("\n=== same-day ticks are stitched into one tile layer ===")
+cand = lambda cid, d: dict(id=cid, date=d, gap_days=6, cloud_pct=1.0, geometry=None)
+tab._search_result = dict(lat=60.26, lon=-140.817, params=dict(radius_km=5.0),
+    pre=[cand("20260812_213534_30_251b", "2026-08-12T21:35:34")],
+    post=[cand("20260824_211813_10_2527", "2026-08-24T21:18:13"),
+          cand("20260824_211810_91_2527", "2026-08-24T21:18:10"),
+          cand("20260825_211355_42_2530", "2026-08-25T21:13:55")])
+tab._fill_table(tab._search_result)
+from qgis.PyQt.QtCore import Qt as _Qt
+for r in range(tab.table.rowCount()):
+    tab.table.item(r, 0).setCheckState(_Qt.Checked)
+picks = dict(tab._preview_picks())
+check(f"4 ticked scenes -> 3 layers ({list(picks)})", len(picks) == 3)
+check("the two 08-24 frames are ONE layer holding both ids",
+      picks.get("PlanetScope after 2026-08-24 (2 scenes stitched)")
+      == ["20260824_211813_10_2527", "20260824_211810_91_2527"])
+check("other days stay their own layers",
+      picks.get("PlanetScope after 2026-08-25") == ["20260825_211355_42_2530"]
+      and picks.get("PlanetScope before 2026-08-12") == ["20260812_213534_30_251b"])
+
 QgsProject.instance().clear()
 dock.teardown()
 print(f"\n{OK} passed, {FAIL} failed")

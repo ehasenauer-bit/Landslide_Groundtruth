@@ -33,7 +33,6 @@ import glob
 import json
 import os
 import time
-import warnings
 import numpy as np
 import rioxarray  # noqa: F401  (registers .rio accessor)
 import xarray as xr
@@ -805,23 +804,51 @@ def _open_scene(sr_path, udm_path, epsg, transform, shape):
         if TOA_BALANCE:
             da = _balance_cast(da)
     da = da.assign_coords(band=["blue", "green", "red", "nir"])
+    # Pin float32 BEFORE the warp. The TOA path multiplies by xarray's default-float64
+    # coefficient/gain arrays (_toa_from_dn, _balance_cast), which silently promotes the
+    # scene to float64 and DOUBLES every array downstream — a 10k x 10k AOI grid is
+    # 1.6 GB in float32 but 3.2 GB in float64. Casting here halves both the warp buffer
+    # and the composite.
+    da = da.astype("float32")
     # warp straight onto the AOI grid; pixels the scene doesn't reach become NaN
     return da.rio.reproject(epsg, transform=transform, shape=shape)
 
 
 def _composite(pairs, lat, lon, radius_km, epsg):
-    """Median composite over the scenes in one window, on the AOI grid."""
+    """Mosaic one side's scenes onto the AOI grid, stitching the frames and discarding
+    overlap: the first scene to cover a pixel keeps it, later frames only fill the gaps
+    it left.
+
+    A wide AOI is delivered as several PlanetScope frames (~24x8 km) that have to be
+    stitched into one image; where two frames overlap, keeping the first and dropping
+    the rest is exactly the "remove the overlapping imagery" the picker implies when
+    several scenes are ticked for one side.
+
+    Built ONE scene at a time into a single running output, so peak memory stays at
+    ~two AOI-grid arrays however many frames there are. The previous version reprojected
+    EVERY frame to the full AOI grid, held them all at once and ran nanmedian over the
+    stack: for a 15 km radius (a 10k x 10k grid — ~1.6 GB per frame in float32, double
+    that on the TOA path) five frames reached tens of GB of live arrays plus nanmedian's
+    own temporaries, which ran the machine out of memory and got the render process
+    OS-killed. First-valid-wins needs no stack."""
     transform, shape = _target_grid(lat, lon, radius_km, epsg)
-    scenes = [_open_scene(sr, udm, epsg, transform, shape) for sr, udm in pairs]
-    if not scenes:
+    comp = None
+    for sr, udm in pairs:
+        da = _open_scene(sr, udm, epsg, transform, shape)
+        # Every frame is already on the identical AOI grid, so combine_first is a plain
+        # where(notnull): comp keeps its own pixels, da fills only where comp is NaN.
+        comp = da if comp is None else comp.combine_first(da)
+        del da
+    if comp is None:
         return None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        comp = xr.concat(scenes, dim="scene").median(dim="scene", skipna=True)
     # Drop inherited per-scene rasterio metadata (e.g. a 4-band 'long_name' and a
     # float NaN nodata) so derived rasters — dNDVI, dBrightness, RGB — don't carry
     # band-count/dtype-mismatched attrs into rioxarray's GeoTIFF writer downstream.
     comp.attrs = {}
+    # Hold the float32 invariant: combine_first upcasts to float64 if EVER handed a
+    # float64 frame, which would double the output. copy=False makes this a no-op on
+    # the normal path (every frame is already float32), so it only bites on a regression.
+    comp = comp.astype("float32", copy=False)
     return comp.rio.write_crs(epsg)
 
 

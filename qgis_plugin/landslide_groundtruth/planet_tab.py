@@ -1539,7 +1539,13 @@ class PlanetTab(QWidget):
         Preview the TICKED table rows — tick a scene's checkbox to include it, tick
         several to compare. With nothing ticked, fall back to the ★ nearest scene on
         each side so the button still gives a sensible before/after pair. Row
-        selection only drives the browse-image preview pane."""
+        selection only drives the browse-image preview pane.
+
+        Ticked scenes from the same side AND the same day are stitched into ONE layer:
+        the tile service mosaics every id in a request, and same-day PlanetScope
+        frames are usually neighbours on one strip, each clipping part of the AOI.
+        Different days stay separate layers so they can still be compared; to see a
+        single frame on its own, double-click its row."""
         result = self._search_result or {}
         picks = []                          # [(side, cid), …] in table order
         for r in range(self.table.rowCount()):
@@ -1555,7 +1561,16 @@ class PlanetTab(QWidget):
                 ranked = self._rank(result.get(side, []))
                 if ranked and ranked[0].get("id"):
                     picks.append((side, ranked[0]["id"]))
-        return [(self._label_for(side, cid), [cid]) for side, cid in picks]
+        groups = {}                         # (side, date) -> [ids], in table order
+        for side, cid in picks:
+            groups.setdefault((side, self._date_for(side, cid)), []).append(cid)
+        out = []
+        for (side, _date), ids in groups.items():
+            label = self._label_for(side, ids[0])
+            if len(ids) > 1:
+                label += f" ({len(ids)} scenes stitched)"
+            out.append((label, ids))
+        return out
 
     def _label_for(self, side, cid):
         date = self._date_for(side, cid)
