@@ -32,6 +32,7 @@ The elevation-differencing that used to live here is gone by request; the geodes
 helpers it shared (dem_diff.warp / utm_bounds / write_gtiff) are reused above.
 """
 import os
+import json
 import math
 import re
 import hashlib
@@ -435,7 +436,22 @@ class Viewer3DTab(QWidget):
             "textures the terrain on every flip. Fully offline / self-contained.")
         self.web_btn.setEnabled(False)   # needs a terrain DEM first
         self.web_btn.clicked.connect(self._export_web_viewer)
-        fbl.addWidget(self.web_btn)
+        f = self.web_btn.font(); f.setBold(True); self.web_btn.setFont(f)
+        self.index_btn = QPushButton("Open past viewers")
+        self.index_btn.setToolTip(
+            "Rebuild and open index.html — a thumbnail card for every 3D viewer "
+            "already exported to this output folder, so a past event opens "
+            "straight from the browser with no QGIS round-trip. Superseded "
+            "re-exports are collapsed behind a toggle. The folder is "
+            "self-contained: zip it, sync it, or hand it to a colleague and "
+            "every link still works.")
+        self.index_btn.clicked.connect(self._open_web_index)
+        # FlowRow so the two labels stay whole in a narrow dock; the export is
+        # the primary action, the index a secondary way back to old work.
+        web_row = FlowRow()
+        web_row.addWidget(self.web_btn)
+        web_row.addWidget(self.index_btn)
+        fbl.addWidget(web_row)
         root.addWidget(flip_box)
 
         # --- figure Details (captions for the exported PNG) ---------------
@@ -1242,6 +1258,54 @@ class Viewer3DTab(QWidget):
                   + ". Tick drape layers, then 'Open / update 3D view'.")
 
     @staticmethod
+    @staticmethod
+    def _imagery_date(layers, side):
+        """Acquisition date for one side's ticked drape layers, or "".
+
+        Checks every layer's NAME first (a run names its GeoTIFF
+        `event_251007_1042_pre_2025-10-07_highlight`), then the file or URL each
+        one actually reads. Reading the source is what makes this survive real
+        projects: a layer the analyst renamed, a streamed Planetary Computer
+        scene (`/vsicurl/…S2B_MSIL2A_20251010T211529…`) and a hand-clipped
+        GeoTIFF all keep the date in the path long after the display name has
+        lost it — and these captions are the only place the exported figure
+        records when its imagery is from.
+
+        A pre/post MARKER wins over position, because a run's outputs are named
+        for the event first and the image second —
+        `2026-06-15_pre_2026-05-24_highlight` is a 2026-05-24 image of a
+        2026-06-15 event. Taking the first date in that name (which is what this
+        used to do) captions both panels with the event date, and the two panels
+        agreeing looks plausible enough to ship.
+
+        Then `side` disambiguates the plugin's change rasters, whose names carry
+        BOTH dates (`…_2026-08-07_to_2026-08-19`): the before panel wants the
+        first, the after panel the second. Only then the first date in the text,
+        which for a Sentinel-2 product id is the sensing time rather than the
+        processing time that follows it."""
+        marker = re.compile(r"(?:^|[^A-Za-z])(pre|post|before|after)[-_ ]?"
+                            r"((?:19|20)\d{2}[-_]?\d{2}[-_]?\d{2})", re.I)
+        pair = re.compile(r"((?:19|20)\d{2}-\d{2}-\d{2})_to_((?:19|20)\d{2}-\d{2}-\d{2})")
+        want = ("post", "after") if side == "after" else ("pre", "before")
+        for text_of in (lambda l: l.name(), lambda l: l.source()):
+            for lyr in layers:
+                t = text_of(lyr) or ""
+                cands = []
+                ms = list(marker.finditer(t))
+                if ms:      # this side's marker if the text carries both, else the one
+                    ms.sort(key=lambda m: m.group(1).lower() not in want)
+                    cands.append(ms[0].group(2))
+                m = pair.search(t)
+                if m:
+                    cands.append(m.group(2 if side == "after" else 1))
+                cands.append(t)
+                for c in cands:                 # _sniff_date validates + normalises
+                    d = Viewer3DTab._sniff_date(c)
+                    if d:
+                        return d
+        return ""
+
+    @staticmethod
     def _sniff_date(*texts):
         """First YYYY-MM-DD / YYYYMMDD date found in the given strings, or None.
 
@@ -1989,8 +2053,7 @@ class Viewer3DTab(QWidget):
             self._warn(f"Web viewer export failed: {e}")
             return
         self._busy(False)
-        base_out = self.dock.results_dir()     # this project's folder once it's saved
-        out_dir = os.path.join(base_out, "viewer3d", "web")
+        out_dir = self._web_out_dir()
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError as e:
@@ -2012,6 +2075,10 @@ class Viewer3DTab(QWidget):
             self._warn(f"Could not write the viewer: {e}")
             return
         self._log(f"Wrote {path} ({round(len(html)/1024)} KB). Opening in browser…")
+        # Refresh the folder's index so this export is reachable from the others
+        # (and they from it) without reopening QGIS. Never fatal: the viewer is
+        # already written and about to open.
+        self._rebuild_web_index(out_dir)
         from qgis.PyQt.QtGui import QDesktopServices
         from qgis.PyQt.QtCore import QUrl
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -2063,15 +2130,28 @@ class Viewer3DTab(QWidget):
             buf.open(QIODevice.WriteOnly)
             img.save(buf, "PNG")
             buf.close()
-            return "data:image/png;base64," + bytes(ba.toBase64()).decode("ascii")
+            uri = "data:image/png;base64," + bytes(ba.toBase64()).decode("ascii")
+            return uri, img
 
-        before_uri = render(before)
-        after_uri = render(after)
+        before_uri, _before_img = render(before)
+        after_uri, after_img = render(after)
         # 255×255 mesh keeps vertex count under 65536 → 16-bit indices, no
         # OES_element_index_uint dependency (the verified path).
         rows = self._dem_grid(scene_crs, extent, 255, 255)
         elev_b64, ncols, nrows, zmin, zmax = w3d.encode_heightfield(rows)
         label = lambda ls: " + ".join(l.name() for l in ls)
+        b_date, a_date = self._imagery_date(before, "before"), self._imagery_date(after, "after")
+        for side, ls, d in (("Before", before, b_date), ("After", after, a_date)):
+            if not d:
+                self._log(f"{side}: no YYYY-MM-DD in the ticked layer name(s) or the "
+                          f"file(s) they read — {label(ls)} — so the figure's caption "
+                          f"will omit that date. Rename the layer to include the "
+                          f"acquisition date, or re-tick the run's own output.")
+        if b_date and a_date:
+            self._log(f"Figure imagery dates: before {b_date}, after {a_date}."
+                      + ("" if b_date < a_date else
+                         "  ← the before image is not earlier than the after image; "
+                         "check which layers are ticked and what they are named."))
         cfg = {
             "title": "Landslide 3D — before / after",
             "before_label": label(before),
@@ -2087,8 +2167,8 @@ class Viewer3DTab(QWidget):
             "crs": scene_crs.authid() or "",
             "utm": [extent.xMinimum(), extent.yMinimum(),
                     extent.xMaximum(), extent.yMaximum()],
-            "before_date": self._sniff_date(label(before)) or "",
-            "after_date": self._sniff_date(label(after)) or "",
+            "before_date": b_date,
+            "after_date": a_date,
         }
         polys, lines, points = self._collect_overlays(scene_crs, extent)
         cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
@@ -2106,10 +2186,223 @@ class Viewer3DTab(QWidget):
             if v:
                 det.append([lbl, v])
         cfg["extra_details"] = det
+        # Where on Earth this is — the map figure's fourth cell. Built here, not
+        # in the browser, because the coastlines come from QGIS's own world map
+        # and the exported page has to keep opening offline.
+        loc = self._locator_cfg(scene_crs, extent)
+        if loc:
+            cfg["locator"] = loc
         if polys or lines or points:
             self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
                       f"{len(points)} point layer(s).")
+        # Small enough to sit in <head>, so the folder's index.html can list this
+        # page without reading past the first few KB of it (see web3d_index).
+        det_obj = getattr(self.dock, "detection", None)
+        cfg["index_meta"] = {
+            "event": (getattr(det_obj, "event_id", "") or "") if det_obj is not None else "",
+            "before_date": b_date or "", "after_date": a_date or "",
+            "imagery": self.det_imagery_sat.currentText().strip(),
+            "thumb": self._thumb_uri(after_img),
+        }
         return w3d.build_viewer_html(cfg)
+
+    THUMB_W = 384                 # index card is ~228 px wide; 384 survives 2x
+
+    def _thumb_uri(self, img, width=None):
+        """Downsample a rendered texture into a card-sized JPEG data URI.
+
+        JPEG, not PNG: an index of twenty events embeds twenty of these, and the
+        PNG of a satellite scene is ~200 KB against ~20 KB here. Returns "" on
+        any failure — a card without a picture still opens its viewer."""
+        from qgis.PyQt.QtCore import QByteArray, QBuffer, QIODevice, Qt
+        try:
+            w = int(width or self.THUMB_W)
+            small = img.scaledToWidth(w, Qt.SmoothTransformation) \
+                if img.width() > w else img
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.WriteOnly)
+            ok = small.save(buf, "JPEG", 72)
+            buf.close()
+            if not ok:
+                return ""
+            return "data:image/jpeg;base64," + bytes(ba.toBase64()).decode("ascii")
+        except Exception as e:
+            self._log(f"Index thumbnail skipped ({type(e).__name__}: {e}).")
+            return ""
+
+    def _thumb_from_png(self, raw):
+        """Same, for a texture scraped out of a page exported before the index."""
+        from qgis.PyQt.QtGui import QImage
+        img = QImage()
+        if not img.loadFromData(raw, "PNG") or img.isNull():
+            return ""
+        return self._thumb_uri(img)
+
+    def _web_out_dir(self):
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
+        return os.path.join(base_out, "viewer3d", "web")
+
+    def _rebuild_web_index(self, out_dir=None, announce=False):
+        """Rewrite index.html: one card per exported viewer in that folder.
+
+        A file:// page cannot list a directory, so the card list has to be baked
+        in — which means rewriting the index whenever the folder changes rather
+        than keeping it live. Cheap for pages that carry their own metadata; the
+        older ones are scraped once and cached by (name, size, mtime)."""
+        from . import web3d_index
+        out_dir = out_dir or self._web_out_dir()
+        if not os.path.isdir(out_dir):
+            if announce:
+                self._warn("No exported viewers yet — export one first.")
+            return None
+        cache_path = os.path.join(out_dir, ".index_cache.json")
+        cache = {}
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cache = json.load(f) or {}
+        except (OSError, ValueError):
+            cache = {}
+        before = set(cache)
+        try:
+            entries = web3d_index.collect(out_dir, thumb_fn=self._thumb_from_png,
+                                          cache=cache)
+            # A short, machine-independent label: the absolute path is somebody
+            # else's Drive folder the moment this page is shared.
+            tail = os.path.join(*out_dir.replace("\\", "/").split("/")[-4:]) \
+                if out_dir.count(os.sep) >= 3 else out_dir
+            html = web3d_index.build_index_html(entries, folder=tail)
+            path = os.path.join(out_dir, web3d_index.INDEX_NAME)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except OSError as e:
+            self._log(f"Could not write the viewer index: {e}")
+            if announce:
+                self._warn(f"Could not write the viewer index: {e}")
+            return None
+        if set(cache) != before or not os.path.exists(cache_path):
+            try:                       # best-effort: the index works without it
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+            except OSError:
+                pass
+        live = sum(1 for e in entries if not e["stale"])
+        self._log(f"Viewer index: {live} event(s) "
+                  f"({len(entries) - live} superseded) \u2192 {path}")
+        return path
+
+    def _open_web_index(self):
+        """Rebuild the index and open it — the entry point for past exports."""
+        from qgis.PyQt.QtGui import QDesktopServices
+        from qgis.PyQt.QtCore import QUrl
+        self._busy(True)
+        try:
+            path = self._rebuild_web_index(announce=True)
+        finally:
+            self._busy(False)
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _locator_cfg(self, scene_crs, extent):
+        """Location-panel geometry for the scene centre, or None on any failure —
+        the figure then falls back to its Details block, as before."""
+        try:
+            from . import locator_map
+            proj = QgsProject.instance()
+            wgs84 = QgsCoordinateReferenceSystem.fromEpsgId(4326)
+            c = QgsCoordinateTransform(scene_crs, wgs84, proj).transform(
+                extent.center())
+            det = getattr(self.dock, "detection", None)
+            loc = locator_map.build_locator(
+                c.y(), c.x(),
+                label=(getattr(det, "event_id", "") or "") if det is not None else "")
+        except Exception as e:
+            self._log(f"Location panel skipped ({type(e).__name__}: {e}).")
+            return None
+        if loc is None:
+            self._log("No QGIS world map (resources/data/world_map.gpkg) on this "
+                      "install — the map figure keeps its Details block.")
+            return None
+        self._log("Location panel: %s%.3f°, %.3f° — %d land polygon(s)." % (
+            (loc["place"] + " · ") if loc["place"] else "",
+            loc["lat"], loc["lon"], len(loc["land"])))
+        # Real satellite backdrop for the "where on Earth" panel, baked in as a
+        # data: URI here rather than fetched in the browser — see _locator_basemap.
+        uri, attrib = self._locator_basemap(loc["lat"], loc["lon"], loc["half_m"])
+        if uri:
+            loc["basemap"] = uri
+            loc["basemap_attrib"] = attrib
+            self._log("Location panel: Esri World Imagery baked in (%d KB)." %
+                      (len(uri) * 3 // 4 // 1024))
+        return loc
+
+    def _locator_basemap(self, lat, lon, half_m, px=1024):
+        """Esri World Imagery for the locator window, as a PNG data URI + credit.
+
+        Rendered HERE, where QGIS has the network and the raster reprojector, and
+        embedded in the exported page as a same-origin data: URI — so the viewer
+        still opens offline and the figure's toDataURL stays untainted, exactly as
+        the before/after textures do. The window is the same event-centred Lambert
+        azimuthal equal-area square locator_map draws its coastline and graticule
+        in, so the imagery registers pixel-for-pixel beneath them.
+
+        Returns ("", "") on any failure (no network, blocked host, invalid layer);
+        the panel then falls back to locator_map's flat vector land."""
+        import urllib.parse
+        from qgis.PyQt.QtCore import (QSize, QByteArray, QBuffer, QIODevice,
+                                      QEventLoop)
+        from qgis.PyQt.QtGui import QColor
+        from qgis.core import (QgsMapSettings, QgsMapRendererParallelJob,
+                               QgsCoordinateReferenceSystem, QgsRectangle)
+        try:
+            laea = QgsCoordinateReferenceSystem()
+            proj4 = ("+proj=laea +lat_0=%.8f +lon_0=%.8f +x_0=0 +y_0=0 "
+                     "+datum=WGS84 +units=m +no_defs" % (float(lat), float(lon)))
+            if hasattr(laea, "createFromProj"):            # QGIS 3.10+
+                laea.createFromProj(proj4)
+            else:                                          # pragma: no cover
+                laea.createFromProj4(proj4)
+            if not laea.isValid():
+                return "", ""
+            tile = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                    "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+            src = ("type=xyz&url=" + urllib.parse.quote(tile, safe=":/")
+                   + "&zmax=19&zmin=0")
+            lyr = QgsRasterLayer(src, "Esri World Imagery", "wms")
+            if not lyr.isValid():
+                self._log("Location panel: Esri World Imagery would not load; "
+                          "keeping the flat vector backdrop.")
+                return "", ""
+            ms = QgsMapSettings()
+            ms.setDestinationCrs(laea)
+            ms.setExtent(QgsRectangle(-float(half_m), -float(half_m),
+                                      float(half_m), float(half_m)))
+            ms.setOutputSize(QSize(int(px), int(px)))
+            ms.setBackgroundColor(QColor(13, 22, 34))      # the panel's own sea tone
+            ms.setLayers([lyr])
+            # A local event loop, not waitForFinished(): the XYZ tiles arrive as
+            # network replies, and blocking the main thread outright can starve
+            # them and hand back an empty frame.
+            job = QgsMapRendererParallelJob(ms)
+            loop = QEventLoop()
+            job.finished.connect(loop.quit)
+            job.start()
+            loop.exec_()
+            img = job.renderedImage()
+            if img is None or img.isNull():
+                return "", ""
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.WriteOnly)
+            ok = img.save(buf, "PNG")
+            buf.close()
+            if not ok:
+                return "", ""
+            return ("data:image/png;base64," + bytes(ba.toBase64()).decode("ascii"),
+                    "Esri, Maxar, Earthstar Geographics")
+        except Exception as e:
+            self._log(f"Location panel basemap skipped ({type(e).__name__}: {e}).")
+            return "", ""
 
     def _overlay_extent(self, scene_crs):
         """Combined bounding box (scene CRS) of the ticked polygon/line overlays.
