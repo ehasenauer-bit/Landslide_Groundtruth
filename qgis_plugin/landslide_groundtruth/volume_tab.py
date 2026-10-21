@@ -30,7 +30,11 @@ How the pieces fit:
             input is explicit and re-measurable, and layers named for their role
             — "Total Area", "Source Area (low)" — are recognised automatically,
             so a project that already holds the outlines comes up ready to
-            measure. A role layer holding several polygons contributes its
+            measure. "New total area" and "New source area (best)" create the
+            two outlines a fit converts already named and assigned, as
+            GeoPackages in the project's folder rather than scratch layers —
+            they are the measurement, so they are kept like one (see
+            ROLE_LAYERS). A role layer holding several polygons contributes its
             largest; the rest are reported, not combined, since they are
             alternative attempts at one outline rather than parts of it.
 
@@ -86,6 +90,7 @@ from qgis.core import (
     QgsDistanceArea, QgsUnitTypes, QgsCoordinateReferenceSystem,
     QgsCoordinateTransform, QgsGeometry, QgsPointXY,
     QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol, QgsVectorDataProvider,
+    QgsVectorFileWriter,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
@@ -143,6 +148,23 @@ ROLE_NAME_ANY = frozenset().union(*ROLE_NAME_TOKENS.values())
 # The source roles, in panel order: (key, role word used in messages). The total
 # role is handled separately — it is the one the volume is computed from.
 SOURCE_ROLES = (("best", "best"), ("low", "low"), ("high", "high"))
+
+# The two outlines a fit actually converts, and what the buttons that create
+# them produce: (role label as the drop-down spells it, layer-name suffix, file
+# stem, fill style). Unlike the scratch SCAR_LAYER these are GeoPackages in the
+# project's own folder — they ARE the measurement, so leaving them in memory
+# puts the afternoon's digitizing one forgotten "Save Features As…" away from
+# being lost. The suffix carries the role word (see ROLE_NAME_TOKENS above), so
+# the project reopens with the drop-down already pointing at the file, and the
+# file name mirrors the layer name so the folder reads like the layer panel.
+ROLE_LAYERS = {
+    "total": ("Total area layer", "Total Area", "total_area",
+              {"color": "255,80,80,40", "outline_color": "220,30,30",
+               "outline_width": "0.6"}),
+    "best": ("Source area (best)", "Source Area (best)", "source_area_best",
+             {"color": "255,170,40,50", "outline_color": "214,120,0",
+              "outline_width": "0.6"}),
+}
 
 # Attribute fields the write-back adds to the scar layer. (name, type, source
 # key in a results row.) Kept short and lower-case so they survive a Shapefile
@@ -439,13 +461,19 @@ class VolumeTab(QWidget):
     def _build_scar_box(self):
         """Where the outlines come from.
 
-        This panel is only about DRAWING. Nothing here is measured — the layer
-        chosen here is just where "New scar layer" and "Draw outline" digitize,
-        so a session's outlines land somewhere deliberate. Which layers get
-        measured is decided by the role drop-downs in Current measurement, so
-        drawing and measuring stay separate concerns.
+        "Draw into" and "Draw outline" are only about DRAWING: the layer chosen
+        there is just where digitizing lands, never what gets measured. Which
+        layers get measured is decided by the role drop-downs in Current
+        measurement, so a session can draw attempts without disturbing the
+        measurement.
 
-        Both buttons hand off to QGIS's own digitizing tools rather than
+        The two role buttons are the exception, and deliberately so: creating
+        the total or best-source outline, naming it, saving it in the project's
+        folder and assigning it is one intention, and splitting it across three
+        panels is how an afternoon's digitizing ends up in a memory layer with
+        no role. Everything they do is still reversible from the drop-downs.
+
+        Every button hands off to QGIS's own digitizing tools rather than
         reimplementing them."""
         box = QgsCollapsibleGroupBox("Scar outlines (draw)")
         box.setSaveCollapsedState(False)
@@ -469,6 +497,25 @@ class VolumeTab(QWidget):
         v.addLayout(row)
 
         btns = FlowRow()
+        self.new_total_btn = QPushButton("New total area")
+        self.new_total_btn.setToolTip(
+            "Create the TOTAL landslide outline, assign it to “Total area "
+            "layer” and start digitizing.\n\n"
+            "Saved as a GeoPackage in this project's folder, not a scratch "
+            "layer — the outline survives closing QGIS, and the project "
+            "reopens measuring it. Press it again for a second slide: the "
+            "existing file is never written over.")
+        f = self.new_total_btn.font(); f.setBold(True)
+        self.new_total_btn.setFont(f)
+        self.new_total_btn.clicked.connect(partial(self._new_role_layer, "total"))
+        self.new_source_btn = QPushButton("New source area (best)")
+        self.new_source_btn.setToolTip(
+            "Create the BEST source-scar outline — the evacuated source area "
+            "alone — assign it to “Source area (best)” and start digitizing. "
+            "This is the outline the source-scar fit converts.\n\n"
+            "Saved as a GeoPackage in this project's folder, like the total "
+            "area. For the low/high source outlines use New scar layer.")
+        self.new_source_btn.clicked.connect(partial(self._new_role_layer, "best"))
         self.new_layer_btn = QPushButton("New scar layer")
         self.new_layer_btn.setToolTip(
             f"Create an empty polygon layer (“{SCAR_LAYER}”), make it active, "
@@ -476,14 +523,16 @@ class VolumeTab(QWidget):
             "can start drawing straight away. Press it once per outline: one "
             "layer for the best estimate, and, for an uncertainty range, one "
             "each for the conservative and generous interpretations. Scratch "
-            "layers: use Export > Save Features As… to keep them.")
+            "layers, unlike the two buttons before it: use Export > Save "
+            "Features As… to keep them.")
         self.new_layer_btn.clicked.connect(self._new_scar_layer)
         self.draw_btn = QPushButton("Draw outline")
         self.draw_btn.setToolTip(
             "Put the layer above into edit mode and arm QGIS's Add Polygon "
             "tool, ready to digitize another outline into it.")
         self.draw_btn.clicked.connect(self._draw_outline)
-        for b in (self.new_layer_btn, self.draw_btn):
+        for b in (self.new_total_btn, self.new_source_btn,
+                  self.new_layer_btn, self.draw_btn):
             btns.addWidget(b)
         v.addWidget(btns)
 
@@ -495,8 +544,22 @@ class VolumeTab(QWidget):
         project = QgsProject.instance()
         project.layersAdded.connect(self._refresh_layers)
         project.layersRemoved.connect(self._refresh_layers)
+        # A role set by hand (or by a role button) is pinned so name matching
+        # leaves it alone — but the pin belongs to THAT project's layers. Opening
+        # another one has to retire it, or the new project's correctly-named
+        # outlines stay out of the drop-downs for the rest of the session and the
+        # tab looks like it can't see them.
+        project.readProject.connect(self._project_changed)
+        project.cleared.connect(self._project_changed)
         self._layer_combo.currentIndexChanged.connect(self._on_layer_changed)
         return box
+
+    def _project_changed(self, *_args):
+        """A different project is open: forget which roles were set deliberately
+        and which we matched, then match again against the layers it brought."""
+        self._role_pinned = {role: False for role in self._role_pinned}
+        self._role_auto = {}
+        self._refresh_layers()
 
     # ---------- layer plumbing ----------
     def _polygon_layers(self):
@@ -719,7 +782,7 @@ class VolumeTab(QWidget):
         layer = self._chosen_layer()
         if layer is None:
             self.sel_lbl.setText(
-                "No polygon layer in this project — press New scar layer to "
+                "No polygon layer in this project — press New total area to "
                 "make one and start drawing.")
             return
         n = layer.featureCount()
@@ -878,6 +941,125 @@ class VolumeTab(QWidget):
             pass
         return False
 
+    def _outline_dir(self):
+        """Folder the saved outlines are written to: the open project's own (see
+        dock.results_dir), created if it isn't there yet. "" when there is
+        nowhere to write — a project that has never been saved AND no Results
+        folder set in Environment. Unlike the Δh raster this does NOT fall back
+        to a temp dir: an outline dropped in /tmp is the scratch layer the
+        button exists to avoid, so it says so instead."""
+        out_dir = self.dock.results_dir()
+        if not out_dir:
+            return ""
+        try:
+            os.makedirs(out_dir, exist_ok=True)   # <tools>/out/interactive may not exist yet
+        except OSError:
+            return ""
+        return out_dir if os.path.isdir(out_dir) else ""
+
+    def _new_role_layer(self, role):
+        """Create the TOTAL or BEST SOURCE outline on disk, assign it to its
+        role and start digitizing — the two outlines a fit converts, in one
+        press each.
+
+        A GeoPackage beside the project rather than a memory layer, because
+        these two ARE the measurement: a scratch layer loses the digitizing to
+        any QGIS restart, and the project that reopens has nothing to measure.
+        Digitizing into a GeoPackage writes to the file every time editing is
+        toggled off, so the outline is kept by the same gesture that finishes
+        it. Assigning the role here is the point of the button — the layer is
+        also NAMED for its role, so the drop-down refills itself when the
+        project is opened again months later."""
+        label, suffix, stem, style = ROLE_LAYERS[role]
+        out_dir = self._outline_dir()
+        if not out_dir:
+            self._notify(
+                "Nowhere to save the outline. Save this QGIS project first — "
+                "outlines are written beside its .qgz — or set “Results "
+                "(unsaved projects)” in Environment.", level=Qgis.Warning)
+            return
+
+        slide = self.name_edit.text().strip() or "slide"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", slide).strip("_") or "slide"
+        name = f"{slide} {suffix}"
+        path = os.path.join(out_dir, f"{safe}_{stem}.gpkg")
+        # Never write over an outline that is already there — it may be the
+        # last session's work, and digitizing is slow to redo. File and layer
+        # name step up together so the folder still reads like the layer panel.
+        n = 1
+        while os.path.exists(path) or QgsProject.instance().mapLayersByName(name):
+            n += 1
+            path = os.path.join(out_dir, f"{safe}_{stem}_{n}.gpkg")
+            name = f"{slide} {suffix} {n}"
+
+        crs = self._target_crs()
+        scratch = QgsVectorLayer(f"Polygon?crs={crs.authid()}", name, "memory")
+        if not scratch.isValid():
+            self._append_log(f"Could not create the {label} outline.")
+            return
+        scratch.dataProvider().addAttributes([QgsField("slide", QVariant.String)])
+        scratch.updateFields()
+
+        # One layer per GeoPackage, named after the file, so "which layer is in
+        # there" is never a question a reader of the folder has to ask.
+        table = os.path.splitext(os.path.basename(path))[0]
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = table
+        opts.fileEncoding = "UTF-8"
+        try:
+            ctx = QgsProject.instance().transformContext()
+            if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
+                err, msg = QgsVectorFileWriter.writeAsVectorFormatV3(
+                    scratch, path, ctx, opts)[:2]
+            else:                                    # QGIS < 3.20
+                err, msg = QgsVectorFileWriter.writeAsVectorFormatV2(
+                    scratch, path, ctx, opts)[:2]
+        except Exception as e:
+            err, msg = -1, str(e)
+        if err != QgsVectorFileWriter.NoError:
+            self._notify(f"Could not write {path}: {msg}", level=Qgis.Warning)
+            return
+
+        layer = QgsVectorLayer(f"{path}|layername={table}", name, "ogr")
+        if not layer.isValid():
+            self._notify(
+                f"Wrote {path} but QGIS could not load it back — add it by "
+                f"hand and assign it to {label}.", level=Qgis.Warning)
+            return
+        symbol = QgsFillSymbol.createSimple(style)
+        if symbol is not None and layer.renderer() is not None:
+            layer.renderer().setSymbol(symbol)
+        # read before the layer is added: adding it runs the name match, which
+        # may hand the role over on its own, and then nothing would be left to
+        # say which layer this one displaced.
+        previous = self._role_layer(role)
+        lg.add_to_group(layer, "Volume")
+        self._refresh_layers()
+
+        idx = self._layer_combo.findData(layer.id())
+        if idx >= 0:
+            self._layer_combo.setCurrentIndex(idx)   # draw into it
+        combo = {"total": self._total_combo, "best": self._best_combo}[role]
+        role_idx = combo.findData(layer.id())
+        if role_idx >= 0:
+            combo.setCurrentIndex(role_idx)
+            # the name match may have claimed the role already, in which case the
+            # line above changes nothing and emits nothing — pin it either way,
+            # so a layer loaded later can't take a role the button just set.
+            self._pin_role(role)
+        took = ""
+        if previous is not None and previous.id() != layer.id():
+            took = f" It takes the role over from “{previous.name()}”."
+        self._notify(
+            f"“{name}” → {label}, saved as {path}.{took}\n"
+            "Click each vertex of the outline, right-click to finish, then "
+            "toggle editing off (or press Save) to write it to the file.")
+        # no follow-up message: the role is already set, so the one _draw_outline
+        # prints ("then assign this layer to…") would be telling you to do work
+        # the button just did.
+        self._arm_digitizing(layer)
+
     def _new_scar_layer(self):
         crs = self._target_crs()
         name, n = SCAR_LAYER, 1
@@ -902,7 +1084,8 @@ class VolumeTab(QWidget):
             self._layer_combo.setCurrentIndex(idx)
         self._append_log(
             f"Created scratch layer “{name}”. It lives in memory only — use "
-            "Export > Save Features As… to keep it.")
+            "Export > Save Features As… to keep it. (New total area and New "
+            "source area (best) write to the project folder instead.)")
         # The FIRST layer is wired to the TOTAL role, because that is the one the
         # volume needs and the one you can't measure without. Later layers are
         # left for you to assign — only you know whether the next outline is the
@@ -914,16 +1097,22 @@ class VolumeTab(QWidget):
                 self._append_log(f"Assigned “{name}” to Total area layer.")
         self._draw_outline()
 
+    def _arm_digitizing(self, layer):
+        """Make `layer` the active one, put it in edit mode and arm QGIS's Add
+        Polygon tool. True when the tool was armed; False when QGIS wouldn't
+        give it up and the user has to pick it from the toolbar."""
+        self.iface.setActiveLayer(layer)
+        if not layer.isEditable():
+            layer.startEditing()
+        return self._trigger("actionAddFeature")
+
     def _draw_outline(self):
         layer = self._chosen_layer()
         if layer is None:
             self._append_log(
-                "No polygon layer to draw on — press New scar layer first.")
+                "No polygon layer to draw on — press New total area first.")
             return
-        self.iface.setActiveLayer(layer)
-        if not layer.isEditable():
-            layer.startEditing()
-        if self._trigger("actionAddFeature"):
+        if self._arm_digitizing(layer):
             self._append_log(
                 f"Digitizing on “{layer.name()}”: click each vertex of the "
                 "outline, right-click to finish. Then assign this layer to "
