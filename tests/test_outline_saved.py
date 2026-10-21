@@ -81,7 +81,7 @@ import atexit
 atexit.register(_restore_settings)
 
 from landslide_groundtruth.dock import LandslideDock
-from landslide_groundtruth.volume_tab import ROLE_LAYERS
+from landslide_groundtruth.volume_tab import ROLE_LAYERS, AREA_FIELD, AREA_EXPRESSION
 
 dock = LandslideDock(FakeIface())
 tab = dock.volume_tab
@@ -141,6 +141,59 @@ check("it did not disturb the total role", tab._role_layer("total") is total)
 check("name matching alone would assign it to best",
       tab._match_role_layers([best]).get("best") is best)
 
+print("\n=== total is a red outline, best source a blue one, no fill ===")
+from qgis.PyQt.QtCore import Qt
+
+
+def outline(layer):
+    sl = layer.renderer().symbol().symbolLayer(0)
+    return sl.strokeColor().name(), sl.brushStyle() == Qt.NoBrush
+
+
+check(f"total: red outline, no fill {outline(total)}", outline(total) == ("#dc1e1e", True))
+check(f"best: blue outline, no fill {outline(best)}", outline(best) == ("#1e5ae6", True))
+probe = QgsVectorLayer(f"{src}|layername={os.path.splitext(os.path.basename(src))[0]}",
+                       "probe", "ogr")
+check(f"the colour is stored IN the GeoPackage, so it opens red anywhere {outline(probe)}",
+      outline(probe) == ("#dc1e1e", True))
+del probe
+
+print("\n=== the outline carries its own area, kept current by QGIS ===")
+from qgis.core import (QgsGeometry, QgsVectorLayerUtils, QgsCoordinateReferenceSystem,
+                       QgsCoordinateTransform)
+idx = total.fields().indexOf(AREA_FIELD)
+dv = total.defaultValueDefinition(idx)
+check(f"an {AREA_FIELD} field on both outlines",
+      idx >= 0 and best.fields().indexOf(AREA_FIELD) >= 0)
+check("filled by an expression that is re-applied on every reshape",
+      dv.expression() == AREA_EXPRESSION and dv.applyOnUpdate())
+check("read-only in the attribute form (an edit would be recomputed anyway)",
+      total.editFormConfig().readOnly(idx))
+# Digitize the way the Add Polygon tool does: createFeature evaluates defaults.
+# ~2.8 km² beside Iliamna.
+g = QgsGeometry.fromWkt("POLYGON((-153.10 60.02,-153.07 60.02,-153.07 60.035,"
+                        "-153.09 60.04,-153.10 60.02))")
+g.transform(QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                   total.crs(), project))
+total.addFeature(QgsVectorLayerUtils.createFeature(total, g, {},
+                                                   total.createExpressionContext()))
+total.commitChanges()
+feat = next(total.getFeatures())
+want = tab._measure_area(g, total.crs()) / 1e6
+check(f"drawn polygon: {AREA_FIELD}={feat[AREA_FIELD]} vs measured {want:.4f} km²",
+      feat[AREA_FIELD] is not None and abs(feat[AREA_FIELD] - want) < 5e-4)
+g2 = QgsGeometry(feat.geometry())        # drag one corner out by half the width
+v0 = g2.vertexAt(1)
+g2.moveVertex(v0.x() + g2.boundingBox().width() * 0.5, v0.y(), 1)
+total.startEditing()
+total.changeGeometry(feat.id(), g2)
+total.commitChanges()
+after = total.getFeature(feat.id())[AREA_FIELD]
+want2 = tab._measure_area(g2, total.crs()) / 1e6
+check(f"reshaped: {AREA_FIELD}={after} vs measured {want2:.4f} km²",
+      after is not None and abs(after - want2) < 5e-4 and abs(after - feat[AREA_FIELD]) > 0.01)
+total.startEditing()                     # leave it as the button did
+
 print("\n=== a second press never writes over the first outline ===")
 stamp = os.path.getmtime(src)
 tab._new_role_layer("total")
@@ -168,6 +221,36 @@ check("and the reopened project still points at them",
 tab._refresh_layers()
 check("with the roles matched back from the layer names",
       tab._role_layer("total") is not None and tab._role_layer("best") is not None)
+check("still red and blue after the reopen",
+      outline(tab._role_layer("total"))[0] == "#dc1e1e"
+      and outline(tab._role_layer("best"))[0] == "#1e5ae6")
+
+print("\n=== a scratch layer is amber until it has a role, then takes its colour ===")
+tab._new_scar_layer()
+scr = tab._chosen_layer()
+check(f"New scar layer with the total already taken: amber {outline(scr)}",
+      scr is not None and outline(scr) == ("#d67800", True)
+      and scr.fields().indexOf(AREA_FIELD) >= 0)
+tab._best_combo.setCurrentIndex(tab._best_combo.findData(scr.id()))
+check(f"assigned to Source area (best) by hand: blue {outline(scr)}",
+      tab._role_layer("best") is scr and outline(scr)[0] == "#1e5ae6")
+tab._total_combo.setCurrentIndex(tab._total_combo.findData(scr.id()))
+check(f"moved to Total area: red {outline(scr)}", outline(scr)[0] == "#dc1e1e")
+mine = QgsVectorLayer("Polygon?crs=EPSG:4326", "my own outline", "memory")
+from qgis.core import QgsFillSymbol
+mine.renderer().setSymbol(QgsFillSymbol.createSimple(
+    {"color": "0,200,0,80", "outline_color": "0,120,0"}))
+project.addMapLayer(mine)
+tab._refresh_layers()
+tab._total_combo.setCurrentIndex(tab._total_combo.findData(mine.id()))
+check(f"a layer the tab did NOT create keeps its own style {outline(mine)}",
+      tab._role_layer("total") is mine and outline(mine) == ("#007800", False))
+project.clear()
+tab._refresh_layers()
+tab._new_scar_layer()
+first = tab._chosen_layer()
+check(f"the FIRST scratch layer is wired to Total area, so it is red {outline(first)}",
+      tab._role_layer("total") is first and outline(first)[0] == "#dc1e1e")
 
 print("\n=== every role button knows where it writes ===")
 check("ROLE_LAYERS covers exactly the two converted outlines",

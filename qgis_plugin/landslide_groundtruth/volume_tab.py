@@ -90,7 +90,7 @@ from qgis.core import (
     QgsDistanceArea, QgsUnitTypes, QgsCoordinateReferenceSystem,
     QgsCoordinateTransform, QgsGeometry, QgsPointXY,
     QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol, QgsVectorDataProvider,
-    QgsVectorFileWriter,
+    QgsVectorFileWriter, QgsDefaultValue, QgsSingleSymbolRenderer,
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
@@ -157,14 +157,37 @@ SOURCE_ROLES = (("best", "best"), ("low", "low"), ("high", "high"))
 # being lost. The suffix carries the role word (see ROLE_NAME_TOKENS above), so
 # the project reopens with the drop-down already pointing at the file, and the
 # file name mirrors the layer name so the folder reads like the layer panel.
+#
+# The style is a fixed convention, the same on every outline the tab creates:
+# total RED, best source BLUE, outline only so the imagery under the scar stays
+# readable. A layer the tab created takes its role's colour whenever it is
+# assigned one (_colour_by_role), so a scratch layer later assigned to the best
+# source turns blue too; one with neither role is amber (SCRATCH_STYLE).
 ROLE_LAYERS = {
     "total": ("Total area layer", "Total Area", "total_area",
-              {"color": "255,80,80,40", "outline_color": "220,30,30",
-               "outline_width": "0.6"}),
+              {"color": "0,0,0,0", "style": "no", "outline_color": "220,30,30",
+               "outline_width": "0.8"}),
     "best": ("Source area (best)", "Source Area (best)", "source_area_best",
-             {"color": "255,170,40,50", "outline_color": "214,120,0",
-              "outline_width": "0.6"}),
+             {"color": "0,0,0,0", "style": "no", "outline_color": "30,90,230",
+              "outline_width": "0.8"}),
 }
+SCRATCH_STYLE = {"color": "0,0,0,0", "style": "no", "outline_color": "214,120,0",
+                 "outline_width": "0.8"}
+
+# Marks a layer this tab created, so its colour may follow its role. Nothing
+# else is ever restyled: a layer you made or styled yourself keeps its look.
+OUTLINE_PROP = "landslide_groundtruth/outline"
+
+# Every outline the tab creates carries its own plan area, kept current by QGIS
+# as the polygon is drawn or reshaped, so it is ready to label or export with no
+# Measure. In km² because it is for display; the measurement itself
+# (_measure_area) never reads it. Measured in equal-area EPSG:6933, so it is an
+# ellipsoidal area in m² whatever the layer's CRS — $area would follow the
+# project's area-unit setting instead — and it agrees with _measure_area to
+# ~0.01%. Read-only in the attribute form, since an edit would be recomputed.
+AREA_FIELD = "area_km2"
+AREA_EXPRESSION = ("round(area(transform($geometry, @layer_crs, 'EPSG:6933'))"
+                   " / 1e6, 4)")
 
 # Attribute fields the write-back adds to the scar layer. (name, type, source
 # key in a results row.) Kept short and lower-case so they survive a Shapefile
@@ -500,7 +523,8 @@ class VolumeTab(QWidget):
         self.new_total_btn = QPushButton("New total area")
         self.new_total_btn.setToolTip(
             "Create the TOTAL landslide outline, assign it to “Total area "
-            "layer” and start digitizing.\n\n"
+            "layer” and start digitizing. Drawn as a red outline, with an "
+            f"“{AREA_FIELD}” field QGIS keeps current as you draw.\n\n"
             "Saved as a GeoPackage in this project's folder, not a scratch "
             "layer — the outline survives closing QGIS, and the project "
             "reopens measuring it. Press it again for a second slide: the "
@@ -512,7 +536,8 @@ class VolumeTab(QWidget):
         self.new_source_btn.setToolTip(
             "Create the BEST source-scar outline — the evacuated source area "
             "alone — assign it to “Source area (best)” and start digitizing. "
-            "This is the outline the source-scar fit converts.\n\n"
+            "This is the outline the source-scar fit converts. Drawn as a "
+            f"blue outline, with the same “{AREA_FIELD}” field.\n\n"
             "Saved as a GeoPackage in this project's folder, like the total "
             "area. For the low/high source outlines use New scar layer.")
         self.new_source_btn.clicked.connect(partial(self._new_role_layer, "best"))
@@ -997,7 +1022,7 @@ class VolumeTab(QWidget):
         if not scratch.isValid():
             self._append_log(f"Could not create the {label} outline.")
             return
-        scratch.dataProvider().addAttributes([QgsField("slide", QVariant.String)])
+        scratch.dataProvider().addAttributes(self._outline_fields())
         scratch.updateFields()
 
         # One layer per GeoPackage, named after the file, so "which layer is in
@@ -1027,9 +1052,15 @@ class VolumeTab(QWidget):
                 f"Wrote {path} but QGIS could not load it back — add it by "
                 f"hand and assign it to {label}.", level=Qgis.Warning)
             return
-        symbol = QgsFillSymbol.createSimple(style)
-        if symbol is not None and layer.renderer() is not None:
-            layer.renderer().setSymbol(symbol)
+        self._prepare_outline(layer, style)
+        # Also into the GeoPackage as its default style, so the file opens red
+        # or blue, with its area kept current, in any project it is dropped into.
+        try:
+            save = (getattr(layer, "saveStyleToDatabaseV2", None)
+                    or layer.saveStyleToDatabase)
+            save(table, f"{label} outline", True, "")
+        except Exception as e:                       # noqa: BLE001 — a nicety
+            self._append_log(f"Could not store the style in {path}: {e}")
         # read before the layer is added: adding it runs the name match, which
         # may hand the role over on its own, and then nothing would be left to
         # say which layer this one displaced.
@@ -1070,13 +1101,11 @@ class VolumeTab(QWidget):
         if not layer.isValid():
             self._append_log("Could not create the scar layer.")
             return
-        layer.dataProvider().addAttributes([QgsField("slide", QVariant.String)])
+        layer.dataProvider().addAttributes(self._outline_fields())
         layer.updateFields()
-        symbol = QgsFillSymbol.createSimple({
-            "color": "255,80,80,50", "outline_color": "220,30,30",
-            "outline_width": "0.6"})
-        if symbol is not None and layer.renderer() is not None:
-            layer.renderer().setSymbol(symbol)
+        # amber until it has a role: assigned below (or later, by hand) to the
+        # total or best source, _colour_by_role turns it red or blue
+        self._prepare_outline(layer, SCRATCH_STYLE)
         lg.add_to_group(layer, "Volume")
         self._refresh_layers()
         idx = self._layer_combo.findData(layer.id())
@@ -1095,7 +1124,51 @@ class VolumeTab(QWidget):
             if role_idx >= 0:
                 self._total_combo.setCurrentIndex(role_idx)
                 self._append_log(f"Assigned “{name}” to Total area layer.")
+        for role in ROLE_LAYERS:     # the name match may have set it silently
+            if self._role_layer(role) is layer:
+                self._colour_by_role(role)
         self._draw_outline()
+
+    @staticmethod
+    def _outline_fields():
+        """The attribute fields every outline the tab creates starts with."""
+        return [QgsField("slide", QVariant.String),
+                QgsField(AREA_FIELD, QVariant.Double)]
+
+    def _prepare_outline(self, layer, style):
+        """Colour a layer this tab created, keep its area field current, and
+        mark it as ours so its colour may follow its role (_colour_by_role)."""
+        self._style_outline(layer, style)
+        idx = layer.fields().indexOf(AREA_FIELD)
+        if idx >= 0:
+            # apply-on-update: recomputed whenever the polygon is reshaped,
+            # not only when it is first drawn
+            layer.setDefaultValueDefinition(
+                idx, QgsDefaultValue(AREA_EXPRESSION, True))
+            form = layer.editFormConfig()
+            form.setReadOnly(idx, True)
+            layer.setEditFormConfig(form)
+        layer.setCustomProperty(OUTLINE_PROP, True)
+
+    @staticmethod
+    def _style_outline(layer, style):
+        symbol = QgsFillSymbol.createSimple(style)
+        if symbol is None:
+            return
+        # a new renderer rather than setSymbol on the old one, so the layer
+        # panel's swatch follows (setRenderer emits rendererChanged)
+        layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+        layer.triggerRepaint()
+
+    def _colour_by_role(self, role, *_args):
+        """A layer this tab created takes its role's colour — red for the total
+        outline, blue for the best source — however it got the role. Layers the
+        tab did not create are never restyled."""
+        if role not in ROLE_LAYERS:
+            return
+        layer = self._role_layer(role)
+        if layer is not None and layer.customProperty(OUTLINE_PROP):
+            self._style_outline(layer, ROLE_LAYERS[role][3])
 
     def _arm_digitizing(self, layer):
         """Make `layer` the active one, put it in edit mode and arm QGIS's Add
@@ -1178,6 +1251,7 @@ class VolumeTab(QWidget):
             # a genuine user change pins the role; programmatic fills are done
             # with signals blocked, so they don't
             combo.currentIndexChanged.connect(partial(self._pin_role, role))
+            combo.currentIndexChanged.connect(partial(self._colour_by_role, role))
 
         self.role_lbl = QLabel()
         self.role_lbl.setWordWrap(True)
