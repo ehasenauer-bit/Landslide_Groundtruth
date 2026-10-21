@@ -14,6 +14,9 @@ strings below are the ones that project file actually holds.
 
 VERSION 3 retires the Volume tab's 1.5 / 1.0 / 2.5 m deposit thickness the same
 way, for the measured 2.5 / 1.5 / 3.5 m.
+
+"Cover the exact epicentre" became the default again on 2026-10-21, so it is no
+longer swapped: St. Elias now keeps it and only the cloud cap and quality move.
 """
 import os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -100,15 +103,15 @@ def filters():
             tab.quality_combo.currentData())
 
 
-print("=== the defaults asked for: AOI overlap + test quality (and no cloud cap) ===")
+print("=== the defaults asked for: exact epicentre + test quality (and no cloud cap) ===")
 project.clear(); state._restore_now()
-check(f"a new project opens on 100 / aoi / any (got {filters()})",
-      filters() == (100, "aoi", "any"))
+check(f"a new project opens on 100 / point / any (got {filters()})",
+      filters() == (100, "point", "any"))
 
 print("\n=== the St. Elias project (version 1) opens on today's defaults ===")
 seed("1", ST_ELIAS)
-check(f"retired 80 / epicentre / standard -> 100 / aoi / any (got {filters()})",
-      filters() == (100, "aoi", "any"))
+check(f"retired 80 / standard -> 100 / any, epicentre kept (got {filters()})",
+      filters() == (100, "point", "any"))
 check("its real choices are kept: 60 d before, 90 d after, 5 km",
       (tab.pre_slider.value(), tab.post_slider.value(), tab.radius_spin.value())
       == (60, 90, 5.0))
@@ -118,13 +121,13 @@ qual, _ = project.readEntry(SCOPE, "planet/quality_combo", "")
 cloud, _ = project.readEntry(SCOPE, "planet/cloud_slider", "")
 check(f"the swap is written into the project at once, stamped v{ps.VERSION} "
       f"(got v{ver}: {cloud} / {cov!r} / {qual!r})",
-      ver == ps.VERSION and cloud == "100" and cov.startswith("AOI overlap")
+      ver == ps.VERSION and cloud == "100" and cov.startswith("Cover the exact epicentre")
       and qual.startswith("Include test-quality"))
 
 print("\n=== ... and only once: after the swap, a choice is a choice ===")
 state._restore_now()          # reopening the migrated project
-check(f"reopening the migrated project keeps 100 / aoi / any (got {filters()})",
-      filters() == (100, "aoi", "any"))
+check(f"reopening the migrated project keeps 100 / point / any (got {filters()})",
+      filters() == (100, "point", "any"))
 seed(ps.VERSION, {"planet/coverage_combo": "Cover the exact epicentre (stricter)",
                   "planet/quality_combo": "Standard quality only",
                   "planet/cloud_slider": "80"})
@@ -144,10 +147,12 @@ seed(None, {"planet/quality_combo": "Standard quality only"})
 check(f"an unstamped project counts as the oldest version (got {filters()})",
       filters()[2] == "any")
 check(f"retired_since('{ps.VERSION}') is empty, '2' has the three thicknesses, "
-      "'1' has all six",
+      "'1' has all five",
       ps.retired_since(ps.VERSION) == {} and len(ps.retired_since("2")) == 3
-      and len(ps.retired_since("1")) == 6)
-check("retired_since tolerates garbage", len(ps.retired_since("x")) == 6)
+      and len(ps.retired_since("1")) == 5)
+check("retired_since tolerates garbage", len(ps.retired_since("x")) == 5)
+check("the coverage default is no longer retired anywhere",
+      "planet/coverage_combo" not in ps.retired_since("1"))
 
 print("\n=== Volume: the old 1.5 / 1.0 / 2.5 m thickness opens on 2.5 / 1.5 / 3.5 ===")
 vol = dock.volume_tab

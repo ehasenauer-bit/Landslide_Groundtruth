@@ -289,11 +289,17 @@ class PlanetTab(QWidget):
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
         self.coverage_combo.addItem("Cover the exact epicentre (stricter)", "point")
-        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("aoi"))  # default, as run_single
+        # Exact epicentre is the default again since 2026-10-21 (it was 08-25..09-24):
+        # every listed scene then shows the event point. Cloud and quality stay
+        # wide open, since it was those three filters TOGETHER that emptied the St.
+        # Elias post list. Same default as run_single --coverage.
+        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))
         self.coverage_combo.setToolTip(
-            "AOI overlap: accept any scene overlapping the search box — recovers "
-            "partial-coverage scenes near the event date. Epicentre: require the "
-            "footprint to contain the point (can miss the nearest scenes).")
+            "Epicentre (the default): require the footprint to contain the point, "
+            "so every scene listed shows the event — but it can miss the nearest "
+            "scenes. AOI overlap: accept any scene overlapping the search box — "
+            "recovers partial-coverage scenes near the event date, and matches "
+            "Planet Explorer.")
         form.addRow("Coverage", self.coverage_combo)
 
         self.quality_combo = QComboBox()

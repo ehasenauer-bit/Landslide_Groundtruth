@@ -58,9 +58,10 @@ RETIRED_DEFAULTS = {
     "2": {
         # PlanetScope scene filters. On 2026-09-25 the St. Elias project still restored
         # all three a day after the defaults changed, and between them they emptied its
-        # post-event list (0 scenes where the current defaults list 23).
+        # post-event list (0 scenes where the current defaults list 23). "Cover the
+        # exact epicentre" was retired with them (08-25..09-24) and became the default
+        # again on 2026-10-21, so it is no longer swapped out.
         "planet/cloud_slider": "80",                                        # to 09-24
-        "planet/coverage_combo": "Cover the exact epicentre (stricter)",    # 08-25..09-24
         "planet/quality_combo": "Standard quality only",                    # to 08-25
     },
     "3": {

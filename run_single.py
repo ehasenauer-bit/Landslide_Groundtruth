@@ -406,10 +406,11 @@ def main():
                          "still caps (PlanetScope 80, Sentinel-2/Landsat 60, either one 20 "
                          "with --auto-window), since it picks scenes for you rather than "
                          "showing them to you.")
-    ap.add_argument("--coverage", choices=["aoi", "point"], default="aoi",
-                    help="PlanetScope coverage requirement: 'aoi' = any scene overlapping the "
-                         "search box (matches Planet Explorer; default), 'point' = scene "
-                         "footprint must contain the exact epicentre (stricter).")
+    ap.add_argument("--coverage", choices=["aoi", "point"], default="point",
+                    help="PlanetScope coverage requirement: 'point' = scene footprint must "
+                         "contain the exact epicentre (stricter; default, as the plugin "
+                         "tab), 'aoi' = any scene overlapping the search box (matches "
+                         "Planet Explorer).")
     ap.add_argument("--quality", choices=["standard", "any"], default="any",
                     help="PlanetScope quality: 'any' = also include 'test'-quality scenes "
                          "(default, as Planet Explorer and the plugin tab do), 'standard' = "
