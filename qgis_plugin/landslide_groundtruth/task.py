@@ -12,6 +12,7 @@ the dock in response to taskCompleted/taskTerminated, which fire on the GUI thre
 import json
 import os
 import re
+import signal
 import subprocess
 
 from qgis.PyQt.QtCore import pyqtSignal
@@ -32,6 +33,8 @@ class PipelineTask(QgsTask):
         self.result_name = result_name  # JSON the script writes (result/search)
         self.proc = None
         self.result = None
+        self.returncode = None          # child exit code (negative = killed by signal)
+        self.exit_note = ""             # plain-language reason when it exits non-zero
 
     def run(self):
         cmd = [self.python_exe, self.script] + self.cli_args
@@ -61,6 +64,7 @@ class PipelineTask(QgsTask):
                 return False
             self.logLine.emit(line.rstrip())
         code = self.proc.wait()
+        self.returncode = code
         try:
             self.proc.stdout.close()
         except Exception:
@@ -75,6 +79,13 @@ class PipelineTask(QgsTask):
                     self.result = json.load(f)
             except Exception as e:
                 self.logLine.emit(f"could not read {self.result_name}: {e}")
+        elif not self.isCanceled():
+            # Non-zero exit -> say WHY in words. The usual killers here leave no Python
+            # traceback: the OS out-of-memory reaper (SIGKILL, macOS 'jettison') and a
+            # native-library crash (SIGSEGV/SIGBUS). Without this the caller only sees
+            # "finished with no result", because result.json is never written on a kill.
+            self.exit_note = exit_reason(code)
+            self.logLine.emit(self.exit_note)
         return code == 0
 
     def _terminate_and_reap(self):
@@ -105,6 +116,14 @@ class PipelineTask(QgsTask):
                     "PROJ_LIB", "PROJ_DATA", "GDAL_DATA", "GDAL_DRIVER_PATH",
                     "GDAL_PLUGINS", "QT_PLUGIN_PATH"):
             env.pop(var, None)
+        # Run the child UNBUFFERED and with the fault handler armed. Its stdout is a
+        # pipe, so Python block-buffers it by default: a SIGKILL (out of memory) or a
+        # segfault then discards the whole buffered log and the failure reaches the
+        # user as a bare "finished with no result". Unbuffered streams each line as it
+        # is printed (so it survives a kill), and faulthandler dumps a native traceback
+        # to stderr on a crashing signal (merged into the same log).
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONFAULTHANDLER"] = "1"
         return env
 
     def cancel(self):
@@ -193,3 +212,37 @@ def failure_hint(text):
         if rx.search(text):
             return hint
     return ""
+
+
+def exit_reason(code):
+    """Plain-language reason for a non-zero child exit code.
+
+    A failure_hint reads the child's OUTPUT; this reads its EXIT CODE, which is the
+    only evidence left when the child is killed without printing anything — an
+    out-of-memory kill or a native crash. POSIX reports a child killed by signal N as
+    returncode -N; some wrappers surface it shell-style as 128+N instead, so handle
+    both. The out-of-memory case is called out by name because it's the common one and
+    it has a clear next step (use a smaller radius)."""
+    sig = None
+    if code is None:
+        return "The run stopped before it finished — see the log above."
+    if code < 0:
+        sig = -code
+    elif code > 128:
+        sig = code - 128
+    if sig is not None:
+        try:
+            name = signal.Signals(sig).name
+        except (ValueError, AttributeError):
+            name = f"signal {sig}"
+        if sig == getattr(signal, "SIGKILL", 9):
+            return (f"The run was killed by the operating system ({name}) — almost "
+                    f"always this means it ran out of memory. Reduce the search radius "
+                    f"(or the number of scenes) and try again.")
+        if sig in (getattr(signal, "SIGSEGV", 11), getattr(signal, "SIGBUS", 10),
+                   getattr(signal, "SIGABRT", 6)):
+            return (f"The run crashed inside a native library ({name}). The log above "
+                    f"shows how far it got.")
+        return f"The run was stopped by {name} (signal {sig}) — see the log above."
+    return (f"The run exited with code {code} without producing a result — the error "
+            f"is in the log above.")
