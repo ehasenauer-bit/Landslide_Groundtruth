@@ -8,7 +8,7 @@ import tempfile
 from urllib.parse import quote
 
 from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon, QImage
+from qgis.PyQt.QtGui import QColor, QBrush, QPixmap, QIcon, QImage
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
@@ -212,9 +212,6 @@ HIGHLIGHT_RENDER = {
 # sources renderable on the map / in the gallery via the data API (preview order)
 STREAMABLE = ("Sentinel-2", "Landsat")
 
-# muted text for table rows the run will NOT composite (ranked below the cutoff)
-MUTED_FG = QColor(120, 120, 120)
-
 # QGIS network-request timeout (ms) while previewing PC tiler layers: the on-
 # demand tiler can be slow to render the first tiles of a fresh scene, and the
 # 60 s default aborts them ("Network request … timed out"). 3 minutes.
@@ -228,12 +225,6 @@ NETWORK_TIMEOUT_MS = 180000
 EARTHDATA_TOKENS_URL = "https://urs.earthdata.nasa.gov/api/users/tokens"
 EARTHDATA_HOST = "urs.earthdata.nasa.gov"
 EARTHDATA_REGISTER_URL = "https://urs.earthdata.nasa.gov/"
-
-# status-line colours shared by the login panel (green ok / red fail / amber hint)
-STATUS_COLORS = {
-    "success": "#2e7d32", "error": "#c62828",
-    "warn": "#e65100", "info": "palette(mid)",
-}
 
 # Responsive text: the dock rescales its base font with its own size so the panel
 # stays readable whether it's a cramped side dock or a large floating window. The
