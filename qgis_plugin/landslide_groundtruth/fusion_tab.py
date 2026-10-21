@@ -139,6 +139,86 @@ WGS84_WKT = (
     '0.0174532925199433],AUTHORITY["EPSG","4326"]]')
 
 
+class _CurrentPageTabs(QTabWidget):
+    """A QTabWidget as tall as the page on show, not as its tallest page.
+
+    The stock one sizes to its tallest page, and the Advanced page reports its
+    four boxes at full EXPANDED height until it is first shown —
+    QgsCollapsibleGroupBox only applies setCollapsed once it is visible. That was
+    ~1170 px against the Run page's ~540, so Fuse sat below ~640 px of empty page
+    under Outputs and had to be scrolled to. All three hints need it: the pages
+    hold word-wrapped labels, so the layout asks heightForWidth, and Qt answers
+    that with the tallest page as well."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _i: self.updateGeometry())
+
+    def _fit(self, hint, page_hint):
+        # keep the tab bar and frame the stock hint adds; swap the tallest
+        # page's height for the current one's
+        heights = [page_hint(self.widget(i)).height() for i in range(self.count())]
+        page = self.currentWidget()
+        if page is not None and heights:
+            hint.setHeight(hint.height() - max(heights) + page_hint(page).height())
+        return hint
+
+    def sizeHint(self):
+        return self._fit(super().sizeHint(), lambda w: w.sizeHint())
+
+    def minimumSizeHint(self):
+        return self._fit(super().minimumSizeHint(), lambda w: w.minimumSizeHint())
+
+    def heightForWidth(self, width):
+        page = self.currentWidget()
+        if page is None:
+            return super().heightForWidth(width)
+        # A side dock is usually narrower than this tab's minimum width (the
+        # dock pins its own at 360 px), and the layout then asks at that minimum
+        # — wider than the page will get, so its wrapped labels come out too
+        # short. Answer for the width the parent can actually give.
+        parent = self.parentWidget()
+        if parent is not None and parent.layout() is not None and parent.width() > 0:
+            m = parent.layout().contentsMargins()
+            width = min(width, parent.width() - m.left() - m.right())
+        # the frame's share of the width, once laid out (a few px either way
+        # only moves where a label wraps)
+        stack = page.parentWidget()
+        pad = self.width() - stack.width() if stack is not None and stack.width() > 0 else 0
+        h = self._page_height(page, max(1, width - pad))
+        chrome = super().sizeHint().height() - max(
+            self.widget(i).sizeHint().height() for i in range(self.count()))
+        return h + chrome
+
+    @staticmethod
+    def _page_height(page, width):
+        """The height the page's box layout will really take at `width`.
+
+        Not page.heightForWidth: laying out, QBoxLayout gives each item its
+        height at the larger of `width` and the item's OWN minimum width, while
+        heightForWidth uses `width` throughout. Below the Inputs box's minimum
+        width (583 px; a side dock is ~400) the two differ by ~80 px, which came
+        out as blank page under Outputs."""
+        lay = page.layout()
+        if lay is None:
+            return page.sizeHint().height()
+        m = lay.contentsMargins()
+        inner = width - m.left() - m.right()
+        heights = []
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item.isEmpty():                       # the closing stretch
+                continue
+            if item.hasHeightForWidth():
+                w = min(max(inner, item.minimumSize().width()),
+                        item.maximumSize().width())
+                heights.append(item.heightForWidth(w))
+            else:
+                heights.append(item.sizeHint().height())
+        return (m.top() + m.bottom() + sum(heights)
+                + max(0, lay.spacing()) * max(0, len(heights) - 1))
+
+
 class FusionTab(QWidget):
     def __init__(self, dock):
         super().__init__()
@@ -185,7 +265,7 @@ class FusionTab(QWidget):
         root.addWidget(self._steps_panel())
         root.addWidget(self._preset_row())
 
-        self.pages = QTabWidget()
+        self.pages = _CurrentPageTabs()
         self.pages.addTab(self._run_page(), "Run")
         self.pages.addTab(self._advanced_page(), "Advanced")
         self.pages.setTabToolTip(0, "The two inputs and what to produce.")
@@ -954,17 +1034,25 @@ class FusionTab(QWidget):
         return box
 
     def _outputs_box(self):
+        # One row of two ticks and no note: this box sits right above Fuse, so
+        # every line in it is a line Fuse is pushed down the dock. What the note
+        # said is in the tooltips.
+        both = ("\n\nBoth bands are always written to the GeoTIFF; these ticks "
+                "only choose which become map layers. Whether SAR helps is "
+                "event-specific, so keeping both is the safe default.")
         box = QgsCollapsibleGroupBox("Outputs")
         box.setSaveCollapsedState(False)
-        form = QFormLayout(box)
+        box.setToolTip(both.strip())
+        v = QVBoxLayout(box)
+        v.setContentsMargins(8, 4, 8, 8)
         self.out_fused_check = QCheckBox("Fused score  (optical + SAR)")
         self.out_fused_check.setChecked(True)
         self.out_fused_check.setToolTip(
             "The soft AND across both sensors. Worth having when SAR corroborates "
             "the optical evidence — Iliamna 2026-08-08 gained precision 12% → 24% "
             "from it.\n\nUntick it when SAR is not helping and you do not want a "
-            "SAR raster involved at all: the SAR input then becomes optional.")
-        form.addRow(self.out_fused_check)
+            "SAR raster involved at all: the SAR input then becomes optional."
+            + both)
 
         self.out_optical_check = QCheckBox("Optical only  (no SAR)")
         self.out_optical_check.setChecked(True)
@@ -972,16 +1060,12 @@ class FusionTab(QWidget):
             "The optical channel with the same terrain and glacier weighting but "
             "no AND.\n\nOn Hubbard 2026-07-28 the deposit is QUIETER in SAR than "
             "the crevassed ice around it, so the AND destroys the detection and "
-            "this is the only usable layer: fused AUC 0.663 vs optical-only 0.889.")
-        form.addRow(self.out_optical_check)
-
-        note = QLabel(
-            "Both bands are always written to the GeoTIFF; these choose which "
-            "become map layers. Whether SAR helps is event-specific, so keeping "
-            "both is the safe default.")
-        note.setWordWrap(True)
-        note.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(note)
+            "this is the only usable layer: fused AUC 0.663 vs optical-only 0.889."
+            + both)
+        row = FlowRow()
+        row.addWidget(self.out_fused_check)
+        row.addWidget(self.out_optical_check)
+        v.addWidget(row)
         return box
 
     @staticmethod
