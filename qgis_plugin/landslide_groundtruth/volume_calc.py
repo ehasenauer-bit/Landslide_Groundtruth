@@ -112,8 +112,12 @@ FIT_OUTLINE = {
 # Sources: Deline et al. 2015, "Rock avalanches onto glaciers", Table 9.1 and
 # pp. 283–284; Sosio et al. 2012, QSR 47, Tables 2 and 4 and p. 24; Shugar & Clague
 # 2011, Sedimentology 58, Table 1; Caplan-Auerbach & Huggel 2007, J. Glaciol.,
-# pp. 129–133; Toney et al. 2021. Where a source gives only a range, the mean is its
-# rounded middle.
+# pp. 129–133; Toney et al. 2021; Toney et al. 2026, JGR-ES (Peters Dome); Schaefer
+# et al. 2023, JGR-ES (Barry Arm). Those last two are the only Alaska volumes in the
+# USGS seismogenic-landslide catalogue (doi 10.5066/P90VGCSK, v4.0) that are measured
+# AND sit on a usable outline — most of its others are Larsen scaling of the source
+# area or area × an assumed thickness. Where a source gives only a range, the mean
+# is its rounded middle.
 #
 # The combo is not stored in the project. It is read back off the three numbers
 # (thickness_setting), so an older project shows whichever setting its values are,
@@ -129,7 +133,9 @@ THICKNESS_SETTINGS = [
      "A rock avalanche spread over a glacier, seen on imagery soon after the event, "
      "while the deposit still holds the snow and ice it picked up — closest to what "
      "a seismic volume counts. Sherman's 25–30 Mm³ over 8.3 km² is 3.0–3.6 m and Red "
-     "Glacier 2003's 12–20 Mm³ over 4 km² is 3–5 m (Sosio et al. 2012, Table 2)."),
+     "Glacier 2003's 12–20 Mm³ over 4 km² is 3–5 m (Sosio et al. 2012, Table 2). "
+     "In Alaska, Peters Dome 2023 (Denali) measured 6.1 Mm³ by DEM differencing "
+     "over ~1.4 km² of deposit, ~4.5 m (Toney et al. 2026)."),
     ("Ice-rich, near date — 2 m (1–3)", "ice_rich_near", 2.0, 1.0, 3.0,
      "An Iliamna-type ice-rich avalanche, the whole of it — ice, snow and rock — "
      "over its full path: 1–2 m at Umbrella Glacier and 2–3 m at Lateral Glacier in "
@@ -147,7 +153,9 @@ THICKNESS_SETTINGS = [
      "Thurwieser 4–5 m by GPS, Becca di Luseney 6–7 m and Brenva 5–6 m (Sosio et "
      "al. 2012, Tables 2 and 4), Kshwan 5 m and Morsárjökull 5.5 m (Deline et al. "
      "2015, Table 9.1). Off the ice, deposits run several times thicker than the "
-     "thin sheets on it."),
+     "thin sheets on it. An unconfined slide down an open slope runs thinner: Barry "
+     "Arm's October 2020 headscarp slide was ~2.5 m (0.65 Mm³ over 0.26 km², lidar "
+     "differencing; Schaefer et al. 2023)."),
     ("Source scar — 15 m (5–50)", "scar", 15.0, 5.0, 50.0,
      "A detachment depth, for an outline of the evacuated source scar alone. Red "
      "Glacier 2003 failed ~15 m deep and Lateral Glacier 2004 5–30 m (Caplan-"

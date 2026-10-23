@@ -119,6 +119,10 @@ check("the label leads with what tells the settings apart (date before numbers)"
                                    "Glacier, near date", "Ice-rich, near date",
                                    "Ice-rich, far date (ice melted)")
           for s in SETTINGS if s[1].startswith(("glacier", "ice_rich"))))
+check("the measured Alaska points are cited where they apply: Peters Dome under "
+      "near date, Barry Arm under off-glacier",
+      "Peters Dome" in by_key["glacier_near"][5]
+      and "Barry Arm" in by_key["confined"][5])
 check("the far-date ice-rich note gives the 2–3× failed volume",
       "2–3×" in by_key["ice_rich_far"][5])
 check("thickness_setting reads 1 / 1.0 / 1.00 as the same number",
