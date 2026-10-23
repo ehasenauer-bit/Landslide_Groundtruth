@@ -161,8 +161,9 @@ check("recorded as the slide's row without another click",
 check(f"both on screen ({vol.vol_thick_out.text()!r} / {vol.vol_scar_out.text()!r})",
       vol.vol_thick_out.text().startswith("2.5 Mm³")
       and "Mm³" in vol.vol_scar_out.text() and "bedrock" in vol.vol_scar_out.text())
-check(f"implied depth is the SCAR's ({vol.depth_out.text()!r})",
-      vol.depth_out.text().startswith(f"{c['v_larsen'] / 2.0e5:,.1f} m"))
+check(f"implied depth spreads the scar volume over the TOTAL ({vol.depth_out.text()!r})",
+      vol.depth_out.text().startswith(f"{c['v_larsen'] / 1.0e6:,.1f} m")
+      and "total 1 km²" in vol.depth_out.text())
 check("no warnings on a clean slide", not vol.vol_warn_lbl.isVisibleTo(vol))
 check("the verdict already lists both",
       "Area × thickness" in vol.verdict_summary.text()

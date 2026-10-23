@@ -1208,16 +1208,19 @@ class VolumeTab(QWidget):
         scar_lbl = QLabel("Source scar")
         scar_lbl.setToolTip(scar_tip)
         f.addRow(scar_lbl, self.vol_scar_out)
-        # V/A — the cheapest sanity check in the tab. 3 m is a plausible bedrock
-        # detachment; 90 m means the outline is wrong, and no other readout on
-        # this panel would have told you. Area × thickness has no such check:
-        # its V/A is the thickness you typed.
+        # V/A — the cheapest sanity check in the tab. Taken over the TOTAL outline
+        # (Ethan's call, 2026-10-23), so it is the mean thickness the Larsen
+        # volume implies across the whole footprint — the same quantity as the
+        # deposit thickness area × thickness multiplies by, and directly
+        # comparable with it.
         self.depth_out = self._ro()
         self.depth_out.setToolTip(
-            "Source-scar volume ÷ source area: the average scar depth that "
-            "estimate implies. Check it against the headscarp you can see — if it "
-            "is tens of metres for a shallow-looking scar, the outline or the "
-            "material is wrong.")
+            "Source-scar (Larsen) volume ÷ TOTAL outline area: the mean thickness "
+            "over the whole landslide footprint that the Larsen volume implies. "
+            "Directly comparable with the deposit thickness under Settings — "
+            "area × thickness is that thickness over the same area — so a value "
+            "several times it means the two fits disagree, and tens of metres "
+            "means the outline or the material is wrong.")
         f.addRow("Implied mean depth", self.depth_out)
         self.areas_out = self._ro()
         self.areas_out.setToolTip(
@@ -1232,12 +1235,14 @@ class VolumeTab(QWidget):
         return box
 
     def _show_depth(self, c):
-        """Source-scar volume ÷ source area — the pair that belongs together."""
-        from . import verdict as V
-        area = _num(c.get("larsen_area_m2"))
-        d = V.implied_depth_m(_num(c.get("v_larsen")), area)
-        self.depth_out.setText("" if d is None else
-                               f"{d:,.1f} m   (scar volume ÷ {_km2(area)})")
+        d, area = _implied_depth(c)
+        if d is not None:
+            self.depth_out.setText(
+                f"{d:,.1f} m   (scar volume ÷ total {_km2(area)})")
+        elif c.get("v_larsen") is not None:
+            self.depth_out.setText("— (no total outline to spread it over)")
+        else:
+            self.depth_out.clear()
 
     def _build_centerline_box(self):
         """Centerline + elevation-drop tools, open by default — most slides get
@@ -2421,7 +2426,7 @@ class VolumeTab(QWidget):
         row["agreement_thickness"] = V.classify(rec["d_thickness"])
         row["agreement_larsen"] = V.classify(rec["d_larsen"])
         row["agreement"] = rec["agreement"]         # the worse of the two
-        depth = V.implied_depth_m(larsen, _num(src.get("larsen_area_m2")))
+        depth, _area = _implied_depth(src)
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
         lat, lon = self._scar_centroid()
         row["scar_lat"] = "" if lat is None else f"{lat:.6f}"
@@ -2476,10 +2481,10 @@ class VolumeTab(QWidget):
                          f"{V.classify(d)}</b>")
             lines.append(line)
         if larsen:
-            depth = V.implied_depth_m(larsen, _num(src.get("larsen_area_m2")))
+            depth, _area = _implied_depth(src)
             if depth:
-                lines.append(f'<span style="{mid}">'
-                             f"implied scar depth {depth:.1f} m</span>")
+                lines.append(f'<span style="{mid}">implied mean depth '
+                             f"{depth:.1f} m over the total outline</span>")
         if rec["text"] and (seis is not None or thick or larsen):
             lines.append(f'<span style="{mid}">{rec["text"]}</span>')
         lat, lon = self._scar_centroid()
@@ -2683,6 +2688,18 @@ def _fmt(v):
     if abs(v) >= 1:
         return f"{v:,.2f}"
     return f"{v:.3g}"
+
+
+def _implied_depth(row):
+    """(depth_m, area_m2): the source-scar volume spread over the TOTAL outline.
+
+    Depth is None when either is missing. Over the total rather than the scar,
+    so it is a mean thickness for the whole slide — comparable with the deposit
+    thickness — instead of a scar depth fixed by the area alone (V/A of the
+    Larsen fit on its own outline is just αA^(γ−1))."""
+    from . import verdict as V
+    area = _num(row.get("a_total"))
+    return V.implied_depth_m(_num(row.get("v_larsen")), area), area
 
 
 def _km2(a):

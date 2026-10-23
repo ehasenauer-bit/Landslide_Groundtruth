@@ -61,7 +61,7 @@ row=s._verdict_row()
 print(f"   D thickness {row['d_thickness']}  D larsen {row['d_larsen']}  "
       f"depth {row['implied_depth']}")
 assert row["d_larsen"]=="0.000" and abs(float(row["d_thickness"])-0.301)<0.001
-assert abs(float(row["implied_depth"])-3.10)<0.01, "depth is scar volume / SOURCE area"
+assert abs(float(row["implied_depth"])-1.25)<0.01, "depth is scar volume / TOTAL area"
 cols=dict(VT.CSV_FIELDS)
 assert cols["vol_thickness_m3"]=="v_thick" and cols["vol_source_scar_m3"]=="v_larsen"
 assert "v_best" not in cols.values(), "no CSV column may read a shared best"

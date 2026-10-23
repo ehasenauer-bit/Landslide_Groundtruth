@@ -202,9 +202,11 @@ reads top to bottom in the order the work is done:
    Measuring the same slide name again replaces its row (and keeps its centerline);
    a new name adds a row. If one fit cannot run — no source outline, say — the other
    still does and the Volumes box says why.
-4. **Volumes** shows both, at three significant figures, plus the scar's implied
-   mean depth (V/A — tens of metres for a shallow-looking scar means the outline or
-   the material is wrong). Warnings about this measurement show here.
+4. **Volumes** shows both, at three significant figures, plus the implied mean
+   depth: the source-scar volume ÷ the **total** outline area, i.e. the mean
+   thickness over the whole footprint that the Larsen volume implies. It compares
+   directly with the deposit thickness under Settings — several times it means the
+   two fits disagree, tens of metres means the outline or the material is wrong. Warnings about this measurement show here.
 5. **Centerline & elevation drop.** **Draw centerline** derives the medial-axis
    spine of the total outline into `Landslide centerlines`, left in edit mode to
    trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall

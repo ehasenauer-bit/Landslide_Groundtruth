@@ -58,11 +58,14 @@ s._current = None
 assert s._estimates()[1] == 1.30e6, "with nothing on screen, the last row"
 print("   _current first, else the last row")
 
-print("\n=== 3. implied depth uses the SOURCE area, not the total ===")
-s._rows = [dict(ROW, a_total=9.9e9)]
+print("\n=== 3. implied depth spreads the scar volume over the TOTAL outline ===")
+s._rows = [dict(ROW)]
 row = s._verdict_row()
-print(f"   implied depth {row['implied_depth']} m   (1.3e6 / 4.2e5 = 3.10)")
-assert abs(float(row["implied_depth"]) - 3.10) < 0.01, row["implied_depth"]
+print(f"   implied depth {row['implied_depth']} m   (1.3e6 / 8.0e5 = 1.625)")
+assert abs(float(row["implied_depth"]) - 1.625) < 0.01, row["implied_depth"]
+s._rows = [dict(ROW, a_total=None)]
+assert s._verdict_row()["implied_depth"] == "", "no total outline -> no depth, not the scar's"
+print("   and none at all without a total outline")
 
 print("\n=== 4. the CSV shows the cross-check on one line ===")
 s._rows = [dict(ROW)]
