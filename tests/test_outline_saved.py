@@ -1,13 +1,13 @@
-"""The two outlines a fit converts are saved in the project's folder, not memory.
+"""Every outline the Volume tab creates is saved in the project's folder, not memory.
 
 Run with tests/run_all.sh, or directly with QGIS's bundled python:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_outline_saved.py
 
-"New scar layer" makes a memory layer: close QGIS without Export > Save Features
-As… and the afternoon's digitizing is gone, and the project that reopens has
-nothing to measure. The Volume tab's "New total area" and "New source area
-(best)" buttons write a GeoPackage beside the .qgz instead (dock.results_dir),
-name it for its role and assign it to that role in one press.
+A memory layer loses the afternoon's digitizing to any QGIS restart, and the
+project that reopens has nothing to measure. Each outline role's New button —
+total, source best, source low, source high — writes a GeoPackage beside the
+.qgz instead (dock.results_dir), names it for its role and assigns it to that
+role in one press.
 
 Checks: the file is really on disk and the layer reads from it; the role is set
 and pinned; the name carries the role so a reopened project re-matches it; a
@@ -118,7 +118,6 @@ check("the layer is a polygon layer, with a slide field",
       and total.fields().indexOf("slide") >= 0)
 check("the role is pinned, so a layer loaded later can't take it over",
       tab._role_pinned.get("total"))
-check("it is also the draw target", tab._chosen_layer() is total)
 check("and QGIS is digitizing into it", dock.iface.activeLayer() is total
       and total.isEditable())
 
@@ -225,17 +224,34 @@ check("still red and blue after the reopen",
       outline(tab._role_layer("total"))[0] == "#dc1e1e"
       and outline(tab._role_layer("best"))[0] == "#1e5ae6")
 
-print("\n=== a scratch layer is amber until it has a role, then takes its colour ===")
-tab._new_scar_layer()
-scr = tab._chosen_layer()
-check(f"New scar layer with the total already taken: amber {outline(scr)}",
-      scr is not None and outline(scr) == ("#d67800", True)
-      and scr.fields().indexOf(AREA_FIELD) >= 0)
-tab._best_combo.setCurrentIndex(tab._best_combo.findData(scr.id()))
-check(f"assigned to Source area (best) by hand: blue {outline(scr)}",
-      tab._role_layer("best") is scr and outline(scr)[0] == "#1e5ae6")
-tab._total_combo.setCurrentIndex(tab._total_combo.findData(scr.id()))
-check(f"moved to Total area: red {outline(scr)}", outline(scr)[0] == "#dc1e1e")
+print("\n=== source low / high: their own files, dashed and dotted blue ===")
+tab._new_role_layer("low")
+low = tab._role_layer("low")
+lsrc = low.source().split("|", 1)[0] if low is not None else ""
+check(f"New beside Source (low) fills that role ({os.path.basename(lsrc)})",
+      low is not None and os.path.basename(lsrc) == "test_slide_source_area_low.gpkg"
+      and os.path.dirname(lsrc) == A)
+tab._new_role_layer("high")
+high = tab._role_layer("high")
+hsrc = high.source().split("|", 1)[0] if high is not None else ""
+check(f"New beside Source (high) fills that role ({os.path.basename(hsrc)})",
+      high is not None and os.path.basename(hsrc) == "test_slide_source_area_high.gpkg")
+check("neither disturbed the total or best roles",
+      tab._role_layer("best") is not None and tab._role_layer("total") is not None
+      and tab._role_layer("low") is not tab._role_layer("best"))
+from qgis.PyQt.QtCore import Qt as _Qt
+pen = lambda l: l.renderer().symbol().symbolLayer(0).strokeStyle()
+check(f"low and high are blue, dashed and dotted {outline(low)} {outline(high)}",
+      outline(low)[0] == "#1e5ae6" and outline(high)[0] == "#1e5ae6"
+      and pen(low) == _Qt.DashLine and pen(high) == _Qt.DotLine)
+check("name matching alone would give each its role",
+      tab._match_role_layers([low]).get("low") is low
+      and tab._match_role_layers([high]).get("high") is high)
+
+print("\n=== a layer the tab made takes the colour of whatever role it is given ===")
+tab._total_combo.setCurrentIndex(tab._total_combo.findData(low.id()))
+check(f"the low outline moved to Total area turns red {outline(low)}",
+      outline(low)[0] == "#dc1e1e")
 mine = QgsVectorLayer("Polygon?crs=EPSG:4326", "my own outline", "memory")
 from qgis.core import QgsFillSymbol
 mine.renderer().setSymbol(QgsFillSymbol.createSimple(
@@ -245,16 +261,20 @@ tab._refresh_layers()
 tab._total_combo.setCurrentIndex(tab._total_combo.findData(mine.id()))
 check(f"a layer the tab did NOT create keeps its own style {outline(mine)}",
       tab._role_layer("total") is mine and outline(mine) == ("#007800", False))
-project.clear()
-tab._refresh_layers()
-tab._new_scar_layer()
-first = tab._chosen_layer()
-check(f"the FIRST scratch layer is wired to Total area, so it is red {outline(first)}",
-      tab._role_layer("total") is first and outline(first)[0] == "#dc1e1e")
+
+print("\n=== Draw digitizes into the role's own layer ===")
+dock.iface.setActiveLayer(None)
+tab._draw_role("high")
+check("Draw beside Source (high) arms editing on that layer",
+      dock.iface.activeLayer() is high and high.isEditable())
+tab._low_combo.setCurrentIndex(0)                 # — none —
+tab._draw_role("low")
+check("Draw with no layer assigned says so instead of guessing one",
+      "No layer is assigned to Source (low)" in tab.log.toPlainText())
 
 print("\n=== every role button knows where it writes ===")
-check("ROLE_LAYERS covers exactly the two converted outlines",
-      set(ROLE_LAYERS) == {"total", "best"})
+check("ROLE_LAYERS covers the four outline roles",
+      set(ROLE_LAYERS) == {"total", "best", "low", "high"})
 check("each entry is (label, layer suffix, file stem, style)",
       all(len(v) == 4 and isinstance(v[3], dict) for v in ROLE_LAYERS.values()))
 

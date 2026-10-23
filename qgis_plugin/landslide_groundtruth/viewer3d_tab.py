@@ -1968,8 +1968,7 @@ class Viewer3DTab(QWidget):
                 return float(v)
             except (TypeError, ValueError):
                 return None
-        a = num(cur.get("a_conv")) or num(cur.get("a_total")) or num(cur.get("src_best"))
-        vb, vl, vh = num(cur.get("v_best")), num(cur.get("v_low")), num(cur.get("v_high"))
+        a = num(cur.get("a_total")) or num(cur.get("src_best"))
         ln, dr = num(cur.get("length")), num(cur.get("drop"))
         if a is not None:
             self.det_area.setText(f"{a/1e6:.2f} km²" if a >= 1e5 else f"{a:.0f} m²")
@@ -1977,16 +1976,26 @@ class Viewer3DTab(QWidget):
             self.det_cl_length.setText(f"{ln/1000:.2f} km" if ln >= 1000 else f"{ln:.0f} m")
         if dr is not None:
             self.det_cl_drop.setText(f"{dr:.0f} m")
-        if vb is not None:
+        # The Volume tab measures two volumes and makes neither the headline, so
+        # the figure carries both, each named.
+        vols = []
+        for key, label in (("v_thick", "area × thickness"),
+                           ("v_larsen", "source scar")):
+            vb = num(cur.get(key))
+            if vb is None:
+                continue
+            vl, vh = num(cur.get(key + "_lo")), num(cur.get(key + "_hi"))
             s = self._fmt_vol(vb)
             if vl is not None and vh is not None:
                 if abs(vb) >= 1e6 and abs(vl) >= 1e6 and abs(vh) >= 1e6:
-                    s += f"  ({vl/1e6:.2f}–{vh/1e6:.2f} Mm³)"   # unit once, for legibility
+                    s += f" ({vl/1e6:.2f}–{vh/1e6:.2f} Mm³)"   # unit once, for legibility
                 else:
-                    s += f"  ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
-            self.det_volume.setText(s)
+                    s += f" ({self._fmt_vol(vl)}–{self._fmt_vol(vh)})"
+            vols.append(f"{s} {label}")
+        if vols:
+            self.det_volume.setText(" · ".join(vols))
         got = [k for k, v in (("area", a), ("length", ln), ("drop", dr),
-                              ("volume", vb)) if v is not None]
+                              ("volume", vols or None)) if v is not None]
         if got:
             self._log("Pulled from Volume tab: " + ", ".join(got) + ".")
         else:

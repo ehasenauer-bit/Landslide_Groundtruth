@@ -126,7 +126,8 @@ print("   zero/negative/None/str all pass through silently")
 print("   describe(0,0,0) =", repr(limits.describe(0,0,0)))
 
 print("\n8. guards are actually wired in")
-for f,needle in (("viewer3d_tab.py","limits.check_grid"),("volume_tab.py","limits.check_grid")):
+# volume_tab's guard went with DEM differencing to parked/ddem (2026-10-23)
+for f,needle in (("viewer3d_tab.py","limits.check_grid"),):
     src=open(os.path.join(PLUG, f)).read()
     assert needle in src, f
     print(f"   {f}: guarded")

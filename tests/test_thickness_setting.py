@@ -206,8 +206,6 @@ layer.dataProvider().addFeatures([f])
 project.addMapLayer(layer)
 vol._refresh_layers()
 vol._total_combo.setCurrentIndex(vol._total_combo.findData(layer.id()))
-vol.fit_combo.setCurrentIndex(
-    [k for _l, k in volume_calc.FITS].index("thickness"))
 
 
 def measure():
@@ -218,17 +216,20 @@ def measure():
 
 
 cur, log = measure()
-v = cur.get("v_best") or 0
+v = cur.get("v_thick") or 0
 check(f"1 km² × 2.5 m ≈ 2.5 Mm³ (got {v:.4g})", abs(v - 2.5e6) / 2.5e6 < 0.01)
-check(f"the result names the setting and its date (got {cur.get('calc')!r})",
-      "Glacier, far date (ice melted)" in (cur.get("calc") or ""))
+check(f"the result names the setting and its date (got {cur.get('thick_calc')!r})",
+      "Glacier, far date (ice melted)" in (cur.get("thick_calc") or ""))
+check("and records the setting and the thickness on the row",
+      cur.get("thick_setting", "").startswith("Glacier, far date")
+      and cur.get("t_best") == 2.5)
 check("no ice or scar warning on the default", "rock left" not in log
       and "detachment depth" not in log)
 pick("glacier_near")
 cur, log = measure()
-v = cur.get("v_best") or 0
+v = cur.get("v_thick") or 0
 check(f"near date: 1 km² × 3.5 m ≈ 3.5 Mm³ (got {v:.4g})",
-      abs(v - 3.5e6) / 3.5e6 < 0.01 and "near date" in (cur.get("calc") or ""))
+      abs(v - 3.5e6) / 3.5e6 < 0.01 and "near date" in (cur.get("thick_calc") or ""))
 pick("ice_rich_far")
 cur, log = measure()
 check("Ice-rich, far date: logs that it is the rock left and the 2–3× failed volume",
@@ -243,9 +244,9 @@ check("Source scar on the TOTAL outline: says it reads too high",
 vol.thick_best_edit.setText("3"); vol.thick_low_edit.setText("2")
 vol.thick_high_edit.setText("4")
 cur, log = measure()
-check(f"Custom numbers: no setting in the result (got {cur.get('calc')!r}), "
+check(f"Custom numbers: no setting in the result (got {cur.get('thick_calc')!r}), "
       "no setting warning",
-      cur.get("calc") == "deposit area × thickness (3 m, 2–4)"
+      cur.get("thick_calc") == "deposit area × thickness (3 m, 2–4)"
       and "detachment depth" not in log and "ROCK sheet" not in log)
 
 project.removeMapLayer(layer.id())
