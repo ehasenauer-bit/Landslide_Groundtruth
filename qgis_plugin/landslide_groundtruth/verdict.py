@@ -133,7 +133,7 @@ def implied_depth_m(volume_m3, area_m2):
 
 
 # Columns appended to the Volume tab's CSV. Every volume gets its OWN column —
-# the tab's own columns carry vol_thickness_* and vol_source_scar_*, these the
+# the tab's own columns carry vol_thickness_* and vol_larsen_*, these the
 # seismic one — or the export cannot show that they were compared.
 VERDICT_CSV_FIELDS = [
     # identity — from the Detection, never typed

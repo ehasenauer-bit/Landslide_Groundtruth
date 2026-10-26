@@ -1980,7 +1980,7 @@ class Viewer3DTab(QWidget):
         # the figure carries both, each named.
         vols = []
         for key, label in (("v_thick", "area × thickness"),
-                           ("v_larsen", "source scar")):
+                           ("v_larsen", "Larsen et al.")):
             vb = num(cur.get(key))
             if vb is None:
                 continue

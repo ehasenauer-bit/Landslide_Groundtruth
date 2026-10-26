@@ -167,7 +167,7 @@ check(f"implied depth spreads the scar volume over the TOTAL ({vol.depth_out.tex
 check("no warnings on a clean slide", not vol.vol_warn_lbl.isVisibleTo(vol))
 check("the verdict already lists both",
       "Area × thickness" in vol.verdict_summary.text()
-      and "Source scar" in vol.verdict_summary.text())
+      and "Larsen et al. (2010)" in vol.verdict_summary.text())
 check("the centerline can be drawn now", vol.centerline_btn.isEnabled())
 
 print("\n=== the centerline lands on the row ===")
@@ -203,7 +203,7 @@ print("\n=== the 3D viewer pulls both volumes, each named ===")
 v3 = dock.viewer3d_tab
 v3._pull_volume_details()
 txt = v3.det_volume.text()
-check(f"figure volume: {txt!r}", "area × thickness" in txt and "source scar" in txt)
+check(f"figure volume: {txt!r}", "area × thickness" in txt and "Larsen et al." in txt)
 
 print("\n=== a new slide name adds a row ===")
 vol.name_edit.setText("Second slide")
@@ -218,7 +218,7 @@ vol._measure()
 c3 = vol._current
 check("area × thickness still runs", c3["v_thick"] and c3["v_larsen"] is None)
 check(f"the skipped fit is explained on screen ({vol.vol_warn_lbl.text()[:50]!r}…)",
-      vol.vol_warn_lbl.isVisibleTo(vol) and "Source scar skipped" in vol.vol_warn_lbl.text()
+      vol.vol_warn_lbl.isVisibleTo(vol) and "Larsen et al. (2010) skipped" in vol.vol_warn_lbl.text()
       and "not run" in vol.vol_scar_out.text())
 vol._total_combo.setCurrentIndex(0)
 vol._best_combo.setCurrentIndex(vol._best_combo.findData(source.id()))

@@ -8,15 +8,15 @@ project is the normal case:
 
   Outlines  Draw (or assign) the TOTAL outline and the BEST SOURCE scar; each
             has its own New / Draw buttons. Source low/high, for an area range
-            on the scar fit, sit in a collapsed box under them.
+            on Larsen et al. (2010), sit in a collapsed box under them.
   Settings  The deposit thickness for area × thickness, and what failed
-            (bedrock/soil) for the source-scar fit.
+            (bedrock/soil) for Larsen et al. (2010).
   Measure   Runs BOTH fits at once and records the result row:
               Area × thickness (Toney et al. 2021) — the TOTAL outline's plan
                 area × the mean deposit thickness, the low/high thickness giving
                 the range. Falls back to the source outline when no total is
                 drawn (then the thickness is a scar depth).
-              Source scar (Larsen Table S1) — the BEST SOURCE outline through the
+              Larsen et al. (2010), Table S1 — the BEST SOURCE outline through the
                 calibrated relation; source low/high widen the range.
             Neither is "the" volume: each keeps its own fields everywhere, so a
             seismic volume can be compared against both.
@@ -33,7 +33,7 @@ The explanatory text lives behind the "? Help" toggle in the header; tooltips
 carry the detail either way, and live warnings always show.
 
 WHICH OUTLINE EACH FIT READS is fixed, because each calibration is defined
-against a particular outline: feeding the scar fit a total outline reads high,
+against a particular outline: feeding Larsen et al. a total outline reads high,
 and a deposit thickness over a source scar reads low.
 
 Roles are assigned by layer rather than by map selection, so the input is
@@ -187,7 +187,7 @@ NEW_TIPS = {
               f"“{AREA_FIELD}” field QGIS keeps current as you draw.\n\n" + _SAVED),
     "best": ("Create the BEST source-scar outline — the evacuated source area "
              "alone — assign it to “Source (best)” and start digitizing. This is "
-             "the outline the source-scar fit converts. Drawn as a blue outline, "
+             "the outline Larsen et al. (2010) converts. Drawn as a blue outline, "
              f"with the same “{AREA_FIELD}” field.\n\n" + _SAVED),
     "low": ("Create the CONSERVATIVE (smaller) source-scar outline, assign it to "
             "“Source (low)” and start digitizing. Dashed blue.\n\n" + _SAVED),
@@ -239,7 +239,7 @@ UNUSABLE_LENGTH_UNITS = (QgsUnitTypes.DistanceDegrees,
 
 TABLE_COLS = ["Slide", "Material", "Thickness (m)",
               "V thick (m³)", "V thick low", "V thick high",
-              "V scar (m³)", "V scar low", "V scar high",
+              "V Larsen (m³)", "V Larsen low", "V Larsen high",
               "Total area (m²)", "Src best (m²)", "Src low (m²)", "Src high (m²)",
               "Length (m)", "Drop (m)", "Layers"]
 # columns right-aligned as numbers
@@ -257,8 +257,8 @@ CSV_FIELDS = [
     ("thickness_area_m2", "thick_area_m2"),
     ("vol_thickness_m3", "v_thick"), ("vol_thickness_lo_m3", "v_thick_lo"),
     ("vol_thickness_hi_m3", "v_thick_hi"),
-    ("vol_source_scar_m3", "v_larsen"), ("vol_source_scar_lo_m3", "v_larsen_lo"),
-    ("vol_source_scar_hi_m3", "v_larsen_hi"),
+    ("vol_larsen_m3", "v_larsen"), ("vol_larsen_lo_m3", "v_larsen_lo"),
+    ("vol_larsen_hi_m3", "v_larsen_hi"),
     ("total_area_m2", "a_total"),
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
@@ -269,7 +269,7 @@ CSV_FIELDS = [
     ("total_layer", "total_layer"), ("source_best_layer", "best_layer"),
     ("source_low_layer", "low_layer"), ("source_high_layer", "high_layer"),
     ("written_layer", "layer_name"), ("written_feature_id", "fid"),
-    ("thickness_calculator", "thick_calc"), ("source_scar_calculator", "larsen_calc"),
+    ("thickness_calculator", "thick_calc"), ("larsen_calculator", "larsen_calc"),
 ]
 
 # The ground-truthing columns: who the event was, what the analyst concluded, and
@@ -336,8 +336,8 @@ class VolumeTab(QWidget):
         root.addWidget(self._help(
             "Draw the TOTAL outline and the BEST SOURCE scar, set the deposit "
             "thickness and what failed, then Measure. One Measure runs both fits "
-            "— area × thickness on the total outline (Toney et al. 2021) and the "
-            "source-scar fit on the source outline (Larsen Table S1) — and "
+            "— area × thickness on the total outline (Toney et al. 2021) and "
+            "Larsen et al. (2010) on the source outline — and "
             "records the slide's row. Neither is the headline: the verdict "
             "compares each with the seismic volume."))
 
@@ -348,7 +348,7 @@ class VolumeTab(QWidget):
         self.measure_btn = QPushButton("Measure")
         self.measure_btn.setToolTip(
             "Measure the assigned outlines and run both fits: area × thickness "
-            "on the TOTAL outline, the source-scar fit on the BEST SOURCE "
+            "on the TOTAL outline, Larsen et al. (2010) on the BEST SOURCE "
             "outline (source low/high widen its range). Records the result as "
             "this slide's row — measuring the same slide again replaces it.")
         self.measure_btn.clicked.connect(self._measure)
@@ -429,7 +429,7 @@ class VolumeTab(QWidget):
         v.addWidget(self._help(
             "TOTAL (red) — the whole affected area: source scar, runout track "
             "and deposit; area × thickness converts it. SOURCE best (blue) — the "
-            "evacuated scar alone; the source-scar fit converts it, and taking in "
+            "evacuated scar alone; Larsen et al. (2010) converts it, and taking in "
             "the track or deposit inflates that volume. New makes the outline as "
             "a GeoPackage beside the project, assigned and ready to draw; Draw "
             "adds another polygon to the assigned layer (a layer is measured by "
@@ -459,7 +459,7 @@ class VolumeTab(QWidget):
         self._best_combo = QComboBox()
         self._best_combo.setToolTip(
             "Layer holding the BEST source-scar interpretation — the evacuated "
-            "scar alone. The source-scar fit converts THIS outline.\n\n"
+            "scar alone. Larsen et al. (2010) converts THIS outline.\n\n"
             "Filled in automatically from “Source Area (best)”, or a plain "
             "“Source Area”.")
         form.addRow("Source (best)", self._role_row("best", self._best_combo))
@@ -475,19 +475,19 @@ class VolumeTab(QWidget):
         rng.setCollapsed(True)
         rf = QFormLayout(rng)
         rf.addRow(self._help(
-            "A conservative and a generous reading of the source scar. The "
-            "source-scar fit reads them as a ±2σ area span and folds it into its "
+            "A conservative and a generous reading of the source scar. "
+            "Larsen et al. (2010) reads them as a ±2σ area span and folds it into its "
             "range; area × thickness ignores them."))
         self._low_combo = QComboBox()
         self._low_combo.setToolTip(
             "Optional. Layer holding the CONSERVATIVE (smaller) source-scar "
-            "interpretation, from “Source Area (low)”. Lowers the source-scar "
+            "interpretation, from “Source Area (low)”. Lowers the Larsen et al. "
             "volume range (paired with source high).")
         rf.addRow("Source (low)", self._role_row("low", self._low_combo))
         self._high_combo = QComboBox()
         self._high_combo.setToolTip(
             "Optional. Layer holding the GENEROUS (larger) source-scar "
-            "interpretation, from “Source Area (high)”. Raises the source-scar "
+            "interpretation, from “Source Area (high)”. Raises the Larsen et al. "
             "volume range (paired with source low).")
         rf.addRow("Source (high)", self._role_row("high", self._high_combo))
         v.addWidget(rng)
@@ -1077,7 +1077,7 @@ class VolumeTab(QWidget):
         outline's plan area × mean thickness, the low/high thickness giving the
         range. The mean thickness is the dominant uncertainty, which is why it's
         carried as an explicit low/best/high rather than hidden in a
-        coefficient. What failed (bedrock/soil) for the source-scar fit — read
+        coefficient. What failed (bedrock/soil) for Larsen et al. (2010) — read
         by that fit only."""
         box = QgsCollapsibleGroupBox("Settings")
         box.setSaveCollapsedState(False)
@@ -1149,7 +1149,7 @@ class VolumeTab(QWidget):
         for label, _key in volume_calc.MATERIALS:
             self.material_combo.addItem(label)
         self.material_combo.setToolTip(
-            "Read by the source-scar fit only. Bedrock failures are deeper for a "
+            "Read by Larsen et al. (2010) only. Bedrock failures are deeper for a "
             "given area than soil failures. This is the single biggest control on "
             "that answer: at a typical scar size the two options differ by about "
             "a factor of 5 — roughly twenty times the ±range shown beside the "
@@ -1158,7 +1158,7 @@ class VolumeTab(QWidget):
         form.addRow("What failed?", self.material_combo)
         # The case this plugin exists for is the one Larsen does not cover.
         form.addRow(self._help(
-            "For the source-scar fit. Neither option covers a "
+            "For Larsen et al. (2010). Neither option covers a "
             "rock-and-ice avalanche: if much of what moved was ice or entrained "
             "snow, that relation is outside its calibration — and the seismic "
             "volume is a mass divided by an assumed density, so check both "
@@ -1191,7 +1191,7 @@ class VolumeTab(QWidget):
         for out in (self.vol_thick_out, self.vol_scar_out):   # the answer
             bold = out.font(); bold.setBold(True); out.setFont(bold)
         scar_tip = (
-            "The source-scar fit (Larsen Table S1) on the best source outline. "
+            "Larsen et al. (2010), Table S1, on the best source outline. "
             "The range in brackets is NOT a prediction interval for this "
             "landslide. It propagates the uncertainty in WHERE THE REGRESSION "
             "LINE SITS (the published spread on the coefficients) plus your own "
@@ -1205,7 +1205,7 @@ class VolumeTab(QWidget):
             "Your low/high outlines are also read as a ±2σ span, so a narrower "
             "pair tightens this range faster than you may intend.")
         self.vol_scar_out.setToolTip(scar_tip)
-        scar_lbl = QLabel("Source scar")
+        scar_lbl = QLabel("Larsen et al. (2010)")
         scar_lbl.setToolTip(scar_tip)
         f.addRow(scar_lbl, self.vol_scar_out)
         # V/A — the cheapest sanity check in the tab. Taken over the TOTAL outline
@@ -1215,7 +1215,7 @@ class VolumeTab(QWidget):
         # comparable with it.
         self.depth_out = self._ro()
         self.depth_out.setToolTip(
-            "Source-scar (Larsen) volume ÷ TOTAL outline area: the mean thickness "
+            "Larsen et al. (2010) volume ÷ TOTAL outline area: the mean thickness "
             "over the whole landslide footprint that the Larsen volume implies. "
             "Directly comparable with the deposit thickness under Settings — "
             "area × thickness is that thickness over the same area — so a value "
@@ -1238,7 +1238,7 @@ class VolumeTab(QWidget):
         d, area = _implied_depth(c)
         if d is not None:
             self.depth_out.setText(
-                f"{d:,.1f} m   (scar volume ÷ total {_km2(area)})")
+                f"{d:,.1f} m   (Larsen volume ÷ total {_km2(area)})")
         elif c.get("v_larsen") is not None:
             self.depth_out.setText("— (no total outline to spread it over)")
         else:
@@ -1484,7 +1484,7 @@ class VolumeTab(QWidget):
 
         Area × thickness converts the TOTAL outline (the deposit footprint the
         published thicknesses are means over), or the source scar when no total
-        is drawn; the source-scar fit converts the BEST SOURCE outline, widened
+        is drawn; Larsen et al. (2010) converts the BEST SOURCE outline, widened
         by source low/high when they are assigned. Either runs without the other
         — a slide with only a total outline still gets its area × thickness
         volume — and the result is recorded as this slide's row straight away
@@ -1572,7 +1572,7 @@ class VolumeTab(QWidget):
                 f"{row['thick_calc']}.")
         if scar:
             self._append_log(
-                f"Source scar: {_fmt(a_best)} m² from “{best_layer.name()}” → "
+                f"Larsen et al. (2010): {_fmt(a_best)} m² from “{best_layer.name()}” → "
                 f"{_fmt(row['v_larsen'])} m³ ({_fmt(row['v_larsen_lo'])} – "
                 f"{_fmt(row['v_larsen_hi'])}), {row['material_label'].lower()}; "
                 f"via {row['larsen_calc']}.")
@@ -1642,10 +1642,10 @@ class VolumeTab(QWidget):
                 "t_best": t, "t_low": t_lo, "t_high": t_hi, "thick_calc": calc}
 
     def _scar_volume(self, a_best, a_low, a_high, warnings):
-        """{v_larsen…} from the source-scar fit, or {} with the reason."""
+        """{v_larsen…} from Larsen et al. (2010), or {} with the reason."""
         if a_best is None:
             warnings.append(
-                "Source scar skipped: no Source (best) outline — draw the "
+                "Larsen et al. (2010) skipped: no Source (best) outline — draw the "
                 "evacuated scar to get the second estimate.")
             return {}
         try:
@@ -1653,7 +1653,7 @@ class VolumeTab(QWidget):
                 a_best, A_low=a_low, A_high=a_high, material=self._material(),
                 fit="scar", project_dir=self.dock.project_edit.text().strip())
         except Exception as e:
-            warnings.append(f"Source-scar calculation failed: {e}")
+            warnings.append(f"Larsen et al. (2010) calculation failed: {e}")
             return {}
         return {"v_larsen": v, "v_larsen_lo": v_lo, "v_larsen_hi": v_hi,
                 "larsen_area_m2": a_best, "larsen_calc": calc}
@@ -2465,7 +2465,7 @@ class VolumeTab(QWidget):
         for label, vol, d, extra in (
                 ("Area × thickness", thick, rec["d_thickness"],
                  f"{src.get('t_best'):g} m thick" if src.get("t_best") else ""),
-                ("Source scar", larsen, rec["d_larsen"],
+                ("Larsen et al. (2010)", larsen, rec["d_larsen"],
                  f"{src.get('material') or 'material?'}, ×2 typical spread")):
             if not vol:
                 continue
@@ -2650,7 +2650,7 @@ class VolumeTab(QWidget):
                 f"“{layer.name()}” also has {', '.join(legacy)} from an earlier "
                 "write-back, when one Measure ran one fit — left as they were. "
                 "The current numbers are vthk_* (area × thickness) and vsrc_* "
-                "(source scar).")
+                "(Larsen et al. 2010).")
         return ok
 
 
@@ -2691,7 +2691,7 @@ def _fmt(v):
 
 
 def _implied_depth(row):
-    """(depth_m, area_m2): the source-scar volume spread over the TOTAL outline.
+    """(depth_m, area_m2): the Larsen et al. volume spread over the TOTAL outline.
 
     Depth is None when either is missing. Over the total rather than the scar,
     so it is a mean thickness for the whole slide — comparable with the deposit

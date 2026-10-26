@@ -162,7 +162,7 @@ independent volumes, side by side, from one **Measure**:
 | Fit | Converts | Needs | Range from |
 |-----|----------|-------|------------|
 | **Area × thickness** (Toney et al. 2021) | the **total** outline (source + track + deposit) | a mean deposit thickness | the low/high thickness |
-| **Source scar** (Larsen et al. 2010, Table S1, `larsen_BR_volume.py`) | the **best source** outline — the evacuated scar alone | what failed: bedrock or soil | the published fit spread, widened by source low/high |
+| **Larsen et al. (2010)** (Table S1, `larsen_BR_volume.py`) | the **best source** outline — the evacuated scar alone | what failed: bedrock or soil | the published fit spread, widened by source low/high |
 
 Neither is the headline: each keeps its own fields in the row, the CSV and the
 written attributes, and the verdict sets each against the seismic volume. The tab
@@ -175,7 +175,7 @@ reads top to bottom in the order the work is done:
    it and arms QGIS's Add Polygon tool; **Draw** adds another polygon to the
    assigned layer. Total is a red outline, source blue. A conservative/generous
    pair of source outlines goes under the collapsed *Source low / high* box — the
-   source-scar fit reads them as a ±2σ area span. The line under the pickers shows
+   Larsen et al. (2010) reads them as a ±2σ area span. The line under the pickers shows
    every assigned area live; swapped roles, or a total smaller than a source, are
    refused before Measure rather than measured.
 
@@ -196,14 +196,14 @@ reads top to bottom in the order the work is done:
 2. **Settings.** The *Deposit thickness* setting fills mean/low/high from published
    values (near date = imagery soon after the event, snow and ice still in the
    deposit; far date = after a melt season); edit any number and it reads Custom.
-   *What failed?* (bedrock/soil) is read by the source-scar fit only and moves it a
+   *What failed?* (bedrock/soil) is read by Larsen et al. (2010) only and moves it a
    long way — choose it from what actually failed, not the surrounding cover.
 3. **Measure** runs both fits and records the slide's row — no separate add step.
    Measuring the same slide name again replaces its row (and keeps its centerline);
    a new name adds a row. If one fit cannot run — no source outline, say — the other
    still does and the Volumes box says why.
 4. **Volumes** shows both, at three significant figures, plus the implied mean
-   depth: the source-scar volume ÷ the **total** outline area, i.e. the mean
+   depth: the Larsen et al. volume ÷ the **total** outline area, i.e. the mean
    thickness over the whole footprint that the Larsen volume implies. It compares
    directly with the deposit thickness under Settings — several times it means the
    two fits disagree, tens of metres means the outline or the material is wrong. Warnings about this measurement show here.
@@ -214,7 +214,7 @@ reads top to bottom in the order the work is done:
 6. **Verdict.** Record the call and your initials; the summary lists the seismic
    volume and each measured one with its own ×ratio and agree/marginal/disagree.
    **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
-   (area × thickness), `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3` (source scar), the
+   (area × thickness), `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3` (Larsen et al.), the
    thickness, `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
    own feature. Save the outline layer before writing back: adding fields needs a
    clean edit buffer, and QGIS renumbers features on save. **Copy results** puts the

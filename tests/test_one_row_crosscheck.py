@@ -78,12 +78,12 @@ buf = _io.StringIO(); w = csv.writer(buf)
 w.writerow([h for h, _k in VT.CSV_FIELDS])
 w.writerow(["" if merged.get(k) is None else merged.get(k) for _h, k in VT.CSV_FIELDS])
 buf.seek(0); out = list(csv.DictReader(buf))[0]
-for c in ("vol_seismic_m3", "vol_thickness_m3", "vol_source_scar_m3",
+for c in ("vol_seismic_m3", "vol_thickness_m3", "vol_larsen_m3",
           "thickness_m", "thickness_setting", "implied_depth_m",
           "agreement_thickness", "agreement_larsen", "agreement", "verdict"):
     print(f"   {c:24s} {out[c]!r}")
     assert out[c] != "", c
-vals = {out["vol_seismic_m3"], out["vol_thickness_m3"], out["vol_source_scar_m3"]}
+vals = {out["vol_seismic_m3"], out["vol_thickness_m3"], out["vol_larsen_m3"]}
 assert len(vals) == 3, "the three volumes must not collapse into one column"
 hdrs = [h for h, _ in VT.CSV_FIELDS]
 assert len(hdrs) == len(set(hdrs)), "duplicate CSV header"

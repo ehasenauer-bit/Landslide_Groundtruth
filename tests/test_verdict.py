@@ -53,7 +53,7 @@ rec = s._refresh_verdict()
 txt = s.verdict_summary.text()
 print("  ", txt.replace("<br>","\n   "))
 assert rec["agreement"]=="agree"
-assert "Area × thickness" in txt and "Source scar" in txt, "both lines on screen"
+assert "Area × thickness" in txt and "Larsen et al. (2010)" in txt, "both lines on screen"
 
 print("\n4. graded disagreement, one estimate at a time")
 for vb, want in ((3.0e6,"agree"), (9.0e6,"marginal"), (3.0e7,"disagree")):
@@ -98,14 +98,14 @@ for k,v in row.items():
 w.writerow(["" if merged.get(k) is None else merged.get(k) for _h,k in VT.CSV_FIELDS])
 buf.seek(0); rd=list(csv.DictReader(buf)); out=rd[0]
 print("   columns:", len(VT.CSV_FIELDS))
-for c in ("vol_seismic_m3","vol_thickness_m3","vol_source_scar_m3","agreement",
+for c in ("vol_seismic_m3","vol_thickness_m3","vol_larsen_m3","agreement",
           "agreement_thickness","agreement_larsen","verdict","event_id"):
     print(f"   {c:20s} = {out[c]!r}")
 assert out["vol_seismic_m3"]=="1300000"
-assert out["vol_source_scar_m3"]=="1300000.0"
+assert out["vol_larsen_m3"]=="1300000.0"
 assert out["vol_thickness_m3"]=="2000000.0"
 assert len({out["vol_seismic_m3"], out["vol_thickness_m3"],
-            out["vol_source_scar_m3"]}) == 3, "must be separate columns"
+            out["vol_larsen_m3"]}) == 3, "must be separate columns"
 hdrs=[h for h,_ in VT.CSV_FIELDS]
 assert len(hdrs)==len(set(hdrs)), "duplicate header!"
 print("\nVERDICT SMOKE TEST PASSED")

@@ -63,7 +63,7 @@ print(f"   D thickness {row['d_thickness']}  D larsen {row['d_larsen']}  "
 assert row["d_larsen"]=="0.000" and abs(float(row["d_thickness"])-0.301)<0.001
 assert abs(float(row["implied_depth"])-1.25)<0.01, "depth is scar volume / TOTAL area"
 cols=dict(VT.CSV_FIELDS)
-assert cols["vol_thickness_m3"]=="v_thick" and cols["vol_source_scar_m3"]=="v_larsen"
+assert cols["vol_thickness_m3"]=="v_thick" and cols["vol_larsen_m3"]=="v_larsen"
 assert "v_best" not in cols.values(), "no CSV column may read a shared best"
 hdrs=[h for h,_ in VT.CSV_FIELDS]; assert len(hdrs)==len(set(hdrs))
 print("   columns:",len(VT.CSV_FIELDS),"| thickness and scar are separate: OK")
