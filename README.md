@@ -210,8 +210,7 @@ written attributes. The tab reads top to bottom in the order the work is done:
    spine of the total outline into `Landslide centerlines`, left in edit mode to
    trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall
    height and travel angle. Reference only.
-6. **Verdict.** Record the call and your initials; the summary gives the scar
-   centroid's distance from the reported epicentre. **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
+6. **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
    (area × thickness), `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3` (Larsen et al.), the
    thickness, `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
    own feature. Save the outline layer before writing back: adding fields needs a

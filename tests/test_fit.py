@@ -1,8 +1,8 @@
 """The volume cross-check must read each estimate from the field that holds it.
 
 One Measure runs both area-based fits, and neither is the headline: area ×
-thickness lives in v_thick*, the source-scar fit in v_larsen*. The verdict's
-estimates, the CSV and the write-back must each read the one they mean, and
+thickness lives in v_thick*, the source-scar fit in v_larsen*. The estimates,
+the CSV and the write-back must each read the one they mean, and
 nothing may fall back to a shared "best" volume — under the old one-fit-per-Measure
 rows that field meant whatever the row's fit made it mean.
 
@@ -24,9 +24,9 @@ class Stub:
     def __init__(self): self.dock=FakeDock(); self._rows=[]
     def _role_layer(self,r): return None
     def _append_log(self,t): pass
-for m in ("_build_verdict_box","_estimates","_scar_centroid","_verdict_row","_refresh_verdict"):
+for m in ("_estimates","_scar_centroid","_event_row"):
     setattr(Stub,m,getattr(VT.VolumeTab,m))
-s=Stub(); _box=s._build_verdict_box()  # keep a ref: Qt deletes children otherwise
+s=Stub()
 det=DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6,
                   origin_utc=__import__("datetime").datetime(2026,2,4,8,48,5))
 s.dock.detection=det
@@ -48,7 +48,6 @@ print("\n=== a shared 'v_best' is never read as either estimate ===")
 s._rows=[{"name":"S1","v_best":1.3e6,"a_conv":4.2e5}]     # an old one-fit row
 t,l,_=s._estimates()
 assert t is None and l is None, (t, l)
-s._refresh_verdict()
 print("   v_best alone -> no estimate")
 
 print("\n=== both on one row: each column from its own field ===")
@@ -57,7 +56,7 @@ s._rows=[{"name":"S1","material":"bedrock","v_larsen":1.3e6,"v_larsen_lo":0.7e6,
           "v_thick_lo":1.6e6,"v_thick_hi":3.6e6,"t_best":2.5,"a_total":1.04e6}]
 t,l,_=s._estimates()
 assert (t,l)==(2.6e6,1.3e6), (t,l)
-row=s._verdict_row()
+row=s._event_row()
 print(f"   thickness {t:g}  source scar {l:g}  depth {row['implied_depth']}")
 assert abs(float(row["implied_depth"])-1.25)<0.01, "depth is scar volume / TOTAL area"
 cols=dict(VT.CSV_FIELDS)

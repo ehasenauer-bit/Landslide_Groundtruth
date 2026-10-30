@@ -658,13 +658,6 @@ class LandslideDock(QgsDockWidget):
             det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
         self.detection = det if det.is_locatable() else None
         self._render_detection(warn)
-        # the Volume tab's verdict states the scar's offset from this epicentre
-        vt = getattr(self, "volume_tab", None)
-        if vt is not None:
-            try:
-                vt._refresh_verdict()
-            except (AttributeError, RuntimeError):
-                pass
 
     def _clear_detection(self):
         for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit):

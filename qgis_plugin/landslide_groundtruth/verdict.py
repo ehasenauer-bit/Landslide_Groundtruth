@@ -1,32 +1,13 @@
-"""The analyst's conclusion — the deliverable ground-truthing actually produces.
+"""Event-level helpers for the Volume tab's CSV, free of Qt so they can be
+tested outside QGIS: the scar's distance from the reported epicentre, the
+implied depth, and the event columns stamped onto every exported row.
 
-Everything else in the plugin gathers evidence. Nothing recorded the finding, so
-a season of work left no machine-readable trace and could not be joined back to
-the seismic catalogue it came from.
-
-Deliberately free of Qt so it can be tested outside QGIS. **VERDICTS** is the
-closed list of calls an analyst can make. "Not found" and "Cannot tell" are
-separate on purpose: a scar that is absent and a scar hidden under cloud are
-completely different results for whoever tunes the detector, and collapsing them
-into one "no" throws that away.
-
-The seismic-volume cross-check (reconcile) was dropped on 2026-10-30 along with
-the Detection box's volume fields.
+The analyst's verdict (a closed list of calls, an analyst name and a note) lived
+here, with a Verdict box on the Volume tab, until 2026-10-30, when both were
+removed; the seismic-volume cross-check went the same day.
 """
 
 import math
-
-VERDICTS = [
-    ("confirmed", "Confirmed — a scar is visible and I have delineated it"),
-    ("probable", "Probable — something changed here but the scar is not clean"),
-    ("not_found", "Not found — I searched the area and see no scar"),
-    ("obscured", "Cannot tell — cloud, snow or darkness obscured the area"),
-    ("wrong_place", "Scar found, but well outside the reported location"),
-    ("not_landslide",
-     "Change is real but is not a landslide (glacier surge, avalanche, flood…)"),
-]
-
-VERDICT_KEYS = [k for k, _ in VERDICTS]
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -59,9 +40,9 @@ def implied_depth_m(volume_m3, area_m2):
         return None
 
 
-# Columns appended to the Volume tab's CSV: who the event was and what the
-# analyst found. The tab's own columns carry vol_thickness_* and vol_larsen_*.
-VERDICT_CSV_FIELDS = [
+# Columns appended to the Volume tab's CSV: who the event was and where the scar
+# sits. The tab's own columns carry vol_thickness_* and vol_larsen_*.
+EVENT_CSV_FIELDS = [
     # identity — from the Detection, never typed
     ("event_id", "event_id"),
     ("origin_utc", "origin_utc"),
@@ -69,13 +50,9 @@ VERDICT_CSV_FIELDS = [
     ("det_lon", "det_lon"),
     ("det_coherency", "det_coherency"),
     ("det_hf_lf", "det_hf_lf"),
-    # what the analyst found
-    ("verdict", "verdict"),
+    # where the digitized scar sits
     ("scar_lat", "scar_lat"),
     ("scar_lon", "scar_lon"),
     ("offset_from_det_km", "offset_km"),
     ("implied_depth_m", "implied_depth"),
-    ("analyst_note", "note"),
-    ("analyst", "analyst"),
-    ("recorded_utc", "recorded_utc"),
 ]

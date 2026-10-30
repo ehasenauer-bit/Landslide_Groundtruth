@@ -2,7 +2,7 @@
 
 The Fit combo used to run one calibration per Measure, so comparing area ×
 thickness with the source-scar fit meant measuring twice and reading two rows —
-and the verdict only ever saw one of them. Now one Measure runs both and the row
+and the export only ever saw one of them. Now one Measure runs both and the row
 carries both, each in its own field and column.
 
 Run with tests/run_all.sh.
@@ -24,11 +24,10 @@ class Stub:
     def __init__(s): s.dock = FakeDock(); s._rows = []; s._current = None
     def _role_layer(s, r): return None
     def _append_log(s, t): pass
-for m in ("_build_verdict_box", "_estimates", "_scar_centroid",
-          "_verdict_row", "_refresh_verdict"):
+for m in ("_estimates", "_scar_centroid", "_event_row"):
     setattr(Stub, m, getattr(VT.VolumeTab, m))
 
-s = Stub(); _box = s._build_verdict_box()
+s = Stub()
 det = DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6,
                     origin_utc=datetime(2026, 2, 4, 8, 48, 5))
 s.dock.detection = det
@@ -49,24 +48,23 @@ print("   both from a SINGLE Measure")
 print("\n=== 2. the slide on screen wins over older rows ===")
 s._rows = [dict(ROW, name="old", v_larsen=9.9e7), dict(ROW)]
 s._current = s._rows[0]
-assert s._estimates()[1] == 9.9e7, "the verdict is about the slide on screen"
+assert s._estimates()[1] == 9.9e7, "the export is about the slide on screen"
 s._current = None
 assert s._estimates()[1] == 1.30e6, "with nothing on screen, the last row"
 print("   _current first, else the last row")
 
 print("\n=== 3. implied depth spreads the scar volume over the TOTAL outline ===")
 s._rows = [dict(ROW)]
-row = s._verdict_row()
+row = s._event_row()
 print(f"   implied depth {row['implied_depth']} m   (1.3e6 / 8.0e5 = 1.625)")
 assert abs(float(row["implied_depth"]) - 1.625) < 0.01, row["implied_depth"]
 s._rows = [dict(ROW, a_total=None)]
-assert s._verdict_row()["implied_depth"] == "", "no total outline -> no depth, not the scar's"
+assert s._event_row()["implied_depth"] == "", "no total outline -> no depth, not the scar's"
 print("   and none at all without a total outline")
 
 print("\n=== 4. the CSV carries both volumes on one line ===")
 s._rows = [dict(ROW)]
-s.verdict_combo.setCurrentIndex(1); s.analyst_edit.setText("EH")
-stamp = s._verdict_row()
+stamp = s._event_row()
 merged = dict(s._rows[0])
 for k, v in stamp.items():
     if merged.get(k) in (None, ""): merged[k] = v
@@ -75,20 +73,23 @@ w.writerow([h for h, _k in VT.CSV_FIELDS])
 w.writerow(["" if merged.get(k) is None else merged.get(k) for _h, k in VT.CSV_FIELDS])
 buf.seek(0); out = list(csv.DictReader(buf))[0]
 for c in ("vol_thickness_m3", "vol_larsen_m3",
-          "thickness_m", "thickness_setting", "implied_depth_m", "verdict"):
+          "thickness_m", "thickness_setting", "implied_depth_m", "event_id"):
     print(f"   {c:24s} {out[c]!r}")
     assert out[c] != "", c
 assert out["vol_thickness_m3"] != out["vol_larsen_m3"], \
     "the two volumes must not collapse into one column"
 hdrs = [h for h, _ in VT.CSV_FIELDS]
 assert len(hdrs) == len(set(hdrs)), "duplicate CSV header"
-print(f"   {len(hdrs)} columns, two distinct volumes")
+for gone in ("verdict", "analyst", "analyst_note", "recorded_utc", "vol_seismic_m3",
+             "agreement", "det_loc_error_km", "offset_vs_loc_error"):
+    assert gone not in hdrs, gone
+print(f"   {len(hdrs)} columns, two distinct volumes, no verdict or seismic columns")
 
 print("\n=== 5. no estimates at all -> no crash ===")
 s._rows = []
 t, l, src = s._estimates()
 assert t is None and l is None and src == {}
-s._refresh_verdict()
+assert s._event_row()["implied_depth"] == ""
 print("   empty table handled")
 
 print("\n=== 6. the labels stopped overclaiming ===")

@@ -8,7 +8,8 @@ are drawn here, total + source best, one slide per project, and BOTH area ×
 thickness and the source-scar fit are wanted on every slide. So:
 
   * the sections run in working order — Outlines, Settings, Measure, Volumes,
-    Centerline & drop, Verdict — with the results table and log collapsed below;
+    Centerline & drop, then Write to layer / Copy results — with the results
+    table and log collapsed below (the Verdict box went on 2026-10-30);
   * one Measure runs both fits, neither the headline, and records the row (no
     "Add to results"); re-measuring the same slide replaces its row and keeps
     its centerline;
@@ -96,16 +97,23 @@ boxes = [w for w in vol.findChildren(QgsCollapsibleGroupBox)
          if w.parent() is vol]
 titles = [b.title() for b in boxes]
 print("  ", " → ".join(titles))
-check("Outlines, Settings, Volumes, Centerline, Verdict, Results, Log",
+check("Outlines, Settings, Volumes, Centerline, Results, Log — no Verdict box",
       titles == ["Outlines", "Settings", "Volumes", "Centerline && elevation drop",
-                 "Verdict — what did you conclude?", "Results table", "Log"])
+                 "Results table", "Log"])
+check("no Verdict widgets are left on the tab",
+      not any(hasattr(vol, a) for a in ("verdict_combo", "analyst_edit",
+                                        "verdict_note", "verdict_summary")))
+wi = vol.layout().indexOf(vol.write_btn.parentWidget())
+check("Write to layer / Copy results sit between Centerline and the results table",
+      vol.copy_btn.parentWidget() is vol.write_btn.parentWidget()
+      and vol.layout().indexOf(boxes[3]) < wi < vol.layout().indexOf(boxes[4]))
 order = [vol.layout().indexOf(w) for w in boxes]
 mi = vol.layout().indexOf(vol.measure_btn.parentWidget())
 check("Measure sits between Settings and Volumes",
       order[1] < mi < order[2])
 check("results table and log start collapsed; the working sections open",
-      boxes[5].isCollapsed() and boxes[6].isCollapsed()
-      and not any(b.isCollapsed() for b in boxes[:5]))
+      boxes[4].isCollapsed() and boxes[5].isCollapsed()
+      and not any(b.isCollapsed() for b in boxes[:4]))
 check("the thickness setting is ABOVE Measure (it used to sit below the answer)",
       vol.layout().indexOf(boxes[1]) < mi)
 check("no Fit combo, no ∫Δh or DEM-differencing widgets, no Add-to-results",
@@ -165,9 +173,6 @@ check(f"implied depth spreads the scar volume over the TOTAL ({vol.depth_out.tex
       vol.depth_out.text().startswith(f"{c['v_larsen'] / 1.0e6:,.1f} m")
       and "total 1 km²" in vol.depth_out.text())
 check("no warnings on a clean slide", not vol.vol_warn_lbl.isVisibleTo(vol))
-check("the verdict neither repeats the volumes nor compares them with a seismic one",
-      "Area × thickness" not in vol.verdict_summary.text()
-      and "seismic" not in vol.verdict_summary.text().lower())
 check("the centerline can be drawn now", vol.centerline_btn.isEnabled())
 
 print("\n=== the centerline lands on the row ===")
@@ -254,10 +259,9 @@ vol._best_combo.setCurrentIndex(vol._best_combo.findData(source.id()))
 vol._measure()
 check("a slide on screen before the switch", vol._current is not None and vol._rows)
 project.clear()
-check("rows and readouts cleared, so no verdict mixes two events",
+check("rows and readouts cleared, so no export mixes two events",
       vol._rows == [] and vol._current is None
-      and vol.vol_thick_out.text() == "press Measure"
-      and "Area × thickness" not in vol.verdict_summary.text())
+      and vol.vol_thick_out.text() == "press Measure")
 
 project.clear()
 dock.teardown()

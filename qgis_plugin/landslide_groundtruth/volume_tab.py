@@ -23,9 +23,8 @@ project is the normal case:
             centerline.py) and, with an elevation raster assigned, the crown-to-
             toe fall height and travel angle read along it. A HILLSHADE is
             shading (0-255), not elevation, so a byte raster is refused.
-  Verdict   The analyst's call, the scar's offset from the epicentre, and
-            Write to layer —
-            which stamps every number onto the TOTAL outline's own feature.
+  Write to layer  Stamps every number onto the TOTAL outline's own feature;
+            Copy results puts the table on the clipboard.
   Results / Log  The row table (one row per slide name: re-measuring a slide
             replaces its row) with CSV export, and the running log.
 
@@ -272,11 +271,10 @@ CSV_FIELDS = [
     ("thickness_calculator", "thick_calc"), ("larsen_calculator", "larsen_calc"),
 ]
 
-# The ground-truthing columns: who the event was, what the analyst concluded, and
-# each independent volume in its own column so the cross-check is visible in the
-# file rather than only on screen. Appended (never interleaved).
-from .verdict import VERDICT_CSV_FIELDS
-CSV_FIELDS = CSV_FIELDS + VERDICT_CSV_FIELDS
+# The event columns: who the event was and where the scar sits relative to it.
+# Appended (never interleaved).
+from .verdict import EVENT_CSV_FIELDS
+CSV_FIELDS = CSV_FIELDS + EVENT_CSV_FIELDS
 
 
 class VolumeTab(QWidget):
@@ -304,7 +302,7 @@ class VolumeTab(QWidget):
     # ---------- UI ----------
     def _build_ui(self):
         """Top to bottom in the order the work is done: outlines, settings,
-        Measure, the two volumes, centerline & drop, the verdict. The results
+        Measure, the two volumes, centerline & drop, Write to layer. The results
         table and the log are collapsed underneath — with one slide per project
         the Volumes box already shows the row."""
         root = QVBoxLayout(self)
@@ -361,10 +359,6 @@ class VolumeTab(QWidget):
         root.addWidget(self._build_volumes_box())
         root.addWidget(self._build_centerline_box())
 
-        verdict = self._build_verdict_box()
-        # The write-back and the copy belong with the call they record, but are
-        # wired here so _build_verdict_box stays buildable on its own (the
-        # verdict tests build it on a bare stub).
         act = FlowRow()
         self.write_btn = QPushButton("Write to layer")
         self.write_btn.setToolTip(
@@ -382,8 +376,7 @@ class VolumeTab(QWidget):
         self.copy_btn.clicked.connect(self._copy_table)
         for b in (self.write_btn, self.copy_btn):
             act.addWidget(b)
-        verdict.layout().addWidget(act)
-        root.addWidget(verdict)
+        root.addWidget(act)
 
         root.addWidget(self._build_results_box())
         root.addWidget(self._build_log_box())
@@ -1351,7 +1344,7 @@ class VolumeTab(QWidget):
         self.csv_btn = QPushButton("Export CSV…")
         self.csv_btn.setToolTip(
             "Write every row to CSV with raw unrounded values, plus the "
-            "detection and your verdict.")
+            "detection and the scar's offset from its epicentre.")
         self.csv_btn.clicked.connect(self._export_csv)
         self.remove_btn = QPushButton("Remove row")
         self.remove_btn.setToolTip("Drop the selected row(s) from the table.")
@@ -1693,8 +1686,8 @@ class VolumeTab(QWidget):
         return None
 
     def _show_current(self):
-        """Put the slide's numbers on screen, and keep its row and the verdict in
-        step — the row IS self._current, so a centerline drawn after Measure
+        """Put the slide's numbers on screen, and keep its row in step — the
+        row IS self._current, so a centerline drawn after Measure
         lands in the table without another click.
 
         3 significant figures of Mm³, not 4 decimal places: the honest spread on
@@ -1750,7 +1743,6 @@ class VolumeTab(QWidget):
                             f"{c['reach_angle']:.1f}° travel angle)")
                 self.drop_out.setText(txt)
         self._refresh_table()
-        self._refresh_verdict()
 
     def _distance_area(self, crs):
         """Ellipsoidal measurement in the given CRS.
@@ -2201,8 +2193,7 @@ class VolumeTab(QWidget):
     def _record(self, row):
         """Make `row` this slide's result: replace the row of the same slide
         name, else append — one row per slide however often it is re-measured,
-        with no separate "add" step to forget before the verdict or Write to
-        layer can see it.
+        with no separate "add" step to forget before Write to layer can see it.
 
         A centerline already drawn for the slide survives a re-measure (changing
         the thickness, say): its length and drop carry over to the new row, and
@@ -2293,56 +2284,7 @@ class VolumeTab(QWidget):
         QApplication.clipboard().setText("\n".join(lines))
         self._append_log(f"Copied {len(self._rows)} row(s) to the clipboard.")
 
-    # ---------- the analyst's conclusion ----------
-    def _build_verdict_box(self):
-        """Record what the analyst actually concluded.
-
-        Every other control in this plugin gathers evidence; this is the only one
-        that captures the finding, which is the thing ground-truthing exists to
-        produce. Without it a season of work leaves the conclusion in someone's
-        head and the seismic catalogue never learns whether its detections were
-        real. Open by default, and refreshed by every Measure."""
-        from . import verdict as V
-        box = QgsCollapsibleGroupBox("Verdict — what did you conclude?")
-        box.setSaveCollapsedState(False)
-        v = QVBoxLayout(box)
-
-        self.verdict_combo = QComboBox()
-        self.verdict_combo.addItem("— not recorded —", "")
-        for key, label in V.VERDICTS:
-            self.verdict_combo.addItem(label, key)
-        self.verdict_combo.setToolTip(
-            "'Not found' and 'Cannot tell' are different answers: a slope with no "
-            "scar and a slope hidden under cloud mean opposite things to whoever "
-            "tunes the detector. Pick the one that is actually true.")
-        # the labels are full sentences; elide the closed combo, not the dock
-        self.verdict_combo.setSizeAdjustPolicy(
-            QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.verdict_combo.setMinimumContentsLength(12)
-        self.verdict_combo.currentIndexChanged.connect(self._refresh_verdict)
-        form = QFormLayout()
-        form.addRow("Call", self.verdict_combo)
-
-        self.analyst_edit = QLineEdit()
-        self.analyst_edit.setPlaceholderText("your name or initials")
-        self.analyst_edit.setToolTip("Recorded with the verdict so a reviewer "
-                                     "knows who made the call.")
-        form.addRow("Analyst", self.analyst_edit)
-        v.addLayout(form)
-
-        self.verdict_note = QPlainTextEdit()
-        self.verdict_note.setPlaceholderText(
-            "What you saw, and what convinced you — or what stopped you.")
-        self.verdict_note.setMaximumHeight(60)
-        v.addWidget(self.verdict_note)
-
-        self.verdict_summary = QLabel()
-        self.verdict_summary.setWordWrap(True)
-        self.verdict_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(self.verdict_summary)
-        self._refresh_verdict()
-        return box
-
+    # ---------- event columns for the CSV ----------
     def _estimates(self):
         """(thickness, larsen, row) — the slide's two area-based volumes.
 
@@ -2358,8 +2300,7 @@ class VolumeTab(QWidget):
         """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
 
         Compared against the detection's epicentre, this is the number that says
-        whether the seismic location was any good — and it is the reason
-        'wrong_place' is a distinct verdict rather than a note."""
+        whether the seismic location was any good."""
         try:
             from qgis.core import (QgsCoordinateReferenceSystem,
                                    QgsCoordinateTransform, QgsProject)
@@ -2393,17 +2334,12 @@ class VolumeTab(QWidget):
         except Exception:
             return None, None
 
-    def _verdict_row(self):
-        """The event-level columns stamped onto every exported row."""
+    def _event_row(self):
+        """The event-level columns stamped onto every exported row: the
+        detection, where the digitized scar sits, and the implied depth."""
         from . import verdict as V
-        from datetime import datetime
         det = getattr(self.dock, "detection", None)
         row = det.as_row() if det is not None else {}
-        row["verdict"] = self.verdict_combo.currentData() or ""
-        row["note"] = self.verdict_note.toPlainText().strip().replace("\n", " ")
-        row["analyst"] = self.analyst_edit.text().strip()
-        row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                               if row["verdict"] else "")
         _thick, _larsen, src = self._estimates()
         depth, _area = _implied_depth(src)
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
@@ -2414,23 +2350,6 @@ class VolumeTab(QWidget):
                if det is not None and det.is_locatable() and lat is not None else None)
         row["offset_km"] = "" if off is None else f"{off:.2f}"
         return row
-
-    def _refresh_verdict(self, *_):
-        """Say where the digitized scar sits relative to the reported epicentre.
-
-        The two volumes and the implied depth are in the Volumes box. The
-        comparison with a seismic volume that used to live here was dropped on
-        2026-10-30, with the Detection box's volume and location-error fields."""
-        from . import verdict as V
-        det = getattr(self.dock, "detection", None)
-        lines = []
-        lat, lon = self._scar_centroid()
-        if det is not None and det.is_locatable() and lat is not None:
-            off = V.haversine_km(det.lat, det.lon, lat, lon)
-            if off is not None:
-                lines.append(f"Scar centroid is {off:.1f} km from the reported "
-                             "epicentre.")
-        self.verdict_summary.setText("<br>".join(lines))
 
     def _export_csv(self):
         if not self._rows:
@@ -2448,12 +2367,12 @@ class VolumeTab(QWidget):
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow([h for h, _k in CSV_FIELDS])
-                stamp = self._verdict_row()
+                stamp = self._event_row()
                 for row in self._rows:
                     merged = dict(row)
-                    # the detection identity and the analyst's conclusion belong
-                    # to the EVENT, so every measured slide carries them; a row's
-                    # own value always wins if it has one.
+                    # the detection identity belongs to the EVENT, so every
+                    # measured slide carries it; a row's own value always wins
+                    # if it has one.
                     for k, val in stamp.items():
                         if merged.get(k) in (None, ""):
                             merged[k] = val
