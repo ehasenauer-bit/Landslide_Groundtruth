@@ -165,8 +165,7 @@ independent volumes, side by side, from one **Measure**:
 | **Larsen et al. (2010)** (Table S1, `larsen_BR_volume.py`) | the **best source** outline — the evacuated scar alone | what failed: bedrock or soil | the published fit spread, widened by source low/high |
 
 Neither is the headline: each keeps its own fields in the row, the CSV and the
-written attributes, and the verdict sets each against the seismic volume. The tab
-reads top to bottom in the order the work is done:
+written attributes. The tab reads top to bottom in the order the work is done:
 
 1. **Outlines.** Press **New** beside *Total area*, draw the whole affected area
    (click each vertex, right-click to finish, toggle editing off to save), then
@@ -211,9 +210,8 @@ reads top to bottom in the order the work is done:
    spine of the total outline into `Landslide centerlines`, left in edit mode to
    trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall
    height and travel angle. Reference only.
-6. **Verdict.** Record the call and your initials; the summary lists the seismic
-   volume and each measured one with its own ×ratio and agree/marginal/disagree.
-   **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
+6. **Verdict.** Record the call and your initials; the summary gives the scar
+   centroid's distance from the reported epicentre. **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
    (area × thickness), `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3` (Larsen et al.), the
    thickness, `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
    own feature. Save the outline layer before writing back: adding fields needs a

@@ -547,11 +547,10 @@ class LandslideDock(QgsDockWidget):
     def _build_detection_box(self):
         """The plugin's front door: the detection record, entered ONCE.
 
-        The analyst arrives holding a seismic detection — epicentre, origin time,
-        LOCATION ERROR, and a volume estimate. Before this box the first three had
-        to be retyped into four separate tabs and the last two had nowhere to go at
-        all, so the search radius ignored the uncertainty it was supposed to cover
-        and the seismic volume could never be compared against the digitized one.
+        The analyst arrives holding a seismic detection — epicentre and origin
+        time. Before this box they had to be retyped into four separate tabs.
+        The location error and seismic volume were taken here too until
+        2026-10-30; each tab now gets a fixed radius (detection.SEARCH_RADIUS_KM).
 
         Typed fields rather than a paste box: the record arrives as a FIGURE (a
         station map with the numbers printed in the corner), so there is no text
@@ -563,10 +562,9 @@ class LandslideDock(QgsDockWidget):
         v = QVBoxLayout(box)
 
         hint = QLabel(
-            "Copy the numbers off the detection figure once. They fill in every "
-            "tab below, set a search radius that actually covers the location "
-            "error, and give the Volume tab something to check its own answer "
-            "against.")
+            "Copy the time and epicentre off the detection figure once. 'Use it "
+            "in every tab' fills them into every tab below, each with its own "
+            "search radius.")
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(hint)
@@ -596,50 +594,20 @@ class LandslideDock(QgsDockWidget):
         coord_paste.link_pair(self.det_lat_edit, self.det_lon_edit)
         form.addRow("Latitude", self.det_lat_edit)
         form.addRow("Longitude", self.det_lon_edit)
-
-        self.det_err_spin = QDoubleSpinBox()
-        self.det_err_spin.setRange(0.0, 200.0)
-        self.det_err_spin.setDecimals(1)
-        self.det_err_spin.setSingleStep(1.0)
-        self.det_err_spin.setSuffix(" km")
-        self.det_err_spin.setSpecialValueText("not given")
-        self.det_err_spin.setToolTip(
-            "The 'Loc error' on the figure — the radius the scar is somewhere "
-            "inside. This drives the search radius: at 17 km of error, the old "
-            "5 km default covered about a twelfth of the ground the slide could "
-            "be on, so an empty result meant 'never looked there'.")
-        form.addRow("Location error", self.det_err_spin)
-
-        self.det_vol_edit = QLineEdit()
-        self.det_vol_edit.setPlaceholderText("1.3        million m³")
-        self.det_vol_edit.setToolTip(
-            "The seismic volume estimate, in millions of m³ — the 'Vol' line. "
-            "The Volume tab compares its own area-derived volume against this.")
-        self.det_vol_lo_edit = QLineEdit()
-        self.det_vol_lo_edit.setPlaceholderText("0.9")
-        self.det_vol_hi_edit = QLineEdit()
-        self.det_vol_hi_edit.setPlaceholderText("1.7")
-        form.addRow("Volume (M m³)", self.det_vol_edit)
-        rng = QHBoxLayout()
-        rng.addWidget(self.det_vol_lo_edit)
-        rng.addWidget(QLabel("to"))
-        rng.addWidget(self.det_vol_hi_edit)
-        form.addRow("Volume range", rng)
         v.addLayout(form)
 
-        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
-                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit):
             w.textChanged.connect(self._read_detection)
         self.det_time_edit.dateTimeChanged.connect(self._read_detection)
-        self.det_err_spin.valueChanged.connect(self._read_detection)
 
         self.det_apply_btn = QPushButton("Use it in every tab")
         self.det_apply_btn.setEnabled(False)
         f = self.det_apply_btn.font(); f.setBold(True); self.det_apply_btn.setFont(f)
         self.det_apply_btn.setToolTip(
-            "Copy the epicentre, the event time and a radius covering the "
-            "location error into the Sentinel-2, PlanetScope, Maxar VHR, SAR and 3D "
-            "tabs, so they cannot drift apart.")
+            "Copy the epicentre and the event time into the Sentinel-2, "
+            "PlanetScope, Maxar VHR, SAR and 3D tabs, so they cannot drift apart, "
+            "and set each one's search radius: Sentinel-2, Maxar, SAR and 3D "
+            "15 km, PlanetScope 10 km.")
         self.det_apply_btn.clicked.connect(self._apply_detection)
         clear_btn = QPushButton("Clear")
         clear_btn.setToolTip("Forget the current detection.")
@@ -685,21 +653,22 @@ class LandslideDock(QgsDockWidget):
         det = Detection(
             event_id=self.det_id_edit.text().strip(),
             origin_utc=self.det_time_edit.dateTime().toPyDateTime(),
-            lat=lat, lon=lon,
-            loc_error_km=(self.det_err_spin.value() or None),
-            vol_best_m3=self._num_or_none(self.det_vol_edit, 1e6),
-            vol_low_m3=self._num_or_none(self.det_vol_lo_edit, 1e6),
-            vol_high_m3=self._num_or_none(self.det_vol_hi_edit, 1e6))
+            lat=lat, lon=lon)
         if not det.event_id and det.origin_utc:
             det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
         self.detection = det if det.is_locatable() else None
         self._render_detection(warn)
+        # the Volume tab's verdict states the scar's offset from this epicentre
+        vt = getattr(self, "volume_tab", None)
+        if vt is not None:
+            try:
+                vt._refresh_verdict()
+            except (AttributeError, RuntimeError):
+                pass
 
     def _clear_detection(self):
-        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
-                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit):
             w.clear()
-        self.det_err_spin.setValue(0.0)
         self.detection = None
         self._render_detection()
 
@@ -724,19 +693,12 @@ class LandslideDock(QgsDockWidget):
                 self.det_summary.setText(
                     self.det_summary.text() + "<br>" + status_html("warn", w))
             return
+        from .detection import radius_summary
         lines = ["<b>" + (det.event_id or "Detection") + "</b>"]
         if det.origin_utc:
             lines.append(f"{det.origin_utc:%Y-%m-%d %H:%M:%S} UTC   =   {det.local_str()}")
-        pos = f"{det.lat:.4f}, {det.lon:.4f}"
-        if det.loc_error_km:
-            pos += f"  ± {det.loc_error_km:g} km"
-        lines.append(pos)
-        v = det.vol_str()
-        if v:
-            lines.append(f"Seismic volume {v}")
-        r = det.suggested_radius_km()
-        lines.append(f"<b>Search radius suggested: {r:g} km</b>"
-                     + ("" if det.loc_error_km else " (no location error entered)"))
+        lines.append(f"{det.lat:.4f}, {det.lon:.4f}")
+        lines.append(f"<b>Search radius: {radius_summary()}</b>")
         html = "<br>".join(lines)
         for w in (warn or []):
             html += "<br>" + status_html("warn", w)
@@ -749,9 +711,9 @@ class LandslideDock(QgsDockWidget):
         """Push the record into every tab that has its own event fields.
 
         The four tabs keep independent lat/lon/time widgets and nothing syncs
-        them, so this is the one place that makes them agree. The radius is set
-        from the LOCATION ERROR, not left at the 5 km default: at 17 km of error
-        a 5 km radius covers about a twelfth of the ground the scar could be on."""
+        them, so this is the one place that makes them agree. Each tab's radius
+        comes from SEARCH_RADIUS_KM rather than staying at its 5 km default."""
+        from .detection import SEARCH_RADIUS_KM, radius_summary
         det = getattr(self, "detection", None)
         if det is None:
             self._warn("Read a detection record first.")
@@ -759,24 +721,24 @@ class LandslideDock(QgsDockWidget):
         if not det.is_locatable():
             self._warn("That record has no usable latitude/longitude.")
             return
-        radius = det.suggested_radius_km()
         when = None
         if det.origin_utc:
             when = QDateTime.fromString(
                 det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
-        targets = [self]
-        for name in ("planet_tab", "gegd_tab", "sar_tab", "viewer3d_tab"):
+        targets = [(self, "sentinel2")]
+        for name, key in (("planet_tab", "planet"), ("gegd_tab", "maxar"),
+                          ("sar_tab", "sar"), ("viewer3d_tab", "viewer3d")):
             t = getattr(self, name, None)
             if t is not None:
-                targets.append(t)
+                targets.append((t, key))
         touched = 0
-        for t in targets:
+        for t, key in targets:
             try:
                 if hasattr(t, "lat_edit"):
                     t.lat_edit.setText(f"{det.lat:.6f}")
                     t.lon_edit.setText(f"{det.lon:.6f}")
                 if hasattr(t, "radius_spin"):
-                    t.radius_spin.setValue(radius)
+                    t.radius_spin.setValue(SEARCH_RADIUS_KM[key])
                 if when is not None and when.isValid() and hasattr(t, "dt_edit"):
                     t.dt_edit.setDateTime(when)
                 touched += 1
@@ -784,9 +746,8 @@ class LandslideDock(QgsDockWidget):
                 continue
         self.iface.messageBar().pushInfo(
             "Detection", f"{det.event_id or 'Detection'} applied to {touched} tabs — "
-            f"search radius {radius:g} km"
-            + (f" (location error {det.loc_error_km:g} km)" if det.loc_error_km else ""))
-        self._append_log(f"Detection applied to {touched} tabs; radius {radius:g} km.")
+            f"search radius {radius_summary()}")
+        self._append_log(f"Detection applied to {touched} tabs; radius {radius_summary()}.")
 
     # ---------- Sentinel-2 / Landsat tab ----------
     def _build_ui(self):

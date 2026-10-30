@@ -67,6 +67,7 @@ from qgis.core import (
 from qgis.gui import QgsCollapsibleGroupBox
 
 from . import coord_paste
+from .detection import SEARCH_RADIUS_KM
 from . import gegd_api as api
 from . import gegd_auth
 from . import gegd_layers as gl
@@ -468,9 +469,7 @@ class GegdTab(QWidget):
         self.radius_spin.setToolTip(
             "Radius of the search circle around the epicentre. A strip is listed only if "
             "its footprint touches this circle (checked here, not just by the server's "
-            "box). 'Use it in every tab' sets it from the detection's location error: a "
-            "5 km circle inside a 17 km error looks at about a twelfth of the ground the "
-            "scar could be on.")
+            "box). 'Use it in every tab' sets it to 15 km.")
         form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
@@ -930,11 +929,6 @@ class GegdTab(QWidget):
         if det is not None:
             bits = [f"<b>{_esc(det.event_id or 'Detection')}</b>",
                     f"{origin:%Y-%m-%d %H:%M:%S} UTC ({_esc(R.alaska_str(origin))})"]
-            if det.loc_error_km:
-                bits.append(f"±{det.loc_error_km:g} km")
-            vol = det.vol_str()
-            if vol:
-                bits.append(_esc(vol))
             lines.append(" · ".join(bits))
         else:
             lines.append("<i>No detection record matches these fields.</i>")
@@ -984,7 +978,7 @@ class GegdTab(QWidget):
             return False
         self.lat_edit.setText(f"{det.lat:.6f}")
         self.lon_edit.setText(f"{det.lon:.6f}")
-        self.radius_spin.setValue(det.suggested_radius_km())
+        self.radius_spin.setValue(SEARCH_RADIUS_KM["maxar"])
         if det.origin_utc is not None:
             when = QDateTime.fromString(det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"),
                                         "yyyy-MM-dd HH:mm:ss")

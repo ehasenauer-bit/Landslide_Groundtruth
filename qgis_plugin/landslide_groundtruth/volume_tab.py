@@ -18,13 +18,13 @@ project is the normal case:
                 drawn (then the thickness is a scar depth).
               Larsen et al. (2010), Table S1 — the BEST SOURCE outline through the
                 calibrated relation; source low/high widen the range.
-            Neither is "the" volume: each keeps its own fields everywhere, so a
-            seismic volume can be compared against both.
+            Neither is "the" volume: each keeps its own fields everywhere.
   Centerline & drop  A medial-axis centerline of the total outline (see
             centerline.py) and, with an elevation raster assigned, the crown-to-
             toe fall height and travel angle read along it. A HILLSHADE is
             shading (0-255), not elevation, so a byte raster is refused.
-  Verdict   The analyst's call, the seismic cross-check, and Write to layer —
+  Verdict   The analyst's call, the scar's offset from the epicentre, and
+            Write to layer —
             which stamps every number onto the TOTAL outline's own feature.
   Results / Log  The row table (one row per slide name: re-measuring a slide
             replaces its row) with CSV export, and the running log.
@@ -338,8 +338,7 @@ class VolumeTab(QWidget):
             "thickness and what failed, then Measure. One Measure runs both fits "
             "— area × thickness on the total outline (Toney et al. 2021) and "
             "Larsen et al. (2010) on the source outline — and "
-            "records the slide's row. Neither is the headline: the verdict "
-            "compares each with the seismic volume."))
+            "records the slide's row. Neither is the headline."))
 
         root.addWidget(self._build_outline_box())
         root.addWidget(self._build_settings_box())
@@ -2341,17 +2340,6 @@ class VolumeTab(QWidget):
         self.verdict_summary.setWordWrap(True)
         self.verdict_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.verdict_summary)
-
-        row = FlowRow()
-        chk = QPushButton("Check volumes")
-        f = chk.font(); f.setBold(True); chk.setFont(f)
-        chk.setToolTip(
-            "Compare the seismic volume from the detection against both volumes "
-            "measured here. Measure does this too; press it after pasting a "
-            "detection.")
-        chk.clicked.connect(self._refresh_verdict)
-        row.addWidget(chk)
-        v.addWidget(row)
         self._refresh_verdict()
         return box
 
@@ -2359,8 +2347,7 @@ class VolumeTab(QWidget):
         """(thickness, larsen, row) — the slide's two area-based volumes.
 
         From the slide on screen, else the last row. Each is read from its OWN
-        field, never from a shared "best", so each can be set against the
-        seismic volume separately — neither is the headline."""
+        field, never from a shared "best" — neither is the headline."""
         row = getattr(self, "_current", None)
         if not row:
             rows = list(getattr(self, "_rows", None) or [])
@@ -2417,15 +2404,7 @@ class VolumeTab(QWidget):
         row["analyst"] = self.analyst_edit.text().strip()
         row["recorded_utc"] = (datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
                                if row["verdict"] else "")
-        thick, larsen, src = self._estimates()
-        rec = V.reconcile(
-            seismic=(det.vol_best_m3 if det is not None else None),
-            larsen=larsen, thickness=thick)
-        for key in ("d_thickness", "d_larsen"):
-            row[key] = "" if rec[key] is None else f"{rec[key]:.3f}"
-        row["agreement_thickness"] = V.classify(rec["d_thickness"])
-        row["agreement_larsen"] = V.classify(rec["d_larsen"])
-        row["agreement"] = rec["agreement"]         # the worse of the two
+        _thick, _larsen, src = self._estimates()
         depth, _area = _implied_depth(src)
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
         lat, lon = self._scar_centroid()
@@ -2434,71 +2413,24 @@ class VolumeTab(QWidget):
         off = (V.haversine_km(det.lat, det.lon, lat, lon)
                if det is not None and det.is_locatable() and lat is not None else None)
         row["offset_km"] = "" if off is None else f"{off:.2f}"
-        row["offset_ratio"] = ("" if off is None or not (det and det.loc_error_km)
-                               else f"{off / det.loc_error_km:.2f}")
         return row
 
     def _refresh_verdict(self, *_):
-        """Show the seismic volume and both measured volumes side by side, each
-        with its own agreement.
+        """Say where the digitized scar sits relative to the reported epicentre.
 
-        The seismic estimate and each area-based one are genuinely independent,
-        so their agreement is the validation. The two area-based volumes get a
-        line each, coloured by their own separation from the seismic volume —
-        neither speaks for the other."""
+        The two volumes and the implied depth are in the Volumes box. The
+        comparison with a seismic volume that used to live here was dropped on
+        2026-10-30, with the Detection box's volume and location-error fields."""
         from . import verdict as V
-        # theme.status_color, not literals: the greens and reds picked by eye
-        # here failed WCAG AA against QGIS's dark theme (2.4:1), and a verdict
-        # nobody can read is worse than no verdict.
-        from .theme import status_color
         det = getattr(self.dock, "detection", None)
-        thick, larsen, src = self._estimates()
-        seis = det.vol_best_m3 if det is not None else None
-        rec = V.reconcile(seismic=seis, larsen=larsen, thickness=thick)
-        mid = "color:palette(mid);"
         lines = []
-        if seis is not None:
-            lines.append(f"Seismic&nbsp;&nbsp;&nbsp;&nbsp;{det.vol_str()}")
-        else:
-            lines.append(f'<span style="{mid}">Seismic&nbsp;&nbsp;&nbsp;&nbsp;'
-                         "— no detection loaded (paste one at the top of the panel)</span>")
-        for label, vol, d, extra in (
-                ("Area × thickness", thick, rec["d_thickness"],
-                 f"{src.get('t_best'):g} m thick" if src.get("t_best") else ""),
-                ("Larsen et al. (2010)", larsen, rec["d_larsen"],
-                 f"{src.get('material') or 'material?'}, ×2 typical spread")):
-            if not vol:
-                continue
-            line = (f"{label}&nbsp;&nbsp;{vol / 1e6:.3g} ×10⁶ m³"
-                    + (f"&nbsp;&nbsp;<span style='{mid}'>({extra})</span>"
-                       if extra else ""))
-            kind = {"agree": "success", "marginal": "warn",
-                    "disagree": "error"}.get(V.classify(d), "")
-            if kind:
-                ratio = max(vol, seis) / min(vol, seis)
-                line += (f'&nbsp;&nbsp;<b style="color:{status_color(kind)};">'
-                         f"→ ×{ratio:.1f} {'of' if vol < seis else 'over'} seismic, "
-                         f"{V.classify(d)}</b>")
-            lines.append(line)
-        if larsen:
-            depth, _area = _implied_depth(src)
-            if depth:
-                lines.append(f'<span style="{mid}">implied mean depth '
-                             f"{depth:.1f} m over the total outline</span>")
-        if rec["text"] and (seis is not None or thick or larsen):
-            lines.append(f'<span style="{mid}">{rec["text"]}</span>')
         lat, lon = self._scar_centroid()
         if det is not None and det.is_locatable() and lat is not None:
             off = V.haversine_km(det.lat, det.lon, lat, lon)
             if off is not None:
-                extra = ""
-                if det.loc_error_km:
-                    inside = "inside" if off <= det.loc_error_km else "OUTSIDE"
-                    extra = (f" — {inside} the {det.loc_error_km:g} km location error")
                 lines.append(f"Scar centroid is {off:.1f} km from the reported "
-                             f"epicentre{extra}.")
+                             "epicentre.")
         self.verdict_summary.setText("<br>".join(lines))
-        return rec
 
     def _export_csv(self):
         if not self._rows:

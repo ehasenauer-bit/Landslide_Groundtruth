@@ -87,13 +87,13 @@ for want in ("Environment", "Detection"):
 
 print("\nSTEP 5 — exercise the new controls on the real dock")
 dock.det_lat_edit.setText("60.50"); dock.det_lon_edit.setText("-140.60")
-dock.det_err_spin.setValue(17.0); dock.det_vol_edit.setText("1.3")
-print("   detection read:", (dock.detection.event_id, dock.detection.lat,
-                             dock.detection.suggested_radius_km()))
-assert dock.detection.suggested_radius_km()==17.0
+print("   detection read:", (dock.detection.event_id, dock.detection.lat, dock.detection.lon))
 dock._apply_detection()
-print("   radius pushed to S2 tab:", dock.radius_spin.value())
-assert dock.radius_spin.value()==17.0
+radii=(dock.radius_spin.value(), dock.planet_tab.radius_spin.value(),
+       dock.gegd_tab.radius_spin.value(), dock.sar_tab.radius_spin.value(),
+       dock.viewer3d_tab.radius_spin.value())
+print("   radius pushed to S2 / Planet / Maxar / SAR / 3D:", radii)
+assert radii==(15.0, 10.0, 15.0, 15.0, 15.0), radii
 print("   env status:", dock.env_status.text()[:70])
 print("   env_gate() with no setup:", dock.env_gate())
 assert dock.env_gate() is False

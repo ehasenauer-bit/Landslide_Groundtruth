@@ -165,9 +165,9 @@ check(f"implied depth spreads the scar volume over the TOTAL ({vol.depth_out.tex
       vol.depth_out.text().startswith(f"{c['v_larsen'] / 1.0e6:,.1f} m")
       and "total 1 km²" in vol.depth_out.text())
 check("no warnings on a clean slide", not vol.vol_warn_lbl.isVisibleTo(vol))
-check("the verdict already lists both",
-      "Area × thickness" in vol.verdict_summary.text()
-      and "Larsen et al. (2010)" in vol.verdict_summary.text())
+check("the verdict neither repeats the volumes nor compares them with a seismic one",
+      "Area × thickness" not in vol.verdict_summary.text()
+      and "seismic" not in vol.verdict_summary.text().lower())
 check("the centerline can be drawn now", vol.centerline_btn.isEnabled())
 
 print("\n=== the centerline lands on the row ===")

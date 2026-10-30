@@ -42,20 +42,19 @@ from qgis.PyQt.QtCore import QDateTime
 s.det_time_edit.setDateTime(QDateTime.fromString("2026-02-04 08:48:37","yyyy-MM-dd HH:mm:ss"))
 s.det_lat_edit.setText("60.50")
 s.det_lon_edit.setText("-140.60")
-s.det_err_spin.setValue(17.0)
-s.det_vol_edit.setText("1.3")
-s.det_vol_lo_edit.setText("0.9")
-s.det_vol_hi_edit.setText("1.7")
 print("  ", s.det_summary.text().replace("<br>","\n   "))
 d=s.detection
 assert d is not None
-assert (d.lat,d.lon,d.loc_error_km)==(60.5,-140.6,17.0)
-assert d.vol_best_m3==1.3e6 and (d.vol_low_m3,d.vol_high_m3)==(0.9e6,1.7e6)
+assert (d.lat,d.lon)==(60.5,-140.6)
+assert not hasattr(d,"loc_error_km") and not hasattr(d,"vol_best_m3"), "the record dropped them"
+for gone in ("det_err_spin","det_vol_edit","det_vol_lo_edit","det_vol_hi_edit"):
+    assert not hasattr(s,gone), gone
 assert d.event_id=="AK2026-0204", d.event_id
-assert d.suggested_radius_km()==17.0
 assert "previous day" in s.det_summary.text()
+assert "Sentinel-2 15 km · PlanetScope 10 km · Maxar 15 km" in s.det_summary.text()
+assert "location error" not in s.det_summary.text().lower()
 assert s.det_apply_btn.isEnabled()
-print("   -> radius 17 km, event id auto-derived, AKST rollover shown")
+print("   -> per-tab radii shown, event id auto-derived, AKST rollover shown")
 
 print("\n3. the dropped minus sign is caught")
 s.det_lon_edit.setText("140.60")
@@ -70,7 +69,7 @@ assert not s.det_apply_btn.isEnabled()
 print("   lat 999 -> detection cleared, Apply disabled")
 s.det_lat_edit.setText("60.50")
 
-print("\n5. push to all four tabs")
+print("\n5. push to every tab, each with its own radius")
 from qgis.PyQt.QtWidgets import QLineEdit, QDoubleSpinBox, QDateTimeEdit
 class FakeTab:
     def __init__(s):
@@ -80,31 +79,22 @@ class FakeTab:
 s.lat_edit=QLineEdit(); s.lon_edit=QLineEdit()
 s.radius_spin=QDoubleSpinBox(); s.radius_spin.setRange(0.2,50.0); s.radius_spin.setValue(5.0)
 s.dt_edit=QDateTimeEdit()
-s.planet_tab=FakeTab(); s.sar_tab=FakeTab(); s.viewer3d_tab=FakeTab()
+s.planet_tab=FakeTab(); s.gegd_tab=FakeTab(); s.sar_tab=FakeTab(); s.viewer3d_tab=FakeTab()
 s._apply_detection()
-for n,t in (("dock",s),("planet",s.planet_tab),("sar",s.sar_tab),("viewer3d",s.viewer3d_tab)):
+for n,t,r in (("dock",s,15.0),("planet",s.planet_tab,10.0),("gegd",s.gegd_tab,15.0),
+              ("sar",s.sar_tab,15.0),("viewer3d",s.viewer3d_tab,15.0)):
     got=(t.lat_edit.text(),t.lon_edit.text(),t.radius_spin.value(),
          t.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm:ss"))
     print(f"   {n:9s} {got}")
-    assert got==("60.500000","-140.600000",17.0,"2026-02-04 08:48:37"), (n,got)
+    assert got==("60.500000","-140.600000",r,"2026-02-04 08:48:37"), (n,got)
 
-print("\n6. volume with no range still works; blank volume is fine")
-s.det_vol_lo_edit.clear(); s.det_vol_hi_edit.clear()
-assert s.detection.vol_best_m3==1.3e6 and s.detection.vol_low_m3 is None
-s.det_vol_edit.clear()
-assert s.detection.vol_best_m3 is None and s.detection is not None
-print("   ok")
-
-print("\n7. no location error -> radius falls back to 5 km")
-s.det_err_spin.setValue(0.0)
-assert s.detection.suggested_radius_km()==5.0
-assert "no location error entered" in s.det_summary.text()
-print("   ok")
+print("\n6. (the volume fields are gone — see 2)")
+print("\n7. (the location error is gone — see 2)")
 
 print("\n8. clear")
 s._clear_detection()
 assert s.detection is None and not s.det_apply_btn.isEnabled()
-assert s.det_lat_edit.text()=="" and s.det_err_spin.value()==0.0
+assert s.det_lat_edit.text()==""
 print("   ok")
 
 print("\n9. Alaska DST still correct")

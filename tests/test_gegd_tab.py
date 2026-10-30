@@ -310,19 +310,18 @@ dock.det_id_edit.setText("AK2026-0808")
 dock.det_time_edit.setDateTime(QDateTime(QDate(2026, 8, 8), QTime(13, 0, 42)))
 dock.det_lat_edit.setText("60.0265")
 dock.det_lon_edit.setText("-153.0559")
-dock.det_err_spin.setValue(17.0)
 dock._apply_detection()
 check(f"lat/lon/radius filled ({tab.lat_edit.text()}, {tab.lon_edit.text()}, "
-      f"{tab.radius_spin.value()} km from the 17 km location error)",
+      f"{tab.radius_spin.value()} km, Maxar's 15 km)",
       tab.lat_edit.text() == "60.026500" and tab.lon_edit.text() == "-153.055900"
-      and tab.radius_spin.value() == 17.0)
+      and tab.radius_spin.value() == 15.0)
 origin, det = tab._origin_utc()
 check(f"matching detection: origin keeps its seconds, as aware UTC ({origin.isoformat()})",
       det is not None and origin == datetime(2026, 8, 8, 13, 0, 42, tzinfo=timezone.utc))
 check(f"event id is the detection's ({tab._event_id()})", tab._event_id() == "AK2026-0808")
 lbl = tab._event_label.text()
 check("event line names the record and spells out Alaska time",
-      "AK2026-0808" in lbl and "AKDT" in lbl and "±17 km" in lbl)
+      "AK2026-0808" in lbl and "AKDT" in lbl)
 tab.lat_edit.setText("61.0")                   # no longer the detection's place
 origin2, det2 = tab._origin_utc()
 check(f"unmatched: 'No detection record matches', origin = field wall clock as UTC "

@@ -4,20 +4,14 @@ Everything else in the plugin gathers evidence. Nothing recorded the finding, so
 a season of work left no machine-readable trace and could not be joined back to
 the seismic catalogue it came from.
 
-Two things live here, both deliberately free of Qt so they can be tested outside
-QGIS:
+Deliberately free of Qt so it can be tested outside QGIS. **VERDICTS** is the
+closed list of calls an analyst can make. "Not found" and "Cannot tell" are
+separate on purpose: a scar that is absent and a scar hidden under cloud are
+completely different results for whoever tunes the detector, and collapsing them
+into one "no" throws that away.
 
-* **VERDICTS** — the closed list of calls an analyst can make. "Not found" and
-  "Cannot tell" are separate on purpose: a scar that is absent and a scar hidden
-  under cloud are completely different results for whoever tunes the detector,
-  and collapsing them into one "no" throws that away.
-* **reconcile()** — the volume cross-check. The detection carries a seismic
-  volume; the Volume tab derives two from the digitized outlines — area ×
-  thickness on the total outline and the Larsen source-scar fit — and DEM
-  differencing would give another. Agreement between independent estimates is the
-  actual validation, and it is compared in LOG10 space because area-to-volume
-  scaling is a power law whose spread is multiplicative — a factor of two, not
-  a fixed number of cubic metres.
+The seismic-volume cross-check (reconcile) was dropped on 2026-10-30 along with
+the Detection box's volume fields.
 """
 
 import math
@@ -34,40 +28,11 @@ VERDICTS = [
 
 VERDICT_KEYS = [k for k, _ in VERDICTS]
 
-# |log10(V_a / V_b)| below this counts as agreement. 0.42 ≈ a factor of 2.6,
-# which is about the honest spread of the Larsen area-volume relation for a
-# single slide — tightening it would manufacture disagreement out of the
-# scaling's own scatter.
-AGREE_LOG10 = 0.42
-MARGINAL_LOG10 = 0.85          # ≈ a factor of 7
-
-
-def d_log10(a, b):
-    """|log10(a/b)|, or None if either side is missing or non-positive."""
-    try:
-        if a is None or b is None or a <= 0 or b <= 0:
-            return None
-        return abs(math.log10(float(a) / float(b)))
-    except (TypeError, ValueError, ZeroDivisionError):
-        return None
-
-
-def classify(d):
-    """agree / marginal / disagree from a log10 separation."""
-    if d is None:
-        return ""
-    if d <= AGREE_LOG10:
-        return "agree"
-    if d <= MARGINAL_LOG10:
-        return "marginal"
-    return "disagree"
-
 
 def haversine_km(lat1, lon1, lat2, lon2):
     """Great-circle distance in km. Used for the offset between the reported
     epicentre and the centroid of the scar the analyst actually digitized —
-    which, against the record's location error, is the single number that says
-    whether the detection was well located."""
+    the single number that says whether the detection was well located."""
     try:
         r = 6371.0088
         p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -78,44 +43,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
         return 2 * r * math.asin(min(1.0, math.sqrt(h)))
     except (TypeError, ValueError):
         return None
-
-
-def reconcile(seismic=None, larsen=None, dh_erosion=None, thickness=None):
-    """Compare the independent volume estimates of one slide.
-
-    `seismic` is the detection's inversion, `larsen` the source-scar
-    area-scaling result, `thickness` the deposit area × thickness volume, and
-    `dh_erosion` a DEM-differencing EROSION volume — the erosion side, not the
-    net, because the net is a near-zero difference of two large numbers and is
-    not the quantity a seismic inversion estimates. (The Volume tab no longer
-    measures ∫Δh — see parked/ddem — but the comparison stays general.)
-
-    Returns a dict with each separation from the seismic volume, the verdict
-    for the WORST of them, and a human sentence. Each estimate's own verdict is
-    classify(out["d_…"]).
-    """
-    out = {
-        "d_larsen": d_log10(larsen, seismic),
-        "d_thickness": d_log10(thickness, seismic),
-        "d_dh": d_log10(dh_erosion, seismic),
-        "agreement": "",
-        "text": "",
-    }
-    ds = [d for d in (out["d_larsen"], out["d_thickness"], out["d_dh"])
-          if d is not None]
-    if not ds:
-        out["text"] = ("Only one volume estimate is available — no cross-check "
-                       "is possible.")
-        return out
-    worst = max(ds)
-    out["agreement"] = classify(worst)
-    ratio = 10 ** worst
-    label = {"agree": "agree", "marginal": "only marginally agree",
-             "disagree": "disagree"}[out["agreement"]]
-    out["text"] = (f"The independent estimates {label} "
-                   f"(largest separation ×{ratio:.1f}, |D| = {worst:.2f}; "
-                   f"agreement threshold {AGREE_LOG10:.2f}).")
-    return out
 
 
 def implied_depth_m(volume_m3, area_m2):
@@ -132,16 +59,14 @@ def implied_depth_m(volume_m3, area_m2):
         return None
 
 
-# Columns appended to the Volume tab's CSV. Every volume gets its OWN column —
-# the tab's own columns carry vol_thickness_* and vol_larsen_*, these the
-# seismic one — or the export cannot show that they were compared.
+# Columns appended to the Volume tab's CSV: who the event was and what the
+# analyst found. The tab's own columns carry vol_thickness_* and vol_larsen_*.
 VERDICT_CSV_FIELDS = [
     # identity — from the Detection, never typed
     ("event_id", "event_id"),
     ("origin_utc", "origin_utc"),
     ("det_lat", "det_lat"),
     ("det_lon", "det_lon"),
-    ("det_loc_error_km", "det_loc_error_km"),
     ("det_coherency", "det_coherency"),
     ("det_hf_lf", "det_hf_lf"),
     # what the analyst found
@@ -149,19 +74,7 @@ VERDICT_CSV_FIELDS = [
     ("scar_lat", "scar_lat"),
     ("scar_lon", "scar_lon"),
     ("offset_from_det_km", "offset_km"),
-    ("offset_vs_loc_error", "offset_ratio"),
-    # the seismic volume, in columns of its own
-    ("vol_seismic_m3", "vol_seismic_m3"),
-    ("vol_seismic_lo_m3", "vol_seismic_lo_m3"),
-    ("vol_seismic_hi_m3", "vol_seismic_hi_m3"),
     ("implied_depth_m", "implied_depth"),
-    # the comparison — each area-based volume against the seismic one, and the
-    # worse of the two as `agreement`
-    ("D_thickness_log10", "d_thickness"),
-    ("D_larsen_log10", "d_larsen"),
-    ("agreement_thickness", "agreement_thickness"),
-    ("agreement_larsen", "agreement_larsen"),
-    ("agreement", "agreement"),
     ("analyst_note", "note"),
     ("analyst", "analyst"),
     ("recorded_utc", "recorded_utc"),

@@ -2,8 +2,8 @@
 
 The Fit combo used to run one calibration per Measure, so comparing area ×
 thickness with the source-scar fit meant measuring twice and reading two rows —
-and the cross-check only ever saw one of them. Now one Measure runs both and the
-row carries both beside the seismic volume, each in its own field and column.
+and the verdict only ever saw one of them. Now one Measure runs both and the row
+carries both, each in its own field and column.
 
 Run with tests/run_all.sh.
 """
@@ -29,8 +29,7 @@ for m in ("_build_verdict_box", "_estimates", "_scar_centroid",
     setattr(Stub, m, getattr(VT.VolumeTab, m))
 
 s = Stub(); _box = s._build_verdict_box()
-det = DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6, loc_error_km=17.0,
-                    vol_best_m3=1.3e6, vol_low_m3=0.9e6, vol_high_m3=1.7e6,
+det = DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6,
                     origin_utc=datetime(2026, 2, 4, 8, 48, 5))
 s.dock.detection = det
 ROW = {"name": "Iliamna", "material": "bedrock", "material_label": "Bedrock",
@@ -45,10 +44,7 @@ s._rows = [dict(ROW)]
 thick, larsen, src = s._estimates()
 print(f"   thickness {thick:,.0f}   source scar {larsen:,.0f}   from row {src['name']!r}")
 assert thick == 2.0e6 and larsen == 1.30e6
-rec = s._refresh_verdict()
-assert rec["d_larsen"] is not None and rec["d_thickness"] is not None, rec
-print("   both compared from a SINGLE Measure:", rec["agreement"])
-print("  ", s.verdict_summary.text().replace("<br>", "\n   ").replace("&nbsp;", " "))
+print("   both from a SINGLE Measure")
 
 print("\n=== 2. the slide on screen wins over older rows ===")
 s._rows = [dict(ROW, name="old", v_larsen=9.9e7), dict(ROW)]
@@ -67,7 +63,7 @@ s._rows = [dict(ROW, a_total=None)]
 assert s._verdict_row()["implied_depth"] == "", "no total outline -> no depth, not the scar's"
 print("   and none at all without a total outline")
 
-print("\n=== 4. the CSV shows the cross-check on one line ===")
+print("\n=== 4. the CSV carries both volumes on one line ===")
 s._rows = [dict(ROW)]
 s.verdict_combo.setCurrentIndex(1); s.analyst_edit.setText("EH")
 stamp = s._verdict_row()
@@ -78,22 +74,21 @@ buf = _io.StringIO(); w = csv.writer(buf)
 w.writerow([h for h, _k in VT.CSV_FIELDS])
 w.writerow(["" if merged.get(k) is None else merged.get(k) for _h, k in VT.CSV_FIELDS])
 buf.seek(0); out = list(csv.DictReader(buf))[0]
-for c in ("vol_seismic_m3", "vol_thickness_m3", "vol_larsen_m3",
-          "thickness_m", "thickness_setting", "implied_depth_m",
-          "agreement_thickness", "agreement_larsen", "agreement", "verdict"):
+for c in ("vol_thickness_m3", "vol_larsen_m3",
+          "thickness_m", "thickness_setting", "implied_depth_m", "verdict"):
     print(f"   {c:24s} {out[c]!r}")
     assert out[c] != "", c
-vals = {out["vol_seismic_m3"], out["vol_thickness_m3"], out["vol_larsen_m3"]}
-assert len(vals) == 3, "the three volumes must not collapse into one column"
+assert out["vol_thickness_m3"] != out["vol_larsen_m3"], \
+    "the two volumes must not collapse into one column"
 hdrs = [h for h, _ in VT.CSV_FIELDS]
 assert len(hdrs) == len(set(hdrs)), "duplicate CSV header"
-print(f"   {len(hdrs)} columns, three distinct volumes")
+print(f"   {len(hdrs)} columns, two distinct volumes")
 
-print("\n=== 5. no estimates at all -> no crash, no false agreement ===")
+print("\n=== 5. no estimates at all -> no crash ===")
 s._rows = []
 t, l, src = s._estimates()
 assert t is None and l is None and src == {}
-assert s._refresh_verdict()["agreement"] == ""
+s._refresh_verdict()
 print("   empty table handled")
 
 print("\n=== 6. the labels stopped overclaiming ===")
@@ -116,13 +111,5 @@ for area, vol, verdict_ in ((4.2e5, 1.3e6, "plausible"), (2.0e6, 1.3e6, "shallow
     print(f"   {vol/1e6:.2g} Mm3 over {area/1e6:.3g} km2 -> {d:6.1f} m  ({verdict_})")
 assert V.implied_depth_m(1.3e6, 4.2e5) > 3.0
 assert V.implied_depth_m(1.3e6, 1.4e4) > 90.0, "a tiny outline must read as absurd"
-
-print("\n=== 8. verdict colours come from the theme, not literals ===")
-assert "#1b7f37" not in src, "hardcoded green failed WCAG on the dark theme"
-assert "status_color" in src
-from landslide_groundtruth import theme
-for k in ("success", "warn", "error"):
-    assert theme.status_color(k)
-print("   agree/marginal/disagree use theme.status_color")
 
 print("\nONE-ROW CROSS-CHECK VERIFIED")
