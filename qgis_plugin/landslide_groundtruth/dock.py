@@ -1624,6 +1624,7 @@ class LandslideDock(QgsDockWidget):
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
         off_point = 0                    # scenes whose footprint misses the epicentre
+        n_bad = 0                        # scenes whose pixels are corrupt (bad_data)
         for r, (side, c) in enumerate(rows):
             info = sel[side]
             cid = c.get("id")
@@ -1772,6 +1773,27 @@ class LandslideDock(QgsDockWidget):
                     "in a nodata gap, so it is ranked last and won't be the "
                     "Preview-on-map default. It still lists in case you want the "
                     "surrounding area.")
+            bad = c.get("bad_data")
+            if bad:
+                # Corrupt pixels (see imagery.WRAPPED_DN_MAX): never ★/✓ (dropped in
+                # _rank_like_run) and not tickable — a Run on it can only fail. Its
+                # cloud % was measured on noise, so the number is replaced, not shown.
+                n_bad += 1
+                for col in range(self.table.columnCount()):
+                    it = self.table.item(r, col)
+                    if it is not None:
+                        it.setForeground(QBrush(MUTED_FG))
+                cloud_item.setText("bad data")
+                cloud_item.setForeground(QBrush(CLOUD_HEAVY))
+                cloud_item.setToolTip(bad)
+                side_item.setFlags(side_item.flags() & ~Qt.ItemIsUserCheckable)
+                side_item.setData(Qt.CheckStateRole, None)    # no checkbox at all
+                side_item.setToolTip(f"✕ {bad}")
+        if n_bad:
+            self._append_log(
+                f"note: {n_bad} of {len(rows)} candidate scene(s) are corrupt on "
+                f"Planetary Computer (bands cut to 8 bits — they render black); "
+                f"they are greyed out and can't be ticked or starred.")
         if off_point:
             self._append_log(
                 f"note: {off_point} of {len(rows)} candidate scene(s) do not cover "
@@ -1812,7 +1834,13 @@ class LandslideDock(QgsDockWidget):
           4. gap_days, nearest the event last, as a final tiebreaker.
         cloud_weight / auto_window no longer reshuffle this: coverage of the point
         and the area is what makes a review scene usable, so it leads regardless of
-        which Run mode produced the candidates."""
+        which Run mode produced the candidates.
+
+        A scene flagged bad_data (corrupt pixels, see imagery.WRAPPED_DN_MAX) is left
+        out entirely, so it can never be the ★, a ✓ or the Preview-on-map default —
+        its cloud % was read off noise and once came out 0%, winning the ★."""
+        cands = [c for c in cands if not c.get("bad_data")]
+
         def covers(c):
             return 0 if self._covers_event(c) else 1        # point-covering first
 
@@ -2087,6 +2115,9 @@ class LandslideDock(QgsDockWidget):
             cloud = f"~{scene_cloud:.0f}%"
         else:
             cloud = "—"
+        bad = c.get("bad_data")          # corrupt pixels: no cloud % worth showing
+        if bad:
+            cloud = "bad data"
         gap = "" if c.get("gap_days") is None else f"{c['gap_days']}d"
         src = c.get("source", "")
         cid = c.get("id")
@@ -2106,6 +2137,8 @@ class LandslideDock(QgsDockWidget):
         elif snow_swamped:
             tip += (f"\n{CLOUD_SNOW_MARK} snow-swamped AOI ({aoi_snow:.0f}% "
                     f"snow/ice) — cloud % is a lower bound; judge by the thumbnail.")
+        if bad:
+            tip = f"{src}\n{cid}\n{date}\n✕ {bad}"
         tile.setToolTip(tip)
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)

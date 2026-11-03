@@ -27,6 +27,7 @@ import datetime as dt
 import threading
 import time
 import warnings
+import dask
 import numpy as np
 import xarray as xr
 import pystac_client
@@ -120,6 +121,53 @@ LS_CLOUD_BITS = 0b11110
 # lower bound there — see _aoi_cloud_fractions.
 S2_SNOW_SCL = [11]           # SCL 11 = snow / ice
 LS_SNOW_BIT = 0b100000       # QA_PIXEL bit 5 = snow / ice
+
+# A reflectance band whose every pixel over the AOI is <= WRAPPED_DN_MAX has lost its
+# high byte. Planetary Computer served the whole 2026-10-28 S2C R086 datatake that way —
+# every band was the true DN mod 256 (checked pixel-for-pixel against AWS Earth Search's
+# copy) — so the -1000 BOA offset drove every pixel negative and the HDR came out black,
+# while its AOI cloud % (OmniCloudMask on noise) read 0% and won the ★. The test only
+# runs where reflectance 0 sits far above the threshold (S2 baseline >= 04.00 at DN
+# 1000, Landsat C2 at DN 7273), so a scene trips it only if EVERY pixel in the box would
+# be a reflectance below about -0.05 — never a dark lake. Pre-04.00 S2 (zero at DN 0)
+# is not checked: there a dark-water box can honestly sit that low. 511 rather than 255
+# leaves room for the overview resampling the coarse search read goes through (seen at
+# 267).
+WRAPPED_DN_MAX = 511
+WRAPPED_MIN_PIXELS = 100     # fewer valid pixels than this and we don't judge
+WRAPPED_NOTE = ("Planetary Computer's copy of this scene is corrupt: no reflectance "
+                "value over the AOI exceeds {peak:.0f} (the 16-bit data was cut to its "
+                "low byte), so it renders black. Pick another scene.")
+
+
+class CorruptSceneError(RuntimeError):
+    """Every scene asked for on one side came back with wrapped bands (see
+    WRAPPED_DN_MAX). `ids` are those scenes. Raised rather than returned so a
+    hand-picked run reports WHY it produced nothing, not just "no imagery"."""
+
+    def __init__(self, ids):
+        self.ids = list(ids)
+        super().__init__(
+            f"Planetary Computer's copy of {', '.join(self.ids)} is corrupt — its "
+            f"reflectance bands were cut to their low byte (no value above "
+            f"{WRAPPED_DN_MAX}), so it would render black. Untick it and pick "
+            f"another scene.")
+
+
+def _zero_dn(item, sensor):
+    """Raw DN of zero surface reflectance for one scene (see WRAPPED_DN_MAX)."""
+    if sensor == "s2":
+        return -_s2_boa_offset(item)       # 1000 from baseline 04.00, else 0
+    return 0.2 / 0.0000275                 # Landsat C2 L2: DN * 2.75e-5 - 0.2
+
+
+def _is_wrapped(peak, n_valid, zero_dn):
+    """True when a scene's brightest valid raw DN over the AOI (`peak`, across its
+    reflectance bands) proves the bands were cut to 8 bits — see WRAPPED_DN_MAX.
+    False whenever it can't tell: too few pixels, no data, or a scene whose zero
+    reflectance sits too close to the threshold to separate dark ground from damage."""
+    return bool(zero_dn > WRAPPED_DN_MAX and n_valid >= WRAPPED_MIN_PIXELS
+                and np.isfinite(peak) and peak <= WRAPPED_DN_MAX)
 
 # Dry-run (search_event) candidate cap per side, mirroring sar_imagery: the
 # preview's job is to show what was actually acquired near the event so the
@@ -292,7 +340,7 @@ _AOI_READ_WORKERS = 8
 
 
 def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
-    """Per-item (cloud%, snow%, source) over the AOI box, keyed by item id.
+    """Per-item (cloud%, snow%, source, bad_data) over the AOI box, keyed by item id.
 
     cloud_pct is the honest "cloud over your point" number the whole-tile
     eo:cloud_cover cannot give. With method='ocm' (default) it is measured by
@@ -306,7 +354,12 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     snow class). All three are None where the AOI has no measured pixels (the
     footprint misses the box) so the caller can fall back to the tile metric.
 
-    Returns (fractions, note): fractions is {item.id: (cloud%, snow%, source)};
+    bad_data is None, or WRAPPED_NOTE when the R/G/NIR read shows the scene's bands
+    were cut to their low byte (see WRAPPED_DN_MAX) — checked on the pixels OCM reads
+    anyway, so it costs nothing. Such a scene is NOT fed to OCM (its cloud % on that
+    noise read 0% and won the ★); its cloud % falls back to the SCL count.
+
+    Returns (fractions, note): fractions is {item.id: (cloud%, snow%, source, bad_data)};
     note is None, or a one-line reason when method='ocm' was asked but OCM fell
     back to SCL for the batch (so the plugin can say WHY, not fail silently).
 
@@ -378,6 +431,19 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     with ThreadPoolExecutor(max_workers=min(_AOI_READ_WORKERS, len(items))) as ex:
         reads = list(ex.map(_read, items))
 
+    # Corrupt-band check on the R/G/NIR just read (raw DN, 0 = off-footprint).
+    by_id = {i.id: i for i in items}
+    bad = {}
+    for iid, _cls, rgn_arr in reads:
+        if rgn_arr is None:
+            continue
+        v = rgn_arr[rgn_arr > 0]
+        peak = float(v.max()) if v.size else float("nan")
+        if _is_wrapped(peak, v.size, _zero_dn(by_id[iid], sensor)):
+            bad[iid] = WRAPPED_NOTE.format(peak=peak)
+            print(f"    [aoi-cloud] !! {iid}: bands wrapped to 8 bits (peak DN "
+                  f"{peak:.0f}) — corrupt on Planetary Computer, flagged")
+
     # OmniCloudMask inference, run SERIALLY under _OCM_LOCK (torch's MPS backend is
     # not thread-safe). Cheap next to the reads. ocm_note is set only when OCM
     # can't load AT ALL (the actionable "wrong venv" case) so the plugin can shout
@@ -395,7 +461,7 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
             print(f"    [aoi-cloud] !! {ocm_note}")
         if predict_from_array is not None:
             for iid, _cls, rgn_arr in reads:
-                if rgn_arr is None:
+                if rgn_arr is None or iid in bad:
                     continue
                 try:
                     with _OCM_LOCK:   # concurrent MPS dispatch segfaults; see _OCM_LOCK
@@ -410,7 +476,7 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     out = {}
     for iid, cls_arr, _rgn in reads:
         if cls_arr is None:
-            out[iid] = (None, None, None)
+            out[iid] = (None, None, None, bad.get(iid))
             continue
         if sensor == "s2":
             a = cls_arr.astype("int16")
@@ -424,19 +490,21 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
             snowy = (a & LS_SNOW_BIT) > 0
         n = int(valid.sum())
         if not n:
-            out[iid] = (None, None, None)
+            out[iid] = (None, None, None, bad.get(iid))
             continue
         snow_pct = 100.0 * float((snowy & valid).sum()) / n
         m = ocm_masks.get(iid)
         if m is not None and m.shape == valid.shape:
-            out[iid] = (100.0 * float((m & valid).sum()) / n, snow_pct, "ocm")
+            out[iid] = (100.0 * float((m & valid).sum()) / n, snow_pct, "ocm",
+                        bad.get(iid))
         else:
-            out[iid] = (100.0 * float((cloudy & valid).sum()) / n, snow_pct, "scl")
+            out[iid] = (100.0 * float((cloudy & valid).sum()) / n, snow_pct, "scl",
+                        bad.get(iid))
     return out, ocm_note
 
 
 def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=None,
-                    aoi_cloud_method=None):
+                    aoi_cloud_method=None, bad_data=None):
     """One STAC item -> a JSON-able candidate row for the dry-run preview.
 
     thumb_url is the item's free rendered preview / browse PNG (no download or
@@ -450,7 +518,9 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
     has no single true-colour COG (e.g. Landsat, PlanetScope).
     geometry/bbox are the scene footprint (GeoJSON + lon/lat bounds); the plugin
     draws them on the map so you can see whether the scene actually covers the
-    AOI (vs. leaving the epicentre in a diagonal nodata gap)."""
+    AOI (vs. leaving the epicentre in a diagonal nodata gap).
+    bad_data is None, or why the scene's pixels are unusable (see WRAPPED_DN_MAX);
+    the plugin greys such a row out and never stars or ticks it."""
     d = item.datetime.replace(tzinfo=None) if item.datetime is not None else None
     cloud = item.properties.get("eo:cloud_cover")
     thumb = None
@@ -465,7 +535,7 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
                 cloud_pct=round(cloud, 1) if cloud is not None else None,
                 aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
                 aoi_snow_pct=round(aoi_snow_pct, 1) if aoi_snow_pct is not None else None,
-                aoi_cloud_method=aoi_cloud_method,
+                aoi_cloud_method=aoi_cloud_method, bad_data=bad_data,
                 gap_days=round(abs((d - event_time).total_seconds()) / 86400.0) if d else None,
                 source=source, thumb_url=thumb, cog_url=cog,
                 # DN offset the plugin's HDR preview adds before /10000 (Sentinel-2
@@ -519,10 +589,10 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     post_aoi, post_note = _aoi_cloud_fractions(post_items, lat, lon, radius_km, sensor)
     return dict(source=src,
                 pre=[_stac_candidate(i, event_time, src,
-                                     *(pre_aoi.get(i.id) or (None, None, None)))
+                                     *(pre_aoi.get(i.id) or (None, None, None, None)))
                      for i in pre_items],
                 post=[_stac_candidate(i, event_time, src,
-                                      *(post_aoi.get(i.id) or (None, None, None)))
+                                      *(post_aoi.get(i.id) or (None, None, None, None)))
                       for i in post_items],
                 aoi_cloud_note=pre_note or post_note)
 
@@ -553,7 +623,11 @@ def _composite(items, lat, lon, radius_km, sensor):
     measurement at all — the scene fill/nodata classes — are dropped, so an
     acquisition's diagonal nodata gap stays transparent instead of turning into a
     black wedge of "reflectance 0". With one scene per side (--auto-window, or a
-    single ticked scene) the output is therefore that scene verbatim."""
+    single ticked scene) the output is therefore that scene verbatim.
+
+    Raises CorruptSceneError naming every scene whose bands came back wrapped to 8
+    bits (see WRAPPED_DN_MAX); _composite_result drops them and composites the rest.
+    The check rides on the median's own read, so a clean scene costs nothing extra."""
     epsg = _utm_epsg(lat, lon)
     bands = S2_BANDS if sensor == "s2" else LS_BANDS
     res = 10 if sensor == "s2" else 30
@@ -567,7 +641,7 @@ def _composite(items, lat, lon, radius_km, sensor):
         measured = ~scl.isin(S2_NODATA_SCL)   # fill/defective only — never cloud
         # B11/B12 are natively 20 m; stackstac has resampled them to the 10 m grid
         # above, so they align with red/nir/green/blue for the SWIR products.
-        data = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured)
+        raw = stack.sel(band=["B04", "B08", "B03", "B02", "B11", "B12"]).where(measured)
         # Processing baseline 04.00+ (≈2022-01-25 onward) bakes BOA_ADD_OFFSET = -1000
         # into the DN, and MPC serves L2A UN-harmonized (verified: post-04.00 dark
         # pixels floor at ~1000 DN, pre-04.00 at ~0). So true reflectance is
@@ -576,8 +650,8 @@ def _composite(items, lat, lon, radius_km, sensor):
         # straddles the 2022 boundary lands both sides on ONE reflectance scale
         # instead of showing the +0.1 step as spurious change (see _s2_boa_offset).
         boa = xr.DataArray([_s2_boa_offset(it) for it in items],
-                           coords={"time": data.time}, dims="time")
-        data = (data + boa) / 10000.0
+                           coords={"time": raw.time}, dims="time")
+        data = (raw + boa) / 10000.0
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
     else:
         qa = stack.sel(band="qa_pixel").astype("uint16")
@@ -587,12 +661,24 @@ def _composite(items, lat, lon, radius_km, sensor):
         fill = (qa & 1) > 0
         # swir16/swir22 are Landsat's SWIR1/SWIR2; same C2 L2 scale/offset as the
         # other surface-reflectance bands, so they rescale together below.
-        data = stack.sel(band=["red", "nir08", "green", "blue", "swir16", "swir22"]).where(~fill)
-        data = data * 0.0000275 - 0.2  # Landsat C2 L2 scale/offset
+        raw = stack.sel(band=["red", "nir08", "green", "blue", "swir16", "swir22"]).where(~fill)
+        data = raw * 0.0000275 - 0.2  # Landsat C2 L2 scale/offset
         data = data.assign_coords(band=["red", "nir", "green", "blue", "swir1", "swir2"])
+    # Per scene: the brightest raw DN over the AOI across all six bands, and how many
+    # pixels it was taken over — computed in the SAME dask pass as the median, so the
+    # source chunks are read once.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        comp = data.median(dim="time", skipna=True).compute()
+        comp, peak, n_valid = dask.compute(
+            data.median(dim="time", skipna=True),
+            raw.max(dim=("band", "y", "x"), skipna=True),
+            raw.count(dim=("band", "y", "x")))
+    # stackstac orders the stack by date, not by `items`, so match on its id coord.
+    zero = {it.id: _zero_dn(it, sensor) for it in items}
+    bad = [str(i) for i, p, n in zip(peak["id"].values, peak.values, n_valid.values)
+           if _is_wrapped(float(p), int(n), zero[str(i)])]
+    if bad:
+        raise CorruptSceneError(bad)
     comp = comp.rio.write_crs(epsg)
     return comp
 
@@ -665,8 +751,23 @@ def _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
     One side may be empty (a hand-picked one-sided run — see fetch_event). That
     side's composite and NDVI/NDSI come back None, and so do the three change
     rasters, which are differences and need both sides to exist."""
-    pre = _composite(pre_items, lat, lon, radius_km, sensor) if pre_items else None
-    post = _composite(post_items, lat, lon, radius_km, sensor) if post_items else None
+    def usable(items, side):
+        """(composite, items) with any corrupt scene dropped (see CorruptSceneError);
+        re-raises only when that leaves the side empty."""
+        if not items:
+            return None, items
+        try:
+            return _composite(items, lat, lon, radius_km, sensor), items
+        except CorruptSceneError as e:
+            keep = [i for i in items if i.id not in e.ids]
+            print(f"    [{sensor}] !! {side}: dropped {len(e.ids)} scene(s) corrupt on "
+                  f"Planetary Computer (bands wrapped to 8 bits): {', '.join(e.ids)}")
+            if not keep:
+                raise
+            return _composite(keep, lat, lon, radius_km, sensor), keep
+
+    pre, pre_items = usable(pre_items, "pre")
+    post, post_items = usable(post_items, "post")
     for side, comp in (("pre", pre), ("post", post)):
         if comp is not None and not _has_coverage(comp):
             hint = " — try without --auto-window to composite more scenes" if auto_window else ""
@@ -799,8 +900,13 @@ def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
                                    max_cloud=cloud, limit=lim, cloud_weight=weight)
         if not pre_items or not post_items:
             continue
-        res = _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
-                                fallback_note=None, auto_window=auto_window)
+        try:
+            res = _composite_result(pre_items, post_items, lat, lon, radius_km, sensor,
+                                    fallback_note=None, auto_window=auto_window)
+        except CorruptSceneError as e:
+            # every ranked scene on one side is corrupt — as good as no scenes
+            print(f"    [{sensor}] {e}")
+            continue
         if res is not None:
             return res
         # scenes found but their nodata gap fell over the AOI — try the next sensor
