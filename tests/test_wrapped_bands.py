@@ -44,6 +44,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import xarray as xr
+from affine import Affine
 
 warnings.simplefilter("ignore")
 sys.path.insert(0, ROOT)
@@ -66,7 +67,9 @@ LAT, LON, R = 62.05, -149.2, 5.0
 def scene(iid, day, baseline="05.13"):
     return SimpleNamespace(id=iid, datetime=dt.datetime(2026, 10, day, 21, 36),
                            properties={"s2:processing_baseline": baseline},
-                           assets={}, geometry=None, bbox=None)
+                           assets={b: SimpleNamespace(href=f"fake://{iid}/{b}")
+                                   for b in ("B04", "B03", "B08")},
+                           geometry=None, bbox=None)
 
 
 def true_dn():
@@ -87,7 +90,7 @@ PIXELS = {GOOD_PRE.id: true_dn(), GOOD_POST.id: true_dn(),
 
 
 def fake_stack(items, assets, epsg=None, resolution=None, bounds_latlon=None,
-               chunksize=None, rescale=False, fill_value=np.nan):
+               chunksize=None, rescale=False, fill_value=np.nan, gdal_env=None):
     """stackstac.stack's shape and its one habit that matters here: the time axis is
     sorted by DATE, whatever order the items came in, and carries an `id` coord."""
     items = sorted(items, key=lambda i: i.datetime)
@@ -101,10 +104,14 @@ def fake_stack(items, assets, epsg=None, resolution=None, bounds_latlon=None,
         cube, dims=("time", "band", "y", "x"),
         coords=dict(time=[np.datetime64(i.datetime) for i in items],
                     id=("time", [i.id for i in items]), band=list(assets),
-                    y=y0 - 10.0 * np.arange(N), x=x0 + 10.0 * np.arange(N))).chunk()
+                    y=y0 - 10.0 * np.arange(N), x=x0 + 10.0 * np.arange(N)),
+        attrs=dict(transform=Affine(10.0, 0.0, x0, 0.0, -10.0, y0))).chunk()
 
 
 im.stackstac.stack = fake_stack
+# The search reads Sentinel-2's R/G/NIR from the COG overview (test_overview_read.py
+# pins that read); here it hands back the same synthetic pixels.
+im._overview_read = lambda href, epsg, transform, shape, res: PIXELS[href.split("/")[2]]
 
 print("=== 1. the rule: wrapped data trips it, honest dark data never does ===")
 s2, old, ls = 1000.0, 0.0, im._zero_dn(None, "landsat")

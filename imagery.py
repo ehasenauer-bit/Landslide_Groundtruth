@@ -35,7 +35,10 @@ from pystac_client.exceptions import APIError
 from pystac_client.stac_api_io import StacApiIO
 from urllib3.util.retry import Retry
 import planetary_computer as pc
+import rasterio
 import stackstac
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
 import rioxarray  # noqa: F401  (registers .rio accessor)
 from pyproj import CRS
 
@@ -338,6 +341,50 @@ def _ocm_models():
 # so this nests under that.
 _AOI_READ_WORKERS = 8
 
+# The search's COG reads give up on a stalled connection instead of waiting for ever.
+# GDAL's default is no timeout, and on 2026-11-02 a dropped Azure connection hung a
+# search for 20+ minutes; the retries also cover the truncated tile reads seen that day.
+_SEARCH_GDAL = dict(GDAL_HTTP_TIMEOUT="60", GDAL_HTTP_MAX_RETRY="3",
+                    GDAL_HTTP_RETRY_DELAY="2")
+_SEARCH_ENV = stackstac.DEFAULT_GDAL_ENV.updated(always=_SEARCH_GDAL)
+
+# Sentinel-2's R/G/NIR for OmniCloudMask come from the COG's own overview — the coarsest
+# whose pixel is at most _OVR_MAX_FRACTION of the AOI grid (40 m on the 100 m grid, 20 m
+# on 50 m) — area-averaged onto the grid, instead of every full-res 10 m pixel being
+# downloaded and nearest-sampled. Measured 2026-11-02 on 127 scenes over six AOIs
+# (Willow2, University Peak, Mt. Logan, Bering, Barry Arm, Talkeetna) against OCM run at
+# twice the grid's resolution: mean error 4.2 points vs 5.6 for the full-res read, 8
+# green/amber/red changes vs 13, and 6.1x less read time (Willow2's search 196 s -> ~50 s).
+# The gain is on slivers — a tile covering <5% of the box — where every-10th-pixel
+# sampling was noisy. The 80 m overview is NOT good enough: one sliver read 3% against a
+# 57% reference. SCL keeps its full-res nearest read, because its overviews hold class
+# values that do not exist. Landsat keeps the stackstac read: it was not measured, and
+# its 30 m read is ~10x smaller to begin with.
+_OVR_MAX_FRACTION = 0.5
+
+
+def _overview_level(factors, native, res):
+    """Index of the coarsest overview whose pixel is <= res * _OVR_MAX_FRACTION, or None
+    for full resolution. `factors` is rasterio's overviews() list, e.g. [2, 4, 8, 16]."""
+    level = None
+    for i, f in enumerate(factors):
+        if native * f <= res * _OVR_MAX_FRACTION:
+            level = i
+    return level
+
+
+def _overview_read(href, epsg, transform, shape, res):
+    """One band on the grid (epsg, transform, (h, w)), read from the overview
+    _overview_level picks and area-averaged onto it; 0 off the footprint."""
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", **_SEARCH_GDAL):
+        with rasterio.open(href) as src:
+            level = _overview_level(src.overviews(1), src.res[0], res)
+        opts = {} if level is None else {"OVERVIEW_LEVEL": level}
+        with rasterio.open(href, **opts) as src, WarpedVRT(
+                src, crs=f"EPSG:{epsg}", transform=transform, width=shape[1],
+                height=shape[0], resampling=Resampling.average, nodata=0) as vrt:
+            return vrt.read(1)
+
 
 def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     """Per-item (cloud%, snow%, source, bad_data) over the AOI box, keyed by item id.
@@ -368,9 +415,11 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     Per scene the classification and R/G/NIR reads share ONE grid (same
     epsg/bounds/resolution, run coarse — ~100 m / ~200 px; see the res comment
     below), so the OCM mask and the SCL 'valid'/'snow' masks align
-    pixel-for-pixel. Single-item reads also make the old stackstac-sorts-by-time
-    mislabeling impossible. Never raises: any read/inference error downgrades to
-    None/fallback so the preview still lists its scenes."""
+    pixel-for-pixel. Sentinel-2's R/G/NIR are read from the COG overview onto the
+    classification read's grid (see _OVR_MAX_FRACTION). Single-item reads also make
+    the old stackstac-sorts-by-time mislabeling impossible. Never raises: any
+    read/inference error downgrades to None/fallback so the preview still lists its
+    scenes."""
     if not items:
         return {}, None
     native = 20 if sensor == "s2" else 30
@@ -394,15 +443,15 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     def _read(item):
         """(id, classification 2-D, R/G/NIR 3-D or None). Never raises — a failed
         read returns None so that scene falls back (SCL) or drops out entirely.
-        One stackstac read per band-group per scene: single-item reads mean
-        `isel(time=0)` is unambiguous, so the stackstac-sorts-by-datetime
-        mislabeling simply cannot happen here."""
+        Single-item reads (stackstac for the classification band and Landsat, the
+        overview read for Sentinel-2's R/G/NIR) mean `isel(time=0)` is unambiguous,
+        so the stackstac-sorts-by-datetime mislabeling simply cannot happen here."""
         try:
             c = stackstac.stack(
                 [item], assets=[cls_band], epsg=epsg, resolution=res,
                 bounds_latlon=bounds, chunksize=2048, rescale=False,
-                fill_value=cls_fill).squeeze("band", drop=True).compute(
-                    scheduler="synchronous")
+                fill_value=cls_fill, gdal_env=_SEARCH_ENV).squeeze(
+                    "band", drop=True).compute(scheduler="synchronous")
             cls_arr = np.asarray(c.isel(time=0).values)
         except Exception as e:
             print(f"    [aoi-cloud] {sensor} {getattr(item, 'id', '?')} read failed "
@@ -413,11 +462,18 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
             try:
                 # Raw DN, fill=0: OCM z-score-normalises each band over its NONZERO
                 # pixels, so DN scaling is irrelevant but 0 must mean no-data.
-                r = stackstac.stack(
-                    [item], assets=rgn_bands, epsg=epsg, resolution=res,
-                    bounds_latlon=bounds, chunksize=2048, rescale=False,
-                    fill_value=0).compute(scheduler="synchronous")
-                rgn_arr = np.asarray(r.isel(time=0).values, dtype="float32")  # (3,H,W)
+                if sensor == "s2":
+                    rgn_arr = np.stack([
+                        _overview_read(item.assets[b].href, epsg, c.attrs["transform"],
+                                       cls_arr.shape, res)
+                        for b in rgn_bands]).astype("float32")             # (3,H,W)
+                else:
+                    r = stackstac.stack(
+                        [item], assets=rgn_bands, epsg=epsg, resolution=res,
+                        bounds_latlon=bounds, chunksize=2048, rescale=False,
+                        fill_value=0, gdal_env=_SEARCH_ENV).compute(
+                            scheduler="synchronous")
+                    rgn_arr = np.asarray(r.isel(time=0).values, dtype="float32")
             except Exception as e:
                 print(f"    [aoi-cloud] {sensor} {item.id} R/G/NIR read failed "
                       f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
