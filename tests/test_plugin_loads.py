@@ -80,7 +80,7 @@ assert names.index("Maxar VHR (GEGD)")==names.index("PlanetScope")+1, names
 print("\nSTEP 4 — the new boxes are on screen")
 from qgis.PyQt.QtWidgets import QGroupBox
 boxes=[b.title() for b in dock.findChildren(QGroupBox)]
-for want in ("Environment", "Detection"):
+for want in ("Setup", "Detection"):
     hit=[b for b in boxes if want in b]
     print(f"   {want:12s} -> {hit[0] if hit else 'MISSING'}")
     assert hit, (want, boxes)

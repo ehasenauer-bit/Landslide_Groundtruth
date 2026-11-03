@@ -41,6 +41,10 @@ done
 # booting at all ("init_fs_encoding").
 unset PYTHONHOME PYTHONPATH
 export QT_QPA_PLATFORM=offscreen
+# The plugin's installed imagery tools (environment.data_dir) — an empty throwaway
+# folder, so no test reads, installs into or removes the user's real install.
+export LANDSLIDE_TOOLS_DIR="$(mktemp -d -t landslide_tools)"
+trap 'rm -rf "$LANDSLIDE_TOOLS_DIR"' EXIT
 
 FILTER="${1:-}"
 pass=0; fail=0; failed=()

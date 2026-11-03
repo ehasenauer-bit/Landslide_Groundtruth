@@ -28,7 +28,7 @@ class Stub:
     def _warn(s,t): s.iface.messageBar().pushWarning("L",t)
     def _append_log(s,t): pass
 for m in ("_build_detection_box","_num_or_none","_read_detection","_clear_detection",
-          "_render_detection","_apply_detection"):
+          "_render_detection","_apply_detection","_load_example"):
     setattr(Stub,m,getattr(D.LandslideDock,m))
 
 s=Stub(); box=s._build_detection_box()

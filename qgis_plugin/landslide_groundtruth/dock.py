@@ -322,10 +322,10 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- top-level layout: shared Environment + tabbed sources ----------
     def _build_dock(self):
-        """Shared Environment header over a QTabWidget: a Sentinel-2/Landsat tab
+        """Shared Setup header over a QTabWidget: a Sentinel-2/Landsat tab
         (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
-        Data/Orders/Tiles system). Environment (venv/project/out) is shared because
-        both tabs launch the SAME venv subprocess."""
+        Data/Orders/Tiles system). Setup is shared because every imagery tab
+        launches the SAME pipeline subprocess (pipeline_launch)."""
         from .fusion_tab import FusionTab
         from .gegd_tab import GegdTab
         from .planet_tab import PlanetTab
@@ -364,99 +364,287 @@ class LandslideDock(QgsDockWidget):
         return container
 
     def _build_env_box(self):
-        """Shared environment settings (paths to the venv + project + output).
+        """Setup: install the imagery tools once (environment.py), or use your own.
 
-        This is a HARD GATE: eleven code paths across five tabs refuse to run
-        until these are set, and the first click a new user makes (the 3D tab's
-        pre-selected "Auto-fetch a DEM") lands on one of them. So it opens itself
-        when unconfigured, states what each path is in words the audience has,
-        shows an example of a correct value, and validates live rather than at
-        the next button press. Read by every tab (see _collect and PlanetTab)."""
-        env = QgsCollapsibleGroupBox("Environment — set these three up once")
+        This is a HARD GATE: the Sentinel-2/Landsat, PlanetScope, SAR and 3D
+        DEM-fetch searches refuse to run until it passes (env_gate), and the first
+        click a new user makes (the 3D tab's pre-selected "Auto-fetch a DEM")
+        lands on one of them. So it opens itself until the tools can run, says up
+        front what works without it and what the install costs, and does the
+        install itself — one button, a progress bar, Cancel — instead of asking
+        for a venv path a plugin-repository user has never heard of.
+
+        "Use my own Python" keeps the old behaviour for a developer checkout:
+        a filled-in Python wins over the managed install (pipeline_python)."""
+        from . import environment
+        env = QgsCollapsibleGroupBox("Setup — imagery tools")
         env.setSaveCollapsedState(False)
         self.env_box = env          # tabs call env_box.setCollapsed(False) to point here
-        ef = QFormLayout(env)
+        v = QVBoxLayout(env)
+        intro = QLabel(
+            "Sentinel-2/Landsat, PlanetScope, SAR and the 3D viewer's DEM download "
+            "run in a separate Python that the plugin installs once: about "
+            f"{environment.DOWNLOAD_MB} MB to download, "
+            f"{environment.DISK_GB:.1f} GB on disk, usually under 10 minutes. "
+            "Volume, Fusion, Maxar VHR (with a GEGD key) and the 3D viewer on a DEM "
+            "you load work without it.")
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        # live status: says whether the tools can run right now, instead of
+        # making the user press Search to find out.
+        self.env_status = QLabel()
+        self.env_status.setWordWrap(True)
+        v.addWidget(self.env_status)
+
+        self.setup_btn = QPushButton("Install imagery tools")
+        f = self.setup_btn.font(); f.setBold(True); self.setup_btn.setFont(f)
+        self.setup_btn.setToolTip(
+            "Downloads uv (Astral's Python installer), a private Python "
+            f"{environment.PYTHON_VERSION} and the pinned imagery packages into "
+            f"{environment.data_dir()}. Nothing is installed into QGIS itself, "
+            "and Remove deletes all of it.")
+        self.setup_btn.clicked.connect(self._start_setup)
+        self.setup_cancel_btn = QPushButton("Cancel")
+        self.setup_cancel_btn.setToolTip("Stop the install. Nothing half-installed "
+                                         "is left marked as ready.")
+        self.setup_cancel_btn.clicked.connect(self._cancel_setup)
+        self.setup_remove_btn = QPushButton("Remove…")
+        self.setup_remove_btn.setToolTip(
+            f"Delete the installed imagery tools ({environment.data_dir()}). Your "
+            "results are not touched; you can install again at any time.")
+        self.setup_remove_btn.clicked.connect(self._remove_setup)
+        row = FlowRow()
+        for b in (self.setup_btn, self.setup_cancel_btn, self.setup_remove_btn):
+            row.addWidget(b)
+        v.addWidget(row)
+        self.setup_progress = QProgressBar()
+        self.setup_progress.setRange(0, 100)
+        v.addWidget(self.setup_progress)
+        self.setup_log = QPlainTextEdit()
+        self.setup_log.setReadOnly(True)
+        self.setup_log.setMaximumHeight(140)
+        self.setup_log.setPlaceholderText("Install log")
+        v.addWidget(self.setup_log)
+        self._setup_task = None
+
         self.python_edit = QLineEdit(self.settings.value(
             "landslide/python", "", type=str))
         self.project_edit = QLineEdit(self.settings.value(
             "landslide/project", "", type=str))
         self.out_edit = QLineEdit(self.settings.value(
             "landslide/out", "", type=str))
-        for label, edit, picker, placeholder, tip in (
-            ("Python for the imagery tools", self.python_edit, self._pick_python,
-             "…/landslide_groundtruth/venv/bin/python3",
-             "The python program inside the project's venv folder — 'python3' in "
-             "venv/bin (macOS/Linux) or python.exe in venv\\Scripts (Windows). "
-             "The plugin runs the imagery tools with it, so they stay out of QGIS. "
-             "Called 'venv python' in the documentation."),
-            ("Folder with the imagery tools", self.project_edit, self._pick_project,
-             "…/landslide_groundtruth   (the folder containing run_single.py)",
-             "The folder you downloaded the pipeline into. It must contain "
-             "run_single.py."),
-            ("Results (unsaved projects)", self.out_edit, self._pick_out,
-             "leave blank for <tools folder>/out/interactive",
+        adv = QgsCollapsibleGroupBox("Use my own Python (advanced)")
+        adv.setSaveCollapsedState(False)
+        self.env_adv_box = adv
+        af = QFormLayout(adv)
+        rows = (
+            (af, "Python for the imagery tools", self.python_edit, self._pick_python,
+             "leave blank to use the imagery tools installed above",
+             "Only for running the pipeline from your own environment, e.g. a "
+             "development checkout: the python program inside that venv — "
+             "'python3' in venv/bin (macOS/Linux) or python.exe in venv\\Scripts "
+             "(Windows). When this is filled in it is used instead of the "
+             "installed imagery tools."),
+            (af, "Folder with the imagery tools", self.project_edit, self._pick_project,
+             "leave blank to use the scripts that come with the plugin",
+             "A folder containing run_single.py (a checkout of the repository) to "
+             "run instead of the copy shipped with the plugin."),
+        )
+        of = QFormLayout()
+        rows += (
+            (of, "Results (unsaved projects)", self.out_edit, self._pick_out,
+             "leave blank for Documents/Landslide Ground-Truthing",
              "A SAVED project keeps every tab's results — PlanetScope, Sentinel-2/"
              "Landsat, SAR, Fusion, volume, 3D — in its own folder, beside its "
              ".qgz, so switching projects switches the files with it. This folder "
              "is used only until the project is saved, and for data every project "
-             "shares (the RGI glacier outlines). Leave blank for out/interactive "
-             "inside the tools folder."),
-        ):
+             "shares (the RGI glacier outlines)."),
+        )
+        for form, label, edit, picker, placeholder, tip in rows:
             edit.setPlaceholderText(placeholder)
             edit.setToolTip(tip)
             edit.textChanged.connect(self._refresh_env_status)
-            row = QHBoxLayout()
-            row.addWidget(edit)
+            edit.textChanged.connect(self._save_settings)
+            line = QHBoxLayout()
+            line.addWidget(edit)
             btn = QPushButton("Browse…")
             btn.setToolTip("Choose " + label[0].lower() + label[1:])
             btn.clicked.connect(picker)
-            row.addWidget(btn)
-            ef.addRow(label, row)
+            line.addWidget(btn)
+            form.addRow(label, line)
+        adv.setCollapsed(not (self.python_edit.text().strip()
+                              or self.project_edit.text().strip()))
         # Where results land right now — this project's folder once it's saved (see
         # results_dir), so the field above only matters until then.
         self.results_label = QLabel()
         self.results_label.setWordWrap(True)
         self.results_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        ef.addRow("Results now go to", self.results_label)
-        # live status: says whether what is typed actually works, instead of
-        # making the user press Search to find out.
-        self.env_status = QLabel()
-        self.env_status.setWordWrap(True)
-        ef.addRow("", self.env_status)
+        of.addRow("Results now go to", self.results_label)
+        v.addLayout(of)
+        v.addWidget(adv)
         self._refresh_env_status()
-        # Opens itself when unconfigured. setSaveCollapsedState(False) means the
-        # collapse state is recomputed every session, so a configured user still
-        # gets it out of the way and an unconfigured one cannot miss it.
+        # Opens itself until the tools can run. setSaveCollapsedState(False) means
+        # the collapse state is recomputed every session, so a configured user
+        # still gets it out of the way and an unconfigured one cannot miss it.
         env.setCollapsed(self._env_ok()[0])
         return env
 
-    def _env_ok(self):
-        """(ok, message) for the current Environment paths.
+    # ---------- which Python runs the pipeline ----------
+    def pipeline_python(self):
+        """The user's own Python when one is set (advanced), else the installed one."""
+        from . import environment
+        return self.python_edit.text().strip() or environment.env_python()
 
-        Checked in the order the user fills them in, so the message always names
-        the FIRST thing still wrong rather than the last."""
+    def pipeline_dir(self):
+        """The folder holding run_single.py: the user's own (advanced), else the
+        scripts shipped with the plugin."""
+        from . import environment
+        return self.project_edit.text().strip() or environment.bundled_pipeline_dir()
+
+    def pipeline_launch(self):
+        """(python, script, cwd) for a run_single.py subprocess, or None.
+
+        None means the tools can't run yet; env_gate has already said why and
+        opened the Setup box, so a caller just returns."""
+        if not self.env_gate():
+            return None
+        d = self.pipeline_dir()
+        return self.pipeline_python(), os.path.join(d, "run_single.py"), d
+
+    def _env_ok(self):
+        """(ok, message) for whatever will run the pipeline.
+
+        Own Python set: check it the old way, in the order the fields are filled
+        in, so the message names the FIRST thing still wrong. Otherwise: the state
+        of the installed imagery tools (environment.status)."""
+        from . import environment
         py = self.python_edit.text().strip()
-        proj = self.project_edit.text().strip()
-        if not py:
-            return False, "Choose the Python program that has the imagery tools installed."
-        if not os.path.exists(py):
-            return False, "There is no file at that Python path."
-        if not proj:
-            return False, "Choose the folder you downloaded the pipeline into."
-        if not os.path.exists(os.path.join(proj, "run_single.py")):
-            return False, "That folder has no run_single.py in it — pick the folder that does."
-        return True, "Ready — the imagery tools can be run."
+        d = self.pipeline_dir()
+        if py and not os.path.exists(py):
+            return False, "There is no file at the Python path in 'Use my own Python'."
+        if not d or not os.path.exists(os.path.join(d, "run_single.py")):
+            return False, ("The folder in 'Use my own Python' has no run_single.py in "
+                           "it — pick the folder that does, or clear it.")
+        if py:
+            return True, "Ready — using your own Python (advanced)."
+        state, msg = environment.status()
+        return environment.usable(state), msg
 
     def _refresh_env_status(self, *_):
-        """Repaint the status line, and clear any red border once a path is fixed."""
+        """Repaint the status line and the buttons, and clear any red border once a
+        path is fixed."""
+        from . import environment
         ok, msg = self._env_ok()
-        kind = "success" if ok else "warn"
+        state, _ = environment.status()
+        running = self._setup_task is not None
+        own = bool(self.python_edit.text().strip())
+        kind = "success" if ok and state != environment.STALE else "warn"
+        if running:
+            kind, msg = "info", "Installing the imagery tools…"
         self.env_status.setText(status_text(kind, msg))
         self.env_status.setStyleSheet(status_css(kind))
+        label = {environment.STALE: "Update imagery tools",
+                 environment.BROKEN: "Repair imagery tools"}.get(
+            state, "Install imagery tools")
+        self.setup_btn.setText(label)
+        self.setup_btn.setVisible(not own and state != environment.READY)
+        self.setup_btn.setEnabled(not running)
+        self.setup_cancel_btn.setVisible(running)
+        self.setup_remove_btn.setVisible(
+            not running and state != environment.MISSING)
+        self.setup_progress.setVisible(running)
+        self.setup_log.setVisible(running or bool(self.setup_log.toPlainText()))
         for edit in (self.python_edit, self.project_edit, self.out_edit):
             if edit.styleSheet() and edit.text().strip():
                 edit.setStyleSheet("")
         self._refresh_results_dir()
+
+    # ---------- installing the imagery tools ----------
+    def _pipeline_running(self):
+        """True while any tab's run_single.py subprocess is going."""
+        from qgis.core import QgsTask
+        for owner in (self, getattr(self, "planet_tab", None),
+                      getattr(self, "sar_tab", None),
+                      getattr(self, "viewer3d_tab", None)):
+            t = getattr(owner, "task", None)
+            try:
+                if t is not None and t.status() in (QgsTask.TaskStatus.Queued,
+                                                    QgsTask.TaskStatus.OnHold,
+                                                    QgsTask.TaskStatus.Running):
+                    return True
+            except RuntimeError:        # finished task, C++ side already deleted
+                pass
+        return False
+
+    def _start_setup(self):
+        from .environment import SetupTask
+        if self._setup_task is not None:
+            return
+        if self._pipeline_running():
+            self._warn("Wait for the running search to finish, then install.")
+            return
+        task = SetupTask()
+        task.logLine.connect(self._setup_line)
+        task.progressChanged.connect(
+            lambda p: self.setup_progress.setValue(int(p)))
+        task.taskCompleted.connect(lambda: self._setup_done(True))
+        task.taskTerminated.connect(lambda: self._setup_done(False))
+        self._setup_task = task
+        self.setup_log.clear()
+        self.setup_progress.setValue(0)
+        self._refresh_env_status()
+        QgsApplication.taskManager().addTask(task)
+
+    def _setup_line(self, line):
+        self.setup_log.appendPlainText(line)
+
+    def _cancel_setup(self):
+        if self._setup_task is not None:
+            self._setup_task.cancel()
+
+    def _setup_done(self, ok):
+        task, self._setup_task = self._setup_task, None
+        cancelled = task is not None and task.isCanceled()
+        error = getattr(task, "error", "") if task is not None else ""
+        self._refresh_env_status()
+        if ok:
+            self.iface.messageBar().pushSuccess(
+                "Landslide", "The imagery tools are installed — Sentinel-2/Landsat, "
+                "PlanetScope, SAR and DEM download can run now.")
+            self.env_box.setCollapsed(True)
+        elif cancelled:
+            self.iface.messageBar().pushInfo(
+                "Landslide", "Install cancelled. Click Install imagery tools to "
+                "start again; anything already downloaded is reused.")
+        else:
+            self._warn("Installing the imagery tools failed. " + (error or "")
+                       + " The install log in the Setup box has the details.")
+
+    def _remove_setup(self):
+        from qgis.PyQt.QtWidgets import QMessageBox
+        from . import environment
+        if self._setup_task is not None:
+            return
+        if self._pipeline_running():
+            self._warn("Wait for the running search to finish, then remove.")
+            return
+        size = environment.installed_size_bytes() / 1e9
+        answer = QMessageBox.question(
+            self, "Remove the imagery tools",
+            f"Delete the imagery tools ({size:.1f} GB in {environment.data_dir()})?"
+            "\n\nYour results are not touched, and you can install the tools "
+            "again at any time.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            environment.remove()
+        except OSError as e:
+            self._warn(f"Could not remove everything: {e}")
+        self.setup_log.clear()
+        self._refresh_env_status()
+        self.env_box.setCollapsed(False)
 
     # ---------- where results are saved ----------
     def results_dir(self):
@@ -474,17 +662,22 @@ class LandslideDock(QgsDockWidget):
         return self.shared_dir()
 
     def shared_dir(self):
-        """The Environment's 'Results (unsaved projects)' folder, else
-        <tools folder>/out/interactive: results of a project not saved yet, and data
-        every project reuses (the RGI glacier archive, which needs an Earthdata
-        login to fetch again). "" when neither path is set — os.path.join("", "out",
-        "interactive") is the RELATIVE "out/interactive", which would drop files
-        wherever QGIS happened to be launched from."""
+        """The Setup box's 'Results (unsaved projects)' folder: results of a project
+        not saved yet, and data every project reuses (the RGI glacier archive, which
+        needs an Earthdata login to fetch again).
+
+        Blank falls back to <tools folder>/out/interactive when an own tools folder
+        is set (a development checkout, as before), else to
+        Documents/Landslide Ground-Truthing — never to a path inside the plugin,
+        which a plugin update replaces."""
+        from . import environment
         out = self.out_edit.text().strip()
         proj = self.project_edit.text().strip()
         if out:
             return out
-        return os.path.join(proj, "out", "interactive") if proj else ""
+        if proj:
+            return os.path.join(proj, "out", "interactive")
+        return environment.default_results_dir()
 
     def _refresh_results_dir(self, *_):
         """Say where results go right now (see results_dir)."""
@@ -518,24 +711,31 @@ class LandslideDock(QgsDockWidget):
         self._refresh_results_dir()
 
     def env_gate(self, edit=None):
-        """Refuse an action that needs the Environment, and POINT AT IT.
+        """Refuse an action that needs the imagery tools, and POINT AT the fix.
 
-        One shared refusal for every tab: opens the box, marks the offending
-        field, focuses it, and says what to do — instead of the old
-        "Set a valid venv python path." into a collapsed box the user has never
-        seen. Returns False so callers can `if not self.dock.env_gate(): return`."""
+        One shared refusal for every tab: opens the Setup box and says what to do.
+        Not installed yet: focuses Install imagery tools. Own Python set but
+        broken: opens 'Use my own Python' and marks the offending field. Returns
+        False so callers can `if not self.dock.env_gate(): return`."""
+        from . import environment
         ok, msg = self._env_ok()
         if ok:
             return True
-        self._warn("Before searching, open the Environment box at the top of this "
-                   "panel and set it up. " + msg + " Ask whoever installed the "
-                   "plugin if you are not sure.")
+        own = bool(self.python_edit.text().strip() or self.project_edit.text().strip())
+        if not own and environment.status()[0] == environment.MISSING:
+            msg += (" Click Install imagery tools in the Setup box at the top of this "
+                    "panel — a one-time download.")
+        self._warn(msg)
         try:
             self.env_box.setCollapsed(False)
+            if not own:
+                self.setup_btn.setFocus()
+                return False
+            self.env_adv_box.setCollapsed(False)
             target = edit
             if target is None:
-                target = (self.python_edit
-                          if not os.path.exists(self.python_edit.text().strip() or "\0")
+                py = self.python_edit.text().strip()
+                target = (self.python_edit if py and not os.path.exists(py)
                           else self.project_edit)
             target.setStyleSheet(invalid_field_css())
             target.setFocus()
@@ -612,9 +812,16 @@ class LandslideDock(QgsDockWidget):
         clear_btn = QPushButton("Clear")
         clear_btn.setToolTip("Forget the current detection.")
         clear_btn.clicked.connect(self._clear_detection)
+        example_btn = QPushButton("Try an example")
+        example_btn.setToolTip(
+            "Fill in a real event — the 8 August 2026 landslide on Iliamna Volcano — "
+            "and copy it into every tab, to see the workflow before using your own "
+            "detection.")
+        example_btn.clicked.connect(self._load_example)
         row = FlowRow()
         row.addWidget(self.det_apply_btn)
         row.addWidget(clear_btn)
+        row.addWidget(example_btn)
         v.addWidget(row)
 
         self.det_summary = QLabel()
@@ -664,6 +871,22 @@ class LandslideDock(QgsDockWidget):
             w.clear()
         self.detection = None
         self._render_detection()
+
+    # "Try an example": the Iliamna Volcano landslide of 2026-08-08, the event the
+    # plugin's Volume, Fusion and SAR work was developed on (event id, origin time
+    # UTC, lat, lon).
+    EXAMPLE_EVENT = ("AK2026-0808", "2026-08-08 13:00:00", "60.0265", "-153.0559")
+
+    def _load_example(self):
+        eid, when, lat, lon = self.EXAMPLE_EVENT
+        self.det_id_edit.setText(eid)
+        self.det_time_edit.setDateTime(QDateTime.fromString(when, "yyyy-MM-dd HH:mm:ss"))
+        self.det_lat_edit.setText(lat)
+        self.det_lon_edit.setText(lon)
+        self._apply_detection()
+        self.iface.messageBar().pushInfo(
+            "Landslide", "Example loaded: the 8 August 2026 landslide on Iliamna "
+            "Volcano. Next: the Sentinel-2 / Landsat tab → Search.")
 
     def _render_detection(self, warn=None):
         """Echo the record back — above all the LOCAL time.
@@ -1243,17 +1466,17 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- path pickers ----------
     def _pick_python(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Select venv python")
+        p, _ = QFileDialog.getOpenFileName(self, "Python for the imagery tools")
         if p:
             self.python_edit.setText(p)
 
     def _pick_project(self):
-        p = QFileDialog.getExistingDirectory(self, "Select project dir")
+        p = QFileDialog.getExistingDirectory(self, "Folder with the imagery tools")
         if p:
             self.project_edit.setText(p)
 
     def _pick_out(self):
-        p = QFileDialog.getExistingDirectory(self, "Select output dir")
+        p = QFileDialog.getExistingDirectory(self, "Results folder for unsaved projects")
         if p:
             self.out_edit.setText(p)
 
@@ -1388,15 +1611,13 @@ class LandslideDock(QgsDockWidget):
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             self._warn("Latitude must be -90..90 and longitude -180..180.")
             return None
-        python = self.python_edit.text().strip()
-        project = self.project_edit.text().strip()
         out = self.results_dir()        # this project's folder once it's saved
-        script = os.path.join(project, "run_single.py")
-        # One shared, actionable refusal that opens the Environment box and marks
-        # the offending field, instead of two dead-end strings naming a "venv".
-        if not self.env_gate():
+        # One shared, actionable refusal that opens the Setup box, instead of
+        # dead-end strings naming a "venv".
+        launch = self.pipeline_launch()
+        if launch is None:
             return None
-        self._save_settings()
+        python, script, project = launch
         os.makedirs(out, exist_ok=True)
 
         when = self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm")
@@ -3083,7 +3304,8 @@ class LandslideDock(QgsDockWidget):
         self.iface.messageBar().pushWarning("Landslide", text.replace("\n", " "))
         self._append_log(text)
 
-    def _save_settings(self):
+    def _save_settings(self, *_):
+        # On every edit: the paths live only here, not in the project (project_state)
         self.settings.setValue("landslide/python", self.python_edit.text().strip())
         self.settings.setValue("landslide/project", self.project_edit.text().strip())
         self.settings.setValue("landslide/out", self.out_edit.text().strip())

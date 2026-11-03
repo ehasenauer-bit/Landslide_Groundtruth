@@ -670,19 +670,12 @@ class Viewer3DTab(QWidget):
         if aoi is None:
             return None
         lat, lon, radius = aoi
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "viewer3d")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return None
+        python, script, project = launch
         os.makedirs(out, exist_ok=True)
         when = self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm")
         args = [
@@ -695,10 +688,14 @@ class Viewer3DTab(QWidget):
 
     def _on_search_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._log("Search finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("The DEM search stopped without a result.",
+                                           self.log.toPlainText()))
             return
         self._search_result = result
         # merge pre + post candidates (ArcticDEM strips + the 3DEP fallbacks the

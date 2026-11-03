@@ -11,9 +11,9 @@ role in one press.
 
 Checks: the file is really on disk and the layer reads from it; the role is set
 and pinned; the name carries the role so a reopened project re-matches it; a
-second press never writes over the first outline; and with nowhere to save
-(unsaved project, no Results folder) it refuses rather than quietly dropping the
-outline in a temp dir.
+second press never writes over the first outline; and an unsaved project with no
+Results folder set saves into the default one (Documents/Landslide Ground-Truthing,
+redirected to a temp folder here) rather than refusing or using a temp dir.
 """
 import os, sys, tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -89,15 +89,18 @@ project = QgsProject.instance()
 dock.out_edit.setText("")
 dock.project_edit.setText("")
 
-print("=== nowhere to save: the button says so instead of using a temp dir ===")
+print("=== unsaved, no Results folder: the default results folder, not a temp dir ===")
+from landslide_groundtruth import environment
+DEFAULT = tempfile.mkdtemp(prefix="default results ")
+environment.default_results_dir = lambda: DEFAULT   # never the real ~/Documents
 project.clear()
 tab.name_edit.setText("test slide")
-before = len(project.mapLayers())
 tab._new_role_layer("total")
-check("an unsaved project with no Results folder creates no layer",
-      len(project.mapLayers()) == before)
-check("the log says to save the project first",
-      "Save this QGIS project first" in tab.log.toPlainText())
+unsaved = tab._role_layer("total")
+src0 = unsaved.source().split("|", 1)[0] if unsaved is not None else ""
+check(f"an unsaved project's outline is saved in the default folder ({src0})",
+      os.path.isfile(src0) and os.path.dirname(src0) == DEFAULT)
+project.clear()
 
 print("\n=== New total area: a GeoPackage in the project's folder ===")
 A = tempfile.mkdtemp(prefix="proj outline ")     # a space, like the real folders

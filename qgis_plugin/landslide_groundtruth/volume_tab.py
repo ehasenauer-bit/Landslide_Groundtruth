@@ -1643,7 +1643,7 @@ class VolumeTab(QWidget):
         try:
             v, v_lo, v_hi, calc = volume_calc.volume_source(
                 a_best, A_low=a_low, A_high=a_high, material=self._material(),
-                fit="scar", project_dir=self.dock.project_edit.text().strip())
+                fit="scar", project_dir=self.dock.pipeline_dir())
         except Exception as e:
             warnings.append(f"Larsen et al. (2010) calculation failed: {e}")
             return {}

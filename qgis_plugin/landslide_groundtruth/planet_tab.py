@@ -1088,21 +1088,14 @@ class PlanetTab(QWidget):
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             self._warn("Latitude must be -90..90 and longitude -180..180.")
             return None
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         # own output subdir so a Planet search.json never clashes with the
         # Sentinel tab's search.json in the shared output directory
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return None
+        python, script, project = launch
         # feed the effective key (an account/pasted key wins over the ambient
         # PL_API_KEY) to the child so `planet.Planet()` authenticates as that account
         # without a separate `planet auth login`
@@ -1150,10 +1143,14 @@ class PlanetTab(QWidget):
 
     def _on_search_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._append_log("Search finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("The PlanetScope search stopped without "
+                                           "a result.", self.log.toPlainText()))
             return
         self._search_result = result
         self._fill_table(result)
@@ -1765,19 +1762,12 @@ class PlanetTab(QWidget):
         if not key:
             self._warn("Set a Planet API key (above) to order & render SR detail.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         self._apply_key_to_env(key)
         os.makedirs(out, exist_ok=True)
 
@@ -1832,10 +1822,14 @@ class PlanetTab(QWidget):
 
     def _on_detail_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._append_log("Render detail finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("Render detail stopped without a result.",
+                                           self.log.toPlainText()))
             # keep any prior pending order resumable (don't strand the button disabled)
             self._refresh_resume_btn()
             self._refresh_retone_btn()
@@ -2006,11 +2000,12 @@ class PlanetTab(QWidget):
 
         Imported straight into QGIS's Python — safe, unlike the imagery stack, because
         planet_cache is pure stdlib path/JSON bookkeeping. Loaded by explicit file path
-        rather than via sys.path so it always tracks the configured project dir instead
-        of a stale copy from a previous one."""
-        project = self.dock.project_edit.text().strip()
+        rather than via sys.path so it always tracks the pipeline folder in use (the
+        plugin's own, or the advanced box's) instead of a stale copy from a previous
+        one."""
+        project = self.dock.pipeline_dir()
         path = os.path.join(project, "planet_cache.py")
-        if not path or not os.path.exists(path):
+        if not project or not os.path.exists(path):
             return None
         try:
             import importlib.util
@@ -2057,8 +2052,11 @@ class PlanetTab(QWidget):
                 # Pick up orders downloaded before the shared cache existed so they
                 # appear in the picker too. Scoped to the output dirs, NOT the whole
                 # project — this runs on the GUI thread and walking venv/ would stall it.
-                pc.adopt([base_out, os.path.join(project, "out"),
-                          os.path.join(project, "Output")], log=lambda *_: None)
+                # No tools folder set: nothing older to adopt (and joining "" would
+                # scan a RELATIVE out/ wherever QGIS was launched from).
+                legacy = ([os.path.join(project, "out"), os.path.join(project, "Output")]
+                          if project else [])
+                pc.adopt([base_out] + legacy, log=lambda *_: None)
                 near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
                                    require_point=True)
                         if aoi else pc.entries())
@@ -2102,19 +2100,12 @@ class PlanetTab(QWidget):
             self._warn("Enter a valid latitude/longitude (or run Search) first — "
                        "Recall needs the location to know which orders to load.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         # No key is required when the clips are still on disk, but pass one through if
         # we have it so a cached order whose files were deleted can be re-downloaded
         # (also free) instead of failing.
@@ -2234,19 +2225,12 @@ class PlanetTab(QWidget):
             self._warn("Run 'Render detail' once first — Re-tone re-renders the "
                        "surface-reflectance clips that render leaves on disk.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         args = [
             "--lat", f"{last['lat']:.6f}", "--lon", f"{last['lon']:.6f}",
             "--datetime", last["when"], "--radius-km", f"{last['radius']:.2f}",
@@ -2333,19 +2317,12 @@ class PlanetTab(QWidget):
         if not key:
             self._warn("Set a Planet API key (above) to resume the order.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         self._apply_key_to_env(key)
         os.makedirs(out, exist_ok=True)
 

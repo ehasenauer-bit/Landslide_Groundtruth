@@ -387,8 +387,8 @@ class SarTab(QWidget):
             "seismic point. One event is not a validation: NISAR layers are "
             "named 'NISAR …' and the Fusion tab never picks them for you.\n\n"
             "Searching is free; previews and change maps read the pixels from "
-            "NASA Earthdata (log in once in the Environment header's 'NASA "
-            "Earthdata Login' box). Expect 10–25 s per NISAR scene, in the "
+            "NASA Earthdata (log in once in the 'NASA Earthdata Login' box "
+            "at the top of the Sentinel-2 / Landsat tab). Expect 10–25 s per NISAR scene, in the "
             "background.")
         form.addRow("", self.nisar_check)
         root.addLayout(form)
@@ -1090,20 +1090,13 @@ class SarTab(QWidget):
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             self._warn("Latitude must be -90..90 and longitude -180..180.")
             return None
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
         base_out = self.dock.results_dir()     # this project's folder once it's saved
         # own output subdir so this search.json never clashes with the other tabs'
         out = os.path.join(base_out, "sar")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return None
+        python, script, project = launch
         # persist the subscription key and feed it to the child so the
         # planetary_computer SDK can sign sentinel-1-rtc items
         key = self.key_edit.text().strip()
@@ -1174,10 +1167,14 @@ class SarTab(QWidget):
 
     def _on_search_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._append_log("Search finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("The SAR search stopped without a result.",
+                                           self.log.toPlainText()))
             return
         self._search_result = result
         self._fill_table(result)
@@ -3051,8 +3048,8 @@ class SarTab(QWidget):
             d = self._cd_out_dir()
             if not d:
                 self._append_log("  not saved: save the project (its results go "
-                                 "beside the .qgz), or set the folder with the imagery "
-                                 "tools in the Environment box, to keep change rasters")
+                                 "beside the .qgz), or set 'Results (unsaved projects)' "
+                                 "in the Setup box, to keep change rasters")
                 return None
             os.makedirs(d, exist_ok=True)
             tag = self._cd_settings_tag(meta or {})

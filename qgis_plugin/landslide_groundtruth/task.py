@@ -35,6 +35,9 @@ class PipelineTask(QgsTask):
         self.result = None
         self.returncode = None          # child exit code (negative = killed by signal)
         self.exit_note = ""             # plain-language reason when it exits non-zero
+        # QGIS's own proxy setting, read here on the GUI thread (QgsSettings)
+        from .environment import proxy_env
+        self._proxy_env = proxy_env()
 
     def run(self):
         cmd = [self.python_exe, self.script] + self.cli_args
@@ -48,11 +51,14 @@ class PipelineTask(QgsTask):
         except OSError:
             pass
 
+        from .environment import NO_WINDOW
+        env = self._clean_env()
+        env.update(self._proxy_env)
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=self.cwd, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
-                env=self._clean_env(),
+                env=env, creationflags=NO_WINDOW,   # no console flashing up on Windows
             )
         except Exception as e:
             self.logLine.emit(f"failed to launch: {e}")
@@ -157,16 +163,14 @@ FAILURE_HINTS = [
     # the interpreter never started at all.
     (r"Failed to import encodings module|init_fs_encoding"
      r"|No module named '?encodings'?",
-     "The Python you chose in Environment cannot start at all. It is probably "
-     "not the python inside the project's venv folder — pick venv/bin/python3 "
-     "(macOS/Linux) or venv\\Scripts\\python.exe (Windows)."),
-    (r"ModuleNotFoundError",
-     "The Python you chose is missing the imagery tools. Point Environment at "
-     "the python inside the project's venv folder, or re-run "
-     "'pip install -r requirements.txt' in that venv."),
-    (r"No module named",
-     "The Python you chose is missing a package the pipeline needs. Re-run "
-     "'pip install -r requirements.txt' in that venv."),
+     "The Python for the imagery tools cannot start at all. If you set your own "
+     "in the Setup box, pick the python inside a venv (venv/bin/python3, or "
+     "venv\\Scripts\\python.exe on Windows) — or clear it to use the installed "
+     "imagery tools; otherwise click Repair imagery tools."),
+    (r"ModuleNotFoundError|No module named",
+     "The imagery tools are missing a package this version needs. Click Update "
+     "imagery tools in the Setup box at the top of the panel (with your own "
+     "Python: re-run 'pip install -r requirements.txt' in it)."),
     (r"MemoryError|Unable to allocate|_ArrayMemoryError",
      "The run ran out of memory. Reduce the search radius and try again."),
     (r"No space left on device|Errno 28",
@@ -212,6 +216,14 @@ def failure_hint(text):
         if rx.search(text):
             return hint
     return ""
+
+
+def failure_message(what, log_text):
+    """`what` plus a next step read from the end of a tab's log, for the message
+    bar — the PlanetScope, SAR and 3D tabs' counterpart of dock.report_failure."""
+    tail = "\n".join((log_text or "").splitlines()[-25:])
+    hint = failure_hint(tail)
+    return f"{what} {hint}" if hint else f"{what} The tab's log says what it printed."
 
 
 def exit_reason(code):

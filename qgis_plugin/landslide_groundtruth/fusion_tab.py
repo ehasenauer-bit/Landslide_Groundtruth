@@ -983,8 +983,8 @@ class FusionTab(QWidget):
         self.rgi_btn.setToolTip(
             "Fetches RGI 7.0 region 01 (Alaska), the 'C' glacier-complex product, "
             "from NSIDC and caches it — about 40-80 MB, once.\n\nNSIDC requires a "
-            "NASA Earthdata Login: fill in the 'NASA Earthdata Login' box in the "
-            "Environment header first (it writes ~/.netrc, which this reads).\n\n"
+            "NASA Earthdata Login: fill in the 'NASA Earthdata Login' box at the "
+            "top of the Sentinel-2 / Landsat tab first (it writes ~/.netrc, which this reads).\n\n"
             "Leave the Outlines field empty and this cached copy is used "
             "automatically.")
         self.rgi_btn.clicked.connect(self._download_rgi)
@@ -1646,7 +1646,7 @@ class FusionTab(QWidget):
         cache = self._glacier_cache_dir()
         if not cache:
             self._warn("Set the folder with the imagery tools (or 'Results (unsaved "
-                       "projects)') in the Environment box first — the outlines are "
+                       "projects)') in the Setup box first — the outlines are "
                        "cached there, once, for every project.")
             return
         self.rgi_btn.setEnabled(False)
@@ -1730,7 +1730,7 @@ class FusionTab(QWidget):
                 return
         if not self._out_dir():
             self._warn("Save the project (its results go beside the .qgz), or set "
-                       "the folder with the imagery tools in the Environment box — "
+                       "'Results (unsaved projects)' in the Setup box — "
                        "otherwise the fused raster would be written relative to "
                        "whatever folder QGIS was started from.")
             return

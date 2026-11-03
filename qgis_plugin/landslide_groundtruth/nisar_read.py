@@ -99,7 +99,7 @@ def credentials():
     except OSError:
         pass
     return None, ("no NASA Earthdata login — open the 'NASA Earthdata Login' box "
-                  "in the plugin's Environment header and log in (it writes "
+                  "at the top of the Sentinel-2 / Landsat tab and log in (it writes "
                   f"~/.netrc), or set EARTHDATA_TOKEN. Free account: https://{EDL_HOST}/")
 
 
@@ -148,7 +148,7 @@ def configure_auth(url, cookie_jar=None):
     return how
 
 
-_LOGIN_FIX = ("Log in again in the 'NASA Earthdata Login' box (Environment header), "
+_LOGIN_FIX = ("Log in again in the 'NASA Earthdata Login' box (top of the Sentinel-2 / Landsat tab), "
               "and check that your Earthdata profile has approved the 'Alaska "
               "Satellite Facility Data Access' application.")
 RETRY_PAUSE_S = 3.0

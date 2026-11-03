@@ -37,7 +37,7 @@ assert ok is False and t.result is None
 tail="\n".join(lines)
 h=failure_hint(tail)
 print("   hint ->", h[:78])
-assert "missing the imagery tools" in h
+assert "missing a package" in h and "Update imagery tools" in h
 assert "credentials" not in h, "the 20240401 scene id must not trigger the 401 hint"
 print("   (note the log contains 20240401 — no false 401 hint)")
 

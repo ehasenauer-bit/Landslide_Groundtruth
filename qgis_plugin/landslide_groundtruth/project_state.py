@@ -23,10 +23,12 @@ control added later persists with no extra bookkeeping — with two exclusions:
 
   SECRET_ATTRS        credentials (Planet key, Earthdata/PC login). A .qgz is
                       shared and often committed; keys stay in QgsSettings.
-  GLOBAL_PATH_ATTRS   venv/project/output paths. Machine-specific, so they are
-                      saved per project AND kept in QgsSettings — a project
-                      without them keeps whatever the global store provided
-                      rather than being blanked.
+  GLOBAL_PATH_ATTRS   the Setup box's paths (own Python, tools folder, results
+                      folder). Machine-specific, so they live ONLY in
+                      QgsSettings: a project shared with someone else must not
+                      overwrite their paths with yours (and your user name).
+                      Older projects that still carry them have them ignored on
+                      open and scrubbed on the next save.
 """
 from functools import partial
 
@@ -81,7 +83,7 @@ SECRET_ATTRS = {
     "key_edit", "user_edit", "pass_edit", "ed_user_edit", "ed_pass_edit",
 }
 
-# saved per project, but a project without them keeps the global QgsSettings value
+# never written to the project file either: per machine, kept in QgsSettings
 GLOBAL_PATH_ATTRS = {"python_edit", "project_edit", "out_edit"}
 
 # owner attribute on the dock -> key prefix ("" = the dock itself)
@@ -119,7 +121,8 @@ class ProjectState:
             if owner is None:
                 continue
             for name, obj in sorted(vars(owner).items()):
-                if name.startswith("_") or name in SECRET_ATTRS:
+                if (name.startswith("_") or name in SECRET_ATTRS
+                        or name in GLOBAL_PATH_ATTRS):
                     continue
                 base = f"{prefix}/{name}" if prefix else name
                 # dict-of-widgets (e.g. dock.scene_checks) keyed by its own token
@@ -158,11 +161,12 @@ class ProjectState:
                 project.writeEntry(SCOPE, key, _read_widget(widget))
             except RuntimeError:      # widget deleted (dock torn down mid-save)
                 pass
+        for attr in GLOBAL_PATH_ATTRS:  # left behind by plugin versions before 1.0
+            project.removeEntry(SCOPE, attr)
 
     def restore(self, *_args):
         """Apply the project's saved values; keys the project doesn't carry fall
-        back to the construction-time defaults (or, for the environment paths,
-        to whatever the global QgsSettings already put in the field).
+        back to the construction-time defaults.
 
         Deferred by a zero-timer so it runs after QGIS has finished loading the
         project and any pending layout/signal work has settled."""
@@ -182,11 +186,11 @@ class ProjectState:
                     # (see RETIRED_DEFAULTS): today's default instead
                     _write_widget(widget, self._defaults.get(key, ""))
                     migrated.append((key, widget))
-                elif ok and not (value == "" and _is_global_path(key)):
+                elif ok:
                     # the project's own value wins — including a deliberately
                     # empty field, so a cleared input comes back cleared
                     _write_widget(widget, value)
-                elif not _is_global_path(key):
+                else:
                     # no value in this project (never saved, or a control added
                     # by a later plugin version): start from the default rather
                     # than inheriting the previously open project's AOI
@@ -229,12 +233,6 @@ def retired_since(saved_version):
         if have < int(ver):
             out.update(values)
     return out
-
-
-def _is_global_path(key):
-    """True for the environment-path fields, which must not be reset to a
-    construction-time default — the global QgsSettings value stands instead."""
-    return key.rsplit("/", 1)[-1] in GLOBAL_PATH_ATTRS
 
 
 def _persistable(w):
