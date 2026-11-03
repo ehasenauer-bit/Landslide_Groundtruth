@@ -1552,6 +1552,9 @@ class VolumeTab(QWidget):
         }
         row.update(thick)
         row.update(scar)
+        depth_note = volume_calc.implied_depth_note(_implied_depth(row)[0])
+        if depth_note:
+            warnings.append(depth_note)
         row["warnings"] = warnings          # on screen only; not a CSV column
         kept = self._record(row)
 

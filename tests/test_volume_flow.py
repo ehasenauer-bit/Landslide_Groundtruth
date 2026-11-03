@@ -70,6 +70,7 @@ class FakeIface(QObject):
 
 
 from landslide_groundtruth import volume_tab as VT
+from landslide_groundtruth import volume_calc as VC
 _help_before = QgsSettings().value(VT.HELP_SETTING, None)
 
 
@@ -146,12 +147,12 @@ def poly(name, wkt):
 print("\n=== the outlines are matched by name and read live ===")
 total = poly("Total Area", "POLYGON((0 1000000, 1000 1000000, 1000 1001000, "
                            "0 1001000, 0 1000000))")              # 1 km²
-source = poly("Source Area (best)", "POLYGON((300 1000500, 700 1000500, "
-                                    "700 1001000, 300 1001000, 300 1000500))")  # 0.2 km²
+source = poly("Source Area (best)", "POLYGON((300 1000750, 700 1000750, "
+                                    "700 1001000, 300 1001000, 300 1000750))")  # 0.1 km²
 check("Total Area → total, Source Area (best) → best",
       vol._role_layer("total") is total and vol._role_layer("best") is source)
 check(f"the readout shows both areas ({vol.role_lbl.text()!r})",
-      "TOTAL 1 km²" in vol.role_lbl.text() and "src best 0.2 km²" in vol.role_lbl.text())
+      "TOTAL 1 km²" in vol.role_lbl.text() and "src best 0.1 km²" in vol.role_lbl.text())
 
 print("\n=== one Measure: both fits, one row ===")
 vol.name_edit.setText("Test slide")
@@ -160,10 +161,10 @@ c = vol._current
 check(f"area × thickness: 1 km² × 2.5 m = {c and c.get('v_thick'):.4g} m³",
       c is not None and abs(c["v_thick"] - 2.5e6) / 2.5e6 < 0.01
       and c["thick_from"] == "total")
-check(f"source scar on the 0.2 km² scar: {c['v_larsen']:.4g} m³ "
+check(f"source scar on the 0.1 km² scar: {c['v_larsen']:.4g} m³ "
       f"({c['v_larsen_lo']:.3g}–{c['v_larsen_hi']:.3g})",
       c["v_larsen"] > 0 and c["v_larsen_lo"] < c["v_larsen"] < c["v_larsen_hi"]
-      and abs(c["larsen_area_m2"] - 2.0e5) / 2.0e5 < 0.01)
+      and abs(c["larsen_area_m2"] - 1.0e5) / 1.0e5 < 0.01)
 check("recorded as the slide's row without another click",
       vol._rows == [c] and vol.table.rowCount() == 1)
 check(f"both on screen ({vol.vol_thick_out.text()!r} / {vol.vol_scar_out.text()!r})",
@@ -200,7 +201,7 @@ f = next(total.getFeatures())
 check(f"vthk_m3 = {f['vthk_m3']}, vsrc_m3 = {f['vsrc_m3']}",
       abs(f["vthk_m3"] - c2["v_thick"]) < 1 and abs(f["vsrc_m3"] - c2["v_larsen"]) < 1)
 check("with the thickness, both areas, the length and the slide name",
-      f["thick_m"] == 3 and abs(f["src_m2"] - 2e5) < 2e3 and f["length_m"]
+      f["thick_m"] == 3 and abs(f["src_m2"] - 1e5) < 1e3 and f["length_m"]
       and f["slide"] == "Test slide")
 check("the source outline is left alone", source.fields().indexOf("vthk_m3") < 0)
 
@@ -258,6 +259,29 @@ vol._total_combo.setCurrentIndex(vol._total_combo.findData(total.id()))
 vol._best_combo.setCurrentIndex(vol._best_combo.findData(source.id()))
 vol._measure()
 check("a slide on screen before the switch", vol._current is not None and vol._rows)
+
+print("\n=== a Larsen volume too thick for a deposit on ice is flagged ===")
+check("the threshold is strict: 5.0 m passes, 5.1 m is flagged",
+      VC.implied_depth_note(5.0) is None and VC.implied_depth_note(5.1)
+      and VC.implied_depth_note(None) is None)
+check("the 0.1 km² scar over 1 km² (~2.6 m) carries no depth note",
+      "probably too high" not in vol.vol_warn_lbl.text())
+src_fid = next(source.getFeatures()).id()
+small_scar = QgsGeometry(next(source.getFeatures()).geometry())
+source.dataProvider().changeGeometryValues({src_fid: QgsGeometry.fromWkt(
+    "POLYGON((0 1000000, 1000 1000000, 1000 1000500, 0 1000500, 0 1000000))")})  # 0.5 km²
+vol._measure()
+big = vol._current
+depth = big["v_larsen"] / big["a_total"]
+check(f"a 0.5 km² scar over the same 1 km² implies {depth:.1f} m, and says so on screen",
+      depth > VC.LARSEN_DEPTH_FLAG_M and vol.vol_warn_lbl.isVisibleTo(vol)
+      and f"{depth:.1f} m mean thickness" in vol.vol_warn_lbl.text()
+      and "probably too high" in vol.vol_warn_lbl.text())
+check("and in the log", "probably too high" in vol.log.toPlainText())
+source.dataProvider().changeGeometryValues({src_fid: small_scar})
+vol._measure()
+check("back on the small scar the note goes away",
+      "probably too high" not in vol.vol_warn_lbl.text())
 project.clear()
 check("rows and readouts cleared, so no export mixes two events",
       vol._rows == [] and vol._current is None

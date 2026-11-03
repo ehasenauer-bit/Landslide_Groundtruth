@@ -163,6 +163,32 @@ THICKNESS_SETTINGS = [
      "30–50 m thick (Shugar & Clague 2011, p. 1764)."),
 ]
 
+# Mean thickness over the TOTAL outline above which the Larsen et al. volume is
+# flagged as probably too high for a deposit on a glacier. Deline et al. 2015,
+# Table 9.1: of 30 rock avalanches that came to rest on a glacier, rock volume ÷
+# deposit area has a median of 2.5 m (middle half 1.9–3.0 m) and only two exceed
+# 5 m (Morsárjökull 5.6, Mount Steele 10.2). Larsen spread over the total outline
+# on 28 of Ethan's Alaska slides ran 0.6–16 m, and on the five with a seismic volume
+# the excess over ~2 m tracked how far Larsen overshot it (checked 2026-11-03).
+# Off the ice a confined deposit can genuinely run 4–8 m (the "confined" setting
+# above), hence "on a glacier" in the note.
+LARSEN_DEPTH_FLAG_M = 5.0
+
+
+def implied_depth_note(depth_m):
+    """Warning text when the Larsen volume implies a mean thickness above
+    LARSEN_DEPTH_FLAG_M over the total outline, else None.
+
+    `depth_m` is the Larsen volume ÷ total outline area (verdict.implied_depth_m),
+    None when either is missing."""
+    if depth_m is None or depth_m <= LARSEN_DEPTH_FLAG_M:
+        return None
+    return (f"Larsen et al. implies a {depth_m:.1f} m mean thickness over the total "
+            f"outline. Only 2 of 30 rock-avalanche deposits on glaciers exceed "
+            f"{LARSEN_DEPTH_FLAG_M:g} m (median 2.5 m; Deline et al. 2015, Table 9.1), so "
+            "on ice this Larsen volume is probably too high. Check that the source "
+            "outline holds only the evacuated scar.")
+
 
 def thickness_setting(t_best, t_low, t_high):
     """The THICKNESS_SETTINGS entry whose mean/low/high these are, or None.
