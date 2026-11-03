@@ -595,13 +595,13 @@ class Viewer3DTab(QWidget):
                 continue          # our own aligned flip copies — not a drape choice
             node = root.findLayer(lyr.id())
             item = QListWidgetItem(lyr.name())
-            item.setData(Qt.UserRole, lyr.id())
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, lyr.id())
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             if prev:
                 check = lyr.id() in prev
             else:
                 check = bool(node and node.isVisible())
-            item.setCheckState(Qt.Checked if check else Qt.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if check else Qt.CheckState.Unchecked)
             self.drape_list.addItem(item)
         self.drape_list.blockSignals(False)
         self._refresh_before_after()
@@ -610,8 +610,8 @@ class Viewer3DTab(QWidget):
         ids = []
         for i in range(self.drape_list.count()):
             it = self.drape_list.item(i)
-            if it.checkState() == Qt.Checked:
-                ids.append(it.data(Qt.UserRole))
+            if it.checkState() == Qt.CheckState.Checked:
+                ids.append(it.data(Qt.ItemDataRole.UserRole))
         return ids
 
     def _on_drape_checks_changed(self, *_):
@@ -1675,7 +1675,7 @@ class Viewer3DTab(QWidget):
         if hasattr(model, "item"):
             for i in range(combo.count()):
                 it = model.item(i)
-                if it is not None and it.checkState() == Qt.Checked:
+                if it is not None and it.checkState() == Qt.CheckState.Checked:
                     d = combo.itemData(i)
                     if d:
                         out.append(d)
@@ -1701,7 +1701,7 @@ class Viewer3DTab(QWidget):
             it = model.item(i)
             if it is not None:
                 it.setCheckState(
-                    Qt.Checked if combo.itemData(i) in want else Qt.Unchecked)
+                    Qt.CheckState.Checked if combo.itemData(i) in want else Qt.CheckState.Unchecked)
 
     def _on_ba_changed(self, *_):
         # the before/after choice changed; which side is showing is now unknown
@@ -2133,7 +2133,7 @@ class Viewer3DTab(QWidget):
             img = job.renderedImage()
             ba = QByteArray()
             buf = QBuffer(ba)
-            buf.open(QIODevice.WriteOnly)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
             img.save(buf, "PNG")
             buf.close()
             uri = "data:image/png;base64," + bytes(ba.toBase64()).decode("ascii")
@@ -2223,11 +2223,11 @@ class Viewer3DTab(QWidget):
         from qgis.PyQt.QtCore import QByteArray, QBuffer, QIODevice, Qt
         try:
             w = int(width or self.THUMB_W)
-            small = img.scaledToWidth(w, Qt.SmoothTransformation) \
+            small = img.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation) \
                 if img.width() > w else img
             ba = QByteArray()
             buf = QBuffer(ba)
-            buf.open(QIODevice.WriteOnly)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
             ok = small.save(buf, "JPEG", 72)
             buf.close()
             if not ok:
@@ -2393,13 +2393,13 @@ class Viewer3DTab(QWidget):
             loop = QEventLoop()
             job.finished.connect(loop.quit)
             job.start()
-            loop.exec_()
+            loop.exec()
             img = job.renderedImage()
             if img is None or img.isNull():
                 return "", ""
             ba = QByteArray()
             buf = QBuffer(ba)
-            buf.open(QIODevice.WriteOnly)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
             ok = img.save(buf, "PNG")
             buf.close()
             if not ok:
@@ -2423,7 +2423,7 @@ class Viewer3DTab(QWidget):
             lyr = proj.mapLayer(lid)
             if not isinstance(lyr, QgsVectorLayer):
                 continue
-            if QgsWkbTypes.geometryType(lyr.wkbType()) == QgsWkbTypes.PointGeometry:
+            if QgsWkbTypes.geometryType(lyr.wkbType()) == Qgis.GeometryType.Point:
                 continue
             ext = lyr.extent()
             if ext is None or ext.isEmpty():
@@ -2571,7 +2571,7 @@ class Viewer3DTab(QWidget):
             gtype = QgsWkbTypes.geometryType(lyr.wkbType())
             # label expression for points (peaks): the layer's display field/expr
             lexpr = lctx = None
-            if gtype == QgsWkbTypes.PointGeometry and lyr.displayExpression():
+            if gtype == Qgis.GeometryType.Point and lyr.displayExpression():
                 lexpr = QgsExpression(lyr.displayExpression())
                 lctx = QgsExpressionContext(
                     QgsExpressionContextUtils.globalProjectLayerScopes(lyr))
@@ -2586,7 +2586,7 @@ class Viewer3DTab(QWidget):
                         g.transform(xform)
                     except Exception:
                         continue
-                if gtype == QgsWkbTypes.PolygonGeometry:
+                if gtype == Qgis.GeometryType.Polygon:
                     mps = g.asMultiPolygon() if g.isMultipart() else [g.asPolygon()]
                     for poly in mps:
                         if not poly:
@@ -2597,13 +2597,13 @@ class Viewer3DTab(QWidget):
                                 "outline": web3d_export.densify_ring(ring, step),
                                 "tris": web3d_export.subdivide_tris(
                                     web3d_export.triangulate_ring(ring), step)})
-                elif gtype == QgsWkbTypes.LineGeometry:
+                elif gtype == Qgis.GeometryType.Line:
                     mls = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
                     for ln in mls:
                         path = [[p.x() - cx, p.y() - cy] for p in ln]
                         if len(path) >= 2:
                             paths.append(path)
-                elif gtype == QgsWkbTypes.PointGeometry:
+                elif gtype == Qgis.GeometryType.Point:
                     pts = g.asMultiPoint() if g.isMultipart() else [g.asPoint()]
                     lbl = self._feature_label(lexpr, lctx, feat)
                     for p in pts:
@@ -2798,7 +2798,8 @@ class Viewer3DTab(QWidget):
                 lt = ""
             if "Fill" in lt:                            # fill symbol -> the ring is its STROKE
                 try:
-                    pen_ok = int(sl.strokeStyle()) != int(Qt.NoPen)
+                    # compared as enums: PyQt6's PenStyle refuses int()
+                    pen_ok = sl.strokeStyle() != Qt.PenStyle.NoPen
                 except Exception:
                     pen_ok = True
                 try:

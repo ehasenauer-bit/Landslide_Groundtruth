@@ -16,7 +16,7 @@ PKG = os.path.join(ROOT, "qgis_plugin")
 sys.path.insert(0, PKG)
 
 from qgis.core import QgsApplication
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app = QgsApplication([], True); app.initQgis()
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget
 from qgis.PyQt.QtCore import QObject, Qt
@@ -85,7 +85,7 @@ dock._fill_table(result)
 
 def row_of(cid):
     for r in range(dock.table.rowCount()):
-        if dock.table.item(r, 0).data(Qt.UserRole + 2) == cid:
+        if dock.table.item(r, 0).data(Qt.ItemDataRole.UserRole + 2) == cid:
             return r
     return None
 
@@ -97,14 +97,14 @@ check(f"its Cloud cell says 'bad data', not its 0% ({dock.table.item(r_bad, 3).t
       dock.table.item(r_bad, 3).text() == "bad data")
 check("the cell's tooltip says why", dock.table.item(r_bad, 3).toolTip() == BAD)
 check("it has no checkbox: not user-checkable ...",
-      not (side.flags() & Qt.ItemIsUserCheckable))
-check("... and no check indicator drawn", side.data(Qt.CheckStateRole) is None)
+      not (side.flags() & Qt.ItemFlag.ItemIsUserCheckable))
+check("... and no check indicator drawn", side.data(Qt.ItemDataRole.CheckStateRole) is None)
 check("it is not the ★ despite the lowest cloud", not side.text().startswith("★"))
 check("nor a ✓", not side.text().startswith("✓"))
 check("the honest 6% scene is the ★ instead",
       dock.table.item(r_ok, 0).text().startswith("★"))
 check("the honest row is still tickable",
-      bool(dock.table.item(r_ok, 0).flags() & Qt.ItemIsUserCheckable))
+      bool(dock.table.item(r_ok, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable))
 
 print("\n=== Preview on map and the ranking skip it ===")
 best = dock._best_streamable("post")

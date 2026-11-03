@@ -67,7 +67,7 @@ import re
 import tempfile
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import Qt, QUrl, QSize, QVariant
+from qgis.PyQt.QtCore import QMetaType, Qt, QUrl, QSize
 from qgis.PyQt.QtGui import QPixmap, QIcon, QColor
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
@@ -76,7 +76,7 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar, QPlainTextEdit, QTableWidget, QTableWidgetItem, QSplitter,
     QScrollArea, QGridLayout, QToolButton, QSlider, QApplication,
 )
-from qgis.core import (
+from qgis.core import (Qgis, 
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
     QgsNetworkAccessManager, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsField, QgsFeature, QgsFillSymbol, QgsGeometry, QgsPointXY,
@@ -354,10 +354,10 @@ class SarTab(QWidget):
         form.addRow(copy_btn)
 
         # Window: how far before / after the event to search, as day sliders.
-        self.pre_slider = QSlider(Qt.Horizontal)
+        self.pre_slider = QSlider(Qt.Orientation.Horizontal)
         self.pre_slider.setRange(1, 365)
         self.pre_slider.setValue(30)
-        self.post_slider = QSlider(Qt.Horizontal)
+        self.post_slider = QSlider(Qt.Orientation.Horizontal)
         self.post_slider.setRange(1, 365)
         self.post_slider.setValue(30)
         self.pre_lbl = QLabel()
@@ -459,7 +459,7 @@ class SarTab(QWidget):
         root.addWidget(self.progress)
 
         # --- outputs: candidate table / gallery / preview / log ---
-        split = QSplitter(Qt.Vertical)
+        split = QSplitter(Qt.Orientation.Vertical)
 
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
@@ -470,7 +470,7 @@ class SarTab(QWidget):
         # seismic-time bracket summary for the starred pair (see sar_pairing)
         self.pair_summary = QLabel("")
         self.pair_summary.setWordWrap(True)
-        self.pair_summary.setTextFormat(Qt.PlainText)
+        self.pair_summary.setTextFormat(Qt.TextFormat.PlainText)
         self.pair_summary.setVisible(False)
         self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
         tl.addWidget(self.pair_summary)
@@ -479,9 +479,9 @@ class SarTab(QWidget):
             ["Side", "Radar", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %",
              "Scene ID"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
@@ -496,7 +496,7 @@ class SarTab(QWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.gallery_scroll.setWidget(self.gallery_inner)
         gl.addWidget(self.gallery_scroll, 1)
         split.addWidget(gallerybox)
@@ -506,7 +506,7 @@ class SarTab(QWidget):
         pl.setContentsMargins(0, 0, 0, 0)
         pl.addWidget(QLabel("Scene preview (amplitude render)"))
         self.preview = QLabel("Search, then select a scene to preview it.")
-        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
         pl.addWidget(self.preview, 1)
@@ -990,7 +990,7 @@ class SarTab(QWidget):
 
         self.key_edit = QLineEdit(
             self.settings.value("landslide/pc_subscription_key", "", type=str))
-        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.key_edit.setPlaceholderText(
             "Subscription key (or set PC_SDK_SUBSCRIPTION_KEY)")
         self.key_edit.returnPressed.connect(self._test_key)
@@ -1045,10 +1045,10 @@ class SarTab(QWidget):
             return
         self._key_reply = None
         self.key_btn.setEnabled(True)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         err = reply.error()
         reply.deleteLater()
-        if err == QNetworkReply.NoError and status == 200:
+        if err == QNetworkReply.NetworkError.NoError and status == 200:
             self._save_key(key)
             self._set_key_status("✓ Key works — saved for SAR previews.", "success")
             self.key_box.setCollapsed(True)
@@ -1429,14 +1429,14 @@ class SarTab(QWidget):
                 "Sentinel-1 — C-band (~5.5 cm), VV/VH; Microsoft Planetary "
                 "Computer RTC. The benchmarked radar.")
             head = self.table.item(r, 0)
-            head.setData(Qt.UserRole, c.get("thumb_url"))
-            head.setData(Qt.UserRole + 1, cid)
-            head.setData(Qt.UserRole + 2, side)
-            head.setData(Qt.UserRole + 3, c.get("polarizations"))
+            head.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
+            head.setData(Qt.ItemDataRole.UserRole + 1, cid)
+            head.setData(Qt.ItemDataRole.UserRole + 2, side)
+            head.setData(Qt.ItemDataRole.UserRole + 3, c.get("polarizations"))
             # checkbox = include this scene in Preview on map. The ★ same-track
             # pair starts ticked; tick others to compare more scenes at once.
-            head.setFlags(head.flags() | Qt.ItemIsUserCheckable)
-            head.setCheckState(Qt.Checked if is_star else Qt.Unchecked)
+            head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            head.setCheckState(Qt.CheckState.Checked if is_star else Qt.CheckState.Unchecked)
             if is_star:
                 head.setToolTip(
                     "★ The default preview pair: post = nearest scene after the "
@@ -1538,7 +1538,7 @@ class SarTab(QWidget):
         track = "" if c.get("relative_orbit") is None else f"t{c['relative_orbit']}"
         cid = c.get("id")
         tile = QToolButton()
-        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
@@ -1571,7 +1571,7 @@ class SarTab(QWidget):
     def _tile_thumb_loaded(self, reply, tile, fallback):
         if reply in self._gallery_replies:
             self._gallery_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1592,7 +1592,7 @@ class SarTab(QWidget):
     def _select_row_by_id(self, cid):
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is not None and head.data(Qt.UserRole + 1) == cid:
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1) == cid:
                 self.table.selectRow(r)
                 return
 
@@ -1606,18 +1606,18 @@ class SarTab(QWidget):
         if not rows:
             return
         head = self.table.item(rows[0].row(), 0)
-        if head is None or not head.data(Qt.UserRole + 1):
+        if head is None or not head.data(Qt.ItemDataRole.UserRole + 1):
             return
-        url = self._preview_url(head.data(Qt.UserRole + 1),
-                                head.data(Qt.UserRole + 3), max_size=1024)
+        url = self._preview_url(head.data(Qt.ItemDataRole.UserRole + 1),
+                                head.data(Qt.ItemDataRole.UserRole + 3), max_size=1024)
         if not url:
             self._preview_pix = None
             self.preview.setText("No quicklook for this scene — Preview on map "
                                  "renders it over the AOI.")
             return
-        _side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
-        baked = (self._with_key(head.data(Qt.UserRole))
-                 if head.data(Qt.UserRole) and _sensor(c) != NISAR else None)
+        _side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
+        baked = (self._with_key(head.data(Qt.ItemDataRole.UserRole))
+                 if head.data(Qt.ItemDataRole.UserRole) and _sensor(c) != NISAR else None)
         self._preview_fallback = baked if (baked and baked != url) else None
         self._fetch_preview(url)
 
@@ -1633,7 +1633,7 @@ class SarTab(QWidget):
             reply.deleteLater()
             return
         self._preview_reply = None
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1654,7 +1654,7 @@ class SarTab(QWidget):
             return
         self.preview.setPixmap(self._preview_pix.scaled(
             max(self.preview.width(), 1), max(self.preview.height(), 1),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1688,9 +1688,9 @@ class SarTab(QWidget):
         picks = []
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+            side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
             if c:
                 picks.append((side, c))
         if not picks:
@@ -1704,7 +1704,7 @@ class SarTab(QWidget):
         head = self.table.item(item.row(), 0)
         if head is None:
             return
-        side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+        side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
         if c:
             self._render_scenes(self._labeled([(side, c)]), mode="preview")
 
@@ -1977,8 +1977,8 @@ class SarTab(QWidget):
     def _tif_loaded(self, reply, label, cand):
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         path = None
@@ -2174,9 +2174,9 @@ class SarTab(QWidget):
         ticked_pre, ticked_post, other = [], [], 0
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+            side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
             if c and _sensor(c) != radar:
                 other += 1
             elif c:
@@ -2385,9 +2385,9 @@ class SarTab(QWidget):
         posts = set()
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side, c = self._candidate_by_id(head.data(Qt.UserRole + 1))
+            side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
             if c and side == "post":
                 posts.add(_sensor(c))
         if len(posts) == 1:
@@ -2578,8 +2578,8 @@ class SarTab(QWidget):
     def _cd_tif_loaded(self, reply, role):
         if reply in self._cd_replies:
             self._cd_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         if ok and data:
@@ -2924,7 +2924,7 @@ class SarTab(QWidget):
             c = QColor(color)
             c.setAlpha(alpha)
             items.append(QgsColorRampShader.ColorRampItem(value, c, text))
-        fn = QgsColorRampShader(lo, hi, None, QgsColorRampShader.Interpolated)
+        fn = QgsColorRampShader(lo, hi, None, Qgis.ShaderInterpolationMethod.Linear)
         fn.setColorRampItemList(items)
         shader = QgsRasterShader()
         shader.setRasterShaderFunction(fn)
@@ -2951,7 +2951,7 @@ class SarTab(QWidget):
             c = QColor(color)
             c.setAlpha(alpha)
             items.append(QgsColorRampShader.ColorRampItem(value, c, text))
-        fn = QgsColorRampShader(0.0, 3.0, None, QgsColorRampShader.Discrete)
+        fn = QgsColorRampShader(0.0, 3.0, None, Qgis.ShaderInterpolationMethod.Discrete)
         fn.setColorRampItemList(items)
         shader = QgsRasterShader()
         shader.setRasterShaderFunction(fn)
@@ -3227,7 +3227,7 @@ class SarTab(QWidget):
                    tuple(round(float(v), 6) for v in gt), shape)
             if key not in cache:
                 # a few seconds per pass on the GUI thread: say so, at least
-                QApplication.setOverrideCursor(Qt.WaitCursor)
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
                 try:
                     sh, smeta = layover_dim.radar_shadow(
                         dem, gt, r["direction"], incidence_deg=inc,
@@ -3386,7 +3386,7 @@ class SarTab(QWidget):
             c = QColor(color)
             c.setAlpha(alpha)
             items.append(QgsColorRampShader.ColorRampItem(value, c, text))
-        fn = QgsColorRampShader(1.0, 2.0, None, QgsColorRampShader.Discrete)
+        fn = QgsColorRampShader(1.0, 2.0, None, Qgis.ShaderInterpolationMethod.Discrete)
         fn.setColorRampItemList(items)
         shader = QgsRasterShader()
         shader.setRasterShaderFunction(fn)
@@ -3638,8 +3638,8 @@ class SarTab(QWidget):
         ids = set()
         for idx in self.table.selectionModel().selectedRows():
             head = self.table.item(idx.row(), 0)
-            if head is not None and head.data(Qt.UserRole + 1):
-                ids.add(head.data(Qt.UserRole + 1))
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1):
+                ids.add(head.data(Qt.ItemDataRole.UserRole + 1))
         return ids
 
     def _draw_footprints(self):
@@ -3665,11 +3665,11 @@ class SarTab(QWidget):
                                  f"{radar} footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
-                QgsField("scene_id", QVariant.String),
-                QgsField("date", QVariant.String),
-                QgsField("gap_days", QVariant.Int),
-                QgsField("orbit", QVariant.String),
-                QgsField("track", QVariant.Int),
+                QgsField("scene_id", QMetaType.Type.QString),
+                QgsField("date", QMetaType.Type.QString),
+                QgsField("gap_days", QMetaType.Type.Int),
+                QgsField("orbit", QMetaType.Type.QString),
+                QgsField("track", QMetaType.Type.Int),
             ])
             lyr.updateFields()
             feats = []

@@ -49,7 +49,8 @@ METHODS = {"_nisar_amp_done", "_nisar_cd_done", "_terrain_masks",
 
 
 class _Qt:
-    WaitCursor = 3
+    class CursorShape:
+        WaitCursor = 3
 
 
 class _QApplication:

@@ -68,11 +68,11 @@ print("3c. status_color() follows the running palette")
 from qgis.PyQt.QtGui import QPalette, QColor as QC
 from qgis.PyQt.QtWidgets import QApplication
 qa=QApplication.instance()
-pal=qa.palette(); pal.setColor(QPalette.Window, QC("#333333")); qa.setPalette(pal)
+pal=qa.palette(); pal.setColor(QPalette.ColorRole.Window, QC("#333333")); qa.setPalette(pal)
 assert theme.is_dark_theme() is True
 assert theme.status_color("success")==theme.STATUS_COLORS_DARK["success"]
 print("   dark palette  ->", theme.status_color("success"))
-pal.setColor(QPalette.Window, QC("#F0F0F0")); qa.setPalette(pal)
+pal.setColor(QPalette.ColorRole.Window, QC("#F0F0F0")); qa.setPalette(pal)
 assert theme.is_dark_theme() is False
 assert theme.status_color("success")==theme.STATUS_COLORS_LIGHT["success"]
 print("   light palette ->", theme.status_color("success"))

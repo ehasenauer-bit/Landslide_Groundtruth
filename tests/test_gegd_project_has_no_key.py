@@ -42,9 +42,13 @@ os.environ["LANDSLIDE_GEGD_CACHE"] = os.path.join(TMP, "cache")
 
 from qgis.core import (QgsApplication, QgsNetworkAccessManager, QgsProject, QgsRasterLayer,
                        QgsSettings)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)
         break

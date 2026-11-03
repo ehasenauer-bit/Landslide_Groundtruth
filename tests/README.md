@@ -20,8 +20,17 @@ bundle** — not the project `venv`, which has the imagery stack but no PyQGIS.
 QGIS_PYTHON=/path/to/QGIS.app/Contents/Frameworks/bin/python3 ./tests/run_all.sh
 ```
 
-The runner also exports `PROJ_LIB` / `GDAL_DATA` from the bundle and clears
-`PYTHONHOME`. Both matter:
+To run everything against another QGIS (QGIS 4 / Qt6), name the whole app
+bundle. Its python, prefix (`QGIS_PREFIX`), auth-method plugins and PROJ/GDAL
+data are then used:
+
+```bash
+QGIS_APP=~/Applications/QGIS-final-4_2_3.app ./tests/run_all.sh
+```
+
+The runner points `LANDSLIDE_TOOLS_DIR` at an empty throwaway folder, so no test
+touches your real *Install imagery tools* environment. It also exports
+`PROJ_LIB` / `GDAL_DATA` from the bundle and clears `PYTHONHOME`. Both matter:
 
 * without `proj.db`, a coordinate transform silently returns its input
   unchanged, so the CRS check would pass for the wrong reason;
@@ -33,9 +42,11 @@ The runner also exports `PROJ_LIB` / `GDAL_DATA` from the bundle and clears
 
 | File | Guards against |
 |---|---|
-| `test_plugin_loads.py` | The plugin failing to import or build. Imports all 26 modules, builds the dock, checks all six tabs, tears down. Run this first — it catches a syntax error anywhere in the package. |
+| `test_plugin_loads.py` | The plugin failing to import or build. Imports every module, builds the dock, checks all seven tabs, tears down. Run this first — it catches a syntax error anywhere in the package. |
+| `test_setup_task.py` | *Install imagery tools* going wrong quietly: button → task → log/progress → done, and what success, failure and Cancel each leave behind. `LANDSLIDE_REAL_INSTALL=1` also runs the real download (about 260 MB). Run it after changing `requirements.lock` or `environment.py`. |
+| `test_paths_not_in_project.py` | A shared `.qgz` carrying the sender's Python/tools/results paths onto the recipient's machine. |
 | `test_detection.py` | Losing the seismic record's meaning: the UTC→Alaska calendar-day rollover, a dropped minus sign on longitude, out-of-range values half-accepted, and the tabs drifting apart, and each tab getting its own search radius (Sentinel-2 15, PlanetScope 10, Maxar 15 km). |
-| `test_env.py` | The Environment box going back to being a silent gate — it must open itself when unconfigured, validate progressively, and mark the field that is actually wrong. |
+| `test_env.py` | The Setup box going back to being a silent gate. It must open itself until the tools can run, offer Install / Update / Repair to match the install's state, and, with your own Python, validate progressively and mark the field that is actually wrong. |
 | `test_fail.py` | Error messages that cry wolf. 14 real failure signatures must be recognised **and 7 ordinary log lines must not be** — a bare `401` matches every PlanetScope scene from 1 April (`20240401_…`). |
 | `test_pick.py` | The map picker's CRS transform (round-trips through UTM 7N to six decimals) and the pasted `lat, lon` pair, which a validator used to swallow silently — pasted into **either** box, with hemisphere letters or lon-first (WKT/GeoJSON) order, while three numbers or degrees-minutes are left alone, and a pair being **typed** waits for Enter instead of splitting at "60.5, -1". `test_plugin_loads.py` pastes into every tab's pair. |
 | `test_defaults.py` | Shipping defaults that cannot answer the question: a default run must carry change evidence (the set is HDR + dBright since 2026-10-21), the dock must not shift the pre window to last summer (that box was removed), and a future or mid-winter window must warn. Also pins the scene list itself: the dock's checkboxes and `review_package.SCENE_KEYS` are two hand-kept copies (different interpreters, no shared import), so a checkbox whose token the export doesn't know would tick and silently produce nothing. And HDR — the one product heavy enough to hit `MemoryError`, and now on by default — must fail softly, so the picture can never take the change rasters down with it. |

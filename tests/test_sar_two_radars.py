@@ -51,7 +51,11 @@ def _lift():
     ast.fix_missing_locations(mod)
 
     class Qt:
-        Checked, Unchecked, UserRole = 2, 0, 256
+        class CheckState:
+            Checked, Unchecked = 2, 0
+
+        class ItemDataRole:
+            UserRole = 256
     ns = {"Qt": Qt}
     exec(compile(mod, SRC, "exec"), ns)
     return ns

@@ -21,8 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(ROOT, "qgis_plugin")
 sys.path.insert(0, PKG)
 
-from qgis.core import QgsApplication, QgsProject, QgsVectorLayer, QgsWkbTypes
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+from qgis.core import Qgis, QgsApplication, QgsProject, QgsVectorLayer, QgsWkbTypes
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app = QgsApplication([], True); app.initQgis()
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget
 from qgis.PyQt.QtCore import QObject
@@ -117,7 +117,7 @@ check(f"named for the slide and the role ({os.path.basename(src)})",
       os.path.basename(src) == "test_slide_total_area.gpkg")
 check("the layer is a polygon layer, with a slide field",
       total is not None
-      and total.geometryType() == QgsWkbTypes.PolygonGeometry
+      and total.geometryType() == Qgis.GeometryType.Polygon
       and total.fields().indexOf("slide") >= 0)
 check("the role is pinned, so a layer loaded later can't take it over",
       tab._role_pinned.get("total"))
@@ -149,7 +149,7 @@ from qgis.PyQt.QtCore import Qt
 
 def outline(layer):
     sl = layer.renderer().symbol().symbolLayer(0)
-    return sl.strokeColor().name(), sl.brushStyle() == Qt.NoBrush
+    return sl.strokeColor().name(), sl.brushStyle() == Qt.BrushStyle.NoBrush
 
 
 check(f"total: red outline, no fill {outline(total)}", outline(total) == ("#dc1e1e", True))
@@ -246,7 +246,7 @@ from qgis.PyQt.QtCore import Qt as _Qt
 pen = lambda l: l.renderer().symbol().symbolLayer(0).strokeStyle()
 check(f"low and high are blue, dashed and dotted {outline(low)} {outline(high)}",
       outline(low)[0] == "#1e5ae6" and outline(high)[0] == "#1e5ae6"
-      and pen(low) == _Qt.DashLine and pen(high) == _Qt.DotLine)
+      and pen(low) == _Qt.PenStyle.DashLine and pen(high) == _Qt.PenStyle.DotLine)
 check("name matching alone would give each its role",
       tab._match_role_layers([low]).get("low") is low
       and tab._match_role_layers([high]).get("high") is high)
@@ -256,7 +256,7 @@ tab._total_combo.setCurrentIndex(tab._total_combo.findData(low.id()))
 check(f"the low outline moved to Total area turns red {outline(low)}",
       outline(low)[0] == "#dc1e1e")
 mine = QgsVectorLayer("Polygon?crs=EPSG:4326", "my own outline", "memory")
-from qgis.core import QgsFillSymbol
+from qgis.core import Qgis, QgsFillSymbol
 mine.renderer().setSymbol(QgsFillSymbol.createSimple(
     {"color": "0,200,0,80", "outline_color": "0,120,0"}))
 project.addMapLayer(mine)
@@ -286,4 +286,10 @@ dock.teardown()
 _restore_settings()
 print(f"\n{OK} passed, {FAIL} failed")
 print("ALL PASS" if not FAIL else "FAILURES")
+# Shut down in QGIS's own order. Left to interpreter exit, QGIS 4 destroys the
+# dock's editing layers after its providers and segfaults (exit 139, after this
+# file has already passed); the real application unloads plugins first.
+del dock, tab
+import gc; gc.collect()
+app.exitQgis()
 sys.exit(1 if FAIL else 0)

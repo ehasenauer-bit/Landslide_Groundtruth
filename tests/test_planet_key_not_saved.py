@@ -26,11 +26,15 @@ sys.path.insert(0, PKG)
 sys.path.insert(0, ROOT)
 
 from qgis.core import QgsApplication, QgsProject, QgsRasterLayer
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 # That prefix resolves the provider plugins to …/MacOS/Contents/PlugIns (absent), which
 # leaves only gdal; the tile preview is an XYZ layer and needs the real 'wms' provider.
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)
         break
@@ -82,8 +86,8 @@ class FakeReply(QObject):
     finished = pyqtSignal()
     body = b""
     def attribute(s, attr):
-        return 201 if attr == QNetworkRequest.HttpStatusCodeAttribute else None
-    def error(s): return QNetworkReply.NoError
+        return 201 if attr == QNetworkRequest.Attribute.HttpStatusCodeAttribute else None
+    def error(s): return QNetworkReply.NetworkError.NoError
     def readAll(s): return QByteArray(s.body)
     def abort(s): pass
 

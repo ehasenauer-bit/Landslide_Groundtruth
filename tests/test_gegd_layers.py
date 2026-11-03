@@ -46,14 +46,18 @@ from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordina
                        QgsMapRendererParallelJob, QgsMapSettings, QgsNetworkAccessManager,
                        QgsProject, QgsRasterLayer, QgsRectangle, QgsRuleBasedRenderer,
                        QgsSettings)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)       # the APIHeader auth method lives here
         break
 app = QgsApplication([], True); app.initQgis()
-from qgis.PyQt.QtCore import QBuffer, QByteArray, QEventLoop, QIODevice, QSize, QTimer, QUrl
+from qgis.PyQt.QtCore import QBuffer, QByteArray, QEventLoop, QIODevice, QSize, Qt, QTimer, QUrl
 from qgis.PyQt.QtGui import QColor, QImage
 
 if not os.path.realpath(QgsSettings().fileName()).startswith(os.path.realpath(TMP)):
@@ -91,8 +95,8 @@ def _offline(request):
 QgsNetworkAccessManager.setRequestPreprocessor(_offline)
 
 # ---- a local stand-in for pro.gegd.com: tiles, and a WMS for the fallback ----
-_img = QImage(256, 256, QImage.Format_ARGB32); _img.fill(QColor(30, 140, 200))
-_ba = QByteArray(); _buf = QBuffer(_ba); _buf.open(QIODevice.WriteOnly); _img.save(_buf, "PNG")
+_img = QImage(256, 256, QImage.Format.Format_ARGB32); _img.fill(QColor(30, 140, 200))
+_ba = QByteArray(); _buf = QBuffer(_ba); _buf.open(QIODevice.OpenModeFlag.WriteOnly); _img.save(_buf, "PNG")
 PNG = bytes(_ba)
 SEEN = []                       # (path, query dict, maxar-api-key header) per request
 LK = threading.Lock()
@@ -144,7 +148,7 @@ HOST = "http://127.0.0.1:%d" % PORT
 
 def take():
     """The requests received since the last call (after the server threads settle)."""
-    lp = QEventLoop(); QTimer.singleShot(300, lp.quit); lp.exec_()
+    lp = QEventLoop(); QTimer.singleShot(300, lp.quit); lp.exec()
     with LK:
         got = list(SEEN)
         SEEN.clear()
@@ -163,7 +167,7 @@ def render(layer, rect4326):
     lp = QEventLoop(); job.finished.connect(lp.quit)
     job.start()
     QTimer.singleShot(30000, lp.quit)
-    lp.exec_()
+    lp.exec()
     return job.renderedImage()
 
 
@@ -300,7 +304,7 @@ stars = sorted(f["side"] for f in fp.getFeatures() if f["star"] == 1)
 check("the ★ pair is flagged in the attributes", stars == ["post", "pre"])
 rules = fp.renderer().rootRule().children() if isinstance(fp.renderer(), QgsRuleBasedRenderer) else []
 check("outline-only, rule-based (★ / mapping / dashed visual-or-context, per side)",
-      len(rules) == 6 and all(r.symbol().symbolLayer(0).brushStyle() == 0 for r in rules))
+      len(rules) == 6 and all(r.symbol().symbolLayer(0).brushStyle() == Qt.BrushStyle.NoBrush for r in rules))
 aoi = gl.aoi_layer(LAT, LON, 5.0, "AK2026-0808")
 c = next(aoi.getFeatures()).geometry().centroid().asPoint()
 check("search circle: one polygon centred on the epicentre, tagged",

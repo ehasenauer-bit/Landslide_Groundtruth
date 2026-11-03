@@ -34,9 +34,13 @@ TMP = tempfile.mkdtemp(prefix="planet_vault_")
 os.environ["QGIS_CUSTOM_CONFIG_PATH"] = TMP
 
 from qgis.core import QgsApplication, QgsCredentials, QgsSettings
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)
         break
@@ -116,8 +120,8 @@ class FakeReply(QObject):
     status = 200
     body = b""
     def attribute(s, attr):
-        return s.status if attr == QNetworkRequest.HttpStatusCodeAttribute else None
-    def error(s): return QNetworkReply.NoError
+        return s.status if attr == QNetworkRequest.Attribute.HttpStatusCodeAttribute else None
+    def error(s): return QNetworkReply.NetworkError.NoError
     def readAll(s): return QByteArray(s.body)
     def abort(s): pass
 

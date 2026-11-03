@@ -61,9 +61,13 @@ os.environ["QGIS_CUSTOM_CONFIG_PATH"] = os.path.join(TMP, "config")
 os.environ["LANDSLIDE_GEGD_CACHE"] = os.path.join(TMP, "cache")
 
 from qgis.core import QgsApplication, QgsLayerTreeGroup, QgsProject, QgsSettings, QgsVectorLayer
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)       # the APIHeader auth method lives here
         break
@@ -270,7 +274,7 @@ keys = {k for k, _w in dock.project_state._widgets if k.startswith("gegd/")}
 check(f"persisted widget set is exactly the pinned one (extra {sorted(keys - EXPECT)}, "
       f"missing {sorted(EXPECT - keys)})", keys == EXPECT)
 check("key_edit is a password-echo field and never persisted",
-      tab.key_edit.echoMode() == QLineEdit.PasswordEchoOnEdit
+      tab.key_edit.echoMode() == QLineEdit.EchoMode.PasswordEchoOnEdit
       and not any("key" in k for k in keys))
 d = {k: w for k, w in dock.project_state._widgets if k.startswith("gegd/")}
 defaults = (d["gegd/radius_spin"].value(), d["gegd/pre_days_spin"].value(),
@@ -404,8 +408,8 @@ starred = [i for i in range(tab._table.rowCount())
            if tab._table.item(i, 0).text().startswith("★")]
 check(f"table: 7 columns; exactly the two ★ rows, both ticked ({starred})",
       tab._table.columnCount() == 7 and len(starred) == 2
-      and all(tab._table.item(i, 0).checkState() == Qt.Checked for i in starred)
-      and sum(tab._table.item(i, 0).checkState() == Qt.Checked
+      and all(tab._table.item(i, 0).checkState() == Qt.CheckState.Checked for i in starred)
+      and sum(tab._table.item(i, 0).checkState() == Qt.CheckState.Checked
               for i in range(tab._table.rowCount())) == 2)
 stereo_rows = [i for i, r in enumerate(tab._row_strips) if r.stereo]
 check("stereo mates carry a badge", stereo_rows and all(
@@ -509,7 +513,7 @@ other = QgsVectorLayer("Point?crs=EPSG:4326", "another tab's layer", "memory")
 project.addMapLayer(other)
 old_ids = {l.id() for l in tab._stream_layers}
 row31 = next(i for i, r in enumerate(tab._row_strips) if r.strip.label == "2026-08-31 WV02")
-tab._table.item(row31, 0).setCheckState(Qt.Checked)
+tab._table.item(row31, 0).setCheckState(Qt.CheckState.Checked)
 tab._stream_picks()
 new = tab._stream_layers
 check(f"three streams now ({[l.name() for l in new]})", len(new) == 3)
@@ -581,7 +585,7 @@ try:
     check("a selected footprint is drawn as an outline, not QGIS's yellow fill",
           sp.selectionRenderingMode() == Qgis.SelectionRenderingMode.CustomSymbol
           and sp.selectionSymbol() is not None
-          and sp.selectionSymbol().symbolLayer(0).brushStyle() == Qt.NoBrush)
+          and sp.selectionSymbol().symbolLayer(0).brushStyle() == Qt.BrushStyle.NoBrush)
 except AttributeError:                  # QGIS < 3.34: no per-layer selection symbol
     print("  (skipped: no per-layer selection symbol in this QGIS)")
 tab._clear_selection()

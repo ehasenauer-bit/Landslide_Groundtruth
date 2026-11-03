@@ -30,7 +30,7 @@ from qgis.PyQt.QtWidgets import (
     QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
     QWidget,
 )
-from qgis.core import (
+from qgis.core import (Qgis, 
     QgsColorRampShader, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsRasterLayer, QgsRasterShader, QgsRectangle,
     QgsSingleBandPseudoColorRenderer,
@@ -288,7 +288,7 @@ class FusionTab(QWidget):
             "snow was — which is what separates a slide from a snowfall, a cloud "
             "shadow or speckle.")
         lbl.setWordWrap(True)
-        lbl.setTextFormat(Qt.RichText)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
         lbl.setStyleSheet("QLabel { color: palette(mid); }")
         return lbl
 
@@ -300,7 +300,7 @@ class FusionTab(QWidget):
         about to fuse the pair they think it is — which is why step 2 shows the
         footprint match and not just a tick."""
         box = QFrame()
-        box.setFrameShape(QFrame.StyledPanel)
+        box.setFrameShape(QFrame.Shape.StyledPanel)
         grid = QGridLayout(box)
         grid.setContentsMargins(10, 8, 10, 8)
         grid.setHorizontalSpacing(10)
@@ -310,7 +310,7 @@ class FusionTab(QWidget):
                                    "SAR change raster",
                                    "Fuse")):
             num = QLabel(f"{i + 1}")
-            num.setAlignment(Qt.AlignCenter)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
             num.setFixedWidth(20)
             num.setStyleSheet(
                 f"QLabel {{ color: white; background: {CLR_ACCENT};"
@@ -319,7 +319,7 @@ class FusionTab(QWidget):
             name.setStyleSheet("QLabel { font-weight: bold; }")
             status = QLabel("…")
             status.setWordWrap(True)
-            status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             grid.addWidget(num, i, 0)
             grid.addWidget(name, i, 1)
             grid.addWidget(status, i, 2)
@@ -339,7 +339,7 @@ class FusionTab(QWidget):
             html += (f'<span style="color:palette(mid); font-size:10px;">'
                      f'&nbsp; {detail}</span>')
         lbl.setText(html)
-        lbl.setTextFormat(Qt.RichText)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
         lbl.setStyleSheet("")
 
     def _update_steps(self):
@@ -549,8 +549,8 @@ class FusionTab(QWidget):
         self.cand_table = QTableWidget(0, 3)
         self.cand_table.setHorizontalHeaderLabels(["#", "Area km\u00b2", "Score"])
         self.cand_table.verticalHeader().setVisible(False)
-        self.cand_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.cand_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.cand_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.cand_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.cand_table.setMaximumHeight(180)
         hh = self.cand_table.horizontalHeader()
         hh.setStretchLastSection(True)
@@ -635,7 +635,7 @@ class FusionTab(QWidget):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(150)
-        self.log.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.log.setStyleSheet(
             "QTextEdit { font-family: Menlo, Consolas, monospace; font-size: 11px; }")
         return self.log
@@ -646,8 +646,8 @@ class FusionTab(QWidget):
         form = QFormLayout(box)
         # the dock can be as narrow as 360 px; without this the label column is
         # squeezed until "Optical change raster" elides to "Optica"
-        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._optical_combo = QComboBox()
         self._optical_combo.setToolTip(
@@ -723,8 +723,8 @@ class FusionTab(QWidget):
 
         # --- everything below is "use more of what you already have" ---
         rule = QFrame()
-        rule.setFrameShape(QFrame.HLine)
-        rule.setFrameShadow(QFrame.Sunken)
+        rule.setFrameShape(QFrame.Shape.HLine)
+        rule.setFrameShadow(QFrame.Shadow.Sunken)
         form.addRow(rule)
         more = QLabel("Use every companion raster the same run produced")
         more.setStyleSheet("QLabel { color: palette(mid); }")
@@ -1078,7 +1078,7 @@ class FusionTab(QWidget):
         bar = f'<span style="color:{colour};">&#9612;</span> ' if colour else ""
         weight = "font-weight:bold;" if bold else "color:palette(mid);"
         lbl = QLabel(f'{bar}<span style="{weight}">{text}</span>')
-        lbl.setTextFormat(Qt.RichText)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
         return lbl
 
     @staticmethod
@@ -1650,7 +1650,7 @@ class FusionTab(QWidget):
                        "cached there, once, for every project.")
             return
         self.rgi_btn.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             path = fusion_glacier.ensure_rgi_c01(cache, log=self._step)
             self.glacier_path_edit.setText(path)
@@ -1735,7 +1735,7 @@ class FusionTab(QWidget):
                        "whatever folder QGIS was started from.")
             return
         self.run_btn.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self._fuse(opt_path, sar_path)
         except Exception as e:                       # noqa: BLE001
@@ -2377,7 +2377,7 @@ class FusionTab(QWidget):
     def _style_score(self, layer, band):
         shader = QgsRasterShader()
         ramp = QgsColorRampShader()
-        ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        ramp.setColorRampType(Qgis.ShaderInterpolationMethod.Linear)
         items = []
         for value, hexcolor, alpha in SCORE_RAMP:
             c = QColor(hexcolor)
@@ -2402,7 +2402,7 @@ class FusionTab(QWidget):
         starting at CONF_NONE."""
         shader = QgsRasterShader()
         ramp = QgsColorRampShader()
-        ramp.setColorRampType(QgsColorRampShader.Discrete)
+        ramp.setColorRampType(Qgis.ShaderInterpolationMethod.Discrete)
 
         def _c(hexcolor, alpha):
             c = QColor(hexcolor)
@@ -2470,7 +2470,7 @@ class FusionTab(QWidget):
         if bold:
             style += "font-weight:bold;"
         self.log.append(f'<span style="{style}">{esc}</span>')
-        self.log.moveCursor(QTextCursor.End)
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
 
     def _warn(self, text):
         self.iface.messageBar().pushWarning("Fusion", text)

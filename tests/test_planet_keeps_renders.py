@@ -24,11 +24,15 @@ PLUG = os.path.join(PKG, "landslide_groundtruth")
 sys.path.insert(0, PKG)
 
 from qgis.core import QgsApplication, QgsProject
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 # That prefix resolves the provider plugins to …/MacOS/Contents/PlugIns (absent), which
 # leaves only gdal; the tile preview is an XYZ layer and needs the real 'wms' provider.
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)
         break
@@ -211,7 +215,7 @@ tab._search_result = dict(lat=60.26, lon=-140.817, params=dict(radius_km=5.0),
 tab._fill_table(tab._search_result)
 from qgis.PyQt.QtCore import Qt as _Qt
 for r in range(tab.table.rowCount()):
-    tab.table.item(r, 0).setCheckState(_Qt.Checked)
+    tab.table.item(r, 0).setCheckState(_Qt.CheckState.Checked)
 picks = dict(tab._preview_picks())
 check(f"4 ticked scenes -> 3 layers ({list(picks)})", len(picks) == 3)
 check("the two 08-24 frames are ONE layer holding both ids",

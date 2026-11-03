@@ -12,7 +12,7 @@ sys.path.insert(0, PKG)
 
 import traceback, warnings
 from qgis.core import QgsApplication, QgsProject
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app=QgsApplication([],True); app.initQgis()
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget
 from qgis.PyQt.QtCore import QObject, pyqtSignal

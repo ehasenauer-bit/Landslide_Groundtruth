@@ -48,7 +48,7 @@ from qgis.core import (
     QgsField, QgsFeature, QgsFillSymbol, QgsGeometry, QgsPointXY,
 )
 from qgis.gui import QgsCollapsibleGroupBox
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
@@ -239,10 +239,10 @@ class PlanetTab(QWidget):
         form = self._options_group(root, "Search window", collapsed=False)
 
         # Window: how far before / after the event to search, as day sliders.
-        self.pre_slider = QSlider(Qt.Horizontal)
+        self.pre_slider = QSlider(Qt.Orientation.Horizontal)
         self.pre_slider.setRange(1, 365)
         self.pre_slider.setValue(30)
-        self.post_slider = QSlider(Qt.Horizontal)
+        self.post_slider = QSlider(Qt.Orientation.Horizontal)
         self.post_slider.setRange(1, 365)
         self.post_slider.setValue(30)
         self.pre_lbl = QLabel()
@@ -264,7 +264,7 @@ class PlanetTab(QWidget):
         form = self._options_group(root, "Scene filters")
 
         # Cloud cover as a teal slider, echoing Planet Explorer's slider filters.
-        self.cloud_slider = QSlider(Qt.Horizontal)
+        self.cloud_slider = QSlider(Qt.Orientation.Horizontal)
         self.cloud_slider.setRange(0, 100)
         # 100 = no cap. The search only LISTS scenes for you to judge by eye, and the
         # cap reads Planet's WHOLE-SCENE cloud_cover (a ~32x20 km strip), so it can't
@@ -278,7 +278,7 @@ class PlanetTab(QWidget):
             "only to thin a long list. Snow and ice are NOT counted as cloud.")
         self.cloud_lbl = QLabel("100%")
         self.cloud_lbl.setFixedWidth(38)
-        self.cloud_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.cloud_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cloud_slider.valueChanged.connect(
             lambda v: self.cloud_lbl.setText(f"{v}%"))
         crow = QHBoxLayout()
@@ -617,7 +617,7 @@ class PlanetTab(QWidget):
             "'Recall order (free)' to load exactly it, or leave it on 'Newest' to load "
             "the most recent before & after. Empty means nothing has been ordered here "
             "yet — the first 'Render detail' is the only one that costs quota.")
-        self.recall_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.recall_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         # The ledger is cumulative — every order this account has ever paid for near
         # the AOI shows up here — so cap the drop-down and let it scroll instead of
         # growing past the bottom of the screen. Needs 'combobox-popup: 0' in the
@@ -647,7 +647,7 @@ class PlanetTab(QWidget):
         root.addWidget(self.progress)
 
         # --- outputs: candidate table / gallery / thumbnail / log ---
-        split = QSplitter(Qt.Vertical)
+        split = QSplitter(Qt.Orientation.Vertical)
 
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
@@ -658,11 +658,11 @@ class PlanetTab(QWidget):
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Extended selection: click a scene to preview exactly it, Ctrl/Shift-click to
         # preview several (e.g. a specific before + after, or two candidates to compare).
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
@@ -677,7 +677,7 @@ class PlanetTab(QWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.gallery_scroll.setWidget(self.gallery_inner)
         gl.addWidget(self.gallery_scroll, 1)
         split.addWidget(gallerybox)
@@ -687,7 +687,7 @@ class PlanetTab(QWidget):
         pl.setContentsMargins(0, 0, 0, 0)
         pl.addWidget(self._section("Scene preview  (browse image)"))
         self.preview = QLabel("Search, then select a scene to preview its browse image.")
-        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
         pl.addWidget(self.preview, 1)
@@ -794,7 +794,7 @@ class PlanetTab(QWidget):
         # 2026-10-13 saved it in plain text in QGIS3.ini, so drop any copy they left.
         self.settings.remove("landslide/planet_pass")
         self.pass_edit = QLineEdit()
-        self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.pass_edit.setPlaceholderText("password")
         self.pass_edit.returnPressed.connect(self._planet_login)
         form.addRow("Password", self.pass_edit)
@@ -815,7 +815,7 @@ class PlanetTab(QWidget):
         # a request needs the key, because reading the password store can ask for the
         # master password and the plugin must never do that at startup.
         self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.key_edit.setToolTip(
             "Needed for the full-res map preview and browse thumbnails, and passed "
             "to the search subprocess. Filled in automatically when you log in. "
@@ -884,7 +884,7 @@ class PlanetTab(QWidget):
         self.login_btn.setEnabled(False)
         body = QByteArray(json.dumps({"email": user, "password": pw}).encode())
         req = QNetworkRequest(QUrl(PLANET_LOGIN_URL))
-        req.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
+        req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         req.setRawHeader(b"X-Planet-App", PLANET_APP_HEADER.encode())
         reply = QgsNetworkAccessManager.instance().post(req, body)
         self._login_reply = reply
@@ -896,8 +896,8 @@ class PlanetTab(QWidget):
             return
         self._login_reply = None
         self.login_btn.setEnabled(True)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         if not ok:
@@ -1368,13 +1368,13 @@ class PlanetTab(QWidget):
                 f"area has pixels, NOT how cloudy it is (that's the Cloud column)."
                 + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             head = self.table.item(r, 0)
-            head.setData(Qt.UserRole, c.get("thumb_url"))
-            head.setData(Qt.UserRole + 1, cid)
-            head.setData(Qt.UserRole + 2, side)
+            head.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
+            head.setData(Qt.ItemDataRole.UserRole + 1, cid)
+            head.setData(Qt.ItemDataRole.UserRole + 2, side)
             # checkbox = include this scene in Preview on map. The ★ nearest
             # scene each side starts ticked; tick others to preview several at once.
-            head.setFlags(head.flags() | Qt.ItemIsUserCheckable)
-            head.setCheckState(Qt.Checked if is_top else Qt.Unchecked)
+            head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            head.setCheckState(Qt.CheckState.Checked if is_top else Qt.CheckState.Unchecked)
             if is_top:
                 head.setToolTip(
                     "★ Nearest clear scene on this side — ticked by default for "
@@ -1428,7 +1428,7 @@ class PlanetTab(QWidget):
         gap = "" if c.get("gap_days") is None else f"gap {c['gap_days']}d"
         cid = c.get("id")
         tile = QToolButton()
-        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
@@ -1452,7 +1452,7 @@ class PlanetTab(QWidget):
     def _tile_thumb_loaded(self, reply, tile):
         if reply in self._gallery_replies:
             self._gallery_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1470,7 +1470,7 @@ class PlanetTab(QWidget):
     def _select_row_by_id(self, cid):
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is not None and head.data(Qt.UserRole + 1) == cid:
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1) == cid:
                 self.table.selectRow(r)
                 return
 
@@ -1493,7 +1493,7 @@ class PlanetTab(QWidget):
         if not rows:
             return
         head = self.table.item(rows[0].row(), 0)
-        url = self._auth_thumb(head.data(Qt.UserRole)) if head else None
+        url = self._auth_thumb(head.data(Qt.ItemDataRole.UserRole)) if head else None
         if not url:
             self._preview_pix = None
             self.preview.setText("No browse image available for this scene.")
@@ -1508,7 +1508,7 @@ class PlanetTab(QWidget):
             reply.deleteLater()
             return
         self._preview_reply = None
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1523,7 +1523,7 @@ class PlanetTab(QWidget):
             return
         self.preview.setPixmap(self._preview_pix.scaled(
             max(self.preview.width(), 1), max(self.preview.height(), 1),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1547,10 +1547,10 @@ class PlanetTab(QWidget):
         picks = []                          # [(side, cid), …] in table order
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side = head.data(Qt.UserRole + 2)
-            cid = head.data(Qt.UserRole + 1)
+            side = head.data(Qt.ItemDataRole.UserRole + 2)
+            cid = head.data(Qt.ItemDataRole.UserRole + 1)
             if cid:
                 picks.append((side, cid))
         if not picks:                       # nothing ticked -> nearest each side
@@ -1578,8 +1578,8 @@ class PlanetTab(QWidget):
         head = self.table.item(item.row(), 0)
         if head is None:
             return
-        side = head.data(Qt.UserRole + 2)
-        cid = head.data(Qt.UserRole + 1)
+        side = head.data(Qt.ItemDataRole.UserRole + 2)
+        cid = head.data(Qt.ItemDataRole.UserRole + 1)
         if cid:
             self._render_picks([(self._label_for(side, cid), [cid])])
 
@@ -1657,7 +1657,7 @@ class PlanetTab(QWidget):
         item_type_ids = [f"{ITEM_TYPE}:{i}" for i in ids]
         body = QByteArray(("ids=" + quote(",".join(item_type_ids))).encode())
         req = QNetworkRequest(QUrl(TILE_HASH_URL + "?api_key=" + quote(key)))
-        req.setHeader(QNetworkRequest.ContentTypeHeader,
+        req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader,
                       "application/x-www-form-urlencoded")
         token = base64.b64encode(f"{key}:".encode()).decode()
         req.setRawHeader(b"Authorization", ("Basic " + token).encode())
@@ -1668,8 +1668,8 @@ class PlanetTab(QWidget):
     def _tile_hash_ready(self, reply, name):
         if reply in self._tile_replies:
             self._tile_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status in (200, 201)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status in (200, 201)
         data = bytes(reply.readAll())
         reply.deleteLater()
         tile_hash = None
@@ -1729,10 +1729,10 @@ class PlanetTab(QWidget):
         picks = {"pre": [], "post": []}
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side = head.data(Qt.UserRole + 2)
-            cid = head.data(Qt.UserRole + 1)
+            side = head.data(Qt.ItemDataRole.UserRole + 2)
+            cid = head.data(Qt.ItemDataRole.UserRole + 1)
             if cid and side in picks:
                 picks[side].append(cid)
         if not picks["pre"] and not picks["post"]:
@@ -2474,8 +2474,8 @@ class PlanetTab(QWidget):
         ids = set()
         for idx in self.table.selectionModel().selectedRows():
             head = self.table.item(idx.row(), 0)
-            if head is not None and head.data(Qt.UserRole + 1):
-                ids.add(head.data(Qt.UserRole + 1))
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1):
+                ids.add(head.data(Qt.ItemDataRole.UserRole + 1))
         return ids
 
     def _draw_footprints(self):
@@ -2496,10 +2496,10 @@ class PlanetTab(QWidget):
                                  f"PlanetScope footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
-                QgsField("scene_id", QVariant.String),
-                QgsField("date", QVariant.String),
-                QgsField("gap_days", QVariant.Int),
-                QgsField("cloud_pct", QVariant.Double),
+                QgsField("scene_id", QMetaType.Type.QString),
+                QgsField("date", QMetaType.Type.QString),
+                QgsField("gap_days", QMetaType.Type.Int),
+                QgsField("cloud_pct", QMetaType.Type.Double),
             ])
             lyr.updateFields()
             feats = []

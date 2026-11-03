@@ -346,7 +346,7 @@ class GegdTab(QWidget):
         root.addWidget(self._progress)
         self._summary_label = QLabel()
         self._summary_label.setWordWrap(True)
-        self._summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self._summary_label)
         self._show_hidden_btn = QPushButton("Show hidden strips")
         self._show_hidden_btn.setCheckable(True)
@@ -387,7 +387,7 @@ class GegdTab(QWidget):
         box, form = self._group("Maxar/Vantor GEGD Pro connection", collapsed=False)
         self._key_box = box
         self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.key_edit.setPlaceholderText("paste your GEGD Pro API key, then Save key")
         self.key_edit.setToolTip(
             "Your GEGD Pro API key (GEGD Pro web app > API keys). Save key puts it in "
@@ -431,7 +431,7 @@ class GegdTab(QWidget):
         form.addRow(row)
         self._key_status = QLabel()
         self._key_status.setWordWrap(True)
-        self._key_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._key_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow(self._key_status)
         self._usage_label = QLabel()
         self._usage_label.setWordWrap(True)
@@ -449,8 +449,8 @@ class GegdTab(QWidget):
         box, form = self._group("Event location and time", collapsed=False)
         self._event_label = QLabel()
         self._event_label.setWordWrap(True)
-        self._event_label.setTextFormat(Qt.RichText)
-        self._event_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._event_label.setTextFormat(Qt.TextFormat.RichText)
+        self._event_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow(self._event_label)
 
         self.lat_edit = QLineEdit()
@@ -645,9 +645,9 @@ class GegdTab(QWidget):
         for i, tip in enumerate(COLUMN_TIPS):
             t.horizontalHeaderItem(i).setToolTip(tip)
         t.verticalHeader().setVisible(False)
-        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.setSelectionBehavior(QAbstractItemView.SelectRows)
-        t.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         t.horizontalHeader().setStretchLastSection(True)
         t.setMinimumHeight(200)
         t.setWordWrap(False)
@@ -658,8 +658,8 @@ class GegdTab(QWidget):
         v.addWidget(t)
         self._detail_label = QLabel()
         self._detail_label.setWordWrap(True)
-        self._detail_label.setTextFormat(Qt.RichText)
-        self._detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._detail_label.setTextFormat(Qt.TextFormat.RichText)
+        self._detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(self._detail_label)
         return box
 
@@ -1239,9 +1239,9 @@ class GegdTab(QWidget):
         pre = r.side == "pre"
         word = "before" if pre else "after"
         pick = QTableWidgetItem(("★ " if r.star else "") + word)
-        pick.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-        pick.setCheckState(Qt.Checked if s.feature_id in self._picks else Qt.Unchecked)
-        pick.setData(Qt.UserRole, s.feature_id)
+        pick.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+        pick.setCheckState(Qt.CheckState.Checked if s.feature_id in self._picks else Qt.CheckState.Unchecked)
+        pick.setData(Qt.ItemDataRole.UserRole, s.feature_id)
         gap = -r.gap_days if pre else r.gap_days
         date = f"{s.acq_utc:%Y-%m-%d %H:%M} ({gap:+.1f} d)" if s.acq_utc else "?"
         band = (s.band_config or "").upper()
@@ -1274,7 +1274,7 @@ class GegdTab(QWidget):
         muted = r.hidden_reason is not None or r.grade != "mapping"
         for it in items:
             if it is not pick:
-                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             it.setBackground(QBrush(PRE_BG if pre else POST_BG))
             it.setForeground(QBrush(MUTED_FG if muted else ROW_FG))
             it.setToolTip(tip)
@@ -1379,10 +1379,10 @@ class GegdTab(QWidget):
     def _on_item_changed(self, item):
         if self._filling or item is None or item.column() != 0:
             return
-        fid = item.data(Qt.UserRole)
+        fid = item.data(Qt.ItemDataRole.UserRole)
         if not fid:
             return
-        if item.checkState() == Qt.Checked:
+        if item.checkState() == Qt.CheckState.Checked:
             self._picks.add(fid)
         else:
             self._picks.discard(fid)
@@ -1500,7 +1500,7 @@ class GegdTab(QWidget):
             for i, r in enumerate(self._row_strips):
                 if r.strip.feature_id in fids:
                     sm.select(self._table.model().index(i, 0),
-                              QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                              QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         except RuntimeError:                # the table went with the dock
             pass
         finally:
@@ -2020,7 +2020,7 @@ class GegdTab(QWidget):
         for m in r.messages:
             if m:
                 lines.append(status_html("warn", _esc(m)) if warn else _esc(m))
-        self._summary_label.setTextFormat(Qt.RichText)
+        self._summary_label.setTextFormat(Qt.TextFormat.RichText)
         self._summary_label.setText("<br>".join(x for x in lines if x))
         self._summary_label.setStyleSheet("")
         self._show_hidden_btn.setVisible(bool(r.n_hidden) or self._show_hidden)
@@ -2028,7 +2028,7 @@ class GegdTab(QWidget):
                                       else f"Show hidden strips ({r.n_hidden})")
 
     def _set_summary(self, kind, text):
-        self._summary_label.setTextFormat(Qt.PlainText)
+        self._summary_label.setTextFormat(Qt.TextFormat.PlainText)
         self._summary_label.setText(status_text(kind, api.redact(text)))
         self._summary_label.setStyleSheet(status_css(kind))
 

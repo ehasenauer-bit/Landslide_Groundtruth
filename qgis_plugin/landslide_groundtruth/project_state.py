@@ -240,7 +240,7 @@ def _persistable(w):
     password fields are skipped: the former are computed output, the latter are
     credentials that must not enter a shared project file."""
     if isinstance(w, QLineEdit):
-        return not w.isReadOnly() and w.echoMode() == QLineEdit.Normal
+        return not w.isReadOnly() and w.echoMode() == QLineEdit.EchoMode.Normal
     return isinstance(w, (QDateTimeEdit, QDoubleSpinBox, QSpinBox, QSlider,
                           QCheckBox, QComboBox))
 
@@ -267,7 +267,7 @@ def _change_signal(w):
 def _read_widget(w):
     """Widget value as a string (project entries are stored as text)."""
     if isinstance(w, QDateTimeEdit):
-        return w.dateTime().toString(Qt.ISODate)
+        return w.dateTime().toString(Qt.DateFormat.ISODate)
     if isinstance(w, (QDoubleSpinBox, QSpinBox, QSlider)):
         return str(w.value())
     if isinstance(w, QCheckBox):
@@ -310,7 +310,7 @@ def _write_widget(w, value):
     (day counts, cloud %) and handlers update exactly as on a user edit; a
     malformed or now-invalid value is ignored rather than raising."""
     if isinstance(w, QDateTimeEdit):
-        dt = QDateTime.fromString(value, Qt.ISODate)
+        dt = QDateTime.fromString(value, Qt.DateFormat.ISODate)
         if dt.isValid():
             w.setDateTime(dt)
     elif isinstance(w, QDoubleSpinBox):

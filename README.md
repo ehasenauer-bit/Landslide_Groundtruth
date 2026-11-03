@@ -1,4 +1,61 @@
-# Landslide imagery-gathering pipeline
+# Landslide Ground-Truthing
+
+A QGIS plugin for confirming and measuring a landslide that a seismic network has
+detected. Enter the detection (origin time and epicentre) once, then:
+
+- search and compare **pre- and post-event imagery**: Sentinel-2, Landsat,
+  PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1 / NISAR radar;
+- **fuse** optical and radar change into one landslide score;
+- read the scar against the terrain in a **3D viewer** (ArcticDEM or your DEM);
+- turn the outline you digitize into a **volume** (Larsen et al. 2010 area–volume
+  scaling, or deposit area × thickness).
+
+## Install (QGIS users)
+
+1. In QGIS (3.44 or later, including QGIS 4): **Plugins → Manage and Install
+   Plugins…**, search for **Landslide Ground-Truthing**, click **Install**.
+   (Or download a release zip and use **Install from ZIP**.)
+2. Open the panel from its toolbar button. At the top, click
+   **Install imagery tools**. It's a one-time download of about 300 MB, 1 GB on
+   disk, usually under 10 minutes.
+   - The plugin downloads [uv](https://docs.astral.sh/uv/) (Astral, MIT/Apache-2.0)
+     from PyPI, a standalone Python 3.12, and a pinned, hash-checked package set
+     (including PyTorch for the snow-robust cloud mask).
+   - All of it goes into your user data folder; nothing is installed into QGIS.
+   - **Remove** deletes it all again.
+   - Volume, Fusion and Maxar VHR work without it.
+3. Click **Try an example** in the Detection box, then open the
+   **Sentinel-2 / Landsat** tab and press **Search**.
+
+### Accounts
+
+| Source | Account needed |
+|---|---|
+| Sentinel-2, Landsat, Sentinel-1, ArcticDEM | none |
+| NISAR radar, RGI glacier outlines | free [NASA Earthdata login](https://urs.earthdata.nasa.gov/), entered in the Sentinel-2 / Landsat tab |
+| PlanetScope | a Planet account (paid), entered in the PlanetScope tab |
+| Maxar VHR | a GEGD Pro API key (US government users), entered in the Maxar VHR tab |
+
+### Platforms
+
+Tested on macOS with QGIS 3.44 LTR and QGIS 4.2. Windows and Linux are expected
+to work but are untested. Please report problems on the
+[issue tracker](https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues).
+
+### License
+
+GPL-2.0-or-later: you can redistribute and/or modify it under the terms of the
+GNU General Public License version 2, or (at your option) any later version. See
+[LICENSE](LICENSE).
+
+---
+
+# For developers: the imagery pipeline
+
+The rest of this file documents the pipeline the plugin runs. A release zip
+carries a copy of it (`scripts/build_release.py` puts it in the plugin's
+`pipeline/` folder). In a checkout it lives here at the repository root, and you
+can run it from the command line.
 
 Takes a predicted location + time (a seismic detection — lat/lon + UTC time) and
 pulls **before/after satellite imagery** for the event —
@@ -12,9 +69,9 @@ confirm the slide and digitize the polygon in QGIS. Once you have, the plugin's
 via the Larsen et al. (2010) scaling — see [Volume from a digitized
 scar](#volume-from-a-digitized-scar).
 
-## Install
+## Developer setup
 
-Python 3.11+ (developed and tested on 3.14).
+Python 3.11+ (developed and tested on 3.14; the plugin's own install uses 3.12).
 
 ```bash
 python -m venv venv && source venv/bin/activate
@@ -252,8 +309,10 @@ back; and the total-area Larsen fit, whose coefficients ship empty
 The **QGIS plugin** in `qgis_plugin/` gives a dock panel: click the
 event location on the map, set the date and the *days before/after* sliders, pick
 an imagery source, and the results load straight into your project. The plugin
-keeps the heavy dependencies in this venv (it shells out to `run_single.py`),
-so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.md`.
+keeps the heavy dependencies out of QGIS: it runs `run_single.py` in a separate
+Python. That's the one its Setup box installs, or this venv if you set it under
+*Use my own Python (advanced)*. Developer setup and release builds:
+`qgis_plugin/README.md`.
 
 ## Important caveats
 

@@ -28,7 +28,7 @@ sys.path.insert(0, PKG)
 
 from qgis.core import (QgsApplication, QgsProject, QgsVectorLayer, QgsFeature,
                        QgsGeometry)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app = QgsApplication([], True); app.initQgis()
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget
 from qgis.PyQt.QtCore import QObject
@@ -112,7 +112,7 @@ check("near date is thicker than far date for both (snow and ice still in it)",
       and by_key["ice_rich_near"][2] > by_key["ice_rich_far"][2])
 from qgis.PyQt.QtCore import Qt
 check("each item's tooltip is its full label (the closed combo elides it)",
-      all(combo.itemData(i, Qt.ToolTipRole) == SETTINGS[i][0]
+      all(combo.itemData(i, Qt.ItemDataRole.ToolTipRole) == SETTINGS[i][0]
           for i in range(len(SETTINGS))))
 check("the label leads with what tells the settings apart (date before numbers)",
       all(s[0].split(" — ")[0] in ("Glacier, far date (ice melted)",

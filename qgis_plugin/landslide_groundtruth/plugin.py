@@ -32,7 +32,7 @@ class LandslidePlugin:
     def toggle(self, checked):
         if self.dock is None:
             self.dock = LandslideDock(self.iface)
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
             self.dock.visibilityChanged.connect(self.action.setChecked)
         self.dock.setVisible(checked)
 

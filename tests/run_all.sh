@@ -9,8 +9,18 @@
 #
 #   ./tests/run_all.sh            # all of them
 #   ./tests/run_all.sh detection  # just the ones matching "detection"
+#   QGIS_APP=~/Applications/QGIS-final-4_2_3.app ./tests/run_all.sh   # another QGIS (4.x)
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# A whole app bundle to test against: its python, its prefix (QGIS_PREFIX is read
+# by the tests' setPrefixPath) and its PROJ/GDAL data.
+if [ -n "${QGIS_APP:-}" ]; then
+  for p in "$QGIS_APP/Contents/MacOS/python" "$QGIS_APP/Contents/Frameworks/bin/python3"; do
+    [ -x "$p" ] && { QGIS_PYTHON="$p"; break; }
+  done
+  export QGIS_PREFIX="$QGIS_APP/Contents/MacOS"
+fi
 
 find_python() {
   if [ -n "${QGIS_PYTHON:-}" ] && [ -x "$QGIS_PYTHON" ]; then echo "$QGIS_PYTHON"; return; fi
@@ -30,7 +40,7 @@ if ! "$PY" -c "import qgis.core" >/dev/null 2>&1; then
 fi
 
 # QGIS's own resources; harmless if the directories are absent.
-for base in /Applications/QGIS-LTR.app /Applications/QGIS.app; do
+for base in ${QGIS_APP:+"$QGIS_APP"} /Applications/QGIS-LTR.app /Applications/QGIS.app; do
   [ -d "$base/Contents/Resources/qgis/proj" ] && {
     export PROJ_LIB="$base/Contents/Resources/qgis/proj"
     export PROJ_DATA="$PROJ_LIB"

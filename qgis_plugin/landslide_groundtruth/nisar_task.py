@@ -35,7 +35,7 @@ class NisarReadTask(QgsTask):
         """jobs: dicts with key, url, pol, bbox, px, out_path, kind ('float' for
         change detection, 'display' for the amplitude preview), cache_dir, and
         for 'display' the stretch: scale, lo, hi, stretch."""
-        super().__init__(description, QgsTask.CanCancel)
+        super().__init__(description, QgsTask.Flag.CanCancel)
         self.batch = int(batch)
         self.jobs = list(jobs)
 

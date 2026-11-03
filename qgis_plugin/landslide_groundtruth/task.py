@@ -24,7 +24,7 @@ class PipelineTask(QgsTask):
 
     def __init__(self, python_exe, script, cwd, cli_args, out_dir,
                  result_name="result.json"):
-        super().__init__("Landslide imagery run", QgsTask.CanCancel)
+        super().__init__("Landslide imagery run", QgsTask.Flag.CanCancel)
         self.python_exe = python_exe
         self.script = script
         self.cwd = cwd

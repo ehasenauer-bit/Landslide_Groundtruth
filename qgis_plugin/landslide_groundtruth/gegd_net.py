@@ -113,12 +113,12 @@ RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 POLL_MS = 100                   # how often the wait looks at the feedback
 STALL_GRACE_S = 5.0             # backstop beyond the transfer timeout
 MAX_REDIRECTS = 5               # same-origin hops followed per request
-_TIMEOUTS = frozenset({QNetworkReply.TimeoutError, QNetworkReply.OperationCanceledError,
-                       QNetworkReply.ProxyTimeoutError})
-_TRANSIENT = _TIMEOUTS | {QNetworkReply.RemoteHostClosedError,
-                          QNetworkReply.TemporaryNetworkFailureError,
-                          QNetworkReply.NetworkSessionFailedError,
-                          QNetworkReply.UnknownNetworkError}
+_TIMEOUTS = frozenset({QNetworkReply.NetworkError.TimeoutError, QNetworkReply.NetworkError.OperationCanceledError,
+                       QNetworkReply.NetworkError.ProxyTimeoutError})
+_TRANSIENT = _TIMEOUTS | {QNetworkReply.NetworkError.RemoteHostClosedError,
+                          QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+                          QNetworkReply.NetworkError.NetworkSessionFailedError,
+                          QNetworkReply.NetworkError.UnknownNetworkError}
 INITIATOR = "LandslideGegd"     # what the Network Logger lists as the initiator
 _DEFAULT_PORT = {"https": 443, "http": 80}
 
@@ -241,12 +241,12 @@ def _wait(reply, feedback, stall_s):
             if feedback is not None and feedback.isCanceled():
                 return "cancelled"
             now = time.monotonic()
-            m = (reply.bytesAvailable(), reply.attribute(QNetworkRequest.HttpStatusCodeAttribute))
+            m = (reply.bytesAvailable(), reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute))
             if m != mark:
                 mark, moved = m, now
             elif stall_s and now - moved > stall_s:
                 return "stalled"
-            if loop.exec_() < 0:
+            if loop.exec() < 0:
                 # exec() refused to run (the thread is being told to quit): give
                 # up rather than spin.
                 return "finished" if reply.isFinished() else "interrupted"
@@ -297,12 +297,12 @@ def _release(reply):
         gui = _gui_thread()
         if gui is None or threading.current_thread() is threading.main_thread():
             reply.deleteLater()
-            QCoreApplication.sendPostedEvents(reply, QEvent.DeferredDelete)
+            QCoreApplication.sendPostedEvents(reply, QEvent.Type.DeferredDelete)
             return
         reply.setParent(None)
         sip.transferto(reply, None)
         reply.moveToThread(gui)
-        QMetaObject.invokeMethod(reply, "deleteLater", Qt.QueuedConnection)
+        QMetaObject.invokeMethod(reply, "deleteLater", Qt.ConnectionType.QueuedConnection)
     except RuntimeError:
         pass
 
@@ -319,13 +319,15 @@ def _dispose(reply):
 
 
 def _read(reply, stalled):
-    status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+    status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
     headers = {}
     for name in reply.rawHeaderList():
         headers[bytes(name).decode("latin-1").lower()] = bytes(reply.rawHeader(name)).decode("latin-1")
-    loc = reply.attribute(QNetworkRequest.RedirectionTargetAttribute)
+    loc = reply.attribute(QNetworkRequest.Attribute.RedirectionTargetAttribute)
     qerr = reply.error()
-    if stalled or 0 < int(qerr) < 200:
+    # PyQt5's enums are ints; PyQt6's NetworkError is a plain Enum that refuses int()
+    code = qerr.value if hasattr(qerr, "value") else int(qerr)
+    if stalled or 0 < code < 200:
         # A network- or proxy-layer failure (timeout, abort, connection closed
         # mid-body): the headers may have arrived, the body did not. Reading the
         # status would hand a truncated 200 to the parser as a good answer.
@@ -333,7 +335,7 @@ def _read(reply, stalled):
     body = bytes(reply.readAll()) if reply.isOpen() else b""     # an aborted reply is closed
     return _Attempt(int(status) if status else None,
                     headers.get("content-type", ""), body, headers, qerr,
-                    reply.errorString() if qerr != QNetworkReply.NoError else "",
+                    reply.errorString() if qerr != QNetworkReply.NetworkError.NoError else "",
                     QUrl(reply.url()),
                     QUrl(loc) if isinstance(loc, QUrl) and not loc.isEmpty() else None,
                     bool(stalled))
@@ -347,14 +349,14 @@ def _once(url, service, how, timeout_s, feedback, force_refresh):
     in which case nothing is sent. When this returns the reply has finished (or
     been aborted) and is on its way to deletion on the GUI thread."""
     req = QNetworkRequest(QUrl(url))
-    req.setAttribute(QNetworkRequest.Attribute(int(QgsNetworkRequestParameters.AttributeInitiatorClass)),
+    req.setAttribute(QNetworkRequest.Attribute(int(QgsNetworkRequestParameters.RequestAttributes.AttributeInitiatorClass)),
                      INITIATOR)
     # Qt must never follow a redirect by itself (it would skip the preprocessors
     # and carry the key along); fetch() decides about every 3xx.
-    req.setAttribute(QNetworkRequest.RedirectPolicyAttribute, QNetworkRequest.ManualRedirectPolicy)
-    req.setAttribute(QNetworkRequest.CacheLoadControlAttribute,
-                     QNetworkRequest.AlwaysNetwork if force_refresh else QNetworkRequest.PreferCache)
-    req.setAttribute(QNetworkRequest.CacheSaveControlAttribute, True)
+    req.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute, QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
+    req.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
+                     QNetworkRequest.CacheLoadControl.AlwaysNetwork if force_refresh else QNetworkRequest.CacheLoadControl.PreferCache)
+    req.setAttribute(QNetworkRequest.Attribute.CacheSaveControlAttribute, True)
     if timeout_s:
         # Qt aborts a transfer that has moved no bytes for this long; QGIS's own
         # global network timeout (Settings > Network) still applies on top.

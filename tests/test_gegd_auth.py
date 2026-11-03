@@ -51,9 +51,13 @@ from qgis.core import (QgsApplication, QgsBlockingNetworkRequest, QgsCoordinateR
                        QgsDataSourceUri, QgsFeedback, QgsFileDownloader, QgsMapRendererParallelJob,
                        QgsMapSettings, QgsNetworkAccessManager, QgsNetworkRequestParameters,
                        QgsRasterLayer, QgsRectangle, QgsSettings, QgsTask)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)       # the APIHeader auth method lives here
         break
@@ -123,8 +127,8 @@ KEY3 = "dummy-gegd-key-THREE-" + "5e4d3c2b1a09f8e7d6c5b4"
 HDR = gegd_auth.KEY_HEADER
 
 # ---- the network: two local servers that record what each request carried ----
-_img = QImage(256, 256, QImage.Format_ARGB32); _img.fill(QColor(30, 140, 200))
-_ba = QByteArray(); _buf = QBuffer(_ba); _buf.open(QIODevice.WriteOnly); _img.save(_buf, "PNG")
+_img = QImage(256, 256, QImage.Format.Format_ARGB32); _img.fill(QColor(30, 140, 200))
+_ba = QByteArray(); _buf = QBuffer(_ba); _buf.open(QIODevice.OpenModeFlag.WriteOnly); _img.save(_buf, "PNG")
 PNG = bytes(_ba)
 SEEN = []                       # {"srv", "tag", "key"} per request received
 LK = threading.Lock()
@@ -232,7 +236,7 @@ B_IP = "http://127.0.0.1:%d" % PB
 
 
 def wait(sec):
-    lp = QEventLoop(); QTimer.singleShot(int(sec * 1000), lp.quit); lp.exec_()
+    lp = QEventLoop(); QTimer.singleShot(int(sec * 1000), lp.quit); lp.exec()
 
 
 def seen(tag_prefix, srv=None):
@@ -253,7 +257,7 @@ TAPS = []
 def _tap(p):
     r = p.request()
     TAPS.append({"url": r.url().toString(), "has": r.hasRawHeader(HDR.encode()),
-                 "policy": r.attribute(QNetworkRequest.RedirectPolicyAttribute)})
+                 "policy": r.attribute(QNetworkRequest.Attribute.RedirectPolicyAttribute)})
 
 
 QgsNetworkAccessManager.instance().requestAboutToBeCreated[QgsNetworkRequestParameters].connect(_tap)
@@ -279,7 +283,7 @@ def render(layer):
     lp = QEventLoop(); job.finished.connect(lp.quit)
     job.start()
     QTimer.singleShot(30000, lp.quit)
-    lp.exec_()
+    lp.exec()
     return job.renderedImage()
 
 
@@ -363,12 +367,12 @@ check("blocking request on the GUI thread succeeds", blocking(A + "/blk_main/x")
 check("... and carries the key", keys(seen("blk_main")) == [KEY1])
 t = [x for x in TAPS[n_taps:] if "/blk_main/" in x["url"]]
 check("... with ManualRedirectPolicy set on it (Qt never follows a redirect with the key)",
-      len(t) == 1 and t[0]["has"] and t[0]["policy"] == QNetworkRequest.ManualRedirectPolicy)
+      len(t) == 1 and t[0]["has"] and t[0]["policy"] == QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
 
 
 class FetchTask(QgsTask):
     def __init__(self, url, raw=False):
-        super().__init__("gegd test fetch", QgsTask.CanCancel)
+        super().__init__("gegd test fetch", QgsTask.Flag.CanCancel)
         self.url, self.raw, self.result_, self.error_ = url, raw, None, None
         self.fb = QgsFeedback()                      # the plan's tasks pass one to fetch()
 
@@ -394,7 +398,7 @@ def run_task(task):
     task.taskTerminated.connect(lp.quit)
     QgsApplication.taskManager().addTask(task)
     QTimer.singleShot(30000, lp.quit)
-    lp.exec_()
+    lp.exec()
     return task
 
 
@@ -461,7 +465,7 @@ first, after = seen("redir_xyz", "A"), seen("after_redir_xyz", "B")
 check(f"XYZ: redirected tiles arrive without the key ({len(after)} of {len(first)})",
       len(first) >= 1 and all(k == KEY1 for k in keys(first)) and all(k is None for k in keys(after)))
 dl = QgsFileDownloader(QUrl(A + "/redir_dl/x"), os.path.join(TMP, "dl.bin"), gegd_auth.AUTHCFG_ID)
-lp = QEventLoop(); dl.downloadExited.connect(lp.quit); QTimer.singleShot(15000, lp.quit); lp.exec_()
+lp = QEventLoop(); dl.downloadExited.connect(lp.quit); QTimer.singleShot(15000, lp.quit); lp.exec()
 check("QgsFileDownloader: Qt does not carry the key across the redirect",
       keys(seen("redir_dl", "A")) == [KEY1] and all(k is None for k in keys(seen("after_redir_dl", "B"))))
 try:
@@ -484,13 +488,13 @@ for url, keep in [("https://pro.gegd.com/x", True), ("https://PRO.GEGD.COM/x", T
     rq = QNetworkRequest(QUrl(url)); rq.setRawHeader(HDR.encode(), b"DUMMY")
     guard.preprocess(rq)
     kept = rq.hasRawHeader(HDR.encode())
-    pol = rq.attribute(QNetworkRequest.RedirectPolicyAttribute)
+    pol = rq.attribute(QNetworkRequest.Attribute.RedirectPolicyAttribute)
     check(f"{url}: {'kept, manual redirects' if keep else 'stripped'}",
-          kept == keep and (pol == QNetworkRequest.ManualRedirectPolicy) == keep)
+          kept == keep and (pol == QNetworkRequest.RedirectPolicy.ManualRedirectPolicy) == keep)
 rq = QNetworkRequest(QUrl("https://evil.example/x"))
 guard.preprocess(rq)
 check("a request without the header is left alone",
-      not rq.hasRawHeader(HDR.encode()) and rq.attribute(QNetworkRequest.RedirectPolicyAttribute) is None)
+      not rq.hasRawHeader(HDR.encode()) and rq.attribute(QNetworkRequest.Attribute.RedirectPolicyAttribute) is None)
 check("allowed_for: an https host only",
       gegd_auth.allowed_for("https://pro.gegd.com") == ("https", "pro.gegd.com", 443)
       and gegd_auth.allowed_for("http://pro.gegd.com") is None and gegd_auth.allowed_for("") is None)

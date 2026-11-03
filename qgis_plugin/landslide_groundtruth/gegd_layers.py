@@ -40,7 +40,7 @@ from qgis.core import (QgsCentroidFillSymbolLayer, QgsDataSourceUri, QgsFeature,
                        QgsField, QgsFillSymbol, QgsGeometry, QgsMarkerSymbol,
                        QgsPointXY, QgsRasterLayer, QgsRuleBasedRenderer,
                        QgsVectorLayer)
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 
 try:                                    # Qgis.SelectionRenderingMode: QGIS >= 3.34
     from qgis.core import Qgis
@@ -228,11 +228,11 @@ def _footprint_geom(strip):
 
 
 FOOTPRINT_FIELDS = (
-    ("feature_id", QVariant.String), ("side", QVariant.String),
-    ("date_utc", QVariant.String), ("sensor", QVariant.String),
-    ("ona", QVariant.Double), ("sun", QVariant.Double),
-    ("cover_pct", QVariant.Double), ("grade", QVariant.String),
-    ("score", QVariant.Double), ("star", QVariant.Int), ("hidden", QVariant.String),
+    ("feature_id", QMetaType.Type.QString), ("side", QMetaType.Type.QString),
+    ("date_utc", QMetaType.Type.QString), ("sensor", QMetaType.Type.QString),
+    ("ona", QMetaType.Type.Double), ("sun", QMetaType.Type.Double),
+    ("cover_pct", QMetaType.Type.Double), ("grade", QMetaType.Type.QString),
+    ("score", QMetaType.Type.Double), ("star", QMetaType.Type.Int), ("hidden", QMetaType.Type.QString),
 )
 
 

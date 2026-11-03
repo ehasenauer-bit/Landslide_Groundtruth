@@ -52,7 +52,7 @@ class _GegdTask(QgsTask):
     """Shared plumbing: a feedback that Cancel reaches, and error capture."""
 
     def __init__(self, description):
-        super().__init__(description, QgsTask.CanCancel)
+        super().__init__(description, QgsTask.Flag.CanCancel)
         self._feedback = QgsFeedback()
         self.error = None
         self.n_requests = 0

@@ -7,7 +7,7 @@ import platform
 import tempfile
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
+from qgis.PyQt.QtCore import QMetaType, Qt, QDateTime, QUrl, QUrlQuery, QSize
 from qgis.PyQt.QtGui import QColor, QBrush, QPixmap, QIcon, QImage
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem, QSplitter, QToolButton, QScrollArea, QGridLayout,
     QTabWidget,
 )
-from qgis.core import (
+from qgis.core import (Qgis, 
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsSettings,
     QgsRectangle, QgsNetworkAccessManager,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -314,9 +314,9 @@ class LandslideDock(QgsDockWidget):
         inner.setMinimumWidth(360)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(inner)
         return scroll
 
@@ -478,7 +478,7 @@ class LandslideDock(QgsDockWidget):
         # results_dir), so the field above only matters until then.
         self.results_label = QLabel()
         self.results_label.setWordWrap(True)
-        self.results_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.results_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         of.addRow("Results now go to", self.results_label)
         v.addLayout(of)
         v.addWidget(adv)
@@ -826,7 +826,7 @@ class LandslideDock(QgsDockWidget):
 
         self.det_summary = QLabel()
         self.det_summary.setWordWrap(True)
-        self.det_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.det_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(self.det_summary)
         self._read_detection()
         box.setCollapsed(False)
@@ -1187,7 +1187,7 @@ class LandslideDock(QgsDockWidget):
         # --- outputs: candidate scenes (top) + run log (bottom) ---
         # A draggable splitter so the user can grow whichever pane matters now,
         # instead of the old fixed 50/50 split that left both cramped.
-        out_split = QSplitter(Qt.Vertical)
+        out_split = QSplitter(Qt.Orientation.Vertical)
 
         scenes = QWidget()
         scenes_box = QVBoxLayout(scenes)
@@ -1212,11 +1212,11 @@ class LandslideDock(QgsDockWidget):
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Source", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Extended, like the PlanetScope tab: select one scene to isolate its
         # footprint and browse image, Ctrl/Shift-click to compare several.
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
@@ -1238,7 +1238,7 @@ class LandslideDock(QgsDockWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.gallery_scroll.setWidget(self.gallery_inner)
         g_layout.addWidget(self.gallery_scroll, 1)
         out_split.addWidget(gallerybox)
@@ -1251,7 +1251,7 @@ class LandslideDock(QgsDockWidget):
         previewbox.setCollapsed(True)
         pv_layout = QVBoxLayout(previewbox)
         self.preview = QLabel("Select a scene to preview its browse image.")
-        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
         pv_layout.addWidget(self.preview, 1)
@@ -1312,7 +1312,7 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Username", self.ed_user_edit)
 
         self.ed_pass_edit = QLineEdit()
-        self.ed_pass_edit.setEchoMode(QLineEdit.Password)
+        self.ed_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.ed_pass_edit.setPlaceholderText("NASA Earthdata password")
         self.ed_pass_edit.returnPressed.connect(self._earthdata_login)
         form.addRow("Password", self.ed_pass_edit)
@@ -1366,10 +1366,10 @@ class LandslideDock(QgsDockWidget):
             return
         self._ed_reply = None
         self.ed_login_btn.setEnabled(True)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         err = reply.error()
         reply.deleteLater()
-        if err == QNetworkReply.NoError and status == 200:
+        if err == QNetworkReply.NetworkError.NoError and status == 200:
             try:
                 self._earthdata_save_netrc(user, password)
             except OSError as e:
@@ -1447,7 +1447,7 @@ class LandslideDock(QgsDockWidget):
                 "~/.netrc exists but has no NASA Earthdata entry.", "warn")
 
     def _day_slider(self, value):
-        s = QSlider(Qt.Horizontal)
+        s = QSlider(Qt.Orientation.Horizontal)
         s.setRange(1, 365)
         s.setValue(value)
         return s, QLabel()
@@ -1675,11 +1675,11 @@ class LandslideDock(QgsDockWidget):
         sources = set()
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell is None or cell.checkState() != Qt.Checked:
+            if cell is None or cell.checkState() != Qt.CheckState.Checked:
                 continue
-            source = cell.data(Qt.UserRole + 1)
-            cid = cell.data(Qt.UserRole + 2)
-            side = cell.data(Qt.UserRole + 3)
+            source = cell.data(Qt.ItemDataRole.UserRole + 1)
+            cid = cell.data(Qt.ItemDataRole.UserRole + 2)
+            side = cell.data(Qt.ItemDataRole.UserRole + 3)
             if source not in STREAMABLE or not cid or side not in picked:
                 continue   # PlanetScope / id-less rows aren't hand-pickable
             picked[side].append(cid)
@@ -1895,17 +1895,17 @@ class LandslideDock(QgsDockWidget):
             # stash the browse URL + source + scene id + side on the row, for the
             # preview and the manual run-selection checkbox.
             side_item = self.table.item(r, 0)
-            side_item.setData(Qt.UserRole, c.get("thumb_url"))
-            side_item.setData(Qt.UserRole + 1, c.get("source", ""))
-            side_item.setData(Qt.UserRole + 2, c.get("id"))
-            side_item.setData(Qt.UserRole + 3, side)
+            side_item.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
+            side_item.setData(Qt.ItemDataRole.UserRole + 1, c.get("source", ""))
+            side_item.setData(Qt.ItemDataRole.UserRole + 2, c.get("id"))
+            side_item.setData(Qt.ItemDataRole.UserRole + 3, side)
             # checkbox = use this scene — 'Preview on map' renders the ticked rows
             # and a Run downloads exactly them. NOTHING starts ticked: pre-ticking
             # the ★ meant a Run silently composited it alongside whatever you had
             # picked, so the only way to run one chosen scene was to notice the ★
             # and untick it. Hand-pickable for Sentinel-2 / Landsat.
-            side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
-            side_item.setCheckState(Qt.Unchecked)
+            side_item.setFlags(side_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            side_item.setCheckState(Qt.CheckState.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 6).setToolTip(c["thumb_url"])
             # colour the Cloud number itself: green/amber/red by AOI cloud, grey
@@ -2007,8 +2007,8 @@ class LandslideDock(QgsDockWidget):
                 cloud_item.setText("bad data")
                 cloud_item.setForeground(QBrush(CLOUD_HEAVY))
                 cloud_item.setToolTip(bad)
-                side_item.setFlags(side_item.flags() & ~Qt.ItemIsUserCheckable)
-                side_item.setData(Qt.CheckStateRole, None)    # no checkbox at all
+                side_item.setFlags(side_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                side_item.setData(Qt.ItemDataRole.CheckStateRole, None)    # no checkbox at all
                 side_item.setToolTip(f"✕ {bad}")
         if n_bad:
             self._append_log(
@@ -2124,8 +2124,8 @@ class LandslideDock(QgsDockWidget):
         if not cell:
             return
         primary = self._scene_preview_url(cell)
-        baked = cell.data(Qt.UserRole)
-        baked = self._auth_thumb_url(baked, cell.data(Qt.UserRole + 1)) if baked else None
+        baked = cell.data(Qt.ItemDataRole.UserRole)
+        baked = self._auth_thumb_url(baked, cell.data(Qt.ItemDataRole.UserRole + 1)) if baked else None
         url = primary or baked
         if not url:
             self._preview_pix = None
@@ -2154,9 +2154,9 @@ class LandslideDock(QgsDockWidget):
 
     def _scene_preview_url(self, cell):
         """Browse-image URL for the selected table row's scene (large preview)."""
-        return self._preview_url_for(cell.data(Qt.UserRole + 1),
-                                     cell.data(Qt.UserRole + 2),
-                                     cell.data(Qt.UserRole), max_size=1024)
+        return self._preview_url_for(cell.data(Qt.ItemDataRole.UserRole + 1),
+                                     cell.data(Qt.ItemDataRole.UserRole + 2),
+                                     cell.data(Qt.ItemDataRole.UserRole), max_size=1024)
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
@@ -2211,7 +2211,7 @@ class LandslideDock(QgsDockWidget):
         rgba = np.empty((h, w, 4), dtype=np.uint8)
         rgba[..., :3] = np.moveaxis(rgb, 0, -1)
         rgba[..., 3] = np.where(np.any(rgb > 0, axis=0), 255, 0)
-        img = QImage(rgba.tobytes(), w, h, 4 * w, QImage.Format_RGBA8888)
+        img = QImage(rgba.tobytes(), w, h, 4 * w, QImage.Format.Format_RGBA8888)
         return QPixmap.fromImage(img.copy())   # copy: detach from the bytes buffer
 
     def _fetch_preview(self, url, fallback=None):
@@ -2228,7 +2228,7 @@ class LandslideDock(QgsDockWidget):
             reply.deleteLater()
             return
         self._preview_reply = None
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
@@ -2249,7 +2249,7 @@ class LandslideDock(QgsDockWidget):
             return
         self.preview.setPixmap(self._preview_pix.scaled(
             max(self.preview.width(), 1), max(self.preview.height(), 1),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2343,7 +2343,7 @@ class LandslideDock(QgsDockWidget):
         src = c.get("source", "")
         cid = c.get("id")
         tile = QToolButton()
-        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
@@ -2381,7 +2381,7 @@ class LandslideDock(QgsDockWidget):
     def _gallery_thumb_loaded(self, reply, tile, fallback):
         if reply in self._gallery_replies:
             self._gallery_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
@@ -2406,7 +2406,7 @@ class LandslideDock(QgsDockWidget):
             return
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell and cell.data(Qt.UserRole + 2) == cid:
+            if cell and cell.data(Qt.ItemDataRole.UserRole + 2) == cid:
                 self.table.selectRow(r)
                 self.table.scrollToItem(cell)
                 break
@@ -2505,8 +2505,8 @@ class LandslideDock(QgsDockWidget):
         ids = set()
         for idx in self.table.selectionModel().selectedRows():
             cell = self.table.item(idx.row(), 0)
-            if cell is not None and cell.data(Qt.UserRole + 2):
-                ids.add(cell.data(Qt.UserRole + 2))
+            if cell is not None and cell.data(Qt.ItemDataRole.UserRole + 2):
+                ids.add(cell.data(Qt.ItemDataRole.UserRole + 2))
         return ids
 
     def _draw_footprints(self, log=False):
@@ -2531,11 +2531,11 @@ class LandslideDock(QgsDockWidget):
                                  f"Scene footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
-                QgsField("source", QVariant.String),
-                QgsField("scene_id", QVariant.String),
-                QgsField("date", QVariant.String),
-                QgsField("gap_days", QVariant.Int),
-                QgsField("cloud_pct", QVariant.Double),
+                QgsField("source", QMetaType.Type.QString),
+                QgsField("scene_id", QMetaType.Type.QString),
+                QgsField("date", QMetaType.Type.QString),
+                QgsField("gap_days", QMetaType.Type.Int),
+                QgsField("cloud_pct", QMetaType.Type.Double),
             ])
             lyr.updateFields()
             feats = []
@@ -2634,11 +2634,11 @@ class LandslideDock(QgsDockWidget):
         picks = []
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell is None or cell.checkState() != Qt.Checked:
+            if cell is None or cell.checkState() != Qt.CheckState.Checked:
                 continue
-            if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+            if cell.data(Qt.ItemDataRole.UserRole + 1) not in STREAMABLE:
                 continue
-            info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+            info = self._candidate_by_id(cell.data(Qt.ItemDataRole.UserRole + 2))
             if info:
                 picks.append((info[0], info[1], "ticked"))
         if not picks:                    # nothing ticked -> the run's pick per side
@@ -2687,10 +2687,10 @@ class LandslideDock(QgsDockWidget):
         cell = self.table.item(item.row(), 0)
         if cell is None:
             return
-        if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+        if cell.data(Qt.ItemDataRole.UserRole + 1) not in STREAMABLE:
             self._warn("Only Sentinel-2 / Landsat scenes can be rendered on the map.")
             return
-        info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+        info = self._candidate_by_id(cell.data(Qt.ItemDataRole.UserRole + 2))
         if info:
             self._render_picks([(info[0], info[1], "double-clicked")])
 
@@ -2822,8 +2822,8 @@ class LandslideDock(QgsDockWidget):
         whole batch is in, so pre and post share one HDR white anchor."""
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         added = False
@@ -2935,7 +2935,7 @@ class LandslideDock(QgsDockWidget):
     def _cog_signed(self, reply, label):
         if reply in self._sign_replies:
             self._sign_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = bytes(reply.readAll())
         reply.deleteLater()
         href = None
@@ -3173,7 +3173,7 @@ class LandslideDock(QgsDockWidget):
             c = QColor(color)
             c.setAlpha(alpha)
             items.append(QgsColorRampShader.ColorRampItem(value, c, text))
-        fn = QgsColorRampShader(lo, 0.0, None, QgsColorRampShader.Interpolated)
+        fn = QgsColorRampShader(lo, 0.0, None, Qgis.ShaderInterpolationMethod.Linear)
         fn.setColorRampItemList(items)
         shader = QgsRasterShader()
         shader.setRasterShaderFunction(fn)

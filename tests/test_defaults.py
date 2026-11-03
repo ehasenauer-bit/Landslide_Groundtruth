@@ -66,7 +66,7 @@ print("\n=== 2. the window guard ===")
 class Stub:
     def __init__(s, when, post=90, lat="60.5"):
         s.dt_edit=QDateTimeEdit(); s.dt_edit.setDateTime(QDateTime(when))
-        s.post_slider=QSlider(Qt.Horizontal); s.post_slider.setRange(1,365); s.post_slider.setValue(post)
+        s.post_slider=QSlider(Qt.Orientation.Horizontal); s.post_slider.setRange(1,365); s.post_slider.setValue(post)
         s.lat_edit=QLineEdit(lat)
         s.window_warn=QLabel()
 setattr(Stub,"_check_event_window",D.LandslideDock._check_event_window)

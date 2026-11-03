@@ -62,17 +62,17 @@ import os
 import re
 from functools import partial
 
-from qgis.PyQt.QtCore import Qt, QVariant
+from qgis.PyQt.QtCore import QMetaType, Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QPlainTextEdit, QTableWidget, QTableWidgetItem,
     QFileDialog, QApplication, QHeaderView, QToolButton, QSizePolicy,
 )
 from qgis.core import (
-    Qgis, QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes,
-    QgsDistanceArea, QgsUnitTypes, QgsCoordinateReferenceSystem,
+    Qgis, QgsProject, QgsVectorLayer, QgsRasterLayer,
+    QgsDistanceArea, QgsCoordinateReferenceSystem,
     QgsCoordinateTransform, QgsGeometry, QgsPointXY,
-    QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol, QgsVectorDataProvider,
+    QgsField, QgsFeature, QgsLineSymbol, QgsFillSymbol,
     QgsVectorFileWriter, QgsDefaultValue, QgsSingleSymbolRenderer,
 )
 from qgis.gui import QgsCollapsibleGroupBox
@@ -200,26 +200,26 @@ NEW_TIPS = {
 # their own volume fields — vthk_* for area × thickness, vsrc_* for the source
 # scar — so neither is stored as "the" volume.
 WRITEBACK_FIELDS = [
-    ("slide", QVariant.String, "name"),
-    ("material", QVariant.String, "material_label"),
-    ("thick_m", QVariant.Double, "t_best"),
-    ("thick_lo_m", QVariant.Double, "t_low"),
-    ("thick_hi_m", QVariant.Double, "t_high"),
-    ("total_m2", QVariant.Double, "a_total"),
-    ("src_m2", QVariant.Double, "src_best"),
-    ("src_lo_m2", QVariant.Double, "src_low"),
-    ("src_hi_m2", QVariant.Double, "src_high"),
-    ("length_m", QVariant.Double, "length"),
-    ("z_top_m", QVariant.Double, "z_top"),
-    ("z_bot_m", QVariant.Double, "z_bottom"),
-    ("drop_m", QVariant.Double, "drop"),
-    ("reach_deg", QVariant.Double, "reach_angle"),
-    ("vthk_m3", QVariant.Double, "v_thick"),
-    ("vthk_lo_m3", QVariant.Double, "v_thick_lo"),
-    ("vthk_hi_m3", QVariant.Double, "v_thick_hi"),
-    ("vsrc_m3", QVariant.Double, "v_larsen"),
-    ("vsrc_lo_m3", QVariant.Double, "v_larsen_lo"),
-    ("vsrc_hi_m3", QVariant.Double, "v_larsen_hi"),
+    ("slide", QMetaType.Type.QString, "name"),
+    ("material", QMetaType.Type.QString, "material_label"),
+    ("thick_m", QMetaType.Type.Double, "t_best"),
+    ("thick_lo_m", QMetaType.Type.Double, "t_low"),
+    ("thick_hi_m", QMetaType.Type.Double, "t_high"),
+    ("total_m2", QMetaType.Type.Double, "a_total"),
+    ("src_m2", QMetaType.Type.Double, "src_best"),
+    ("src_lo_m2", QMetaType.Type.Double, "src_low"),
+    ("src_hi_m2", QMetaType.Type.Double, "src_high"),
+    ("length_m", QMetaType.Type.Double, "length"),
+    ("z_top_m", QMetaType.Type.Double, "z_top"),
+    ("z_bot_m", QMetaType.Type.Double, "z_bottom"),
+    ("drop_m", QMetaType.Type.Double, "drop"),
+    ("reach_deg", QMetaType.Type.Double, "reach_angle"),
+    ("vthk_m3", QMetaType.Type.Double, "v_thick"),
+    ("vthk_lo_m3", QMetaType.Type.Double, "v_thick_lo"),
+    ("vthk_hi_m3", QMetaType.Type.Double, "v_thick_hi"),
+    ("vsrc_m3", QMetaType.Type.Double, "v_larsen"),
+    ("vsrc_lo_m3", QMetaType.Type.Double, "v_larsen_lo"),
+    ("vsrc_hi_m3", QMetaType.Type.Double, "v_larsen_hi"),
 ]
 # What an older write-back (one fit per Measure) left on a layer. Never touched
 # now — just named in the log, so a stale vol_m3 beside the new fields is
@@ -232,9 +232,9 @@ LEGACY_WRITEBACK = ("fit", "area_m2", "area_lo_m2", "area_hi_m2", "vol_m3",
 # the install cannot resolve reports — in both cases the number is not an area in
 # any usable sense, and feeding it to the volume relation would produce a
 # confident answer that is wrong by orders of magnitude. See _measure_area.
-UNUSABLE_AREA_UNITS = (QgsUnitTypes.AreaSquareDegrees, QgsUnitTypes.AreaUnknownUnit)
-UNUSABLE_LENGTH_UNITS = (QgsUnitTypes.DistanceDegrees,
-                         QgsUnitTypes.DistanceUnknownUnit)
+UNUSABLE_AREA_UNITS = (Qgis.AreaUnit.SquareDegrees, Qgis.AreaUnit.Unknown)
+UNUSABLE_LENGTH_UNITS = (Qgis.DistanceUnit.Degrees,
+                         Qgis.DistanceUnit.Unknown)
 
 TABLE_COLS = ["Slide", "Material", "Thickness (m)",
               "V thick (m³)", "V thick low", "V thick high",
@@ -521,9 +521,9 @@ class VolumeTab(QWidget):
         # closed combo rather than let the longest set the dock's minimum width.
         # Short, too: with New and Draw beside it a longer minimum crowds the
         # row's own label out of a 400 px dock.
-        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(4)
-        combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         h.addWidget(combo, 1)
         new = QToolButton()
         new.setText("New")
@@ -572,7 +572,7 @@ class VolumeTab(QWidget):
             ordered = list(project.mapLayers().values())
         return [l for l in ordered
                 if isinstance(l, QgsVectorLayer)
-                and l.geometryType() == QgsWkbTypes.PolygonGeometry
+                and l.geometryType() == Qgis.GeometryType.Polygon
                 and l.name() != CENTERLINE_LAYER]
 
     def _refresh_layers(self, *_args):
@@ -909,7 +909,7 @@ class VolumeTab(QWidget):
             self._notify(
                 "Nowhere to save the outline. Save this QGIS project first — "
                 "outlines are written beside its .qgz — or set “Results "
-                "(unsaved projects)” in Environment.", level=Qgis.Warning)
+                "(unsaved projects)” in Environment.", level=Qgis.MessageLevel.Warning)
             return
 
         slide = self.name_edit.text().strip() or "slide"
@@ -950,15 +950,15 @@ class VolumeTab(QWidget):
                     scratch, path, ctx, opts)[:2]
         except Exception as e:
             err, msg = -1, str(e)
-        if err != QgsVectorFileWriter.NoError:
-            self._notify(f"Could not write {path}: {msg}", level=Qgis.Warning)
+        if err != QgsVectorFileWriter.WriterError.NoError:
+            self._notify(f"Could not write {path}: {msg}", level=Qgis.MessageLevel.Warning)
             return
 
         layer = QgsVectorLayer(f"{path}|layername={table}", name, "ogr")
         if not layer.isValid():
             self._notify(
                 f"Wrote {path} but QGIS could not load it back — add it by "
-                f"hand and assign it to {label}.", level=Qgis.Warning)
+                f"hand and assign it to {label}.", level=Qgis.MessageLevel.Warning)
             return
         self._prepare_outline(layer, style)
         # Also into the GeoPackage as its default style, so the file opens red
@@ -996,8 +996,8 @@ class VolumeTab(QWidget):
     @staticmethod
     def _outline_fields():
         """The attribute fields every outline the tab creates starts with."""
-        return [QgsField("slide", QVariant.String),
-                QgsField(AREA_FIELD, QVariant.Double)]
+        return [QgsField("slide", QMetaType.Type.QString),
+                QgsField(AREA_FIELD, QMetaType.Type.Double)]
 
     def _prepare_outline(self, layer, style):
         """Colour a layer this tab created, keep its area field current, and
@@ -1081,7 +1081,7 @@ class VolumeTab(QWidget):
             self._thick_setting_combo.addItem(label, key)
             # the closed combo elides (below), so the full label rides along
             self._thick_setting_combo.setItemData(
-                self._thick_setting_combo.count() - 1, label, Qt.ToolTipRole)
+                self._thick_setting_combo.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
         self._thick_setting_combo.addItem("Custom — your own values", "custom")
         self._thick_setting_combo.setToolTip(
             "What kind of deposit the TOTAL outline is, for area × thickness. "
@@ -1095,7 +1095,7 @@ class VolumeTab(QWidget):
         # minimum width; let the closed combo elide instead (the list still opens
         # full width).
         self._thick_setting_combo.setSizeAdjustPolicy(
-            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._thick_setting_combo.setMinimumContentsLength(12)
         self._thick_setting_combo.activated.connect(self._apply_thickness_setting)
         form.addRow("Deposit thickness", self._thick_setting_combo)
@@ -1270,7 +1270,7 @@ class VolumeTab(QWidget):
             "measurement: the TOTAL outline when one is assigned, otherwise the "
             "source outline. Pick a specific polygon layer to override.")
         self._cl_source_combo.setSizeAdjustPolicy(
-            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._cl_source_combo.setMinimumContentsLength(8)
         form.addRow("Centerline from", self._cl_source_combo)
 
@@ -1283,7 +1283,7 @@ class VolumeTab(QWidget):
             "a DEM/DSM, or let the 3D viewer tab fetch ArcticDEM, then pick it "
             "here.")
         self._dem_combo.setSizeAdjustPolicy(
-            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._dem_combo.setMinimumContentsLength(8)
         self._dem_combo.currentIndexChanged.connect(self._on_dem_changed)
         form.addRow("Elevation (DEM)", self._dem_combo)
@@ -1331,11 +1331,11 @@ class VolumeTab(QWidget):
         self.table = QTableWidget(0, len(TABLE_COLS))
         self.table.setHorizontalHeaderLabels(TABLE_COLS)
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents)
+            QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setMinimumHeight(110)
         v.addWidget(self.table)
@@ -1425,8 +1425,8 @@ class VolumeTab(QWidget):
         and hides the number) while staying selectable for copying."""
         e = QLabel(text)
         e.setWordWrap(True)
-        e.setTextFormat(Qt.PlainText)
-        e.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        e.setTextFormat(Qt.TextFormat.PlainText)
+        e.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         return e
 
     def _append_log(self, msg):
@@ -1440,7 +1440,7 @@ class VolumeTab(QWidget):
         try:
             self.iface.messageBar().pushMessage(
                 "Volume", msg.split("\n")[0].strip(),
-                level=Qgis.Info if level is None else level, duration=7)
+                level=Qgis.MessageLevel.Info if level is None else level, duration=7)
         except Exception:
             pass
 
@@ -1497,12 +1497,12 @@ class VolumeTab(QWidget):
             self._notify(
                 f"{problem} Reassign the drop-downs — measuring was skipped "
                 "rather than reporting a number from the wrong outline.",
-                level=Qgis.Warning)
+                level=Qgis.MessageLevel.Warning)
             return
         if total_feat is None and best_feat is None:
             self._notify(
                 "No outline to measure — draw (or assign) the Total area and "
-                "Source (best) outlines first.", level=Qgis.Warning)
+                "Source (best) outlines first.", level=Qgis.MessageLevel.Warning)
             return
 
         warnings = []
@@ -1777,7 +1777,7 @@ class VolumeTab(QWidget):
         da = self._distance_area(crs)
         if da.areaUnits() not in UNUSABLE_AREA_UNITS:
             return da.convertAreaMeasurement(
-                da.measureArea(geom), QgsUnitTypes.AreaSquareMeters)
+                da.measureArea(geom), Qgis.AreaUnit.SquareMeters)
         self._note_planar_fallback()
         g, _work = self._to_utm(geom, crs)
         return None if g is None else g.area()
@@ -1787,7 +1787,7 @@ class VolumeTab(QWidget):
         da = self._distance_area(crs)
         if da.lengthUnits() not in UNUSABLE_LENGTH_UNITS:
             return da.convertLengthMeasurement(
-                da.measureLength(line), QgsUnitTypes.DistanceMeters)
+                da.measureLength(line), Qgis.DistanceUnit.Meters)
         self._note_planar_fallback()
         g, _work = self._to_utm(line, crs)
         return None if g is None else g.length()
@@ -1961,7 +1961,7 @@ class VolumeTab(QWidget):
         confident wrong answer in the wrong units. The data type is the reliable
         tell (an elevation DEM is Int16/Float32); the name is a backstop."""
         try:
-            if dem.dataProvider().dataType(1) == Qgis.Byte:
+            if dem.dataProvider().dataType(1) == Qgis.DataType.Byte:
                 return True
         except Exception:
             pass
@@ -2172,13 +2172,13 @@ class VolumeTab(QWidget):
             self._append_log("Could not create the centerline layer.")
             return None
         layer.dataProvider().addAttributes([
-            QgsField("slide", QVariant.String),
-            QgsField("length_m", QVariant.Double),
-            QgsField("method", QVariant.String),
-            QgsField("z_top_m", QVariant.Double),
-            QgsField("z_bot_m", QVariant.Double),
-            QgsField("drop_m", QVariant.Double),
-            QgsField("reach_deg", QVariant.Double),
+            QgsField("slide", QMetaType.Type.QString),
+            QgsField("length_m", QMetaType.Type.Double),
+            QgsField("method", QMetaType.Type.QString),
+            QgsField("z_top_m", QMetaType.Type.Double),
+            QgsField("z_bot_m", QMetaType.Type.Double),
+            QgsField("drop_m", QMetaType.Type.Double),
+            QgsField("reach_deg", QMetaType.Type.Double),
         ])
         layer.updateFields()
         symbol = QgsLineSymbol.createSimple({"color": "255,32,32", "width": "0.7"})
@@ -2243,7 +2243,7 @@ class VolumeTab(QWidget):
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 if c in TABLE_NUMERIC:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(r, c, item)
 
     def _selected_rows(self):
@@ -2404,8 +2404,8 @@ class VolumeTab(QWidget):
                 f"No rows are selected, so this will stamp attributes onto ALL "
                 f"{len(self._rows)} measured slides and commit the edit:\n\n"
                 f"{names}\n\nSelect rows first to write just those. Continue?",
-                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
-            if ok != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
+            if ok != QMessageBox.StandardButton.Yes:
                 self._append_log("Write to layer cancelled.")
                 return
         project = QgsProject.instance()
@@ -2426,11 +2426,11 @@ class VolumeTab(QWidget):
                 "are committed — save the project/layer as usual.")
         else:
             self._notify("Nothing was written — see the log for why.",
-                         level=Qgis.Warning)
+                         level=Qgis.MessageLevel.Warning)
 
     def _write_one(self, layer, row):
         caps = layer.dataProvider().capabilities()
-        if not caps & QgsVectorDataProvider.ChangeAttributeValues:
+        if not caps & Qgis.VectorProviderCapability.ChangeAttributeValues:
             self._append_log(
                 f"“{row['name']}”: {layer.name()} does not accept attribute "
                 "edits (read-only source).")
@@ -2447,7 +2447,7 @@ class VolumeTab(QWidget):
         missing = [(n, t) for n, t, _k in WRITEBACK_FIELDS
                    if layer.fields().indexOf(n) < 0]
         if missing:
-            if not caps & QgsVectorDataProvider.AddAttributes:
+            if not caps & Qgis.VectorProviderCapability.AddAttributes:
                 self._append_log(
                     f"“{row['name']}”: {layer.name()} cannot take new fields "
                     f"({', '.join(n for n, _t in missing)} are missing).")

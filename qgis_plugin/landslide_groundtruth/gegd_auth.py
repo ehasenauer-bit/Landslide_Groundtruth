@@ -245,8 +245,8 @@ class HostGuard:
                 return
             if url_allowed(request.url(), self.allowed):
                 # Qt must never carry the key across a redirect by itself.
-                request.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
-                                     QNetworkRequest.ManualRedirectPolicy)
+                request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                                     QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
                 with self._lock:
                     self.kept += 1
                 return
@@ -261,7 +261,7 @@ class HostGuard:
                 QgsMessageLog.logMessage(
                     f"Maxar/Vantor GEGD Pro key withheld from a request to {host}: "
                     f"it is only ever sent to {self.allowed[0]}://{self.allowed[1]}.",
-                    LOG_TAG, Qgis.Warning)
+                    LOG_TAG, Qgis.MessageLevel.Warning)
         except Exception:
             # Fail closed: if anything above broke, the key does not leave.
             try:
@@ -468,8 +468,8 @@ class HeaderInjector:
         try:
             if url_allowed(request.url(), self.allowed) and not request.hasRawHeader(_HDR):
                 request.setRawHeader(_HDR, self._value)
-                request.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
-                                     QNetworkRequest.ManualRedirectPolicy)
+                request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                                     QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
         except Exception:
             pass
 
@@ -570,7 +570,7 @@ def ensure_ready(parent=None):
     """
     if not _on_gui_thread():
         QgsMessageLog.logMessage("gegd_auth.ensure_ready() refused off the GUI thread.",
-                                 LOG_TAG, Qgis.Warning)
+                                 LOG_TAG, Qgis.MessageLevel.Warning)
         return False
     if _GUARD is None:              # plugin.initGui normally did this already
         install_host_guard()

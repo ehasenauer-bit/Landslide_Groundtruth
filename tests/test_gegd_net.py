@@ -63,9 +63,13 @@ os.environ["LANDSLIDE_GEGD_CACHE"] = os.path.join(TMP, "cache")
 
 from qgis.core import (QgsApplication, QgsFeedback, QgsNetworkAccessManager,
                        QgsNetworkRequestParameters, QgsSettings, QgsTask)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
-for _plug in ("/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
-              "/Applications/QGIS.app/Contents/PlugIns/qgis"):
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+# the bundle under test first (QGIS_PREFIX, set by run_all.sh QGIS_APP=...): a
+# QGIS 4 process cannot load QGIS 3's Qt5 auth-method plugins
+for _plug in ([os.path.join(os.environ["QGIS_PREFIX"], "..", "PlugIns", "qgis")]
+              if os.environ.get("QGIS_PREFIX") else []) + [
+        "/Applications/QGIS-LTR.app/Contents/PlugIns/qgis",
+        "/Applications/QGIS.app/Contents/PlugIns/qgis"]:
     if os.path.isdir(_plug):
         QgsApplication.setPluginPath(_plug)       # the APIHeader auth method lives here
         break
@@ -288,7 +292,7 @@ def _tap(p):
     r = p.request()
     TAPS.append({"url": r.url().toString(), "has": r.hasRawHeader(HDR.encode()),
                  "initiator": p.initiatorClassName(),
-                 "policy": r.attribute(QNetworkRequest.RedirectPolicyAttribute)})
+                 "policy": r.attribute(QNetworkRequest.Attribute.RedirectPolicyAttribute)})
 
 
 QgsNetworkAccessManager.instance().requestAboutToBeCreated[QgsNetworkRequestParameters].connect(_tap)
@@ -359,7 +363,7 @@ class FetchTask(QgsTask):
     """gegd_net.fetch in a QgsTask worker, the way gegd_tasks runs it."""
 
     def __init__(self, url, **kw):
-        super().__init__("gegd_net test fetch", QgsTask.CanCancel)
+        super().__init__("gegd_net test fetch", QgsTask.Flag.CanCancel)
         self.url, self.kw = url, kw
         self.fb = QgsFeedback()
         self.result_ = self.error_ = None
@@ -396,7 +400,7 @@ def start(task):
 
 def done(task):
     try:
-        return task.status() in (QgsTask.Complete, QgsTask.Terminated)
+        return task.status() in (QgsTask.TaskStatus.Complete, QgsTask.TaskStatus.Terminated)
     except RuntimeError:            # the task manager deletes a task once it has ended
         return True
 
@@ -433,7 +437,7 @@ tp = taps("/json_ok")
 check(f"one request created, seen once by the main manager ({len(tp)})", len(tp) == 1)
 check("… with the initiator kept for the Network Logger and ManualRedirectPolicy set",
       tp and tp[0]["initiator"] == gegd_net.INITIATOR and tp[0]["has"]
-      and tp[0]["policy"] == QNetworkRequest.ManualRedirectPolicy)
+      and tp[0]["policy"] == QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
 check("the usage meter counted it once", gegd_auth.usage_today()[0] - U0 == 1)
 s0 = guard.stripped
 t = run_task(FetchTask(B_LOCAL + "/json_offhost"))
@@ -625,7 +629,7 @@ class LoopTask(QgsTask):
     thread instead."""
 
     def __init__(self, tag, n):
-        super().__init__("gegd_net test burst", QgsTask.CanCancel)
+        super().__init__("gegd_net test burst", QgsTask.Flag.CanCancel)
         self.url = A + "/json_quick_%s" % tag
         self.tag, self.n = tag, n
         self.fb = QgsFeedback()
@@ -683,7 +687,7 @@ check(f"usage = one per request created on the allowed host "
       f"({gegd_auth.usage_today()[0] - U0} counted, {len(allowed)} created)",
       gegd_auth.usage_today()[0] - U0 == len(allowed))
 check("every allowed-host request carried the key and manual redirects",
-      allowed and all(x["has"] and x["policy"] == QNetworkRequest.ManualRedirectPolicy
+      allowed and all(x["has"] and x["policy"] == QNetworkRequest.RedirectPolicy.ManualRedirectPolicy
                       for x in allowed))
 check("nothing the servers received carried the key off the allowed host",
       all(k is None for k in keys([s for s in SEEN if s["srv"] == "B"])))

@@ -12,7 +12,7 @@ sys.path.insert(0, PKG)
 
 from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform, QgsProject, QgsPointXY)
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app=QgsApplication([],False); app.initQgis()
 from qgis.PyQt.QtWidgets import QLineEdit, QPlainTextEdit, QPushButton
 from landslide_groundtruth import dock as D
@@ -106,7 +106,7 @@ s.lat_edit.clear(); s.lon_edit.clear()
 QTest.keyClicks(s.lat_edit, "60.5, -140.6")
 print("   while typing:", repr(s.lat_edit.text()), repr(s.lon_edit.text()))
 assert (s.lat_edit.text(), s.lon_edit.text())==("60.5, -140.6","")
-QTest.keyClick(s.lat_edit, Qt.Key_Return)
+QTest.keyClick(s.lat_edit, Qt.Key.Key_Return)
 print("   after Enter: ", s.lat_edit.text(), s.lon_edit.text())
 assert (s.lat_edit.text(), s.lon_edit.text())==("60.500000","-140.600000")
 
