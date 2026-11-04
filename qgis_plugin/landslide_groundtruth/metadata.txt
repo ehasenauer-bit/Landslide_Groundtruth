@@ -1,13 +1,35 @@
 [general]
 name=Landslide Ground-Truthing
-qgisMinimumVersion=3.22
-description=Interactive landslide scar delineation from PlanetScope / Sentinel-2 / Landsat imagery (true/false colour, SWIR debris-on-snow false colour, dNDVI/dNDSI/brightness change), with SAR (Sentinel-1) change detection, a native QGIS 3D terrain viewer (ArcticDEM or a loaded DEM) for reading scars against cirque/headwall relief, and scar-area-to-volume estimation.
-about=Pick an event location on the map, set its date and the pre/post imagery windows, choose an imagery source (PlanetScope ~3 m, Sentinel-2 ~10 m, or Landsat ~30 m), and run the ground-truthing pipeline. Results (pre/post RGB, dNDVI, brightness change, candidate scar polygon, crown/tip points) load straight into your project for review. Once you have digitized the scar, the Volume tab measures the selected polygon(s) and converts source area to volume via the Larsen et al. (2010) area-volume scaling, with a medial-axis centerline for slide length. Requires a configured Python environment with the pipeline installed (see plugin settings); the plugin runs that environment as a background process.
-version=0.1.0
+qgisMinimumVersion=3.44
+qgisMaximumVersion=4.99
+description=Ground-truth a seismically detected landslide: pre/post Sentinel-2, Landsat, PlanetScope, Maxar and SAR imagery, optical+SAR change fusion, a 3D terrain viewer and scar-to-volume estimates.
+about=Enter a landslide detection (origin time and epicentre) once, then search and compare pre- and post-event imagery from Sentinel-2, Landsat, PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1/NISAR radar; fuse optical and radar change into one landslide score; read the scar against the terrain in 3D (ArcticDEM or your own DEM); and turn the outline you digitize into a volume (Larsen et al. 2010 area-volume scaling). "Try an example" in the Detection box loads a real event to start from.
+
+    SETUP: the imagery searches run in a separate Python that the plugin installs itself the first time - click "Install imagery tools" at the top of the panel (about 300 MB to download, 1 GB on disk; nothing is installed into QGIS). It downloads uv (Astral, MIT/Apache-2.0) from PyPI, a standalone Python 3.12 and a pinned, hash-checked package set including PyTorch (for the snow-robust cloud mask) into your user data folder; "Remove" deletes all of it. Volume, Fusion and Maxar VHR work without it.
+
+    ACCOUNTS: Sentinel-2, Landsat, Sentinel-1 and ArcticDEM need none. PlanetScope needs a Planet account (paid). Maxar VHR needs a GEGD Pro API key (US government users). NISAR and the RGI glacier outlines need a free NASA Earthdata login.
+
+    COVERAGE: built for Alaska (glacier outlines and DEM fetch); the optical and radar searches work worldwide.
+
+    PLATFORMS: tested on macOS with QGIS 3.44 and 4.2. Windows and Linux are expected to work but are untested - please report problems on the issue tracker.
+
+    License: GPL-2.0-or-later.
+version=1.0.0
 author=Ethan Hasenauer
-email=ethan.hasenauer@sjsu.edu
-tags=landslide,remote sensing,planet,sentinel,landsat,stac,hazard,sar,swir,ndsi,dem,arcticdem,3d,terrain,volume,centerline
+email=ehasenauer@alaska.edu
+homepage=https://github.com/ehasenauer-bit/Landslide_Groundtruth#readme
+repository=https://github.com/ehasenauer-bit/Landslide_Groundtruth
+tracker=https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues
+changelog=1.0.0 - First public release.
+    * One-click "Install imagery tools": the plugin builds its own Python environment; no venv to make by hand.
+    * The imagery pipeline ships inside the plugin.
+    * QGIS 4 (Qt6) support.
+    * "Try an example" event in the Detection box.
+    * Clearer messages when a PlanetScope, SAR or DEM search fails.
+    * Project files no longer store machine-specific paths.
+tags=landslide,earthquake,seismic,hazard,remote sensing,change detection,sentinel,landsat,planet,maxar,sar,sentinel-1,nisar,glacier,dem,arcticdem,3d,volume,alaska
 category=Plugins
 icon=icon.png
-experimental=True
+experimental=False
+deprecated=False
 hasProcessingProvider=no

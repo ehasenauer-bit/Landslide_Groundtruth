@@ -32,6 +32,10 @@ Two hazards follow, and both are silent if unhandled:
 The reference grid is the COARSER of the two inputs, on the principle that a
 fused score is only as trustworthy as its worst input — upsampling SAR to 10 m
 would manufacture detail out of speckle.
+
+Its RESOLUTION only. The extent is the intersection of every input's footprint
+(`crop_to_common`), because reach and detail are different questions and the
+coarser raster is not the right answer to both.
 """
 import numpy as np
 
@@ -118,6 +122,99 @@ def ground_pixel_m(gt, shape):
     from . import layover_dim
     dx, dy = layover_dim.metric_pixel_size(gt, shape[0])
     return float(max(dx, dy))
+
+
+def extent_km(gt, shape):
+    """(width, height) of a grid in km, whatever CRS it is in.
+
+    For labels and log lines. "20x20 km" is the one number that tells two change
+    rasters of the same event apart when their layer names cannot."""
+    from . import layover_dim
+    dx, dy = layover_dim.metric_pixel_size(gt, shape[0])
+    return (dx * shape[1] / 1000.0, dy * shape[0] / 1000.0)
+
+
+def bbox_in_crs(path, dst_proj):
+    """A raster's footprint as (minx, miny, maxx, maxy), expressed in `dst_proj`.
+
+    The edges are densified before transforming. Sending only the four corners of
+    a UTM tile into lon/lat understates the box, because the edges between them
+    bow; over a 90 km scene at 60N that is several pixel rows, and it would be
+    absorbed silently into the intersection below."""
+    from osgeo import osr
+    gt, shape, proj = reference_grid(path)
+    bb = grid_bbox(gt, shape)
+    if not proj or not dst_proj:
+        return bb
+    src, dst = osr.SpatialReference(), osr.SpatialReference()
+    src.ImportFromWkt(proj)
+    dst.ImportFromWkt(dst_proj)
+    if src.IsSame(dst):
+        return bb
+    for s in (src, dst):
+        s.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    tr = osr.CoordinateTransformation(src, dst)
+    xs, ys = [], []
+    n = 32
+    for i in range(n + 1):
+        f = i / float(n)
+        x = bb[0] + (bb[2] - bb[0]) * f
+        y = bb[1] + (bb[3] - bb[1]) * f
+        for ex, ey in ((x, bb[1]), (x, bb[3]), (bb[0], y), (bb[2], y)):
+            u, v, _ = tr.TransformPoint(float(ex), float(ey))
+            xs.append(u)
+            ys.append(v)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def crop_to_common(gt, shape, proj, paths, min_px=16):
+    """Shrink a reference grid to the ground EVERY input actually covers.
+
+    pick_reference answers "how fine should the fused grid be". It must not also
+    answer "how far does it reach" — but it did, because the reference raster's
+    own extent was handed straight to the warp. The two questions have different
+    answers, and conflating them is silent:
+
+      a 20 km optical tile fused against a 90 km SAR scene produced a 90 km
+      raster carrying optical evidence over 5% of itself. The rest scored from
+      SAR alone or not at all, and the result looked exactly as if the small
+      optical raster had been the one used -- which, over 5% of the output, it
+      was.
+
+    So the extent is the INTERSECTION: the ground where both inputs have
+    something to say. Pixel edges are inherited from the reference grid, so the
+    crop is a whole number of reference pixels and nothing is resampled twice.
+
+    Returns (gt, (rows, cols), info)."""
+    require_north_up(gt)
+    px, py = abs(gt[1]), abs(gt[5])
+    if px <= 0 or py <= 0:
+        raise ValueError("the reference grid has a zero pixel size")
+    if gt[1] < 0:
+        raise ValueError(f"the reference grid is mirrored east-west (pixel "
+                         f"width {gt[1]}); reproject it before fusing")
+    x0, y0, x1, y1 = grid_bbox(gt, shape)
+    for p in paths:
+        b = bbox_in_crs(p, proj)
+        x0, y0 = max(x0, b[0]), max(y0, b[1])
+        x1, y1 = min(x1, b[2]), min(y1, b[3])
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("the inputs do not overlap at all - they describe "
+                         "different places")
+    ox, oy = gt[0], gt[3]                    # north-up origin: min x, max y
+    eps = 1e-6                               # in PIXELS; the divides normalise
+    c0 = max(0, int(np.ceil((x0 - ox) / px - eps)))
+    c1 = min(shape[1], int(np.floor((x1 - ox) / px + eps)))
+    r0 = max(0, int(np.ceil((oy - y1) / py - eps)))
+    r1 = min(shape[0], int(np.floor((oy - y0) / py + eps)))
+    w, h = c1 - c0, r1 - r0
+    if w < min_px or h < min_px:
+        raise ValueError(
+            f"the inputs overlap on only {max(w, 0)}x{max(h, 0)} pixels of the "
+            f"{shape[1]}x{shape[0]} reference grid - too little to fuse")
+    gt2 = (ox + c0 * px, gt[1], 0.0, oy - r0 * py, 0.0, gt[5])
+    return gt2, (h, w), {"kept": (w * h) / float(shape[0] * shape[1]),
+                         "cropped": (h, w) != tuple(shape)}
 
 
 def pick_reference(paths):

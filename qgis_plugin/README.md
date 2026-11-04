@@ -7,54 +7,69 @@ pipeline runs and loads the results — true/false-colour pre+post, dNDVI,
 brightness change, and the predicted epicentre point — straight into your project
 for review. You confirm the slide and digitize the scar by eye in QGIS.
 
-## How it works (Option B: subprocess → venv)
+Users install it from the QGIS plugin repository. See the repository's main
+README. This file is for working on the plugin.
+
+## How it works (subprocess → separate Python)
 
 The plugin runs inside QGIS's own Python (PyQt/PyQGIS only) and does **not**
-import the heavy imagery stack. When you click **Run**, it launches the
-project's `venv` Python as a background process running `run_single.py`, streams
-its output to the log, then reads the `result.json` it writes and loads the
-listed layer files. This keeps all the science dependencies in the venv and out
-of QGIS — nothing extra to install into QGIS itself.
+import the heavy imagery stack. When you click **Search** or **Run**, it launches
+a separate Python as a background process running `run_single.py`, streams its
+output to the log, then reads the `result.json` it writes and loads the listed
+layer files.
 
 ```
-QGIS Python (plugin UI)  --subprocess-->  venv Python (run_single.py)
+QGIS Python (plugin UI)  --subprocess-->  imagery Python (run_single.py)
         ^                                          |
         |  load layers  <----- result.json + *.tif/*.gpkg files
 ```
 
-## Install
+That Python is one of two (`dock.pipeline_python` / `pipeline_dir`):
 
-1. Copy (or symlink) the inner `landslide_groundtruth/` folder into your QGIS
-   plugins directory:
+- **Installed by the plugin** (`environment.py`, the Setup box's *Install
+  imagery tools*). uv, a standalone Python 3.12 and `requirements.lock` go into
+  the per-user data folder (`environment.data_dir()`). The scripts are the
+  plugin's own `pipeline/` copy in a release zip, or this repository's root in a
+  development checkout.
+- **Your own** (*Use my own Python (advanced)*): any interpreter with
+  `requirements.txt` installed, plus optionally a folder holding
+  `run_single.py`. This is the development setup below.
+
+## Development setup
+
+1. Build the venv at the repository root:
+   `python -m venv venv && venv/bin/pip install -r requirements.txt`.
+2. Symlink the inner `landslide_groundtruth/` folder into your QGIS profile's
+   plugins directory. QGIS 3 shown; QGIS 4 profiles live under `QGIS4/`:
 
    - **macOS:** `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
    - **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
    - **Linux:** `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
 
    ```bash
-   ln -s "/Users/ethanhasenauer/Documents/AEC Work/SatClaude/landslide_groundtruth/qgis_plugin/landslide_groundtruth" \
+   ln -s "$PWD/qgis_plugin/landslide_groundtruth" \
      "$HOME/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/landslide_groundtruth"
    ```
-   (A symlink means edits to the code are picked up on the next QGIS restart /
+   (run from the repository root; edits are picked up on the next QGIS restart /
    *Plugin Reloader*.)
+3. Enable **Landslide Ground-Truthing** under **Plugins ▸ Manage and Install
+   Plugins ▸ Installed**, open the dock, and under **Setup ▸ Use my own Python
+   (advanced)** set *Python for the imagery tools* to `venv/bin/python`. These
+   paths live in QgsSettings, never in a project file.
 
-2. Restart QGIS → **Plugins ▸ Manage and Install Plugins ▸ Installed** → enable
-   **Landslide Ground-Truthing**. (It's marked experimental; tick *Show also
-   experimental plugins* if you don't see it.)
+Tests: `tests/run_all.sh` (QGIS 3.44 LTR), or
+`QGIS_APP=~/Applications/QGIS-final-4_2_3.app tests/run_all.sh` for QGIS 4.
 
-3. Click the toolbar button to open the dock.
+## Releasing
 
-## First-run setup (the Environment box)
-
-| Field | Set to |
-|-------|--------|
-| **venv python** | `…/landslide_groundtruth/venv/bin/python` |
-| **project dir** | `…/landslide_groundtruth` (folder containing `run_single.py`) |
-| **output dir**  | where results/clips should be written (default: `<project>/out/interactive`) |
-
-These persist between sessions. Planet auth is read automatically from
-`~/.planet/` (run `…/venv/bin/planet auth login` once if needed); without it the
-pipeline falls back to Sentinel-2/Landsat.
+1. Bump `version` and `changelog` in `metadata.txt`.
+2. If `requirements.txt` changed: `python3 scripts/build_release.py --relock --uv
+   /path/to/uv`. This recompiles `requirements.lock`, pinned to what `./venv`
+   has installed. Then check that a fresh *Install imagery tools* still works.
+3. `python3 scripts/build_release.py` writes `dist/landslide_groundtruth-<version>.zip`,
+   with the pipeline scripts copied into `pipeline/`.
+4. Upload it at <https://plugins.qgis.org/plugins/add/> (OSGeo ID login). The site
+   scans it with Bandit and detect-secrets; critical findings block a version.
 
 ## Use
 
@@ -136,10 +151,10 @@ pipeline falls back to Sentinel-2/Landsat.
 - **Sentinel-2 and Landsat are always free** (Microsoft Planetary Computer, no
   quota), so a Run that uses or falls back to them costs nothing.
 
-## Notes / current limitations (v0.1, experimental)
+## Notes / current limitations
 
-- PlanetScope runs place **2 Orders** (pre+post) and consume Planet quota; see
-  *Dialing in an event vs. billing* above.
+- PlanetScope renders place Orders (pre+post) that consume Planet quota, once per
+  scene (see the main README's *Ordering a scene once*).
 - Progress is stage-level (parsed from the script's stdout), not a true percent.
 - This is imagery-gathering only — scar delineation/area are done by hand in QGIS
   against the loaded layers.

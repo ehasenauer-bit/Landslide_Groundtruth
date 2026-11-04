@@ -14,7 +14,7 @@ Usage:
   python run_single.py --lat 60.465 --lon -142.10 \\
       --datetime "2023-08-07 11:19" --radius-km 3 \\
       --pre-days 60 --post-days 90 --prefer planet --out out/interactive
-  # optional: --event-id Bagley_test --seasonal --auto-window
+  # optional: --event-id Bagley_test --auto-window
   # preview only (no orders/downloads): add --search-only
 
 Already looked at this event? Don't order it again — Planet quota is spent at order
@@ -56,6 +56,28 @@ def _adopt_legacy_orders(out_dir):
               f"are recallable now without re-ordering")
 
 
+def _scene_tag(ids):
+    """Filename tag for the PlanetScope scene(s) one side of a render composited.
+
+    One scene -> its id ('20260824_211813_10_2527'). Several -> the earliest id's date,
+    the count and a hash of the whole set ('20260813_2scenes_1a2b3c4d'), so two
+    different sets never share a name. '' when the ids aren't known, which keeps the
+    old event-only name."""
+    ids = sorted({str(i).strip() for i in (ids or []) if str(i).strip()})
+    if not ids:
+        return ""
+    if len(ids) == 1:
+        return ids[0]
+    import hashlib
+    digest = hashlib.sha1(",".join(ids).encode()).hexdigest()[:8]
+    return f"{ids[0][:8]}_{len(ids)}scenes_{digest}"
+
+
+def _tagged(base, *parts, toa=False):
+    """'<base>_<part>_…[_toa].tif', skipping empty parts."""
+    return "_".join([base] + [p for p in parts if p]) + ("_toa" if toa else "") + ".tif"
+
+
 def _write_render_json(a, event_id, r):
     """Render each side's true-colour GeoTIFF from the composites in `r` and write
     <out>/render.json (layer paths + notes + any pending order ids). Shared by
@@ -87,12 +109,22 @@ def _write_render_json(a, event_id, r):
         out["stretch"] = dict(tone)
         render = rp._linear
     elif a.planet_tone == "hdr":
-        # HDR (exposure fusion): renders and fuses its own spread of exposures
-        # (rp.HDR_WHITES), so there is no single white point and no auto-stretch — the fusion
-        # IS the dynamic-range fit. Honours knee + contrast; the manual white/black don't apply.
+        # HDR: ONE global curve — the rolloff shoulder plus a log shadow lift (rp.HDR_LIFT)
+        # — fitted to the scene's own bright tail. Honours knee + contrast; --planet-white
+        # is honoured as the anchor when given, otherwise it is fitted ONCE from both sides
+        # (rp.hdr_white) so the before/after pair stays comparable under the swipe tool.
+        # --planet-black doesn't apply: the curve's whole point is not to clip the dark end.
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None else rp.CONTRAST,
                     knee=a.planet_knee if a.planet_knee is not None else rp.KNEE)
-        out["stretch"] = {"hdr": "adaptive exposures"}   # per-scene, see review_package._hdr_whites
+        if a.planet_white is not None:
+            tone["white"] = a.planet_white
+            out["notes"].append(f"hdr: white {a.planet_white:.3f} from --planet-white")
+        else:
+            comps = [c for c in (r.get("pre"), r.get("post")) if c is not None]
+            white_used, note = rp.hdr_white(comps)
+            tone["white"] = white_used
+            out["notes"].append(note)
+        out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
         render = rp._highlight_hdr
     else:
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
@@ -125,11 +157,22 @@ def _write_render_json(a, event_id, r):
             # what the pixels were actually rendered with, for the log and for reproducing it
             out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
         render = rp._highlight_rolloff if a.planet_tone == "knee" else rp._highlight_natural
+    # Name each side's GeoTIFF for the scene(s) in it and the product, not just the event
+    # and tone. Rendering OTHER scenes then writes a new file instead of overwriting the one
+    # an earlier render's layer is still showing — which is what lets downloaded scenes
+    # stay on the map side by side. Only the same scenes + tone + product reuse a path (a
+    # re-tone or recall of what's already there), and the plugin replaces that one layer.
+    scenes = r.get("scenes") or {
+        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
+        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
+    prod = r.get("product") or {}
+    tags = {s: _scene_tag(scenes.get(s)) for s in ("pre", "post")}
     for side in ("pre", "post"):
         comp = r.get(side)
         if comp is None:
             continue
-        path = f"{base}_{side}_planet_{a.planet_tone}.tif"
+        path = _tagged(base, side, tags[side], f"planet_{a.planet_tone}",
+                       toa=prod.get(side) == "toa")
         try:
             render(comp, path, comp.rio.crs, **tone)
             out[side] = path
@@ -144,7 +187,6 @@ def _write_render_json(a, event_id, r):
     # so the guard lives here where both sides meet. Derived from the raw composites, not
     # the tone curve, so it's identical on every path and costs only a subtraction.
     pre_c, post_c = r.get("pre"), r.get("post")
-    prod = r.get("product") or {}
     pre_p, post_p = prod.get("pre"), prod.get("post")
     if pre_c is not None and post_c is not None:
         if not (pre_p and post_p and pre_p == post_p):
@@ -157,8 +199,11 @@ def _write_render_json(a, event_id, r):
             import imagery as im
             try:
                 dbright = (im._brightness(post_c) - im._brightness(pre_c)).rename("dbright")
-                dpath = f"{base}_dbright.tif"
-                dbright.rio.write_crs(pre_c.rio.crs).rio.to_raster(dpath, driver="GTiff")
+                pair = (f"{tags['pre']}_vs_{tags['post']}"
+                        if tags["pre"] and tags["post"] else "")
+                dpath = _tagged(base, "dbright", pair, toa=pre_p == "toa")
+                # tiled + overviewed, same as every other package raster
+                rp._to_tif(dbright, dpath, pre_c.rio.crs)
                 out["dbright"] = dpath
             except Exception as e:
                 out["notes"].append(f"dbright: render failed: {e}")
@@ -166,9 +211,7 @@ def _write_render_json(a, event_id, r):
     out["toa"] = bool(r.get("toa"))   # DN/TOA render vs SR — the plugin labels the layer
     # scene ids actually composited per side, so the plugin can date the layers on ANY path
     # (render/recall/re-tone) — not just when it launched the render with the scenes ticked.
-    out["scenes"] = r.get("scenes") or {
-        "pre": [x.strip() for x in (a.pre_scene_ids or "").split(",") if x.strip()],
-        "post": [x.strip() for x in (a.post_scene_ids or "").split(",") if x.strip()]}
+    out["scenes"] = scenes
     orders = r.get("pending") or {}
     if orders:
         out["pending"] = {"orders": orders, "lat": a.lat, "lon": a.lon,
@@ -198,7 +241,7 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
         if s == "planet":
             import planet_imagery as pi
             r = pi.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window,
                                 cloud_weight=args.cloud_weight,
                                 max_cloud_pct=args.max_cloud,
@@ -207,17 +250,22 @@ def _search_one_source(s, lat, lon, radius_km, when: dt.datetime, args):
         elif s == "s1":
             import sar_imagery as si
             r = si.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
+                                auto_window=args.auto_window)
+        elif s == "nisar":
+            import nisar_imagery as ni
+            r = ni.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window)
         elif s == "dem":
             import dem_imagery as di
             r = di.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window)
         else:
             import imagery as im
             r = im.search_event(lat, lon, radius_km, when, pre_days=args.pre_days,
-                                post_days=args.post_days, seasonal=args.seasonal,
+                                post_days=args.post_days,
                                 auto_window=args.auto_window, sensor=s,
                                 cloud_weight=args.cloud_weight,
                                 max_cloud_pct=args.max_cloud)
@@ -245,11 +293,24 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
 
     sensors = {"auto": ["s2", "landsat"], "planet": ["planet"],
                "s2": ["s2"], "landsat": ["landsat"], "s1": ["s1"],
+               "sar": ["s1", "nisar"], "nisar": ["nisar"],
                "dem": ["dem"]}[args.prefer]
     if "s2" in sensors and when < dt.datetime(2016, 1, 1):
         sensors = [s for s in sensors if s != "s2"]
         if "landsat" not in sensors:
             sensors.append("landsat")
+    # NISAR only where the window can reach its archive (science from 2025-10-17).
+    # The date is the permissive floor only — whether data exists is the granule
+    # search's job, see nisar_imagery.applicable — so this drops nothing real.
+    skipped = []
+    if "nisar" in sensors:
+        import nisar_imagery as ni
+        if not ni.applicable(when, args.pre_days, args.post_days):
+            sensors = [s for s in sensors if s != "nisar"]
+            skipped.append(f"NISAR not searched: this window ends before its first "
+                           f"science acquisition ({ni.FIRST_SCIENCE:%Y-%m-%d})")
+    if not sensors:
+        return dict(pre=[], post=[], notes=skipped, failed=[])
 
     # The per-source searches are independent network-bound calls, so fan them out
     # across threads: the preview then returns in ~the slowest single source
@@ -261,7 +322,10 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             lambda s: _search_one_source(s, lat, lon, radius_km, when, args),
             sensors))
 
-    pre, post, notes = [], [], []
+    pre, post, notes = [], [], list(skipped)
+    # Sources whose search raised, so a caller can tell "searched, nothing matched" from
+    # "never searched" — the tab used to report a failed Planet search as 0 scenes found.
+    failed = [note for r, note in results if r is None and note]
     for r, note in results:
         if r is not None:
             pre += r["pre"]
@@ -276,7 +340,7 @@ def _search_candidates(lat, lon, radius_km, when: dt.datetime, args) -> dict:
             notes.append(note)
     pre.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
     post.sort(key=lambda c: c.get("gap_days") if c.get("gap_days") is not None else 1e9)
-    return dict(pre=pre, post=post, notes=notes)
+    return dict(pre=pre, post=post, notes=notes, failed=failed)
 
 
 def _print_search_table(res: dict):
@@ -319,13 +383,17 @@ def main():
     ap.add_argument("--event-id", default=None,
                     help="label for the output files (default: derived from time)")
     ap.add_argument("--prefer", default="auto",
-                    choices=["auto", "planet", "s2", "landsat", "s1", "dem"],
+                    choices=["auto", "planet", "s2", "landsat", "s1", "sar",
+                             "nisar", "dem"],
                     help="imagery source; 'auto' = Sentinel-2 -> Landsat (STAC). "
                          "'planet' searches PlanetScope only and is used by the "
                          "plugin's PlanetScope tab (search/preview; runs need a "
                          "PlanetScope order flow, added separately). 's1' searches "
                          "Sentinel-1 RTC (SAR amplitude) and is used by the plugin's "
                          "SAR tab — search/preview only (--search-only required). "
+                         "'nisar' searches NISAR L-band GCOV (ASF, via NASA CMR) and "
+                         "'sar' both radars, NISAR only when the window reaches its "
+                         "archive (2025-10-17 on) — also search/preview only. "
                          "'dem' searches PGC ArcticDEM/EarthDEM/REMA time-stamped DEM "
                          "strips and is used by the plugin's DEM differencing tab — "
                          "also search/preview only.")
@@ -348,21 +416,30 @@ def main():
                          "still caps (PlanetScope 80, Sentinel-2/Landsat 60, either one 20 "
                          "with --auto-window), since it picks scenes for you rather than "
                          "showing them to you.")
-    ap.add_argument("--coverage", choices=["aoi", "point"], default="aoi",
-                    help="PlanetScope coverage requirement: 'aoi' = any scene overlapping the "
-                         "search box (matches Planet Explorer; default), 'point' = scene "
-                         "footprint must contain the exact epicentre (stricter).")
-    ap.add_argument("--quality", choices=["standard", "any"], default="standard",
-                    help="PlanetScope quality: 'standard' = standard-quality scenes only "
-                         "(default), 'any' = also include 'test'-quality scenes. Near a fresh "
-                         "event the nearest/clearest scenes are often test-only (Planet Explorer "
-                         "shows them); test = looser geo/radiometric calibration, fine for the "
-                         "visual review.")
+    ap.add_argument("--coverage", choices=["aoi", "point"], default="point",
+                    help="PlanetScope coverage requirement: 'point' = scene footprint must "
+                         "contain the exact epicentre (stricter; default, as the plugin "
+                         "tab), 'aoi' = any scene overlapping the search box (matches "
+                         "Planet Explorer).")
+    ap.add_argument("--quality", choices=["standard", "any"], default="any",
+                    help="PlanetScope quality: 'any' = also include 'test'-quality scenes "
+                         "(default, as Planet Explorer and the plugin tab do), 'standard' = "
+                         "standard-quality scenes only. 'standard' hides most of Alaska: over "
+                         "the 2026-08-18 St. Elias event 78%% of scenes since May, and 95%% "
+                         "since July, were test. Test = looser geo/radiometric calibration, "
+                         "fine for the visual review.")
     ap.add_argument("--scenes", default=None,
                     help="comma-separated review layers to download: true_color, "
-                         "highlight_natural, false_color, ndvi, dndvi, dbright "
-                         "(default: all). The predicted-point layer is always written. "
-                         "Ignored with --search-only.")
+                         "highlight_natural, highlight_hdr, false_color, "
+                         "swir_falsecolor, ndvi, dndvi, dndsi, dbright (default: all; "
+                         "see review_package.SCENE_KEYS). The swir_falsecolor and dndsi "
+                         "layers need SWIR and so skip on PlanetScope. highlight_hdr is "
+                         "the same curve as --planet-tone hdr — one global curve fitted "
+                         "to the scene, which clips at neither end — and holds the whole "
+                         "AOI in float, so it is the one product that can run a large AOI "
+                         "out of memory; it skips with a line in the log rather than "
+                         "failing the package. The predicted-point layer is always "
+                         "written. Ignored with --search-only.")
     ap.add_argument("--pre-scene-ids", default=None,
                     help="comma-separated scene IDs to composite for the PRE side, "
                          "overriding the automatic scene ranking (Sentinel-2 / Landsat "
@@ -374,8 +451,6 @@ def main():
                          "run exports just that side's imagery and skips dNDVI / dNDSI / "
                          "dBrightness, which are pre->post differences. Useful for a "
                          "fresh event with no usable pre-scene yet.")
-    ap.add_argument("--seasonal", action="store_true",
-                    help="winter event: use prior-year pre window")
     ap.add_argument("--auto-window", action="store_true",
                     help="tightest window: use only the clear scene nearest the event on "
                          "each side; --pre-days/--post-days act as the max search range")
@@ -454,11 +529,12 @@ def main():
                          "never does. See review_package.TONE_MODES. 'knee' additionally "
                          "fits its black/white points to a frame that is all snow/ice — see "
                          "--planet-no-auto-stretch; 'linear' honours --planet-white/"
-                         "--planet-black but never auto-fits. 'hdr' = exposure fusion: "
-                         "renders the knee curve at several exposures and fuses them "
-                         "(Mertens) so deep shadow AND blown snow both keep detail in one "
-                         "image; it fits its own dynamic range, so white/black/auto-stretch "
-                         "don't apply (see review_package._highlight_hdr).")
+                         "--planet-black but never auto-fits. 'hdr' = one global curve: "
+                         "the knee curve plus a log shadow lift, so deep shadow AND sunlit "
+                         "snow both keep detail in one image and nothing clips at either "
+                         "end. Its white point is fitted from the scene unless "
+                         "--planet-white says otherwise; --planet-black doesn't apply "
+                         "(see review_package._highlight_hdr).")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "
@@ -504,7 +580,7 @@ def main():
                     help="Planet order id for the POST side to resume.")
     a = ap.parse_args()
 
-    if a.prefer in ("s1", "dem") and not a.search_only:
+    if a.prefer in ("s1", "sar", "nisar", "dem") and not a.search_only:
         print(f"--prefer {a.prefer} is search/preview only "
               "(no composite Run pipeline); add --search-only")
         return 1
@@ -646,7 +722,7 @@ def main():
 
     # args namespace process_one() reads; radius_scale=1.0 so radius-km is literal
     args = Namespace(out=a.out, prefer=a.prefer,
-                     pre_days=a.pre_days, post_days=a.post_days, seasonal=a.seasonal,
+                     pre_days=a.pre_days, post_days=a.post_days,
                      radius_scale=1.0, auto_window=a.auto_window,
                      cloud_weight=a.cloud_weight, max_cloud=a.max_cloud,
                      coverage=a.coverage, quality=a.quality, scenes=a.scenes,
@@ -662,11 +738,12 @@ def main():
             res = _search_candidates(a.lat, a.lon, a.radius_km, a.when, args)
         except Exception as e:
             traceback.print_exc()
-            res = dict(pre=[], post=[], notes=[f"search failed: {e}"])
+            res = dict(pre=[], post=[], notes=[f"search failed: {e}"],
+                       failed=[f"search failed: {e}"])
         res.update(event_id=event_id, lat=a.lat, lon=a.lon,
                    datetime_utc=a.when.isoformat(),
                    params=dict(pre_days=a.pre_days, post_days=a.post_days,
-                               seasonal=a.seasonal, auto_window=a.auto_window,
+                               auto_window=a.auto_window,
                                cloud_weight=a.cloud_weight, max_cloud=a.max_cloud,
                                coverage=a.coverage, quality=a.quality,
                                prefer=a.prefer, radius_km=a.radius_km))

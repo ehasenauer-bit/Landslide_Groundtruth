@@ -68,11 +68,11 @@ print("3c. status_color() follows the running palette")
 from qgis.PyQt.QtGui import QPalette, QColor as QC
 from qgis.PyQt.QtWidgets import QApplication
 qa=QApplication.instance()
-pal=qa.palette(); pal.setColor(QPalette.Window, QC("#333333")); qa.setPalette(pal)
+pal=qa.palette(); pal.setColor(QPalette.ColorRole.Window, QC("#333333")); qa.setPalette(pal)
 assert theme.is_dark_theme() is True
 assert theme.status_color("success")==theme.STATUS_COLORS_DARK["success"]
 print("   dark palette  ->", theme.status_color("success"))
-pal.setColor(QPalette.Window, QC("#F0F0F0")); qa.setPalette(pal)
+pal.setColor(QPalette.ColorRole.Window, QC("#F0F0F0")); qa.setPalette(pal)
 assert theme.is_dark_theme() is False
 assert theme.status_color("success")==theme.STATUS_COLORS_LIGHT["success"]
 print("   light palette ->", theme.status_color("success"))
@@ -126,7 +126,8 @@ print("   zero/negative/None/str all pass through silently")
 print("   describe(0,0,0) =", repr(limits.describe(0,0,0)))
 
 print("\n8. guards are actually wired in")
-for f,needle in (("viewer3d_tab.py","limits.check_grid"),("volume_tab.py","limits.check_grid")):
+# volume_tab's guard went with DEM differencing to parked/ddem (2026-10-23)
+for f,needle in (("viewer3d_tab.py","limits.check_grid"),):
     src=open(os.path.join(PLUG, f)).read()
     assert needle in src, f
     print(f"   {f}: guarded")

@@ -208,6 +208,20 @@ def _decode(arr, sensor, mask_dark=False):
     return bad
 
 
+def _observed(arr, sensor):
+    """True where this scene actually SAW the pixel.
+
+    _decode answers "is this pixel unusable", and a scene that does not cover the
+    pixel is correctly unusable — for that scene, on its own. It is NOT evidence
+    that the pixel is cloudy, and the moment several scenes vote against each
+    other that distinction becomes the whole ballgame. The PC bbox render fills
+    outside a scene's footprint with the fill code, which is 0 for both tables
+    (SCL 0 = NO_DATA, Landsat QA fill = 0), so 0 and NaN both mean "no
+    observation here"."""
+    a = np.asarray(arr, dtype=np.float64)
+    return np.isfinite(a) & ~np.isclose(a, 0.0)
+
+
 def cloud_mask_on_grid(meta, gt, shape, proj, *, sides=("pre", "post"),
                        frac_thresh=0.5, mask_dark=False, log=None):
     """Boolean cloud mask on the fusion grid, from the scenes the Run composited.
@@ -234,28 +248,34 @@ def cloud_mask_on_grid(meta, gt, shape, proj, *, sides=("pre", "post"),
     h, w = shape
 
     any_bad = np.zeros(shape, dtype=bool)
+    unseen = np.zeros(shape, dtype=bool)
     fetched = failed = 0
     for side in sides:
         ids = [s for s in (meta.get(f"{side}_scenes") or []) if s]
         if not ids:
             continue
         votes = np.zeros(shape, dtype=np.float32)
-        got = 0
+        seen = np.zeros(shape, dtype=np.float32)
+        got = miss = 0
         for item_id in ids:
             path = _fetch_class_band(collection, item_id, asset, bbox, w, h)
             if not path:
                 failed += 1
+                miss += 1
                 if log:
                     log(f"    {side}: could not fetch {asset} for {item_id}")
                 continue
             try:
                 arr = fusion_grid.warp_to_reference(path, gt, shape, proj,
                                                     resample="nearest")
-                votes += _decode(arr, sensor, mask_dark).astype(np.float32)
+                obs = _observed(arr, sensor)
+                votes += (_decode(arr, sensor, mask_dark) & obs).astype(np.float32)
+                seen += obs.astype(np.float32)
                 got += 1
                 fetched += 1
             except Exception as e:                   # noqa: BLE001
                 failed += 1
+                miss += 1
                 if log:
                     log(f"    {side}: {item_id}: {type(e).__name__}: {e}")
             finally:
@@ -264,18 +284,42 @@ def cloud_mask_on_grid(meta, gt, shape, proj, *, sides=("pre", "post"),
                 except OSError:
                     pass
         if got:
-            # Denominator is how many scenes the COMPOSITE used, not how many we
-            # managed to fetch. The threshold's whole meaning is "enough of the
-            # median's inputs were cloudy to corrupt it"; dividing by `got` would
-            # turn one failed fetch into a stronger claim about the composite.
-            any_bad |= (votes / float(len(ids))) >= frac_thresh
+            # Denominator is how many of this side's scenes actually SAW each
+            # pixel, plus the ones that could not be fetched — those are assumed
+            # to have seen it and to have been clear, which is the original rule
+            # here and the reason it is kept: one failed fetch must not become a
+            # stronger claim about the composite.
+            #
+            # It used to be len(ids) — every scene voting on every pixel. That is
+            # right only while a single granule covers the whole AOI. Past about
+            # 20 km radius the Run composites SEVERAL MGRS tiles, and a tile that
+            # does not cover a pixel renders as the fill code, which both class
+            # tables list as unusable. So every tile voted "cloudy" on every
+            # pixel outside itself. Measured at Mt Logan, 45 km radius, four
+            # tiles a side (T07VDG/VDH/VEG/VEH, each seeing 24-37% of the AOI):
+            # every pixel collected three spurious votes, 3/4 cleared the 0.5
+            # threshold, and 99.5% of the AOI was masked — leaving optical
+            # evidence on the ~10 km square at the centre where all four tiles
+            # overlap, and nowhere else. At least one scene really saw 99.8%.
+            denom = seen + float(miss)
+            frac = np.divide(votes, denom, out=np.zeros(shape, dtype=np.float32),
+                             where=denom > 0)
+            any_bad |= (denom > 0) & (frac >= frac_thresh)
+            if not miss:
+                # every scene for this side came back, so "no scene saw it" is a
+                # fact rather than a gap in what we fetched
+                unseen |= seen <= 0
 
     if not fetched:
         return None, (f"no {asset} bands could be fetched "
                       f"({failed} attempt(s) failed) — optical left unmasked")
+    any_bad |= unseen
     pct = 100.0 * any_bad.mean() if any_bad.size else 0.0
     note = (f"{asset} cloud mask from {fetched} scene band(s): "
             f"{pct:.1f}% of the AOI masked")
+    if unseen.any():
+        note += (f" (of the AOI, {100.0 * unseen.mean():.1f}% is ground no "
+                 "scene in the metadata observed at all)")
     if failed:
         note += (f" ({failed} band(s) unavailable — those scenes count as CLEAR, "
                  "so the mask is weaker than it looks)")

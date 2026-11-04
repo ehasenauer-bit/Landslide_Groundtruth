@@ -1,21 +1,22 @@
-"""Fetch pre/post PlanetScope imagery around a landslide event via the Planet APIs.
+"""PlanetScope imagery for the plugin's PlanetScope tab, via the Planet APIs.
 
 PlanetScope (~3 m, 4-band BGRN surface reflectance) is the highest-resolution
-source in this pipeline and is tried FIRST; `imagery.fetch_event` falls back to
-Sentinel-2 (~10 m) then Landsat (~30 m) when Planet has no coverage for the
-event/date window or when the account is not authenticated.
+optical source the plugin offers. It is NOT part of the automatic Run pipeline
+(`imagery.fetch_event` is Sentinel-2 -> Landsat only); the tab drives it through
+run_single.py, one step at a time, so you choose scenes by eye before paying:
 
-Flow per window (pre and post):
-  1. Data API search PSScene by AOI + date + cloud_cover (+ permission/quality).
-  2. Orders API: order the best N scenes (ranked by a blend of distance to the
-     event date and cloud cover) as the `analytic_sr_udm2` bundle, server-side
-     clipped to the AOI (minimal download), then download.
-  3. Cloud/shadow-mask each clip with its UDM2 'clear' band, reproject to the
-     event UTM zone, and median-composite. NDVI/dNDVI as in `imagery.py`.
+  1. search_event — Data API search of PSScene by AOI + date (+ whole-scene
+     cloud_cover, permission, quality), ranked by a blend of distance to the event
+     date and cloud cover. Free.
+  2. render_preview — Orders API: order the ticked scenes as the `analytic_sr_udm2`
+     bundle (or `analytic_udm2` for TOA), server-side clipped to the AOI, download,
+     reproject to the event UTM zone and median-composite. recall_preview /
+     retone_preview / resume_preview re-composite orders already paid for.
 
-Returns the SAME dict contract as `imagery.fetch_event` (pre/post composites,
-ndvi_pre/post, dndvi, dbright, sensor, pre_scenes/post_scenes) so the review-package
-export is identical regardless of which optical source was used.
+Nothing here masks pixels with UDM2. Its classes are exclusive, so a snow/ice pixel
+is never "clear": masking to UDM2 clear removed 89% of the AOI on average across 19
+cached glacier clips (81 points of it snow-class), and its cloud flag both lands on
+visibly crevassed ice and misses real fog. Clouds are left visible in the render.
 
 Quota: only step 2 costs anything, and it costs it at order CREATION. Every order
 placed here is therefore downloaded into the shared cache and written to the ledger
@@ -32,12 +33,11 @@ import glob
 import json
 import os
 import time
-import warnings
 import numpy as np
 import rioxarray  # noqa: F401  (registers .rio accessor)
 import xarray as xr
 
-import imagery as im  # reuse _bbox, _utm_epsg, _ndvi
+import imagery as im  # reuse _bbox, _utm_epsg, windows
 import planet_cache as pc  # shared order cache + ledger (never re-order what we own)
 
 ITEM_TYPE = "PSScene"
@@ -54,13 +54,30 @@ PS_SR_SCALE = 1e-4                   # PlanetScope SR DN -> reflectance
 #
 # TOA does carry the atmosphere, though, and at a LOW sun angle develops a strong MAGENTA
 # cast: heavy blue path radiance plus red-weighted reflectance coefficients squeeze green.
-# It is a multiplicative colour imbalance, which a dark-object subtraction can't fix (and
-# DOS also crushes a snow scene, whose darkest pixel isn't a true dark object). Instead
-# _balance_cast white-balances it: clouds/snow are physically neutral, so scale the visible
-# bands to make the brightest pixels grey. It only scales bands UP (never darkens), is
-# clamped, and is skipped when there's no bright neutral anchor. The dark end / contrast is
-# left to the tone curve's auto-stretch, which already fits it per scene.
+# It is a multiplicative colour imbalance, which a dark-object subtraction can't fix.
+# Instead _balance_cast white-balances it: clouds/snow are physically neutral, so scale the
+# visible bands to make the brightest pixels grey. It only scales bands UP (never darkens),
+# is clamped, and is skipped when there's no bright neutral anchor.
+#
+# The path radiance itself is ADDITIVE, though, and the balance can't remove it — it
+# multiplies it. Left in, it puts a floor under every band (measured blue p0.1 0.04-0.16 TOA,
+# highest at low sun), the balance's blue gain (up to 1.74x) lifts that to ~0.27-0.30, and
+# the darkest shadow in the frame renders as mid-grey: the HDR curve's log lift is steepest
+# below ~0.05, where no pixel is left, so it lands on the shadows at roughly unity gain and
+# the whole render sits in DN ~90-220 (2024-09-11 Denali, sun 31 deg; 2026-09-02 Logan,
+# sun 37 deg). _dehaze subtracts that floor per band BEFORE the balance, which is the order
+# the physics has (additive term first, then the multiplicative one). It is a dark-object
+# subtraction, so it is GATED: an all-snow frame's darkest pixel isn't a dark object, and
+# subtracting it would crush the snow — when even the darkest visible band's floor is above
+# TOA_HAZE_MAX there is no dark object to trust, and the step is skipped. Measured on three
+# pre/post pairs: the darkest 1% moves 35-45 DN down, shadow texture +10-58% (zero only on
+# a cast shadow too dark to hold any), snow texture unchanged (within 2%).
 TOA_BUNDLE = "analytic_udm2"         # DN + UDM2 (no atmospheric correction)
+TOA_DEHAZE = True                    # subtract a TOA scene's path-radiance floor (False = skip)
+TOA_HAZE_PCT = 0.1                   # per-band percentile taken as the floor (the darkest pixels)
+TOA_HAZE_MARGIN = 0.10               # ... dropped this FRACTION lower, so real shadow keeps a toe
+TOA_HAZE_MAX = 0.15                  # skip when the darkest visible band's floor is above this
+TOA_HAZE_SAMPLE = 2_000_000          # target sample size for the percentile (strided read)
 TOA_BALANCE = True                   # white-balance a TOA scene's atmospheric cast (False = skip)
 TOA_BRIGHT_PCT = 85.0                # brightest (100-this)% of visible pixels = the neutral target
 TOA_MIN_ANCHOR = 0.50                # ... but only balance when that target is this bright (snow/cloud)
@@ -109,6 +126,7 @@ DOWNLOAD_TRIES = 4                   # passes at an order's files before giving 
 
 DEFAULT_MAX_CLOUD_PCT = 80.0         # whole-scene cloud cap when not overridden
 AUTO_WINDOW_MAX_CLOUD_PCT = 20.0     # stricter cap under --auto-window (nearest CLEAR scene)
+SEARCH_LIMIT = 60                    # scenes per side the free preview lists (see search_event)
 
 
 def _resolve_cloud_frac(max_cloud_pct, auto_window):
@@ -125,6 +143,74 @@ def _resolve_cloud_frac(max_cloud_pct, auto_window):
     return pct / 100.0
 
 
+SPEC_URL = "https://api.planet.com/compute/ops/bundles/spec"   # what planet.specs fetches
+SPEC_TRIES = 3
+SPEC_TIMEOUT_S = 15.0
+
+
+def _prime_bundle_spec():
+    """Hand the Planet SDK its bundle spec before it goes to fetch it itself.
+
+    planet.specs downloads the Orders API bundle spec the first time anything checks
+    an item type — every data.search and every order does — with one bare httpx.get
+    (httpx's 5 s default timeout) tried twice, and each run_single call is a fresh
+    process with no copy. So a few seconds of Planet or network lag failed the whole
+    search as FetchBundlesSpecError, and the tab showed it as "0 scenes" (2026-09-25
+    13:31; the identical search minutes later found 60 pre / 13 post). Fetch it here
+    with a real timeout and a few tries, keep the last good copy in the order cache,
+    and fall back to that copy when Planet doesn't answer: the spec (bundle names per
+    item type) changes rarely, and a search only needs it to say PSScene exists. Any
+    surprise in the SDK's internals just leaves it to fetch as before."""
+    try:
+        from planet import specs
+        loader = specs.PRODUCT_BUNDLES
+    except Exception:
+        return
+    if getattr(loader, "cache", None) is not None:
+        return
+    import itertools
+    import httpx
+    copy = os.path.join(pc.cache_root(), "bundles_spec.json")
+    spec = None
+    for attempt in range(SPEC_TRIES):
+        try:
+            resp = httpx.get(SPEC_URL, timeout=SPEC_TIMEOUT_S)
+            resp.raise_for_status()
+            spec = resp.json()
+            spec["bundles"]                       # a body without it counts as a failure
+            break
+        except Exception:
+            spec = None
+            if attempt + 1 < SPEC_TRIES:
+                time.sleep(2 ** attempt)
+    if spec is not None:
+        try:
+            with open(copy + ".tmp", "w") as fh:
+                json.dump(spec, fh)
+            os.replace(copy + ".tmp", copy)
+        except OSError:
+            pass
+    else:
+        try:
+            with open(copy) as fh:
+                spec = json.load(fh)
+        except (OSError, ValueError):
+            return          # no copy to fall back on: the SDK tries, and says why it failed
+        saved = dt.datetime.fromtimestamp(os.path.getmtime(copy))
+        print(f"    [planet] Planet's bundle spec didn't answer after {SPEC_TRIES} tries; "
+              f"using the copy saved {saved:%Y-%m-%d %H:%M}")
+    try:
+        bundles = spec["bundles"]
+        loader.cache = {                           # the exact shape planet.specs builds
+            "bundles": bundles,
+            "bundle_names": bundles.keys(),
+            "item_types": set(itertools.chain.from_iterable(
+                bundles[b]["assets"].keys() for b in bundles)),
+        }
+    except (KeyError, TypeError, AttributeError):
+        pass
+
+
 def _client():
     """Planet client authenticated with the key the caller published via PL_API_KEY.
 
@@ -137,6 +223,7 @@ def _client():
     the SDK default (on-disk profile / `planet auth login`) only when it's unset."""
     import os
     import planet
+    _prime_bundle_spec()     # every search/order validates against it; see there
     key = os.environ.get("PL_API_KEY", "").strip()
     if key:
         return planet.Planet(session=planet.Session(auth=planet.Auth.from_key(key)))
@@ -172,12 +259,13 @@ def search_scenes(pl, aoi, start, end, event_time, max_cloud=0.6, limit=6,
       None  -> rank by temporal proximity to event_time alone (the tightest
         --auto-window mode).
     cover: if a GeoJSON geometry (the event point) is given, REQUIRE each scene's
-    footprint to contain it instead of merely intersecting the AOI bbox. A single
-    PlanetScope strip only covers a few km, so over a large search box the plain
-    bbox filter can return a scene clipping only the AOI's edge — leaving the
-    epicentre uncovered. Requiring coverage of the point guarantees the chosen
-    scenes actually overlap the location being ground-truthed (and, when none do,
-    the caller falls back to Sentinel-2/Landsat rather than mapping an off-centre
+    footprint to contain it instead of merely intersecting the AOI bbox. A
+    PlanetScope scene is ~32 x 20 km (SuperDove) and is framed along the satellite
+    track on no tiling grid, so over a large search box the plain bbox filter can
+    return a scene clipping only the AOI's edge — leaving the epicentre
+    uncovered. Requiring coverage of the point guarantees the chosen scenes
+    actually overlap the location being ground-truthed (and, when none do, the
+    caller falls back to Sentinel-2/Landsat rather than mapping an off-centre
     strip).
     """
     from planet import data_filter as df
@@ -274,17 +362,25 @@ def _candidate(item, event_time, aoi_cloud_pct=None):
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
-                 post_days=60, seasonal=False, auto_window=False, cloud_weight=0.5,
+                 post_days=60, auto_window=False, cloud_weight=0.5,
                  max_cloud_pct=None, require_point=False, allow_test_quality=False):
     """Free dry-run: candidate PlanetScope scenes per side, NO orders placed.
 
-    Data API search is free and consumes no quota; only Orders do. Uses the same
-    window/ranking logic as fetch_event so the preview matches a real run.
+    Data API search is free and consumes no quota; only Orders do.
     Returns dict(source, pre=[...], post=[...]). Auth/SDK errors propagate to the
     caller (the dry-run dispatcher), which records them as a per-source note.
 
-    max_cloud_pct / require_point / allow_test_quality: see fetch_event — kept
-    identical here so the preview shows exactly the scenes a Run would consider.
+    auto_window: list only the single scene nearest the event on each side (nearest
+    day first, clearest within it), ignoring cloud_weight; pre_days/post_days then
+    act as the maximum search range each side.
+    max_cloud_pct: whole-scene cloud-cover cap (0-100). None -> the mode default
+    (80, or 20 under auto_window). Scene-wide, not the AOI, so a high cap lists
+    scenes clear over the AOI but cloudy elsewhere (matching Planet Explorer).
+    require_point: if True, require each scene footprint to CONTAIN the epicentre;
+    if False (default) accept any scene overlapping the AOI search box.
+    allow_test_quality: if True, also list scenes Planet publishes as 'test' quality
+    (else only quality_category == 'standard'). Near a fresh event the nearest
+    scenes are frequently test-only; fine for a visual review, looser calibration.
 
     Each candidate carries aoi_cloud_pct — the honest cloud-over-your-AOI number
     the whole-scene cloud_cover can't give — but here it is always None, on
@@ -303,9 +399,15 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
-    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days)
     weight = None if auto_window else cloud_weight   # None = nearest-only (auto_window)
-    lim = 1 if auto_window else 6
+    # The preview LISTS scenes for you to judge by eye, so it shows far more than
+    # search_scenes' default 6. Six hid 306 scenes ≤20% cloud across the 6
+    # benchmark events, including 19 ≤50%-cloud scenes within 3 d of the event: the
+    # gap + cloud_weight*cloud cost ranks a clear scene 10 d out ahead of a
+    # partly-cloudy one 2 d out, and the whole-scene cloud can't say which is clear
+    # over the AOI. SEARCH_LIMIT keeps every scene within 3 d on those events.
+    lim = 1 if auto_window else SEARCH_LIMIT
     cloud = _resolve_cloud_frac(max_cloud_pct, auto_window)
     cover = point if require_point else None         # default: AOI overlap (Planet Explorer-like)
     pre_items = search_scenes(pl, aoi, pre0, pre1, event_time, max_cloud=cloud,
@@ -615,6 +717,43 @@ def _toa_from_dn(da, scene_path):
     return da * factors
 
 
+def _haze_floor(da):
+    """Per-band path-radiance floor of a TOA scene: (DataArray over `band`, or None, note).
+
+    TOA_HAZE_PCT of each band's valid pixels, dropped by TOA_HAZE_MARGIN so the darkest
+    real shadow keeps a little toe instead of all landing on exactly 0. None when the
+    darkest VISIBLE band's floor is above TOA_HAZE_MAX — no dark object in the frame (an
+    all-snow AOI), so the floor is surface, not atmosphere. Strided to TOA_HAZE_SAMPLE
+    pixels so it costs the same on any clip; `da` still carries rasterio's band coords."""
+    ny, nx = da.shape[-2], da.shape[-1]
+    step = max(1, int(np.sqrt(ny * nx / float(TOA_HAZE_SAMPLE))))
+    sub = np.asarray(da[:, ::step, ::step].values, dtype="float32")
+    floors = []
+    for b in range(sub.shape[0]):
+        v = sub[b]
+        v = v[np.isfinite(v) & (v > 0)]
+        if v.size == 0:
+            return None, "dehaze: off — a band has no valid pixels"
+        floors.append(float(np.percentile(v, TOA_HAZE_PCT)) * (1.0 - TOA_HAZE_MARGIN))
+    vis = [f for b, f in zip(da.band.values, floors) if b in (1, 2, 3)]
+    if vis and min(vis) > TOA_HAZE_MAX:
+        return None, (f"dehaze: off — darkest visible floor {min(vis):.3f} is above "
+                      f"{TOA_HAZE_MAX}, no dark object in the frame")
+    return (xr.DataArray(floors, coords={"band": da.band}, dims="band"),
+            "dehaze: floor " + ", ".join(f"{f:.3f}" for f in floors))
+
+
+def _dehaze(da):
+    """Subtract a TOA scene's additive path-radiance floor, per band (see TOA_DEHAZE).
+    Runs BEFORE _balance_cast so the balance gain is fitted to — and applied to — the
+    surface signal rather than multiplying the haze. Clipped at 0, never below; a frame
+    with no dark object (_haze_floor -> None) is returned untouched."""
+    floor, _ = _haze_floor(da)
+    if floor is None:
+        return da
+    return (da - floor).clip(0.0, None)
+
+
 def _balance_cast(da):
     """White-balance a TOA scene's atmospheric cast (see the TOA_* block above). Clouds and
     snow are physically neutral, so scale the visible bands (1,2,3 = blue,green,red) to make
@@ -624,8 +763,8 @@ def _balance_cast(da):
     Only scales bands UP (gain >= 1), so it neutralises without darkening; each gain is
     clamped to TOA_MAX_GAIN against a noisy estimate; and the whole step is skipped when the
     brightest pixels are below TOA_MIN_ANCHOR — i.e. there's no snow/cloud to trust as a
-    neutral reference, so a colourful terrain-only scene is left alone. The dark end and
-    contrast are the tone curve's auto-stretch's job, not this."""
+    neutral reference, so a colourful terrain-only scene is left alone. The additive haze
+    floor is _dehaze's job, run before this; the contrast is the tone curve's."""
     vis = [b for b in da.band.values if b in (1, 2, 3)]
     if not vis:
         return da
@@ -644,199 +783,81 @@ def _balance_cast(da):
     return da * xr.DataArray(gains, coords={"band": da.band}, dims="band")
 
 
-def _open_scene(sr_path, udm_path, epsg, transform, shape, mask_clouds=True):
+def _open_scene(sr_path, udm_path, epsg, transform, shape):
     """One clipped PSScene -> reflectance DataArray (bands blue/green/red/nir),
     reprojected onto the shared (transform, shape) target grid.
 
-    mask_clouds: UDM2-mask non-clear pixels to NaN (True, the default — what a
-    quantitative NDVI/composite run wants). The on-map SR detail preview passes
-    False so it shows EVERY real pixel: UDM2 can misflag bright snow/ice as cloud,
-    and punching those to NaN would blank out exactly the overexposed terrain the
-    preview exists to reveal. Clouds, if any, are then just visible in the render."""
+    udm_path is unused: every pixel is kept, clouds included (see the module
+    docstring for why UDM2 masking is wrong over ice). It stays in the signature
+    because _pair_downloads hands out (analytic, udm2) pairs."""
     da = rioxarray.open_rasterio(sr_path, masked=True).astype("float32")
     if "_sr" in os.path.basename(sr_path).lower():
         da = da * PS_SR_SCALE            # SR DN -> surface reflectance
     else:
         # analytic (DN) product = the --planet-toa path: convert to TOA reflectance
-        # ourselves and white-balance its atmospheric cast, instead of Planet's SR
-        # correction (which over-corrects bright snow). See _toa_from_dn / _balance_cast.
+        # ourselves, remove its haze floor and white-balance its atmospheric cast, instead
+        # of Planet's SR correction (which over-corrects bright snow). See _toa_from_dn /
+        # _dehaze / _balance_cast.
         da = _toa_from_dn(da, sr_path)
+        if TOA_DEHAZE:
+            da = _dehaze(da)
         if TOA_BALANCE:
             da = _balance_cast(da)
     da = da.assign_coords(band=["blue", "green", "red", "nir"])
-    if mask_clouds and udm_path and os.path.exists(udm_path):
-        udm = rioxarray.open_rasterio(udm_path)
-        clear = udm.sel(band=1).rio.reproject_match(da)   # UDM2 band 1: 1 = clear
-        da = da.where(clear == 1)
+    # Pin float32 BEFORE the warp. The TOA path multiplies by xarray's default-float64
+    # coefficient/gain arrays (_toa_from_dn, _balance_cast), which silently promotes the
+    # scene to float64 and DOUBLES every array downstream — a 10k x 10k AOI grid is
+    # 1.6 GB in float32 but 3.2 GB in float64. Casting here halves both the warp buffer
+    # and the composite.
+    da = da.astype("float32")
     # warp straight onto the AOI grid; pixels the scene doesn't reach become NaN
     return da.rio.reproject(epsg, transform=transform, shape=shape)
 
 
-def _composite(pairs, lat, lon, radius_km, epsg, mask_clouds=True):
-    """Median composite over the scenes in one window, on the AOI grid. UDM2
-    cloud-masking is applied unless mask_clouds=False (see _open_scene)."""
+def _composite(pairs, lat, lon, radius_km, epsg):
+    """Mosaic one side's scenes onto the AOI grid, stitching the frames and discarding
+    overlap: the first scene to cover a pixel keeps it, later frames only fill the gaps
+    it left.
+
+    A wide AOI is delivered as several PlanetScope frames (~24x8 km) that have to be
+    stitched into one image; where two frames overlap, keeping the first and dropping
+    the rest is exactly the "remove the overlapping imagery" the picker implies when
+    several scenes are ticked for one side.
+
+    Built ONE scene at a time into a single running output, so peak memory stays at
+    ~two AOI-grid arrays however many frames there are. The previous version reprojected
+    EVERY frame to the full AOI grid, held them all at once and ran nanmedian over the
+    stack: for a 15 km radius (a 10k x 10k grid — ~1.6 GB per frame in float32, double
+    that on the TOA path) five frames reached tens of GB of live arrays plus nanmedian's
+    own temporaries, which ran the machine out of memory and got the render process
+    OS-killed. First-valid-wins needs no stack."""
     transform, shape = _target_grid(lat, lon, radius_km, epsg)
-    scenes = [_open_scene(sr, udm, epsg, transform, shape, mask_clouds=mask_clouds)
-              for sr, udm in pairs]
-    if not scenes:
+    comp = None
+    for sr, udm in pairs:
+        da = _open_scene(sr, udm, epsg, transform, shape)
+        # Every frame is already on the identical AOI grid, so combine_first is a plain
+        # where(notnull): comp keeps its own pixels, da fills only where comp is NaN.
+        comp = da if comp is None else comp.combine_first(da)
+        del da
+    if comp is None:
         return None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        comp = xr.concat(scenes, dim="scene").median(dim="scene", skipna=True)
     # Drop inherited per-scene rasterio metadata (e.g. a 4-band 'long_name' and a
     # float NaN nodata) so derived rasters — dNDVI, dBrightness, RGB — don't carry
     # band-count/dtype-mismatched attrs into rioxarray's GeoTIFF writer downstream.
     comp.attrs = {}
+    # Hold the float32 invariant: combine_first upcasts to float64 if EVER handed a
+    # float64 frame, which would double the output. copy=False makes this a no-op on
+    # the normal path (every frame is already float32), so it only bites on a regression.
+    comp = comp.astype("float32", copy=False)
     return comp.rio.write_crs(epsg)
 
 
-def _event_result(pre, post, pre_ids, post_ids):
-    """Build the fetch_event return contract from two finished composites.
-
-    Returns None when either side has no usable pixels over the AOI (all
-    cloud-masked, or the clips landed outside it), so the caller falls back to
-    Sentinel-2/Landsat rather than exporting a blank package. Shared by the ordering
-    path and the cache-recall path so both produce identical results."""
-    if pre is None or post is None or not im._has_coverage(pre) \
-            or not im._has_coverage(post):
-        bad = [s for s, c in (("pre", pre), ("post", post))
-               if c is None or not im._has_coverage(c)]
-        print(f"    [planet] scenes clipped to no clear pixels over the AOI on "
-              f"the {' and '.join(bad)} side (cloud-masked out or a scene nodata gap)")
-        return None
-    ndvi_pre, ndvi_post = im._ndvi(pre), im._ndvi(post)
-    dndvi = (ndvi_post - ndvi_pre).rename("dndvi")
-    bright_pre, bright_post = im._brightness(pre), im._brightness(post)
-    dbright = (bright_post - bright_pre).rename("dbright")
-    return dict(pre=pre, post=post, ndvi_pre=ndvi_pre, ndvi_post=ndvi_post,
-                dndvi=dndvi, bright_pre=bright_pre, bright_post=bright_post,
-                dbright=dbright, sensor="planet",
-                pre_scenes=list(pre_ids), post_scenes=list(post_ids))
-
-
-def _cached_event(event_id, lat, lon, radius_km):
-    """fetch_event's result built entirely from orders already in the ledger, or None.
-
-    No search, no order, no Planet client, no network — the whole point is that a
-    re-run of a project whose PlanetScope scenes are already paid for spends nothing.
-    Requires a pre AND a post order for the event whose clips are still on disk and
-    whose AOI covers the requested radius (see planet_cache.find); anything less is a
-    miss and the caller goes on to search/order normally."""
-    recs = pc.find(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km,
-                   require_radius_km=radius_km, require_files=True)
-    sides = pc.newest_by_side(recs)
-    if not (sides.get("pre") and sides.get("post")):
-        return None
-    epsg = im._utm_epsg(lat, lon)
-    comps, ids = {}, {}
-    for side, rec in sides.items():
-        pairs = _pair_downloads(pc.resolve_path(rec))
-        if not pairs:
-            return None
-        print(f"    [planet-cache] reusing {side} order {rec['order_id'][:12]} "
-              f"({len(pairs)} clip(s)) already ordered for this event — no quota")
-        comps[side] = _composite(pairs, lat, lon, radius_km, epsg)
-        ids[side] = rec.get("scene_ids") or []
-    return _event_result(comps["pre"], comps["post"], ids["pre"], ids["post"])
-
-
-def fetch_event(lat, lon, radius_km, event_time: dt.datetime,
-                pre_days=60, post_days=60, seasonal=False, workdir=None,
-                auto_window=False, cloud_weight=0.5,
-                max_cloud_pct=None, require_point=False, allow_test_quality=False,
-                event_id=None, reuse=True):
-    """PlanetScope pre/post composites + dNDVI, or None if no usable coverage.
-
-    Returns None (so the caller falls back to Sentinel-2/Landsat) when either
-    window has no orderable scenes. Auth/SDK errors propagate to the caller,
-    which logs them and falls back.
-
-    reuse: check the order ledger FIRST and, when this event already has a pre and a
-    post order cached, composite those and place no order at all (see
-    _cached_event). This is why re-running a project doesn't spend quota twice. Pass
-    reuse=False to force a fresh search + order — e.g. after widening the window or
-    changing the cloud cap, where the cached scene choice is no longer what you want.
-    event_id: the event's id, used to key the ledger. Without it, cached orders are
-    matched by AOI proximity alone.
-    workdir: legacy, unused. Orders are downloaded into the shared cache
-    (planet_cache.cache_root()) so they are recallable from any project.
-
-    cloud_weight: gap-days one will travel from the event date to avoid 1% cloud
-    when ranking which scenes to order/composite (gap_days + cloud_weight *
-    cloud_pct); a small weight keeps the composite close to the event date.
-    auto_window: if True, order only the single clear scene nearest the event on
-    each side (tightest window, and the fewest orders), ignoring cloud_weight;
-    pre_days/post_days then act as the maximum search range each side.
-    max_cloud_pct: whole-scene cloud-cover cap (0-100). None -> the mode default
-    (80, or 20 under auto_window). The cap is scene-wide; per-pixel UDM2 masking
-    still applies, so a high cap recovers scenes clear over the AOI but cloudy
-    elsewhere (matching Planet Explorer).
-    require_point: if True, require each scene footprint to CONTAIN the epicentre;
-    if False (default) accept any scene overlapping the AOI search box (Planet
-    Explorer-like). False surfaces partial-coverage scenes near the event date;
-    the composite is built on a fixed AOI grid and gaps are filled by the median
-    of the other scenes (or trigger the S2/Landsat fallback if truly uncovered).
-    allow_test_quality: if True, also order scenes Planet publishes as 'test'
-    quality (else only quality_category == 'standard'). Near a fresh event the
-    nearest/clearest PlanetScope scenes are frequently test-only; they're fine for
-    the visual review but carry looser geo/radiometric calibration.
-    """
-    # Cache first, before the client is even constructed: a fully-cached event needs
-    # no auth and no network, so a re-run works offline and cannot touch quota.
-    if reuse:
-        hit = _cached_event(event_id, lat, lon, radius_km)
-        if hit is not None:
-            return hit
-
-    pl = _client()
-    aoi = _bbox_geojson(lat, lon, radius_km)
-    point = _point_geojson(lat, lon)
-
-    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
-
-    # default: blend ranking (gap + cloud_weight*cloud) keeps the composite near
-    # the event date. auto_window instead orders only the nearest scene each side,
-    # among reasonably clear ones (stricter cloud cap) so "nearest" doesn't pick a
-    # clouded scene one day closer than a clear one.
-    weight = None if auto_window else cloud_weight
-    lim = 1 if auto_window else 6
-    cloud = _resolve_cloud_frac(max_cloud_pct, auto_window)
-    cover = point if require_point else None         # default: AOI overlap (Planet Explorer-like)
-    pre_items = search_scenes(pl, aoi, pre0, pre1, event_time, max_cloud=cloud,
-                              limit=lim, cloud_weight=weight, cover=cover,
-                              allow_test_quality=allow_test_quality)
-    post_items = search_scenes(pl, aoi, post0, post1, event_time, max_cloud=cloud,
-                               limit=lim, cloud_weight=weight, cover=cover,
-                               allow_test_quality=allow_test_quality)
-    if not pre_items or not post_items:
-        # Name the empty side(s) so the log/banner says WHY Planet is being skipped
-        # (no orderable scene there within the window + cloud cap + quality filter),
-        # rather than a bare "no coverage".
-        sides = [s for s, items in (("pre", pre_items), ("post", post_items)) if not items]
-        print(f"    [planet] no orderable scene in the {' and '.join(sides)} window "
-              f"(within the date range, cloud cap, coverage, and quality filters)")
-        return None
-
-    epsg = im._utm_epsg(lat, lon)
-    pre_ids = [i["id"] for i in pre_items]
-    post_ids = [i["id"] for i in post_items]
-    meta = dict(event_id=event_id, lat=lat, lon=lon, radius_km=radius_km)
-    # Submit BOTH orders before waiting on either, so Planet processes the pre and
-    # post clips concurrently. Total order latency then ~max(pre, post) instead of
-    # the old pre+post (each order's blocking wait runs ~1-5 min). Waiting pre
-    # first is fine — post is already cooking server-side meanwhile.
-    pre_order = _create_order(pl, pre_ids, aoi)
-    post_order = _create_order(pl, post_ids, aoi)
-    pre_pairs = _wait_download(pl, pre_order, dict(meta, side="pre"))
-    post_pairs = _wait_download(pl, post_order, dict(meta, side="post"))
-
-    return _event_result(_composite(pre_pairs, lat, lon, radius_km, epsg),
-                         _composite(post_pairs, lat, lon, radius_km, epsg),
-                         pre_ids, post_ids)
-
-
-def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
+def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None, scenes=None):
     """Wait on each {side: order_id}, download it, and composite that side.
+
+    scenes: optional dict, filled with {side: [scene ids]} parsed from the clips that
+    actually arrived — resume_preview's only way to know which scenes it rendered (it
+    is handed order ids, not scene ids), and run_single names the render file for them.
 
     Shared by render_preview (orders it just created) and resume_preview (orders an
     earlier render placed but didn't finish waiting on). Returns
@@ -868,10 +889,9 @@ def _finish_orders(pl, orders, lat, lon, radius_km, epsg, event_id=None):
             # what this side actually is (DN/TOA vs SR), from the clips on disk — so a
             # caller differencing pre against post can tell they're the same product.
             products[side] = "toa" if _pairs_toa(pairs) else "sr"
-            # mask_clouds=False: a visual detail preview should show every real pixel
-            # (esp. bright snow UDM2 may misflag), not punch cloud-masked holes.
-            comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
-                                     mask_clouds=False)
+            if scenes is not None:
+                scenes[side] = _scene_ids(pairs)
+            comps[side] = _composite(pairs, lat, lon, radius_km, epsg)
             if comps[side] is None:
                 notes.append(
                     f"{side}: ordered scene(s) clipped to no pixels over the AOI")
@@ -952,8 +972,8 @@ def _composite_record(rec, side, lat, lon, radius_km, epsg, client=None):
     already exists in the Planet account, so fetching it again costs NO quota — only
     time. Needs `client` (a _LazyClient) to do that; without one, a missing-file
     record becomes a note so a caller that must stay offline still degrades cleanly.
-    mask_clouds=False matches _finish_orders, so a recalled render is pixel-identical
-    to the original."""
+    Same _composite as _finish_orders, so a recalled render is pixel-identical to
+    the original."""
     oid = rec["order_id"]
     path = pc.resolve_path(rec)
     pairs = _pair_downloads(path)
@@ -975,7 +995,7 @@ def _composite_record(rec, side, lat, lon, radius_km, epsg, client=None):
                           f"be ordered again.")
     if not pairs:
         return None, f"{side}: cached order {oid[:12]} holds no usable SR clips"
-    comp = _composite(pairs, lat, lon, radius_km, epsg, mask_clouds=False)
+    comp = _composite(pairs, lat, lon, radius_km, epsg)
     if comp is None:
         return None, (f"{side}: cached order {oid[:12]} covers no pixels over this AOI "
                       f"— it was clipped to a different box")
@@ -1080,8 +1100,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
     was previously ordered for the event regardless of what's ticked, use
     recall_preview. reuse=False forces a fresh order even when cached.
 
-    Differs from fetch_event: no windowed search or ranking — it composites the
-    exact ids handed in — and it renders whichever side(s) were requested (one side
+    No windowed search or ranking — it composites the exact ids handed in — and it renders whichever side(s) were requested (one side
     alone is fine), so a single ticked scene can be previewed. Per-side failures
     become notes rather than aborting the whole render, so one bad order still lets
     the other side load."""
@@ -1116,7 +1135,7 @@ def render_preview(lat, lon, radius_km, pre_ids=None, post_ids=None,
         pl = client.get()
         aoi = _bbox_geojson(lat, lon, radius_km)
         # Submit BOTH orders before waiting on either, so Planet clips the pre and
-        # post concurrently server-side (same trick as fetch_event); total latency
+        # post concurrently server-side; total latency
         # ~max(pre, post) instead of pre+post.
         orders = {}
         for side, ids in to_order.items():
@@ -1144,8 +1163,8 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
     Backs the plugin's tone-mode switch: changing the tone curve is purely a local
     re-render, so read the clips back, composite them on the same AOI grid, and hand
     the composites to the caller to write with whichever curve is now selected.
-    Reading the same files with the same target grid and the same mask_clouds=False as
-    the original render makes the composites identical — the ONLY difference between
+    Reading the same files with the same target grid and the same _composite as the
+    original render makes the composites identical — the ONLY difference between
     two tone modes is the curve applied on the way to 8-bit.
 
     Looks for the clips in two places, in order: <workdir>/<side>/, where renders left
@@ -1178,10 +1197,9 @@ def retone_preview(lat, lon, radius_km, workdir=None, event_id=None):
         products[side] = "toa" if side_toa else "sr"
         scenes[side] = _scene_ids(pairs)
         try:
-            # mask_clouds=False mirrors _finish_orders: same pixels in, so only the
+            # same _composite as _finish_orders: same pixels in, so only the
             # tone curve differs between modes (see docstring).
-            comps[side] = _composite(pairs, lat, lon, radius_km, epsg,
-                                     mask_clouds=False)
+            comps[side] = _composite(pairs, lat, lon, radius_km, epsg)
             if comps[side] is None:
                 notes.append(f"{side}: downloaded clip(s) cover no pixels over the AOI")
             else:
@@ -1212,8 +1230,10 @@ def resume_preview(lat, lon, radius_km, orders, event_id=None):
     pl = _client()
     epsg = im._utm_epsg(lat, lon)
     orders = {s: o for s, o in (orders or {}).items() if o and s in ("pre", "post")}
+    scenes = {"pre": [], "post": []}
     comps, notes, pending, products = _finish_orders(pl, orders, lat, lon, radius_km,
-                                                     epsg, event_id=event_id)
+                                                     epsg, event_id=event_id,
+                                                     scenes=scenes)
     return dict(pre=comps["pre"], post=comps["post"], epsg=epsg, notes=notes,
                 pending=pending, reused={}, toa=(_order_bundle == TOA_BUNDLE),
-                product=products)
+                product=products, scenes=scenes)

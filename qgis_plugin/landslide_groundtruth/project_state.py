@@ -23,10 +23,12 @@ control added later persists with no extra bookkeeping — with two exclusions:
 
   SECRET_ATTRS        credentials (Planet key, Earthdata/PC login). A .qgz is
                       shared and often committed; keys stay in QgsSettings.
-  GLOBAL_PATH_ATTRS   venv/project/output paths. Machine-specific, so they are
-                      saved per project AND kept in QgsSettings — a project
-                      without them keeps whatever the global store provided
-                      rather than being blanked.
+  GLOBAL_PATH_ATTRS   the Setup box's paths (own Python, tools folder, results
+                      folder). Machine-specific, so they live ONLY in
+                      QgsSettings: a project shared with someone else must not
+                      overwrite their paths with yours (and your user name).
+                      Older projects that still carry them have them ignored on
+                      open and scrubbed on the next save.
 """
 from functools import partial
 
@@ -40,24 +42,58 @@ from qgis.core import QgsProject
 # QgsProject custom-property scope ("plugin name") all our entries live under.
 SCOPE = "landslide_groundtruth"
 
-# Stamped alongside the values so a future key/meaning change can migrate an
-# older project instead of silently misreading it. Restore itself is
-# version-agnostic: a key that is absent simply falls back to its default.
+# Stamped alongside the values so a key/meaning change can migrate an older
+# project instead of silently misreading it. A key that is absent simply falls
+# back to its default; the one thing the version changes is RETIRED_DEFAULTS.
+# "1" = every project before 2026-09-25; "2" = 2026-09-25 to 2026-10-21.
 VERSION_KEY = "state/version"
-VERSION = "1"
+VERSION = "3"
+
+# Values that USED to be a control's default, retired because they hid data. save()
+# writes every widget, untouched ones included, so a project saved under an old
+# default holds it exactly as if it had been chosen — and restore would bring it back
+# over the new default on every open, for good. So a project stamped with an older
+# VERSION has each of these exact values swapped for today's default, once, on open;
+# any other stored value is a real choice and is kept. Retiring another default for
+# that reason: add its old value under a new VERSION key and bump VERSION to match.
+RETIRED_DEFAULTS = {
+    "2": {
+        # PlanetScope scene filters. On 2026-09-25 the St. Elias project still restored
+        # all three a day after the defaults changed, and between them they emptied its
+        # post-event list (0 scenes where the current defaults list 23). "Cover the
+        # exact epicentre" was retired with them (08-25..09-24) and became the default
+        # again on 2026-10-21, so it is no longer swapped out.
+        "planet/cloud_slider": "80",                                        # to 09-24
+        "planet/quality_combo": "Standard quality only",                    # to 08-25
+    },
+    "3": {
+        # Deposit thickness for the area × thickness fit, to 2026-10-21: Toney et al.'s
+        # Iliamna 1.5 m. Measured Alaska rock avalanches on glaciers average 2–3 m
+        # (Deline et al. 2015, Table 9.1), so the default became 2.5 / 1.5 / 3.5 m. An
+        # Iliamna project that meant 1.5 m can't be told apart from the old default and
+        # opens on 2.5 m too; re-enter 1.5 there.
+        # Dormant since 2026-11-04: the thickness fields went with area × thickness
+        # to parked/thickness/, so no widget has these keys and nothing is swapped.
+        # Kept so the migration still applies if the fit is put back.
+        "volume/thick_best_edit": "1.5",
+        "volume/thick_low_edit": "1.0",
+        "volume/thick_high_edit": "2.5",
+    },
+}
 
 # never written to the project file — see module docstring
 SECRET_ATTRS = {
     "key_edit", "user_edit", "pass_edit", "ed_user_edit", "ed_pass_edit",
 }
 
-# saved per project, but a project without them keeps the global QgsSettings value
+# never written to the project file either: per machine, kept in QgsSettings
 GLOBAL_PATH_ATTRS = {"python_edit", "project_edit", "out_edit"}
 
 # owner attribute on the dock -> key prefix ("" = the dock itself)
 OWNERS = (
     ("", ""),
     ("planet_tab", "planet"),
+    ("gegd_tab", "gegd"),
     ("sar_tab", "sar"),
     ("fusion_tab", "fusion"),
     ("viewer3d_tab", "viewer3d"),
@@ -88,7 +124,8 @@ class ProjectState:
             if owner is None:
                 continue
             for name, obj in sorted(vars(owner).items()):
-                if name.startswith("_") or name in SECRET_ATTRS:
+                if (name.startswith("_") or name in SECRET_ATTRS
+                        or name in GLOBAL_PATH_ATTRS):
                     continue
                 base = f"{prefix}/{name}" if prefix else name
                 # dict-of-widgets (e.g. dock.scene_checks) keyed by its own token
@@ -127,11 +164,12 @@ class ProjectState:
                 project.writeEntry(SCOPE, key, _read_widget(widget))
             except RuntimeError:      # widget deleted (dock torn down mid-save)
                 pass
+        for attr in GLOBAL_PATH_ATTRS:  # left behind by plugin versions before 1.0
+            project.removeEntry(SCOPE, attr)
 
     def restore(self, *_args):
         """Apply the project's saved values; keys the project doesn't carry fall
-        back to the construction-time defaults (or, for the environment paths,
-        to whatever the global QgsSettings already put in the field).
+        back to the construction-time defaults.
 
         Deferred by a zero-timer so it runs after QGIS has finished loading the
         project and any pending layout/signal work has settled."""
@@ -139,15 +177,23 @@ class ProjectState:
 
     def _restore_now(self):
         project = QgsProject.instance()
+        saved_version, _ = project.readEntry(SCOPE, VERSION_KEY, "")
+        retired = retired_since(saved_version)
+        migrated = []
         self._restoring = True
         try:
             for key, widget in self._widgets:
                 value, ok = project.readEntry(SCOPE, key, "")
-                if ok and not (value == "" and _is_global_path(key)):
+                if ok and key in retired and value == retired[key]:
+                    # an old default the project was saved under, not a choice
+                    # (see RETIRED_DEFAULTS): today's default instead
+                    _write_widget(widget, self._defaults.get(key, ""))
+                    migrated.append((key, widget))
+                elif ok:
                     # the project's own value wins — including a deliberately
                     # empty field, so a cleared input comes back cleared
                     _write_widget(widget, value)
-                elif not _is_global_path(key):
+                else:
                     # no value in this project (never saved, or a control added
                     # by a later plugin version): start from the default rather
                     # than inheriting the previously open project's AOI
@@ -156,6 +202,17 @@ class ProjectState:
             pass
         finally:
             self._restoring = False
+        if migrated:
+            # Record the swap in the project NOW rather than leave it to save(): the
+            # writeProject slot can miss the file being serialised (module docstring),
+            # and the next edit stamps the new VERSION — after which the retired value,
+            # still stored, would be restored as a choice on every open.
+            try:
+                project.writeEntry(SCOPE, VERSION_KEY, VERSION)
+                for key, widget in migrated:
+                    project.writeEntry(SCOPE, key, _read_widget(widget))
+            except RuntimeError:
+                pass
 
     def clear(self):
         """Drop every plugin entry from the current project."""
@@ -165,10 +222,20 @@ class ProjectState:
             project.removeEntry(SCOPE, key)
 
 
-def _is_global_path(key):
-    """True for the environment-path fields, which must not be reset to a
-    construction-time default — the global QgsSettings value stands instead."""
-    return key.rsplit("/", 1)[-1] in GLOBAL_PATH_ATTRS
+def retired_since(saved_version):
+    """{key: retired default} for every default retired after `saved_version`.
+
+    A project that predates versioning, or holds something unparseable, counts as
+    version 0, so it gets every retirement — the same as the oldest project."""
+    try:
+        have = int(saved_version)
+    except (TypeError, ValueError):
+        have = 0
+    out = {}
+    for ver, values in sorted(RETIRED_DEFAULTS.items(), key=lambda kv: int(kv[0])):
+        if have < int(ver):
+            out.update(values)
+    return out
 
 
 def _persistable(w):
@@ -176,7 +243,7 @@ def _persistable(w):
     password fields are skipped: the former are computed output, the latter are
     credentials that must not enter a shared project file."""
     if isinstance(w, QLineEdit):
-        return not w.isReadOnly() and w.echoMode() == QLineEdit.Normal
+        return not w.isReadOnly() and w.echoMode() == QLineEdit.EchoMode.Normal
     return isinstance(w, (QDateTimeEdit, QDoubleSpinBox, QSpinBox, QSlider,
                           QCheckBox, QComboBox))
 
@@ -203,7 +270,7 @@ def _change_signal(w):
 def _read_widget(w):
     """Widget value as a string (project entries are stored as text)."""
     if isinstance(w, QDateTimeEdit):
-        return w.dateTime().toString(Qt.ISODate)
+        return w.dateTime().toString(Qt.DateFormat.ISODate)
     if isinstance(w, (QDoubleSpinBox, QSpinBox, QSlider)):
         return str(w.value())
     if isinstance(w, QCheckBox):
@@ -246,7 +313,7 @@ def _write_widget(w, value):
     (day counts, cloud %) and handlers update exactly as on a user edit; a
     malformed or now-invalid value is ignored rather than raising."""
     if isinstance(w, QDateTimeEdit):
-        dt = QDateTime.fromString(value, Qt.ISODate)
+        dt = QDateTime.fromString(value, Qt.DateFormat.ISODate)
         if dt.isValid():
             w.setDateTime(dt)
     elif isinstance(w, QDoubleSpinBox):

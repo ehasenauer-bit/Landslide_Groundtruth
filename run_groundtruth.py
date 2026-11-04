@@ -27,7 +27,7 @@ def process_one(ev, args):
     planet_dir = os.path.join(args.out, "planet_cache", ev["event_id"])
     img = im.fetch_event(ev["lat"], ev["lon"], img_radius, ev["datetime_utc"],
                          pre_days=args.pre_days, post_days=args.post_days,
-                         seasonal=args.seasonal, prefer=args.prefer, workdir=planet_dir,
+                         prefer=args.prefer, workdir=planet_dir,
                          auto_window=getattr(args, "auto_window", False),
                          cloud_weight=getattr(args, "cloud_weight", 0.5),
                          max_cloud_pct=getattr(args, "max_cloud", None),

@@ -173,6 +173,13 @@ def build_viewer_html(cfg):
     Required cfg keys: title, before_label, after_label, ncols, nrows, width_m,
     height_m, zmin, zmax, exaggeration, elev_b64, before_uri, after_uri.
     before_uri/after_uri are full data: URIs for the two RGB textures."""
+    # The index page reads this block instead of the payload below it: the same
+    # few facts, but a few hundred bytes at the TOP of the file, so listing a
+    # folder of 9 MB viewers costs one short read each instead of a scrape.
+    meta = cfg.get("index_meta") or {}
+    if meta:
+        cfg = dict(cfg)
+        del cfg["index_meta"]          # not duplicated into the payload
     payload = json.dumps(cfg, separators=(",", ":"))
     # payload is embedded in a <script type=application/json>; base64 + numbers
     # only, so the sole thing that could break out is a literal </script>.
@@ -180,12 +187,26 @@ def build_viewer_html(cfg):
     return (
         _HTML_HEAD
         + _escape_title(cfg.get("title", "3D before / after"))
+        + "</title>\n"
+        + (_meta_script(meta) if meta else "")
         + _HTML_MID
         + payload
         + _HTML_SCRIPT_OPEN
         + _VIEWER_JS
         + _HTML_TAIL
     )
+
+
+# Kept here rather than imported from web3d_index, which reads it back: this
+# module is imported top-level by some tests, so it must stay relative-import
+# free. The two ends are bound by a round-trip check in test_web3d_index.
+_META_ID = "l3d-meta"
+
+
+def _meta_script(meta):
+    """The <head> block the folder's index.html reads instead of the payload."""
+    payload = json.dumps(meta, separators=(",", ":")).replace("</", "<\\/")
+    return '<script type="application/json" id="%s">%s</script>\n' % (_META_ID, payload)
 
 
 def _escape_title(t):
@@ -199,7 +220,7 @@ _HTML_HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>"""
 
-_HTML_MID = """</title>
+_HTML_MID = """
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0e13; overflow: hidden;
@@ -212,6 +233,11 @@ _HTML_MID = """</title>
          color: #dfe6f2; padding: 8px 14px; border-radius: 8px; font-size: 14px;
          font-weight: 600; cursor: pointer; user-select: none; }
   .btn.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+  /* the back-link is navigation, not a control: quieter than the flip
+     buttons so it never reads as the primary action. */
+  .btn.ghost { background: transparent; color: #aeb9cc; font-weight: 500;
+               text-decoration: none; padding: 8px 10px; }
+  .btn.ghost:hover { color: #dfe6f2; border-color: #4a5a7a; }
   #tag { position: fixed; left: 12px; bottom: 12px; color: #aeb9cc;
          font-size: 13px; background: rgba(11,14,19,.6); padding: 6px 10px;
          border-radius: 6px; max-width: 60vw; }
@@ -260,6 +286,8 @@ _HTML_MID = """</title>
 <div id="labels"></div>
 <div id="layers"></div>
 <div id="hud">
+  <a id="indexLink" class="btn ghost" href="index.html"
+     title="All exported 3D viewers in this folder">← All events</a>
   <button id="beforeBtn" class="btn active">◀ Before</button>
   <button id="afterBtn" class="btn">After ▶</button>
   <button id="exportBtn" class="btn">⬇ Export 3D figure</button>
@@ -611,6 +639,19 @@ _VIEWER_JS = r'''
   }
   load(CFG.before_uri, 0);
   load(CFG.after_uri, 1);
+
+  // Esri World Imagery for the location panel, baked in at export time (a
+  // same-origin data: URI, so the page still opens offline and the figure's
+  // toDataURL stays untainted). Optional: absent on installs with no network at
+  // export, in which case locatorPanel keeps its flat vector backdrop.
+  var locBasemap = null;
+  (function () {
+    var u = CFG.locator && CFG.locator.basemap;
+    if (!u) return;
+    var im = new Image();
+    im.onload = function () { locBasemap = im; };
+    im.src = u;
+  })();
 
   // ---------- camera (orbit, Z-up) ----------
   var span = Math.max(W, H);
@@ -1377,12 +1418,25 @@ _VIEWER_JS = r'''
   // reuses the 3D slide template (BEFORE | AFTER / AFTER+overlays | Details) so the
   // two figures read as one document, and adds the cartographic furniture a plan view
   // needs and a perspective view cannot carry: a true scale bar and a fixed north arrow.
+
+  // Tick + title metrics in ONE place, because mapLayout has to reserve exactly the
+  // room drawMapAxes then uses. A flat percentage of the panel height did not: the
+  // text scales with pxW and the margin scaled with pxH, so on a wide panel (the
+  // slide cell is ~2:1) "Distance E (km)" was drawn past the bottom of the canvas
+  // and the montage cropped it mid-glyph, right where the caption starts.
+  function mapAxisMetrics(pxW) {
+    var fs = Math.max(13, Math.round(pxW/60)), tl = Math.max(6, pxW/130);
+    // below the map frame: tick mark (tl) + 5 gap + numbers, the title 1.9em under
+    // the numbers' top, a top-baselined glyph box ~1.15em deep, ~0.35em breathing room.
+    return { fs: fs, tl: tl, below: tl + 5 + fs*3.4 };
+  }
   function mapLayout(pxW, pxH) {
     var Wm = +CFG.width_m, Hm = +CFG.height_m;
     // margins: left for the northing labels, bottom for easting, top-right for the
     // compass, bottom-right for the scale bar.
     var mL = Math.round(pxW*0.120), mR = Math.round(pxW*0.030);
-    var mT = Math.round(pxH*0.045), mB = Math.round(pxH*0.115);
+    var mT = Math.round(pxH*0.045);
+    var mB = Math.max(Math.round(pxH*0.115), Math.ceil(mapAxisMetrics(pxW).below));
     var aw = Math.max(10, pxW-mL-mR), ah = Math.max(10, pxH-mT-mB);
     var sc = Math.min(aw/Wm, ah/Hm);                 // pixels per ground metre
     var iw = Wm*sc, ih = Hm*sc;                      // letterboxed: aspect preserved
@@ -1393,13 +1447,6 @@ _VIEWER_JS = r'''
   }
   // same unit rule as the 3D axes, so the two figures label distance identically
   function mapFmt(sp) { return sp>=3000 ? {scale:0.001,dec:1,unit:"km"} : {scale:1,dec:0,unit:"m"}; }
-  function mapExtentText() {
-    // ONE unit for both dimensions, chosen from the larger: the axes may legitimately
-    // label E in km and N in m (that is the 3D figure's per-axis rule, kept for parity),
-    // but a single "6.0 km × 2400 m" extent line just reads as a mistake.
-    var Wm = +CFG.width_m, Hm = +CFG.height_m, f = mapFmt(Math.max(Wm, Hm));
-    return (Wm*f.scale).toFixed(f.dec) + " × " + (Hm*f.scale).toFixed(f.dec) + " " + f.unit;
-  }
   function mapHalo(ctx, txt, x, y, fs, bold, align, base) {
     ctx.textAlign = align; ctx.textBaseline = base;
     ctx.font = (bold?"bold ":"") + fs + "px sans-serif";
@@ -1408,9 +1455,9 @@ _VIEWER_JS = r'''
     ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
   }
   function drawMapAxes(ctx, L, pxW, pxH) {
-    var fs = Math.max(13, Math.round(pxW/60));
+    var A = mapAxisMetrics(pxW), fs = A.fs, tl = A.tl;   // same numbers mapLayout reserved
     var fE = mapFmt(L.Wm), fN = mapFmt(L.Hm);
-    var axC = "rgba(246,249,253,0.97)", lw = Math.max(2, pxW/900), tl = Math.max(6, pxW/130);
+    var axC = "rgba(246,249,253,0.97)", lw = Math.max(2, pxW/900);
     ctx.save();
     ctx.strokeStyle = axC; ctx.lineWidth = lw;
     ctx.strokeRect(L.x0, L.y0, L.iw, L.ih);          // the map frame
@@ -1483,6 +1530,122 @@ _VIEWER_JS = r'''
     ctx.fillStyle = "#f6f9ff"; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
     ctx.fillText(txt, cx, y-pady);
     ctx.restore();
+  }
+  // ---------- the location panel: where on Earth this scene is ----------
+  // The map slide's fourth cell used to repeat the Details block the 3D slide
+  // already carries; a reader who does not know the valley in the other three
+  // panels needs the other thing entirely. Everything drawn here is baked into
+  // CFG.locator by locator_map.py (metres in an equal-area projection centred ON
+  // the event, y north), so the panel needs no basemap, no tiles and no network
+  // -- this file still opens offline, and toDataURL stays untainted.
+  function locLayout(pxW, pxH) {
+    // Deliberately the same top/bottom margins as mapLayout: this frame sits
+    // beside the "AFTER + overlays" map, and a locator floating at its own
+    // height reads as a mistake. Square window, centred in the cell.
+    var W = 2*(+CFG.locator.half_m);
+    var mT = Math.round(pxH*0.045);
+    var mB = Math.max(Math.round(pxH*0.115), Math.ceil(mapAxisMetrics(pxW).below));
+    var iw = Math.min(Math.max(10, pxH-mT-mB), pxW*0.92);
+    return { x0: (pxW-iw)/2, y0: mT + (pxH-mT-mB-iw)/2, iw: iw, ih: iw,
+             s: iw/W, Wm: W, Hm: W };
+  }
+  function locTrace(g, L, pts) {
+    for (var i=0;i<pts.length;i++) { var q = mapPx(L, pts[i][0], pts[i][1]);
+      if (i) g.lineTo(q[0], q[1]); else g.moveTo(q[0], q[1]); }
+  }
+  // Where a graticule line leaves the frame, so its label can ride that edge:
+  // parallels off the left (then right), meridians off the top (then bottom) --
+  // the top edge, not the bottom, so the labels never fight the scale bar.
+  function locFrameHit(L, pts, axis) {
+    var edges = (axis === "lat")
+      ? [["x", L.x0, "left"], ["x", L.x0+L.iw, "right"]]
+      : [["y", L.y0, "top"], ["y", L.y0+L.ih, "bottom"]];
+    for (var e=0;e<edges.length;e++) {
+      var horiz = edges[e][0] === "x", c = edges[e][1];
+      for (var i=1;i<pts.length;i++) {
+        var a = mapPx(L, pts[i-1][0], pts[i-1][1]), b = mapPx(L, pts[i][0], pts[i][1]);
+        var av = horiz ? a[0] : a[1], bv = horiz ? b[0] : b[1];
+        if (av === bv || (av-c)*(bv-c) > 0) continue;
+        var t = (c-av)/(bv-av);
+        var x = horiz ? c : a[0]+(b[0]-a[0])*t, y = horiz ? a[1]+(b[1]-a[1])*t : c;
+        if (x >= L.x0-0.5 && x <= L.x0+L.iw+0.5 && y >= L.y0-0.5 && y <= L.y0+L.ih+0.5)
+          return { x: x, y: y, edge: edges[e][2] };
+      }
+    }
+    return null;
+  }
+  function locStar(g, x, y, r) {
+    g.beginPath();
+    for (var i=0;i<10;i++) {
+      var a = -Math.PI/2 + i*Math.PI/5, rr = (i%2) ? r*0.42 : r;
+      var px = x + Math.cos(a)*rr, py = y + Math.sin(a)*rr;
+      if (i) g.lineTo(px, py); else g.moveTo(px, py);
+    }
+    g.closePath();
+  }
+  function locatorPanel(pxW, pxH) {
+    var LOC = CFG.locator || {};
+    var cc = document.createElement("canvas"); cc.width = pxW; cc.height = pxH;
+    var g = cc.getContext("2d");
+    g.fillStyle = "#0b0e13"; g.fillRect(0, 0, pxW, pxH);
+    var L = locLayout(pxW, pxH), fs = Math.max(12, Math.round(pxW/78));
+    var haveIm = !!(locBasemap && locBasemap.complete && locBasemap.naturalWidth);
+    g.save();
+    g.beginPath(); g.rect(L.x0, L.y0, L.iw, L.ih); g.clip();
+    if (haveIm) {                                                       // Esri imagery
+      g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
+      g.drawImage(locBasemap, L.x0, L.y0, L.iw, L.ih);
+    } else {
+      g.fillStyle = "#0d1622"; g.fillRect(L.x0, L.y0, L.iw, L.ih);      // sea
+    }
+    g.lineJoin = "round";
+    // The rings run past the frame on purpose (locator_map clips generously in
+    // lon/lat, not to the window), so the canvas clip above is what ends them --
+    // a polygon cut exactly at the frame would draw its cut edge as coastline.
+    // Over real imagery the coast is already visible, so the land is not filled
+    // and only a thin outline rides it for legibility.
+    (LOC.land || []).forEach(function (poly) {
+      g.beginPath();
+      poly.forEach(function (ring) { locTrace(g, L, ring); g.closePath(); });
+      if (!haveIm) { g.fillStyle = "#36455a"; g.fill("evenodd"); }      // land + lakes
+      g.strokeStyle = haveIm ? "rgba(255,255,255,0.38)" : "rgba(158,180,206,0.85)";
+      g.lineWidth = Math.max(1, L.iw/(haveIm ? 760 : 620)); g.stroke();
+    });
+    g.strokeStyle = haveIm ? "rgba(255,255,255,0.24)" : "rgba(214,228,246,0.22)";
+    g.lineWidth = Math.max(1, L.iw/900);
+    (LOC.grat || []).forEach(function (ln) {
+      g.beginPath(); locTrace(g, L, ln.pts); g.stroke();
+    });
+    g.restore();
+    (LOC.grat || []).forEach(function (ln) {
+      var h = locFrameHit(L, ln.pts, ln.axis); if (!h) return;
+      if (h.edge === "left")  mapHalo(g, ln.lab, h.x+6, h.y, fs, false, "left", "middle");
+      if (h.edge === "right") mapHalo(g, ln.lab, h.x-6, h.y, fs, false, "right", "middle");
+      if (h.edge === "top")   mapHalo(g, ln.lab, h.x, h.y+6, fs, false, "center", "top");
+      if (h.edge === "bottom")mapHalo(g, ln.lab, h.x, h.y-6, fs, false, "center", "alphabetic");
+    });
+    var q = mapPx(L, 0, 0), r = Math.max(9, L.iw/34);   // the event: always dead centre
+    locStar(g, q[0], q[1], r);
+    g.strokeStyle = "rgba(0,0,0,0.85)"; g.lineWidth = Math.max(1.5, r/5); g.stroke();
+    g.fillStyle = "#ff4d4d"; g.fill();
+    if (LOC.label) mapHalo(g, LOC.label, q[0], q[1]-r-5, fs, true, "center", "alphabetic");
+    g.strokeStyle = "rgba(246,249,253,0.97)"; g.lineWidth = Math.max(2, pxW/900);
+    g.strokeRect(L.x0, L.y0, L.iw, L.ih);
+    drawMapScaleBar(g, L, pxW, pxH);
+    // Imagery credit, required by Esri's terms — bottom-left, clear of the
+    // scale bar in the opposite corner.
+    if (haveIm && LOC.basemap_attrib)
+      mapHalo(g, LOC.basemap_attrib, L.x0 + 6, L.y0 + L.ih - 6,
+              Math.max(9, Math.round(pxW/112)), false, "left", "alphabetic");
+    return cc;
+  }
+  function locatorCaption() {
+    var LOC = CFG.locator || {}, la = +LOC.lat, lo = +LOC.lon, t = "LOCATION";
+    if (LOC.place) t += " · " + LOC.place;
+    if (la === la && lo === lo)
+      t += " · " + Math.abs(la).toFixed(3) + "° " + (la >= 0 ? "N" : "S") + "  "
+                 + Math.abs(lo).toFixed(3) + "° " + (lo >= 0 ? "E" : "W");
+    return t;
   }
   function drawMapOverlays(ctx, L) {
     ctx.save();
@@ -1575,17 +1738,23 @@ _VIEWER_JS = r'''
       { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
       { cap: "AFTER + overlays" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:true }
     ].map(function (pn) { return { img: mapPanel(pn.side, pn.ov, pxW, pxH), cap: pn.cap }; });
+    // Fourth cell: the location map, when the export could build one. The dates
+    // are already under each panel and the rest of the Details block is on the
+    // 3D slide, so the cell is better spent saying WHERE this is. No locator
+    // (no world map on this QGIS install) falls back to the old Details block.
+    var hasLoc = !!(CFG.locator && +CFG.locator.half_m > 0);
+    if (hasLoc) shots.push({ img: locatorPanel(pxW, pxH), cap: locatorCaption() });
     composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH}, {
       title: (CFG.title || "Landslide") + " — map view",
+      hideDetails: hasLoc,
       detailRows: [["Coordinate system", CFG.crs || "—"],
-                   ["View", "Map (plan view, north up)"],
-                   ["Ground extent", mapExtentText()],
                    ["Before image", CFG.before_date || "—"],
                    ["After image", CFG.after_date || "—"]],
       fileName: "landslide_map_figure.png",
       zipName: "landslide_map_bundle.zip",
       zipLabel: "⬇ Download ZIP (slide + panels)",
-      panelNames: ["map_before.png", "map_after.png", "map_after_overlays.png"],
+      panelNames: ["map_before.png", "map_after.png", "map_after_overlays.png",
+                   "map_location.png"],
       withOrbit: false
     });
   }
@@ -1626,6 +1795,33 @@ _VIEWER_JS = r'''
     draw();
     composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH});
   }
+  // The overlay legend normally lives in the Details block. When a slide spends
+  // that cell on something else it moves up into the empty right half of the
+  // title bar rather than being dropped: colour is the ONLY thing identifying
+  // what is outlined in the "+ overlays" panel.
+  function drawFigureLegend(g, L, titleW) {
+    if (!layerMeta.length) return;
+    var avail = L.FW - L.m*2 - titleW - 40, fs = 16, sw = 0, total = 0, gap = 9, sep = 26;
+    function measure() {
+      sw = Math.round(fs*0.95); total = -sep; g.font = fs+"px sans-serif";
+      layerMeta.forEach(function (mm) {
+        total += sw + gap + g.measureText(mm.name).width + sep; });
+    }
+    measure();
+    if (total > avail) { fs = 13; measure(); }
+    var x = L.FW - L.m - Math.min(total, avail), y = L.TH/2 + 4;
+    g.textAlign = "left"; g.textBaseline = "middle";
+    layerMeta.forEach(function (mm) {
+      var w = sw + gap + g.measureText(mm.name).width;
+      if (x + w > L.FW - L.m + 0.5) return;          // out of bar; drop the rest
+      g.fillStyle = "rgb("+mm.color[0]+","+mm.color[1]+","+mm.color[2]+")";
+      g.fillRect(x, y-sw/2, sw, sw);
+      g.strokeStyle = "rgba(255,255,255,0.45)"; g.lineWidth = 1;   // a near-black
+      g.strokeRect(x+0.5, y-sw/2+0.5, sw-1, sw-1);                 // swatch vanishes
+      g.fillStyle = "#cbd5e6"; g.fillText(mm.name, x+sw+gap, y);
+      x += w + sep;
+    });
+  }
   function composeFigure(shots, L, opts) {
     opts = opts || {};
     var fig = document.createElement("canvas"); fig.width=L.FW; fig.height=L.FH;
@@ -1633,7 +1829,9 @@ _VIEWER_JS = r'''
     g.fillStyle = "#0b0e13"; g.fillRect(0,0,L.FW,L.FH);
     g.fillStyle = "#f2f5fb"; g.font = "bold 26px sans-serif";
     g.textAlign = "left"; g.textBaseline = "middle";
-    g.fillText(opts.title || (CFG.title||"Landslide 3D"), L.m, L.TH/2 + 4);
+    var ttl = opts.title || (CFG.title||"Landslide 3D");
+    g.fillText(ttl, L.m, L.TH/2 + 4);
+    if (opts.hideDetails) drawFigureLegend(g, L, g.measureText(ttl).width);
     var cells = [ [L.m, L.TH+L.m], [2*L.m+L.colW, L.TH+L.m],
                   [L.m, L.TH+2*L.m+L.rowH], [2*L.m+L.colW, L.TH+2*L.m+L.rowH] ];
     shots.forEach(function (s, i) {
@@ -1644,33 +1842,35 @@ _VIEWER_JS = r'''
       g.textAlign="center"; g.textBaseline="middle";
       g.fillText(s.cap, x+L.colW/2, y+L.imgH+L.capH/2);
     });
-    // details cell (bottom-right)
-    var ix=cells[3][0], iy=cells[3][1], yy=iy+8;
-    g.textAlign="left"; g.textBaseline="top";
-    g.fillStyle="#f2f5fb"; g.font="bold 22px sans-serif"; g.fillText("Details", ix, yy); yy+=38;
-    g.font="17px sans-serif";
-    (opts.detailRows ||
-     [["Coordinate system", CFG.crs||"—"],
-      ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
-      ["Before image", CFG.before_date||"—"],
-      ["After image", CFG.after_date||"—"]]).forEach(function (kv) {
-      g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
-      g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
-    });
-    (CFG.extra_details||[]).forEach(function (kv) {
-      if (!kv[1]) return;
-      g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
-      g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
-    });
-    yy+=14;
-    if (layerMeta.length) {
-      g.fillStyle="#aeb9cc"; g.font="600 18px sans-serif"; g.fillText("Overlays", ix, yy); yy+=30;
-      g.font="16px sans-serif";
-      layerMeta.forEach(function (mm) {
-        g.fillStyle="rgb("+mm.color[0]+","+mm.color[1]+","+mm.color[2]+")";
-        g.fillRect(ix, yy, 16, 16);
-        g.fillStyle="#e6ecf6"; g.fillText(mm.name, ix+24, yy+1); yy+=24;
+    // details cell (bottom-right) — unless a fourth panel has claimed it
+    if (!opts.hideDetails) {
+      var ix=cells[3][0], iy=cells[3][1], yy=iy+8;
+      g.textAlign="left"; g.textBaseline="top";
+      g.fillStyle="#f2f5fb"; g.font="bold 22px sans-serif"; g.fillText("Details", ix, yy); yy+=38;
+      g.font="17px sans-serif";
+      (opts.detailRows ||
+       [["Coordinate system", CFG.crs||"—"],
+        ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
+        ["Before image", CFG.before_date||"—"],
+        ["After image", CFG.after_date||"—"]]).forEach(function (kv) {
+        g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
+        g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
       });
+      (CFG.extra_details||[]).forEach(function (kv) {
+        if (!kv[1]) return;
+        g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
+        g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
+      });
+      yy+=14;
+      if (layerMeta.length) {
+        g.fillStyle="#aeb9cc"; g.font="600 18px sans-serif"; g.fillText("Overlays", ix, yy); yy+=30;
+        g.font="16px sans-serif";
+        layerMeta.forEach(function (mm) {
+          g.fillStyle="rgb("+mm.color[0]+","+mm.color[1]+","+mm.color[2]+")";
+          g.fillRect(ix, yy, 16, 16);
+          g.fillStyle="#e6ecf6"; g.fillText(mm.name, ix+24, yy+1); yy+=24;
+        });
+      }
     }
     var url = fig.toDataURL("image/png");
     var ov = document.createElement("div"); ov.id = "exportModal";

@@ -1,0 +1,1072 @@
+{
+ "_synthetic": true,
+ "_generator": "tests/fixtures/gegd/make_fixtures.py",
+ "_note": "SYNTHETIC test fixture: made-up values in the real GEGD schema. Not a captured response.",
+ "_event": {
+  "name": "Iliamna-shaped (synthetic)",
+  "lat": 60.0265,
+  "lon": -153.0559,
+  "origin_utc": "2026-08-08T13:00:00Z",
+  "r_km": 5.0,
+  "pre_days": 365,
+  "post_days": 90
+ },
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "id": "e493580b-7bf6-5e96-b374-fc8429568986",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.1255646,
+       59.7448044
+      ],
+      [
+       -153.075394,
+       60.1032536
+      ],
+      [
+       -152.7704679,
+       60.0926009
+      ],
+      [
+       -152.8206385,
+       59.7341517
+      ],
+      [
+       -153.1255646,
+       59.7448044
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "e493580b-7bf6-5e96-b374-fc8429568986",
+    "cloudCover": 0.043,
+    "offNadirAngle": 28.5,
+    "groundSampleDistance": 0.562,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-152.94801625,59.91870265]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-09-22T21:15:03.463Z",
+    "resolutionX": 5.048509e-06,
+    "resolutionY": 5.048509e-06,
+    "createdDate": "2026-09-22T23:32:03Z",
+    "lastModifiedDate": "2026-09-22T23:57:03.463Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-09-22T21:15:03.463000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 165.8,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-09-22T21:15:03.463000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 29.6,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F300000000922A",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "dc9757ad-a608-5a8a-9b4c-e7ad6367e68f",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.1219685,
+       59.7439061
+      ],
+      [
+       -153.0717978,
+       60.1023553
+      ],
+      [
+       -152.7668717,
+       60.0917026
+      ],
+      [
+       -152.8170424,
+       59.7332534
+      ],
+      [
+       -153.1219685,
+       59.7439061
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "dc9757ad-a608-5a8a-9b4c-e7ad6367e68f",
+    "cloudCover": 0.04,
+    "offNadirAngle": 27.2,
+    "groundSampleDistance": 0.556,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-152.9444201,59.91780435]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-09-22T21:15:43.120Z",
+    "resolutionX": 4.99461e-06,
+    "resolutionY": 4.99461e-06,
+    "createdDate": "2026-09-22T23:32:43Z",
+    "lastModifiedDate": "2026-09-22T23:57:43.120Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-09-22T21:15:43.120000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 166.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-09-22T21:15:43.120000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 29.5,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F300000000922B",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "a670c452-cc18-5e8e-9ecf-f44ad3f5acdd",
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        -153.5953189,
+        59.8468378
+       ],
+       [
+        -153.5953189,
+        60.2061622
+       ],
+       [
+        -153.0559,
+        60.2061622
+       ],
+       [
+        -153.0559,
+        59.8468378
+       ],
+       [
+        -153.5953189,
+        59.8468378
+       ]
+      ]
+     ],
+     [
+      [
+       [
+        -153.0559,
+        59.8468378
+       ],
+       [
+        -153.0559,
+        60.2061622
+       ],
+       [
+        -152.5164811,
+        60.2061622
+       ],
+       [
+        -152.5164811,
+        59.8468378
+       ],
+       [
+        -153.0559,
+        59.8468378
+       ]
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "a670c452-cc18-5e8e-9ecf-f44ad3f5acdd",
+    "cloudCover": 0,
+    "offNadirAngle": 0,
+    "groundSampleDistance": 0.3,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "MULTIPLE",
+    "sensorName": "Multiple",
+    "sensorCode": "MULTIPLE",
+    "rasterType": "Mosaic Product",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.0559,60.0265]}",
+    "bandConfiguration": "BGRN",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-09-02T22:06:25Z",
+    "createdDate": "2026-09-15T17:29:19Z",
+    "lastModifiedDate": "2026-09-15T18:58:23.348Z",
+    "productName": "VIVID_STANDARD_30",
+    "usageProductId": 127,
+    "dataLayer": "plus_metro",
+    "processingLevel": "VIVID_STANDARD_30 - 1:12,000",
+    "isPrivate": false
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "81e37bb0-30d0-5296-b9f4-fcf6703775d2",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2266075,
+       59.8969742
+      ],
+      [
+       -153.2623668,
+       60.2378646
+      ],
+      [
+       -152.957115,
+       60.245857
+      ],
+      [
+       -152.9213557,
+       59.9049665
+      ],
+      [
+       -153.2266075,
+       59.8969742
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "81e37bb0-30d0-5296-b9f4-fcf6703775d2",
+    "cloudCover": 0,
+    "offNadirAngle": 14.1,
+    "groundSampleDistance": 0.478,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.09186125,60.071415575]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-08-31T21:30:30.008Z",
+    "resolutionX": 4.293927e-06,
+    "resolutionY": 4.293927e-06,
+    "createdDate": "2026-08-31T23:47:30Z",
+    "lastModifiedDate": "2026-09-01T00:12:30.008Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-08-31T21:30:30.008000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 170.2,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-08-31T21:30:30.008000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 37.9,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F3000000000831",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "4b61e5a9-cbc1-5ee2-ae8d-690e4511693d",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.1946834,
+       59.8674568
+      ],
+      [
+       -153.175858,
+       60.136786
+      ],
+      [
+       -152.8811553,
+       60.1316445
+      ],
+      [
+       -152.8999807,
+       59.8623153
+      ],
+      [
+       -153.1946834,
+       59.8674568
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "4b61e5a9-cbc1-5ee2-ae8d-690e4511693d",
+    "cloudCover": 0,
+    "offNadirAngle": 20.2,
+    "groundSampleDistance": 0.5,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.03791935,59.99955065]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-08-26T21:15:32.801Z",
+    "resolutionX": 4.491556e-06,
+    "resolutionY": 4.491556e-06,
+    "createdDate": "2026-08-26T23:32:32Z",
+    "lastModifiedDate": "2026-08-26T23:57:32.801Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-08-26T21:15:32.801000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 165.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-08-26T21:15:32.801000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 39.1,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F3000000000826",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "5409f017-7446-50e9-9590-c5be3c963c7d",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.0899938,
+       60.0172663
+      ],
+      [
+       -153.0743823,
+       60.0614995
+      ],
+      [
+       -152.985845,
+       60.0537
+      ],
+      [
+       -153.0014565,
+       60.0094668
+      ],
+      [
+       -153.0899938,
+       60.0172663
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "5409f017-7446-50e9-9590-c5be3c963c7d",
+    "cloudCover": 0,
+    "groundSampleDistance": 0.46,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "UMBRA",
+    "sensorName": "umbra",
+    "sensorCode": "UMBRA",
+    "rasterType": "UMBRA",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.0379194,60.03548315]}",
+    "bandConfiguration": "1",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-08-20T05:12:44Z",
+    "resolutionX": 4.1e-06,
+    "resolutionY": 4.1e-06,
+    "createdDate": "2026-08-20T18:04:28Z",
+    "lastModifiedDate": "2026-08-20T18:10:21.658Z",
+    "usageProductId": 8,
+    "dataLayer": "umbra",
+    "isThirdParty": true,
+    "sensorType": "Radar",
+    "isPrivate": false,
+    "legacyIdentifier": "D0F0000000000820"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "62323a29-7257-5665-8636-def993a325db",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2390123,
+       59.9021946
+      ],
+      [
+       -153.2953969,
+       60.1702116
+      ],
+      [
+       -152.9806715,
+       60.1867379
+      ],
+      [
+       -152.9242868,
+       59.9187208
+      ],
+      [
+       -153.2390123,
+       59.9021946
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "62323a29-7257-5665-8636-def993a325db",
+    "cloudCover": 0.007,
+    "offNadirAngle": 29.6,
+    "groundSampleDistance": 0.596,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV01",
+    "sensorName": "WV01",
+    "sensorCode": "WV01",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.109841875,60.044466225]}",
+    "bandConfiguration": "P",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-08-01T00:18:47.500Z",
+    "resolutionX": 5.353935e-06,
+    "resolutionY": 5.353935e-06,
+    "createdDate": "2026-08-01T02:35:47Z",
+    "lastModifiedDate": "2026-08-01T03:00:47.500Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-08-01T00:18:47.500000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 218.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-08-01T00:18:47.500000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "NONE",
+    "productType": "Ortho",
+    "sunElevation": 43.2,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F2000000000801",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "0088ac1a-1676-503b-8a82-25c0cbfa78b9",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -152.9839775,
+       60.0624324
+      ],
+      [
+       -152.9839775,
+       60.1522636
+      ],
+      [
+       -152.8041712,
+       60.1522636
+      ],
+      [
+       -152.8041712,
+       60.0624324
+      ],
+      [
+       -152.9839775,
+       60.0624324
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "0088ac1a-1676-503b-8a82-25c0cbfa78b9",
+    "cloudCover": 0.01,
+    "offNadirAngle": 16.0,
+    "groundSampleDistance": 0.31,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV03",
+    "sensorName": "WV03",
+    "sensorCode": "WV03",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-152.89407435,60.107348]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-07-15T21:20:00Z",
+    "resolutionX": 2.784765e-06,
+    "resolutionY": 2.784765e-06,
+    "createdDate": "2026-07-15T23:37:00Z",
+    "lastModifiedDate": "2026-07-16T00:02:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-07-15T21:20:00.000000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 171.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-07-15T21:20:00.000000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 50.0,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F4000000000715",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "1c449812-9b09-5793-8ae2-00340f1b6bb7",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.1720645,
+       59.9649243
+      ],
+      [
+       -153.1626504,
+       60.2343766
+      ],
+      [
+       -152.867813,
+       60.2318055
+      ],
+      [
+       -152.8772271,
+       59.9623532
+      ],
+      [
+       -153.1720645,
+       59.9649243
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "1c449812-9b09-5793-8ae2-00340f1b6bb7",
+    "cloudCover": 0.31,
+    "offNadirAngle": 24.0,
+    "groundSampleDistance": 0.5,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.01993875,60.0983649]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-07-10T21:40:00Z",
+    "resolutionX": 4.491556e-06,
+    "resolutionY": 4.491556e-06,
+    "createdDate": "2026-07-10T23:57:00Z",
+    "lastModifiedDate": "2026-07-11T00:22:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-07-10T21:40:00.000000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 172.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-07-10T21:40:00.000000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 51.0,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "B0F3000000000710",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "bf36f7da-f60a-5d5b-b677-8ce2c1c9cfb1",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2105642,
+       59.8174107
+      ],
+      [
+       -153.2318997,
+       60.1226505
+      ],
+      [
+       -152.937197,
+       60.127792
+      ],
+      [
+       -152.9158615,
+       59.8225522
+      ],
+      [
+       -153.2105642,
+       59.8174107
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "bf36f7da-f60a-5d5b-b677-8ce2c1c9cfb1",
+    "cloudCover": 0.148,
+    "offNadirAngle": 12.8,
+    "groundSampleDistance": 0.47,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.0738806,59.97260135]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2026-05-20T21:49:19.140Z",
+    "resolutionX": 4.222063e-06,
+    "resolutionY": 4.222063e-06,
+    "createdDate": "2026-05-21T00:06:19Z",
+    "lastModifiedDate": "2026-05-21T00:31:19.140Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2026-05-20T21:49:19.140000Z",
+    "processingLevel": "LV3D",
+    "sensorType": "Optical",
+    "sunAzimuth": 175.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2026-05-20T21:49:19.140000Z",
+    "isPrivate": false,
+    "demCorrection": "Fine DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 50.1,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "10F3000000000520",
+    "ce90Accuracy": 8.4
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "1da4537b-ab98-508b-ba18-4b94e6aa1903",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2141295,
+       59.9007364
+      ],
+      [
+       -153.2141295,
+       60.1522636
+      ],
+      [
+       -152.8976705,
+       60.1522636
+      ],
+      [
+       -152.8976705,
+       59.9007364
+      ],
+      [
+       -153.2141295,
+       59.9007364
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "1da4537b-ab98-508b-ba18-4b94e6aa1903",
+    "cloudCover": 0,
+    "offNadirAngle": 22.0,
+    "groundSampleDistance": 0.596,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV01",
+    "sensorName": "WV01",
+    "sensorCode": "WV01",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.0559,60.0265]}",
+    "bandConfiguration": "P",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2025-10-21T22:10:00Z",
+    "resolutionX": 5.353935e-06,
+    "resolutionY": 5.353935e-06,
+    "createdDate": "2025-10-22T00:27:00Z",
+    "lastModifiedDate": "2025-10-22T00:52:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2025-10-21T22:10:00.000000Z",
+    "sensorType": "Optical",
+    "sunAzimuth": 190.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2025-10-21T22:10:00.000000Z",
+    "isPrivate": false,
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "NONE",
+    "productType": "Ortho",
+    "sunElevation": 12.5,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "10F2000000001021"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "d6437bc4-2643-5c22-a84f-a4b6b74bd734",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.1017506,
+       59.9411604
+      ],
+      [
+       -153.1017506,
+       60.1657382
+      ],
+      [
+       -152.8662044,
+       60.1657382
+      ],
+      [
+       -152.8662044,
+       59.9411604
+      ],
+      [
+       -153.1017506,
+       59.9411604
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "d6437bc4-2643-5c22-a84f-a4b6b74bd734",
+    "cloudCover": 0.02,
+    "offNadirAngle": 18.0,
+    "groundSampleDistance": 0.32,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV03_VNIR",
+    "sensorName": "WV03",
+    "sensorCode": "WV03_VNIR",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-152.9839775,60.0534493]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2025-09-28T21:20:00Z",
+    "resolutionX": 2.874596e-06,
+    "resolutionY": 2.874596e-06,
+    "createdDate": "2025-09-28T23:37:00Z",
+    "lastModifiedDate": "2025-09-29T00:02:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2025-09-28T21:20:00.000000Z",
+    "sensorType": "Optical",
+    "sunAzimuth": 168.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2025-09-28T21:20:00.000000Z",
+    "isPrivate": false,
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 30.5,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "10F4000000000928"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "7e9fbdfa-f986-5903-945d-7dccbc61f81a",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2835442,
+       59.9026224
+      ],
+      [
+       -153.2443664,
+       60.1263456
+      ],
+      [
+       -152.9721008,
+       60.1144451
+      ],
+      [
+       -153.0112787,
+       59.8907219
+      ],
+      [
+       -153.2835442,
+       59.9026224
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "7e9fbdfa-f986-5903-945d-7dccbc61f81a",
+    "cloudCover": 0,
+    "offNadirAngle": 34.0,
+    "groundSampleDistance": 0.5,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "GE01",
+    "sensorName": "GE01",
+    "sensorCode": "GE01",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.127822525,60.00853375]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2025-08-30T21:55:00Z",
+    "resolutionX": 4.491556e-06,
+    "resolutionY": 4.491556e-06,
+    "createdDate": "2025-08-31T00:12:00Z",
+    "lastModifiedDate": "2025-08-31T00:37:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2025-08-30T21:55:00.000000Z",
+    "processingLevel": "LV2A",
+    "sensorType": "Optical",
+    "sunAzimuth": 178.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2025-08-30T21:55:00.000000Z",
+    "isPrivate": false,
+    "demCorrection": "Coarse DEM",
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 38.0,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "10F5000000000830",
+    "ce90Accuracy": 0.0014
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "e8a1bbf7-5e18-5d4c-8b2a-363f6ad820ee",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.2033412,
+       59.8917533
+      ],
+      [
+       -153.2033412,
+       60.1612467
+      ],
+      [
+       -152.9084588,
+       60.1612467
+      ],
+      [
+       -152.9084588,
+       59.8917533
+      ],
+      [
+       -153.2033412,
+       59.8917533
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "e8a1bbf7-5e18-5d4c-8b2a-363f6ad820ee",
+    "cloudCover": 0.02,
+    "offNadirAngle": 41.0,
+    "groundSampleDistance": 0.5,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV02",
+    "sensorName": "WV02",
+    "sensorCode": "WV02",
+    "rasterType": "Maxar",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-153.0559,60.0265]}",
+    "bandConfiguration": "RGB",
+    "crs": "EPSG:4326",
+    "acquisitionDate": "2025-08-12T22:05:00Z",
+    "resolutionX": 4.491556e-06,
+    "resolutionY": 4.491556e-06,
+    "createdDate": "2025-08-13T00:22:00Z",
+    "lastModifiedDate": "2025-08-13T00:47:00.000Z",
+    "productName": "DAILY_TAKE",
+    "usageProductId": 8,
+    "dataLayer": "daily_take",
+    "radiometricLevel": "Corrected",
+    "latestAcquisitionTime": "2025-08-12T22:05:00.000000Z",
+    "sensorType": "Optical",
+    "sunAzimuth": 182.0,
+    "bitsPerPixel": 8,
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2025-08-12T22:05:00.000000Z",
+    "isPrivate": false,
+    "imageDescriptor": "OrthoRectified3",
+    "panSharpenAlgorithm": "UNB",
+    "productType": "Ortho",
+    "sunElevation": 41.0,
+    "radiometricEnhancement": "DRA",
+    "legacyIdentifier": "10F3000000000812"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "e5187118-33bb-54d4-9375-be0c4df131b4",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -153.0037562,
+       59.8468378
+      ],
+      [
+       -153.0037562,
+       60.2959934
+      ],
+      [
+       -152.3366748,
+       60.2959934
+      ],
+      [
+       -152.3366748,
+       59.8468378
+      ],
+      [
+       -153.0037562,
+       59.8468378
+      ]
+     ]
+    ]
+   },
+   "geometry_name": "featureGeometry",
+   "properties": {
+    "featureId": "e5187118-33bb-54d4-9375-be0c4df131b4",
+    "cloudCover": 0,
+    "groundSampleDistance": 0.5,
+    "groundSampleDistanceUnit": "Meter",
+    "source": "WV01",
+    "sensorName": "WV01",
+    "sensorCode": "WV01",
+    "rasterType": "Strip",
+    "featureCentroid": "{\"type\":\"Point\",\"coordinates\":[-152.6702155,60.0714156]}",
+    "crs": "EPSG:32605",
+    "acquisitionDate": "2021-03-27T00:51:39Z",
+    "resolutionX": 0.5,
+    "resolutionY": -0.5,
+    "createdDate": "2023-01-26T17:15:32Z",
+    "lastModifiedDate": "2025-03-29T07:29:06.119Z",
+    "productName": "RDOG_BASE",
+    "usageProductId": 9,
+    "copyright": "Image Copyright 2023 DigitalGlobe Inc",
+    "dataLayer": "rdog_base",
+    "latestAcquisitionTime": "2021-04-01T00:36:53.000000",
+    "spatialAccuracy": "1:12,000",
+    "sensorType": "Optical",
+    "classification": "UNCLASSIFIED",
+    "earliestAcquisitionTime": "2021-03-27T00:51:39.000000",
+    "isPrivate": false,
+    "licenseType": "nextview",
+    "outputMosaic": true,
+    "productType": "Panchromatic",
+    "isEnvelopeGeometry": false,
+    "legacyIdentifier": "20F0000000000327",
+    "niirs": 4,
+    "hasSeamlines": true,
+    "ce90Accuracy": 8.4
+   }
+  }
+ ],
+ "totalFeatures": "unknown",
+ "numberReturned": 15,
+ "timeStamp": "2026-10-13T00:00:00.000Z",
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "urn:ogc:def:crs:EPSG::4326"
+  }
+ }
+}

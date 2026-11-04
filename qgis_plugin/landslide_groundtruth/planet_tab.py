@@ -9,18 +9,22 @@ straight on the QGIS canvas with no order and zero quota — is done in-process 
 Planet's Data API tile service (the same one Planet Explorer uses):
 
   1. POST the scene ids to https://tiles.planet.com/data/v1/layers  -> a tile hash
-  2. add https://tiles{0-3}.planet.com/data/v1/layers/<hash>/{z}/{x}/{y}?api_key=…
-     as an XYZ raster layer.
+     (the one call that needs the API key)
+  2. add https://tiles{0-3}.planet.com/data/v1/layers/<hash>/{z}/{x}/{y} as an XYZ
+     raster layer -- with NO key in it: the layer source is saved into the project.
 
 v1 scope is BROWSE + MAP PREVIEW only (no ordering/download yet); ordering the
 AOI-clipped SR+UDM2 bundle into the review package comes in a later pass.
 
 Auth: the tile POST + browse thumbnails need a Planet API key. Priority is an
 explicit account login (email/password -> the account's api_key) or a key pasted in
-the field (both saved to QgsSettings 'landslide/planet_api_key'), and only then the
-PL_API_KEY env var as a fallback -- so signing in always overrides a stray ambient
-key. The search subprocess authenticates the same way (the effective key is exported
-as PL_API_KEY before it runs).
+the field, and only then the PL_API_KEY env var as a fallback -- so signing in always
+overrides a stray ambient key. The search subprocess authenticates the same way (the
+effective key is exported as PL_API_KEY before it runs). The password only ever goes
+to the login POST and is never saved: the key it recovers is all a later session
+needs. The key is saved in the QGIS password store when there is a master password,
+else in QgsSettings, and read back only when a request first needs it; see
+planet_keystore.py.
 """
 import base64
 import json
@@ -44,11 +48,13 @@ from qgis.core import (
     QgsField, QgsFeature, QgsFillSymbol, QgsGeometry, QgsPointXY,
 )
 from qgis.gui import QgsCollapsibleGroupBox
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from . import coord_paste
 from . import layer_group as lg
+from . import planet_keystore
 
 # Planet's Data API tile service (undocumented, but stable — it's what Planet
 # Explorer's "Add preview to map" relies on). POST scene ids to get a tile hash,
@@ -152,13 +158,18 @@ class PlanetTab(QWidget):
         self.task = None
         self._search_result = None       # last search.json (candidates + params)
         self._login_reply = None         # in-flight Planet login POST
+        self._saved_key = ""             # the key last read from / written to the store
         self._preview_reply = None       # in-flight browse-thumbnail request
         self._preview_pix = None         # last loaded thumbnail, kept for rescaling
         self._tile_replies = []          # in-flight tile-hash POSTs
         self._detail_labels = None       # side -> layer label for the pending SR render
         self._detail_dates = None        # side -> acquisition date for the pending SR render (folder name)
         self._preview_group = None       # layer-tree folder the tile preview loads into
-        self._preview_layers = []        # preview layers (XYZ tiles / SR GeoTIFFs) on the map
+        self._preview_layers = []        # free XYZ tile previews; each Preview on map replaces them
+        # SR detail layers (downloaded, paid-for renders) + their dBrightness. Kept apart
+        # from the tile previews so a preview can never take them off the map, and never
+        # cleared by a later render: another render adds beside them. See _on_detail_done.
+        self._detail_layers = []
         self._preview_extent = None      # union of previewed scene footprints (EPSG:4326)
         self._footprint_layers = []      # scene-footprint vector layers on the map
         self._gallery_replies = []       # in-flight quicklook-thumbnail requests
@@ -196,9 +207,10 @@ class PlanetTab(QWidget):
         # "and", not "&": a group-box title takes & as a mnemonic marker too
         form = self._options_group(root, "Event location and time", collapsed=False)
         self.lat_edit = QLineEdit()
-        self.lat_edit.setPlaceholderText("e.g. 59.906992")
+        self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
+        coord_paste.link_pair(self.lat_edit, self.lon_edit)
         form.addRow("Latitude", self.lat_edit)
         form.addRow("Longitude", self.lon_edit)
 
@@ -227,10 +239,10 @@ class PlanetTab(QWidget):
         form = self._options_group(root, "Search window", collapsed=False)
 
         # Window: how far before / after the event to search, as day sliders.
-        self.pre_slider = QSlider(Qt.Horizontal)
+        self.pre_slider = QSlider(Qt.Orientation.Horizontal)
         self.pre_slider.setRange(1, 365)
         self.pre_slider.setValue(30)
-        self.post_slider = QSlider(Qt.Horizontal)
+        self.post_slider = QSlider(Qt.Orientation.Horizontal)
         self.post_slider.setRange(1, 365)
         self.post_slider.setValue(30)
         self.pre_lbl = QLabel()
@@ -252,17 +264,21 @@ class PlanetTab(QWidget):
         form = self._options_group(root, "Scene filters")
 
         # Cloud cover as a teal slider, echoing Planet Explorer's slider filters.
-        self.cloud_slider = QSlider(Qt.Horizontal)
+        self.cloud_slider = QSlider(Qt.Orientation.Horizontal)
         self.cloud_slider.setRange(0, 100)
-        self.cloud_slider.setValue(80)
+        # 100 = no cap. The search only LISTS scenes for you to judge by eye, and the
+        # cap reads Planet's WHOLE-SCENE cloud_cover (a ~32x20 km strip), so it can't
+        # know a scene is clear over a 5 km AOI. At 80 it emptied Azumi's whole post
+        # window (all 4 scenes were 87-100% whole-scene cloud).
+        self.cloud_slider.setValue(100)
         self.cloud_slider.setToolTip(
-            "Maximum WHOLE-SCENE cloud cover to consider. Scene-wide metric, not "
-            "your AOI — per-pixel UDM2 masking still applies, so a high value "
-            "surfaces scenes clear over your point but cloudy elsewhere (what Planet "
-            "Explorer shows).")
-        self.cloud_lbl = QLabel("80%")
+            "Maximum WHOLE-SCENE cloud cover to list (100 = no cap, the default). "
+            "Planet's cloud_cover covers the full ~32x20 km strip, not your AOI, so a "
+            "scene 90% cloudy overall can still be clear over your point — lower this "
+            "only to thin a long list. Snow and ice are NOT counted as cloud.")
+        self.cloud_lbl = QLabel("100%")
         self.cloud_lbl.setFixedWidth(38)
-        self.cloud_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.cloud_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cloud_slider.valueChanged.connect(
             lambda v: self.cloud_lbl.setText(f"{v}%"))
         crow = QHBoxLayout()
@@ -273,11 +289,17 @@ class PlanetTab(QWidget):
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItem("AOI overlap (match Planet Explorer)", "aoi")
         self.coverage_combo.addItem("Cover the exact epicentre (stricter)", "point")
-        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))  # default
+        # Exact epicentre is the default again since 2026-10-21 (it was 08-25..09-24):
+        # every listed scene then shows the event point. Cloud and quality stay
+        # wide open, since it was those three filters TOGETHER that emptied the St.
+        # Elias post list. Same default as run_single --coverage.
+        self.coverage_combo.setCurrentIndex(self.coverage_combo.findData("point"))
         self.coverage_combo.setToolTip(
-            "AOI overlap: accept any scene overlapping the search box — recovers "
-            "partial-coverage scenes near the event date. Epicentre: require the "
-            "footprint to contain the point (can miss the nearest scenes).")
+            "Epicentre (the default): require the footprint to contain the point, "
+            "so every scene listed shows the event — but it can miss the nearest "
+            "scenes. AOI overlap: accept any scene overlapping the search box — "
+            "recovers partial-coverage scenes near the event date, and matches "
+            "Planet Explorer.")
         form.addRow("Coverage", self.coverage_combo)
 
         self.quality_combo = QComboBox()
@@ -306,7 +328,7 @@ class PlanetTab(QWidget):
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
         self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
-        self.tone_combo.addItem("HDR (exposure fusion) — shadow AND snow detail at once",
+        self.tone_combo.addItem("HDR (one global curve) — shadow AND snow detail at once",
                                 "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
@@ -326,12 +348,13 @@ class PlanetTab(QWidget):
             "Bright ice clips to flat white, exactly as a naive stretch would — the point "
             "is to see the un-toned pixels. Honours the Manual stretch below, but not "
             "Auto-stretch or Contrast (neither applies).\n"
-            "• HDR (exposure fusion) — renders the rolloff curve at several exposures and "
-            "fuses them (Mertens exposure fusion), so a scene with deep shadow AND blown "
-            "snow keeps detail at BOTH ends in one image. It fits its own dynamic range, so "
-            "the white point / Auto-stretch / Manual stretch don't apply. Slower to render "
-            "(a few exposures + the fusion), the local-tone-map answer when a single white "
-            "point can't hold the scene.\n"
+            "• HDR (one global curve) — the rolloff curve with a log shadow lift on top, "
+            "fitted to the scene's own bright tail, so a frame with deep shadow AND sunlit "
+            "snow keeps detail at BOTH ends in one image. Nothing in the chain clips: no "
+            "pixel comes out pure black or pure white, on any scene. The white point is "
+            "fitted from the scene unless you set it in Manual stretch; Auto-stretch and "
+            "the black point don't apply. The cost is global contrast — holding both ends "
+            "reads flatter than the rolloff does.\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
             "once; pick None to check what the raw reflectance looks like unshaped. rolloff "
@@ -594,7 +617,7 @@ class PlanetTab(QWidget):
             "'Recall order (free)' to load exactly it, or leave it on 'Newest' to load "
             "the most recent before & after. Empty means nothing has been ordered here "
             "yet — the first 'Render detail' is the only one that costs quota.")
-        self.recall_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.recall_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         # The ledger is cumulative — every order this account has ever paid for near
         # the AOI shows up here — so cap the drop-down and let it scroll instead of
         # growing past the bottom of the screen. Needs 'combobox-popup: 0' in the
@@ -611,8 +634,10 @@ class PlanetTab(QWidget):
             "box, so you can see whether a strip actually covers the epicentre. "
             "With table rows selected, only THOSE scenes' footprints are drawn — "
             "click a row to isolate its strip, Ctrl/Shift-click for several, "
-            "click in empty table space to show all candidates again. A single "
-            "PlanetScope strip is only a few km wide.")
+            "click in empty table space to show all candidates again. A SuperDove "
+            "scene is about 32 × 20 km, usually bigger than the search box — but "
+            "the frames follow the satellite's track and sit on no tiling grid, so a "
+            "scene can overlap the box and still miss the epicentre.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
         root.addWidget(self.footprint_check)
 
@@ -622,7 +647,7 @@ class PlanetTab(QWidget):
         root.addWidget(self.progress)
 
         # --- outputs: candidate table / gallery / thumbnail / log ---
-        split = QSplitter(Qt.Vertical)
+        split = QSplitter(Qt.Orientation.Vertical)
 
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
@@ -633,11 +658,11 @@ class PlanetTab(QWidget):
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Extended selection: click a scene to preview exactly it, Ctrl/Shift-click to
         # preview several (e.g. a specific before + after, or two candidates to compare).
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
@@ -652,7 +677,7 @@ class PlanetTab(QWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.gallery_scroll.setWidget(self.gallery_inner)
         gl.addWidget(self.gallery_scroll, 1)
         split.addWidget(gallerybox)
@@ -662,7 +687,7 @@ class PlanetTab(QWidget):
         pl.setContentsMargins(0, 0, 0, 0)
         pl.addWidget(self._section("Scene preview  (browse image)"))
         self.preview = QLabel("Search, then select a scene to preview its browse image.")
-        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
         pl.addWidget(self.preview, 1)
@@ -737,14 +762,14 @@ class PlanetTab(QWidget):
         """A collapsible 'Planet account' panel modelled on the official
         qgis-planet-plugin login tab: sign in with your Planet email + password
         (which exchanges them for your API key), or paste an API key directly. The
-        recovered key flows into the SAME PL_API_KEY / QgsSettings path everything
+        recovered key flows into the SAME PL_API_KEY / saved-key path everything
         else on this tab already uses, so login is just a friendlier front door to
         the existing key field."""
         box = QgsCollapsibleGroupBox("Planet Labs account")
         box.setSaveCollapsedState(False)
         # start collapsed only when actually signed in (an explicit account/pasted
         # key); a bare PL_API_KEY env var leaves the box open to prompt sign-in
-        box.setCollapsed(bool(self._stored_key()))
+        box.setCollapsed(self._has_stored_key())
         self.login_box = box
         form = QFormLayout(box)
 
@@ -764,11 +789,12 @@ class PlanetTab(QWidget):
         self.user_edit.returnPressed.connect(self._planet_login)
         form.addRow("Email", self.user_edit)
 
-        # Prefill from the last successful login so credentials survive between
-        # sessions (stored in QgsSettings, same plaintext store as the API key).
-        self.pass_edit = QLineEdit(
-            self.settings.value("landslide/planet_pass", "", type=str))
-        self.pass_edit.setEchoMode(QLineEdit.Password)
+        # Never prefilled and never saved: signing in trades the password for the
+        # account's API key, and the key alone keeps you signed in. Builds before
+        # 2026-10-13 saved it in plain text in QGIS3.ini, so drop any copy they left.
+        self.settings.remove("landslide/planet_pass")
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.pass_edit.setPlaceholderText("password")
         self.pass_edit.returnPressed.connect(self._planet_login)
         form.addRow("Password", self.pass_edit)
@@ -785,28 +811,26 @@ class PlanetTab(QWidget):
 
         # API key: the manual alternative to email/password, and where a successful
         # login drops the recovered key. This is the field _api_key()/_collect() read.
-        # Seed from the *stored* key only (not the env var) so an account login takes
-        # priority over any ambient PL_API_KEY.
-        self.key_edit = QLineEdit(
-            self.settings.value("landslide/planet_api_key", "", type=str))
-        self.key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
-        self.key_edit.setPlaceholderText("Planet API key (or set PL_API_KEY)")
+        # Starts empty even when a key is saved: _stored_key() fills it the first time
+        # a request needs the key, because reading the password store can ask for the
+        # master password and the plugin must never do that at startup.
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.key_edit.setToolTip(
             "Needed for the full-res map preview and browse thumbnails, and passed "
-            "to the search subprocess. Filled in automatically when you log in; "
-            "saved to QGIS settings. An account login or a key typed here takes "
-            "priority over the PL_API_KEY environment variable, which is only used "
-            "as a fallback when you haven't signed in.")
+            "to the search subprocess. Filled in automatically when you log in. "
+            "Saved in the QGIS password store when you have a QGIS master password, "
+            "otherwise in QGIS settings (plain text), and read back the first time "
+            "it is needed. An account login or a key typed here takes priority over "
+            "the PL_API_KEY environment variable, which is only used as a fallback "
+            "when you haven't signed in.")
         self.key_edit.textEdited.connect(self._mark_manual_key)
         form.addRow("API key", self.key_edit)
 
-        # If we came back signed in, immediately override any ambient PL_API_KEY in
-        # this process so every consumer (previews, thumbnails, the search subprocess)
-        # uses the signed-in account's key rather than a stray env key inherited at
-        # launch — without this, an early consumer could read the env key first.
-        stored = self._stored_key()
-        if stored:
-            os.environ["PL_API_KEY"] = stored
+        # A saved key is NOT exported to PL_API_KEY here: that would mean reading the
+        # password store at startup. It still outranks an ambient PL_API_KEY, because
+        # every consumer asks _api_key() (dock._auth_thumb_url too) and every subprocess
+        # launch goes through _apply_key_to_env(self._api_key()) first.
 
         self.login_status = QLabel()
         self.login_status.setWordWrap(True)
@@ -830,7 +854,11 @@ class PlanetTab(QWidget):
         src = self._auth_source()
         user = self.settings.value("landslide/planet_user", "", type=str)
         # Log out only makes sense for an explicit stored key, not the env fallback.
-        self.logout_btn.setEnabled(bool(self._stored_key()))
+        self.logout_btn.setEnabled(self._has_stored_key())
+        self.key_edit.setPlaceholderText(
+            "saved — read when first needed"
+            if planet_keystore.has_key(self.settings)
+            else "Planet API key (or set PL_API_KEY)")
         if src == "account":
             self.login_box.setTitle(
                 f"Planet Labs account — signed in{f' ({user})' if user else ''}")
@@ -851,11 +879,12 @@ class PlanetTab(QWidget):
             self._set_login_status(
                 "Enter your Planet email and password (or paste an API key).", "warn")
             return
+        planet_keystore.reset_refusal()  # pressing Log in may ask for the master password again
         self._set_login_status("Signing in…", "info")
         self.login_btn.setEnabled(False)
         body = QByteArray(json.dumps({"email": user, "password": pw}).encode())
         req = QNetworkRequest(QUrl(PLANET_LOGIN_URL))
-        req.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
+        req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         req.setRawHeader(b"X-Planet-App", PLANET_APP_HEADER.encode())
         reply = QgsNetworkAccessManager.instance().post(req, body)
         self._login_reply = reply
@@ -867,8 +896,8 @@ class PlanetTab(QWidget):
             return
         self._login_reply = None
         self.login_btn.setEnabled(True)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         if not ok:
@@ -885,15 +914,24 @@ class PlanetTab(QWidget):
                 "Signed in, but no API key came back — try pasting a key.", "error")
             return
         self.key_edit.setText(api_key)
-        # Persist the whole login (email + password + recovered key) so the next
-        # session comes back signed in without re-entering anything. Tag the source as
-        # 'account' so this key outranks any ambient PL_API_KEY env var.
-        self.settings.setValue("landslide/planet_api_key", api_key)
+        # Persist the email + recovered key so the next session comes back signed in.
+        # The password has done its job: drop it (a re-login asks for it again). Tag
+        # the source as 'account' so this key outranks any ambient PL_API_KEY env var.
+        where = planet_keystore.save(self.settings, api_key)
+        self._saved_key = api_key
         self.settings.setValue("landslide/planet_auth_source", "account")
         self.settings.setValue("landslide/planet_user", user)
-        self.settings.setValue("landslide/planet_pass", self.pass_edit.text())
+        self.pass_edit.clear()
         os.environ["PL_API_KEY"] = api_key
-        self._set_login_status(f"✓ Signed in as {user}.", "success")
+        note, tone = {
+            "vault": (" Key saved in the QGIS password store.", "success"),
+            "settings": (" Key saved in QGIS settings, as plain text. Set a QGIS "
+                         "master password (Settings ▸ Options ▸ Authentication) and "
+                         "log in again to keep it encrypted instead.", "success"),
+            "session": (" The QGIS password store stayed locked, so the key is kept "
+                        "for this session only.", "warn"),
+        }.get(where, ("", "success"))
+        self._set_login_status(f"✓ Signed in as {user}.{note}", tone)
         self._refresh_login_state()
         self.login_box.setCollapsed(True)
 
@@ -927,9 +965,9 @@ class PlanetTab(QWidget):
     def _planet_logout(self):
         self.key_edit.clear()
         self.pass_edit.clear()
-        self.settings.remove("landslide/planet_api_key")
+        planet_keystore.forget(self.settings)   # never prompts
+        self._saved_key = ""
         self.settings.remove("landslide/planet_auth_source")
-        self.settings.remove("landslide/planet_pass")
         os.environ.pop("PL_API_KEY", None)
         # If a PL_API_KEY env var is set outside this process (e.g. via launchctl /
         # the shell), it reappears on the next QGIS launch and becomes the fallback
@@ -951,13 +989,50 @@ class PlanetTab(QWidget):
 
     def _stored_key(self):
         """An *explicit* Planet API key the user provided — recovered from an account
-        login or pasted by hand, and persisted to QgsSettings. Deliberately excludes
+        login or pasted by hand, and persisted (planet_keystore). Deliberately excludes
         the ambient PL_API_KEY env var so an account login takes priority over a stray
-        environment key."""
+        environment key.
+
+        The first call in a session reads the saved key, which may show QGIS's
+        master-password prompt, and keeps it in the field so later calls don't.
+        Only for the moment a request needs the key; for "is there one?" use
+        _has_stored_key()."""
         field = getattr(self, "key_edit", None)
         if field is not None and field.text().strip():
             return field.text().strip()
-        return self.settings.value("landslide/planet_api_key", "", type=str)
+        if not planet_keystore.has_key(self.settings):
+            return ""
+        key = planet_keystore.load(self.settings)
+        if key:
+            self._saved_key = key
+            if field is not None:
+                field.setText(key)
+        else:
+            self._report_store_problem()
+        return key
+
+    def _has_stored_key(self):
+        """Whether there is an explicit key, typed or saved, WITHOUT reading it, so
+        never a master-password prompt. Drives the panel's signed-in state."""
+        field = getattr(self, "key_edit", None)
+        if field is not None and field.text().strip():
+            return True
+        return planet_keystore.has_key(self.settings)
+
+    def _report_store_problem(self):
+        """Say why a saved key could not be read (planet_keystore.load came back empty)."""
+        if getattr(self, "login_status", None) is None:
+            return
+        why = planet_keystore.problem()
+        if why == "locked":
+            self._set_login_status(
+                "Your saved Planet key is in the QGIS password store, which stayed "
+                "locked. Press Log in to be asked for the master password again.", "warn")
+        elif why == "missing":
+            self._set_login_status(
+                "Your saved Planet key is no longer in the QGIS password store. "
+                "Log in again.", "warn")
+        self._refresh_login_state()
 
     def _env_key(self):
         """The ambient PL_API_KEY environment variable — used only as a fallback."""
@@ -972,7 +1047,7 @@ class PlanetTab(QWidget):
         """How the effective key was obtained: 'account' (email/password login),
         'manual' (pasted key), 'env' (PL_API_KEY fallback), or '' (nothing yet)."""
         src = self.settings.value("landslide/planet_auth_source", "", type=str)
-        if self._stored_key():
+        if self._has_stored_key():
             # a stored key with no recorded source is a pre-existing paste
             return src if src in ("account", "manual") else "manual"
         if self._env_key():
@@ -981,13 +1056,15 @@ class PlanetTab(QWidget):
 
     def _apply_key_to_env(self, key):
         """Publish `key` to the child subprocess + in-process SDK via PL_API_KEY, and
-        persist it to QgsSettings — but only when it's an explicit account/pasted key,
-        never promoting the ambient env var into the stored (account) slot."""
+        persist it (planet_keystore) — but only when it's an explicit account/pasted
+        key, never promoting the ambient env var into the stored (account) slot, and
+        only when it changed, so a search doesn't rewrite the store every time."""
         if not key:
             return
         os.environ["PL_API_KEY"] = key
-        if self._auth_source() != "env":
-            self.settings.setValue("landslide/planet_api_key", key)
+        if self._auth_source() != "env" and key != self._saved_key:
+            planet_keystore.save(self.settings, key)
+            self._saved_key = key
 
     def _mark_manual_key(self, text):
         """User is typing an API key by hand → record the source as a manual paste so
@@ -1011,22 +1088,14 @@ class PlanetTab(QWidget):
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             self._warn("Latitude must be -90..90 and longitude -180..180.")
             return None
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         # own output subdir so a Planet search.json never clashes with the
         # Sentinel tab's search.json in the shared output directory
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return None
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return None
+        python, script, project = launch
         # feed the effective key (an account/pasted key wins over the ambient
         # PL_API_KEY) to the child so `planet.Planet()` authenticates as that account
         # without a separate `planet auth login`
@@ -1074,10 +1143,14 @@ class PlanetTab(QWidget):
 
     def _on_search_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._append_log("Search finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("The PlanetScope search stopped without "
+                                           "a result.", self.log.toPlainText()))
             return
         self._search_result = result
         self._fill_table(result)
@@ -1097,6 +1170,21 @@ class PlanetTab(QWidget):
                 f"{cached} PlanetScope order(s) here are already paid for — "
                 f"'Recall order (free)' loads them back onto the map without touching "
                 f"your quota.")
+        failed = result.get("failed") or []
+        if failed and not (npre or npost):
+            # The search itself raised (Planet didn't answer, key rejected, …), so nothing
+            # was searched. Saying "Found 0 scenes" here reads as an empty sky, and sends
+            # you off loosening filters that were never applied.
+            why = "; ".join(failed)
+            self._append_log(f"Search FAILED — no scenes are listed because none were "
+                             f"searched: {why}")
+            self.iface.messageBar().pushWarning(
+                "PlanetScope", f"Search failed, so no scenes are listed ({why}). Your "
+                "filters aren't the cause: press Search again, and if it keeps failing "
+                "check the Planet key/login."
+                + (f" Recall still works offline: {cached} paid order(s) here."
+                   if cached else ""))
+            return
         self.iface.messageBar().pushInfo(
             "PlanetScope", f"Found {npre} pre / {npost} post candidate scene(s) "
                            f"(no orders placed)."
@@ -1280,13 +1368,13 @@ class PlanetTab(QWidget):
                 f"area has pixels, NOT how cloudy it is (that's the Cloud column)."
                 + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             head = self.table.item(r, 0)
-            head.setData(Qt.UserRole, c.get("thumb_url"))
-            head.setData(Qt.UserRole + 1, cid)
-            head.setData(Qt.UserRole + 2, side)
+            head.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
+            head.setData(Qt.ItemDataRole.UserRole + 1, cid)
+            head.setData(Qt.ItemDataRole.UserRole + 2, side)
             # checkbox = include this scene in Preview on map. The ★ nearest
             # scene each side starts ticked; tick others to preview several at once.
-            head.setFlags(head.flags() | Qt.ItemIsUserCheckable)
-            head.setCheckState(Qt.Checked if is_top else Qt.Unchecked)
+            head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            head.setCheckState(Qt.CheckState.Checked if is_top else Qt.CheckState.Unchecked)
             if is_top:
                 head.setToolTip(
                     "★ Nearest clear scene on this side — ticked by default for "
@@ -1340,7 +1428,7 @@ class PlanetTab(QWidget):
         gap = "" if c.get("gap_days") is None else f"gap {c['gap_days']}d"
         cid = c.get("id")
         tile = QToolButton()
-        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
@@ -1364,7 +1452,7 @@ class PlanetTab(QWidget):
     def _tile_thumb_loaded(self, reply, tile):
         if reply in self._gallery_replies:
             self._gallery_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1382,7 +1470,7 @@ class PlanetTab(QWidget):
     def _select_row_by_id(self, cid):
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is not None and head.data(Qt.UserRole + 1) == cid:
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1) == cid:
                 self.table.selectRow(r)
                 return
 
@@ -1405,7 +1493,7 @@ class PlanetTab(QWidget):
         if not rows:
             return
         head = self.table.item(rows[0].row(), 0)
-        url = self._auth_thumb(head.data(Qt.UserRole)) if head else None
+        url = self._auth_thumb(head.data(Qt.ItemDataRole.UserRole)) if head else None
         if not url:
             self._preview_pix = None
             self.preview.setText("No browse image available for this scene.")
@@ -1420,7 +1508,7 @@ class PlanetTab(QWidget):
             reply.deleteLater()
             return
         self._preview_reply = None
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
         pix = QPixmap()
@@ -1435,7 +1523,7 @@ class PlanetTab(QWidget):
             return
         self.preview.setPixmap(self._preview_pix.scaled(
             max(self.preview.width(), 1), max(self.preview.height(), 1),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1448,15 +1536,21 @@ class PlanetTab(QWidget):
         Preview the TICKED table rows — tick a scene's checkbox to include it, tick
         several to compare. With nothing ticked, fall back to the ★ nearest scene on
         each side so the button still gives a sensible before/after pair. Row
-        selection only drives the browse-image preview pane."""
+        selection only drives the browse-image preview pane.
+
+        Ticked scenes from the same side AND the same day are stitched into ONE layer:
+        the tile service mosaics every id in a request, and same-day PlanetScope
+        frames are usually neighbours on one strip, each clipping part of the AOI.
+        Different days stay separate layers so they can still be compared; to see a
+        single frame on its own, double-click its row."""
         result = self._search_result or {}
         picks = []                          # [(side, cid), …] in table order
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side = head.data(Qt.UserRole + 2)
-            cid = head.data(Qt.UserRole + 1)
+            side = head.data(Qt.ItemDataRole.UserRole + 2)
+            cid = head.data(Qt.ItemDataRole.UserRole + 1)
             if cid:
                 picks.append((side, cid))
         if not picks:                       # nothing ticked -> nearest each side
@@ -1464,7 +1558,16 @@ class PlanetTab(QWidget):
                 ranked = self._rank(result.get(side, []))
                 if ranked and ranked[0].get("id"):
                     picks.append((side, ranked[0]["id"]))
-        return [(self._label_for(side, cid), [cid]) for side, cid in picks]
+        groups = {}                         # (side, date) -> [ids], in table order
+        for side, cid in picks:
+            groups.setdefault((side, self._date_for(side, cid)), []).append(cid)
+        out = []
+        for (side, _date), ids in groups.items():
+            label = self._label_for(side, ids[0])
+            if len(ids) > 1:
+                label += f" ({len(ids)} scenes stitched)"
+            out.append((label, ids))
+        return out
 
     def _label_for(self, side, cid):
         date = self._date_for(side, cid)
@@ -1475,8 +1578,8 @@ class PlanetTab(QWidget):
         head = self.table.item(item.row(), 0)
         if head is None:
             return
-        side = head.data(Qt.UserRole + 2)
-        cid = head.data(Qt.UserRole + 1)
+        side = head.data(Qt.ItemDataRole.UserRole + 2)
+        cid = head.data(Qt.ItemDataRole.UserRole + 1)
         if cid:
             self._render_picks([(self._label_for(side, cid), [cid])])
 
@@ -1533,7 +1636,8 @@ class PlanetTab(QWidget):
                     post = self._date_for("post", ids[0])
         self._preview_group = lg.name("Planet", lg.date_pair(pre, post),
                                       lg.radius_tag(self.radius_spin.value()), "preview")
-        self._clear_preview_layers()
+        self._clear_preview_layers()  # the previous TILE preview only — downloaded SR
+                                      # renders stay on the map (see _clear_preview_layers)
         self._abort_tile_replies()   # a re-entry (row double-click mid-request) must
                                      # not share this batch's _tile_pending counter
         self._preview_extent = None
@@ -1547,28 +1651,25 @@ class PlanetTab(QWidget):
     def _request_tile_layer(self, name, ids, key):
         """POST scene ids -> tile hash, then add the XYZ layer (async, off the GUI).
 
-        Authenticate with the api_key as a QUERY PARAM, the way the rest of the tile
-        service does (the XYZ tile GETs, the browse thumbnails) and Planet's own
-        qgis-planet-plugin does: tiles.planet.com/data/v1/layers rejects HTTP Basic
-        auth with a 401. The Basic header is kept as a harmless belt-and-suspenders
-        fallback (the Data API accepts it)."""
+        The only tile-service call that needs the key, and it is never saved. It goes
+        both as a query param (as Planet's own qgis-planet-plugin sends it) and as HTTP
+        Basic; on 2026-10-13 each one alone got a 201 here."""
         item_type_ids = [f"{ITEM_TYPE}:{i}" for i in ids]
         body = QByteArray(("ids=" + quote(",".join(item_type_ids))).encode())
         req = QNetworkRequest(QUrl(TILE_HASH_URL + "?api_key=" + quote(key)))
-        req.setHeader(QNetworkRequest.ContentTypeHeader,
+        req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader,
                       "application/x-www-form-urlencoded")
         token = base64.b64encode(f"{key}:".encode()).decode()
         req.setRawHeader(b"Authorization", ("Basic " + token).encode())
         reply = QgsNetworkAccessManager.instance().post(req, body)
         self._tile_replies.append(reply)
-        reply.finished.connect(
-            lambda r=reply, n=name, k=key: self._tile_hash_ready(r, n, k))
+        reply.finished.connect(lambda r=reply, n=name: self._tile_hash_ready(r, n))
 
-    def _tile_hash_ready(self, reply, name, key):
+    def _tile_hash_ready(self, reply, name):
         if reply in self._tile_replies:
             self._tile_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status in (200, 201)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status in (200, 201)
         data = bytes(reply.readAll())
         reply.deleteLater()
         tile_hash = None
@@ -1600,15 +1701,16 @@ class PlanetTab(QWidget):
             self._append_log(f"    tile request failed for {name} (HTTP {status})"
                              f"{f': {detail}' if detail else ''}{hint}")
         else:
-            self._add_tile_layer(name, tile_hash, key)
+            self._add_tile_layer(name, tile_hash)
             self._grow_preview_extent(bounds)
         self._tile_pending -= 1
         if self._tile_pending <= 0:
             self.map_preview_btn.setEnabled(True)
             if self._preview_layers:
-                # Frame the actual scene footprint, not the AOI: a PlanetScope strip
-                # is only a few km wide and can sit well off the epicentre, so zooming
-                # to the AOI can leave the imagery off-screen (blank canvas).
+                # Frame the actual scene footprint, not the AOI: a PlanetScope scene
+                # (~32 x 20 km, framed along-track on no tiling grid) can overlap the
+                # AOI at one corner and sit well off the epicentre, so zooming to the
+                # AOI can leave the imagery off-screen (blank canvas).
                 self.zoom_btn.setEnabled(True)
                 if self._preview_extent is not None:
                     self._zoom_to_rect(self._preview_extent)
@@ -1627,10 +1729,10 @@ class PlanetTab(QWidget):
         picks = {"pre": [], "post": []}
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
-            if head is None or head.checkState() != Qt.Checked:
+            if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
-            side = head.data(Qt.UserRole + 2)
-            cid = head.data(Qt.UserRole + 1)
+            side = head.data(Qt.ItemDataRole.UserRole + 2)
+            cid = head.data(Qt.ItemDataRole.UserRole + 1)
             if cid and side in picks:
                 picks[side].append(cid)
         if not picks["pre"] and not picks["post"]:
@@ -1660,20 +1762,12 @@ class PlanetTab(QWidget):
         if not key:
             self._warn("Set a Planet API key (above) to order & render SR detail.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         self._apply_key_to_env(key)
         os.makedirs(out, exist_ok=True)
 
@@ -1728,10 +1822,14 @@ class PlanetTab(QWidget):
 
     def _on_detail_done(self):
         self._busy(False)
-        result = getattr(self.task, "result", None)
-        self.task = None
+        task, self.task = self.task, None
+        result = getattr(task, "result", None)
         if not result:
             self._append_log("Render detail finished with no result.")
+            if task is not None and not task.isCanceled():
+                from .task import failure_message
+                self._warn(failure_message("Render detail stopped without a result.",
+                                           self.log.toPlainText()))
             # keep any prior pending order resumable (don't strand the button disabled)
             self._refresh_resume_btn()
             self._refresh_retone_btn()
@@ -1791,9 +1889,11 @@ class PlanetTab(QWidget):
         radius = (self._last_render or {}).get("radius", self.radius_spin.value())
         group = lg.name("Planet", lg.date_pair(dates.get("pre"), dates.get("post")),
                         lg.radius_tag(radius), product)
-        # replace whatever the previous preview (tiles or SR) put on the map
-        self._clear_preview_layers()
-        self._preview_extent = None
+        # Add BESIDE what is already on the map — never clear it first. The SR layers
+        # there are scenes already downloaded (paid for), and a render of other scenes
+        # writes other files (run_single names each for its scenes, tone and product), so
+        # every earlier render stays loaded. The only layer this replaces is one reading
+        # the very file being loaded again (see _drop_layers_reading).
         loaded = 0
         for side in ("pre", "post"):
             path = result.get(side)
@@ -1804,8 +1904,9 @@ class PlanetTab(QWidget):
             label += f" · SR detail ({tone_word})"
             lyr = QgsRasterLayer(path, label)
             if lyr.isValid():
+                self._drop_layers_reading(path)
                 lg.add_to_group(lyr, group)
-                self._preview_layers.append(lyr)
+                self._detail_layers.append(lyr)
                 loaded += 1
                 self._append_log(f"  loaded {label}")
             else:
@@ -1814,7 +1915,7 @@ class PlanetTab(QWidget):
         # (run_single writes it into render.json in that case) and the user asked for it.
         # Same run folder as the RGB, styled to show only darkening (reuses the S2/Landsat
         # tab's ramp). Not counted in `loaded` — it's a change raster, not an SR-detail
-        # tone layer — but tracked so the next render/preview clears it.
+        # tone layer — but kept like one: a later render or preview leaves it alone.
         dpath = result.get("dbright")
         if dpath and os.path.exists(dpath) and self.dbright_check.isChecked():
             dpair = lg.date_pair(dates.get("pre"), dates.get("post"))
@@ -1822,8 +1923,9 @@ class PlanetTab(QWidget):
             dlyr = QgsRasterLayer(dpath, dlabel)
             if dlyr.isValid():
                 self.dock._style_dbright(dlyr)
+                self._drop_layers_reading(dpath)
                 lg.add_to_group(dlyr, group)
-                self._preview_layers.append(dlyr)
+                self._detail_layers.append(dlyr)
                 self._append_log(f"  loaded {dlabel} (brightness decreases only)")
             else:
                 self._append_log("  could not open the dBrightness layer")
@@ -1838,6 +1940,11 @@ class PlanetTab(QWidget):
                 "the same product (one SR, one TOA). Re-render both sides with the same "
                 "'Raw TOA' setting to get a comparable brightness-change layer.")
         if loaded:
+            # The render supersedes the free tile preview it was chosen from, so that goes
+            # — tiles only; downloaded renders are never in _preview_layers. Only once
+            # something loaded, so a failed render doesn't blank the preview as well.
+            self._clear_preview_layers()
+            self._preview_extent = None
             # The GeoTIFFs are clipped to the AOI box, so framing the AOI frames the
             # render exactly (no per-layer extent bookkeeping needed).
             self.zoom_btn.setEnabled(True)
@@ -1893,11 +2000,12 @@ class PlanetTab(QWidget):
 
         Imported straight into QGIS's Python — safe, unlike the imagery stack, because
         planet_cache is pure stdlib path/JSON bookkeeping. Loaded by explicit file path
-        rather than via sys.path so it always tracks the configured project dir instead
-        of a stale copy from a previous one."""
-        project = self.dock.project_edit.text().strip()
+        rather than via sys.path so it always tracks the pipeline folder in use (the
+        plugin's own, or the advanced box's) instead of a stale copy from a previous
+        one."""
+        project = self.dock.pipeline_dir()
         path = os.path.join(project, "planet_cache.py")
-        if not path or not os.path.exists(path):
+        if not project or not os.path.exists(path):
             return None
         try:
             import importlib.util
@@ -1935,14 +2043,20 @@ class PlanetTab(QWidget):
                 return
             aoi = self._recall_aoi()
             project = self.dock.project_edit.text().strip()
-            base_out = self.dock.out_edit.text().strip() or os.path.join(
-                project, "out", "interactive")
+            # the OLD shared results folder, not this project's: orders made before the
+            # shared cache existed can only be there (every order since lands in the
+            # cache), and walking a project folder on a network drive from the GUI
+            # thread would stall QGIS for nothing
+            base_out = self.dock.shared_dir()
             try:
                 # Pick up orders downloaded before the shared cache existed so they
                 # appear in the picker too. Scoped to the output dirs, NOT the whole
                 # project — this runs on the GUI thread and walking venv/ would stall it.
-                pc.adopt([base_out, os.path.join(project, "out"),
-                          os.path.join(project, "Output")], log=lambda *_: None)
+                # No tools folder set: nothing older to adopt (and joining "" would
+                # scan a RELATIVE out/ wherever QGIS was launched from).
+                legacy = ([os.path.join(project, "out"), os.path.join(project, "Output")]
+                          if project else [])
+                pc.adopt([base_out] + legacy, log=lambda *_: None)
                 near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
                                    require_point=True)
                         if aoi else pc.entries())
@@ -1986,20 +2100,12 @@ class PlanetTab(QWidget):
             self._warn("Enter a valid latitude/longitude (or run Search) first — "
                        "Recall needs the location to know which orders to load.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         # No key is required when the clips are still on disk, but pass one through if
         # we have it so a cached order whose files were deleted can be re-downloaded
         # (also free) instead of failing.
@@ -2119,20 +2225,12 @@ class PlanetTab(QWidget):
             self._warn("Run 'Render detail' once first — Re-tone re-renders the "
                        "surface-reflectance clips that render leaves on disk.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         args = [
             "--lat", f"{last['lat']:.6f}", "--lon", f"{last['lon']:.6f}",
             "--datetime", last["when"], "--radius-km", f"{last['radius']:.2f}",
@@ -2219,20 +2317,12 @@ class PlanetTab(QWidget):
         if not key:
             self._warn("Set a Planet API key (above) to resume the order.")
             return
-        python = self.dock.python_edit.text().strip()
-        project = self.dock.project_edit.text().strip()
-        base_out = self.dock.out_edit.text().strip() or os.path.join(
-            project, "out", "interactive")
+        base_out = self.dock.results_dir()     # this project's folder once it's saved
         out = os.path.join(base_out, "planet")
-        script = os.path.join(project, "run_single.py")
-        if not (python and os.path.exists(python)):
-            # shared gate: warns, opens the Environment box, marks and focuses
-            # the offending field (dock.env_gate)
-            self.dock.env_gate()
+        launch = self.dock.pipeline_launch()  # opens Setup if it can't run
+        if launch is None:
             return
-        if not os.path.exists(script):
-            self._warn(f"run_single.py not found in project dir:\n{script}")
-            return
+        python, script, project = launch
         self._apply_key_to_env(key)
         os.makedirs(out, exist_ok=True)
 
@@ -2267,7 +2357,7 @@ class PlanetTab(QWidget):
         self.task.taskTerminated.connect(self._on_detail_done)
         QgsApplication.taskManager().addTask(self.task)
 
-    def _add_tile_layer(self, name, tile_hash, key):
+    def _add_tile_layer(self, name, tile_hash):
         # Build the XYZ datasource URI exactly like Planet's own qgis-planet-plugin
         # (planet_api/p_client.tile_service_url + pe_utils.tile_service_data_src_uri):
         # a RAW, unencoded tile URL placed last, with {z}/{x}/{y} kept as literal
@@ -2281,8 +2371,15 @@ class PlanetTab(QWidget):
         # layer.extent() desyncs it from that grid and the tiles stop rendering. That
         # is why QGIS's own 'Zoom to Layer' zooms to the whole Earth for these layers
         # — use the tab's "Zoom to scene" button to frame the scene instead.
-        tile_url = (TILE_XYZ_URL.format(shard=random.randint(0, 3), hash=tile_hash)
-                    + f"?api_key={key}")
+        #
+        # And NO api_key in the url. QGIS saves every layer source into the project,
+        # so a key here sat in plain text in 22 of the 61 projects on the shared drive.
+        # Planet doesn't need it: the tile hash is the credential. Tiles came back
+        # byte-identical with no key, a bogus key and the real one (checked live
+        # 2026-10-13); only the POST in _request_tile_layer is authenticated. If Planet
+        # ever starts refusing keyless tiles, send the key as a request header (a
+        # QgsNetworkAccessManager request preprocessor), never back in this uri.
+        tile_url = TILE_XYZ_URL.format(shard=random.randint(0, 3), hash=tile_hash)
         uri = f"type=xyz&crs=EPSG:3857&format=&url={tile_url}"
         lyr = QgsRasterLayer(uri, name, "wms")
         if not lyr.isValid():
@@ -2307,11 +2404,55 @@ class PlanetTab(QWidget):
             self._preview_extent.combineExtentWith(rect)
 
     def _clear_preview_layers(self):
+        """Take the free tile previews off the map — and only those.
+
+        The SR detail layers are downloaded, paid-for renders. They are tracked apart,
+        in _detail_layers, precisely so that a new Preview on map (or the render that
+        supersedes a preview) can never remove them."""
         for lyr in self._preview_layers:
             lg.remove_layer(lyr)
         self._preview_layers = []
         if hasattr(self, "zoom_btn"):
-            self.zoom_btn.setEnabled(False)
+            # still something to frame while downloaded renders remain
+            self.zoom_btn.setEnabled(bool(self._live_detail_layers()))
+
+    def _live_detail_layers(self):
+        """_detail_layers minus any since removed from the project (by hand, or by
+        _drop_layers_reading); the list is pruned to match."""
+        project = QgsProject.instance()
+        live = []
+        for lyr in self._detail_layers:
+            try:
+                if project.mapLayer(lyr.id()) is not None:
+                    live.append(lyr)
+            except RuntimeError:          # the layer's C++ object is already gone
+                pass
+        self._detail_layers = live
+        return live
+
+    def _drop_layers_reading(self, path):
+        """Remove any layer already showing exactly the file `path`, before it loads again.
+
+        Only a render of the SAME scenes with the same tone and product writes the same
+        file — a Re-tone with a new stretch, or a Recall/Resume of an order already on
+        the map — and that write has just replaced the pixels under the old layer, so it
+        is a stale copy of the layer about to be added, not a different scene. Every
+        other layer, every other downloaded scene included, is left alone. Searches the
+        whole project rather than _detail_layers, so a copy loaded before a plugin
+        reload, or saved in the project, is caught too."""
+        target = os.path.normcase(os.path.realpath(path))
+        for lyr in list(QgsProject.instance().mapLayers().values()):
+            try:
+                if lyr.providerType() != "gdal":
+                    continue
+                src = lyr.source().split("|")[0]
+                name = lyr.name()
+            except (RuntimeError, AttributeError):
+                continue
+            if src and os.path.normcase(os.path.realpath(src)) == target:
+                lg.remove_layer(lyr)
+                self._append_log(f"  replaced the earlier copy of {name} "
+                                 f"(same scenes, same file)")
 
     # ---------- scene footprints ----------
     def _on_footprint_toggle(self, checked):
@@ -2333,8 +2474,8 @@ class PlanetTab(QWidget):
         ids = set()
         for idx in self.table.selectionModel().selectedRows():
             head = self.table.item(idx.row(), 0)
-            if head is not None and head.data(Qt.UserRole + 1):
-                ids.add(head.data(Qt.UserRole + 1))
+            if head is not None and head.data(Qt.ItemDataRole.UserRole + 1):
+                ids.add(head.data(Qt.ItemDataRole.UserRole + 1))
         return ids
 
     def _draw_footprints(self):
@@ -2355,10 +2496,10 @@ class PlanetTab(QWidget):
                                  f"PlanetScope footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
-                QgsField("scene_id", QVariant.String),
-                QgsField("date", QVariant.String),
-                QgsField("gap_days", QVariant.Int),
-                QgsField("cloud_pct", QVariant.Double),
+                QgsField("scene_id", QMetaType.Type.QString),
+                QgsField("date", QMetaType.Type.QString),
+                QgsField("gap_days", QMetaType.Type.Int),
+                QgsField("cloud_pct", QMetaType.Type.Double),
             ])
             lyr.updateFields()
             feats = []

@@ -352,16 +352,14 @@ def stable_ground_stats(dh_source, outline_wkt, epsg, bounds, res,
     """Residual bias and per-pixel noise of an IMPORTED Δh, from ground OUTSIDE
     the outline. Returns {"offset_m", "sigma_m", "stable_px", "ok"}.
 
-    Why this exists. The worked case is a SAR amplitude inversion of the MOSART
-    kind — elevation change reconstructed from Sentinel-1 AMPLITUDE by a
-    least-squares shape-from-shading fit, written out as `post − reference`
-    straight to GeoTIFF (that integration is parked, see parked/mosart/). An
-    inversion of that kind constrains the SHAPE of the change field far better
-    than its absolute datum,
-    so the product carries a DC offset that nothing upstream removes — and volume
-    is LINEAR in that offset. Half a metre of residual bias over a 1 km² outline
-    integrates to 500,000 m³, which is a large fraction of a real event's whole
-    volume, reported as signal.
+    Why this exists. Any Δh produced OUTSIDE this plugin arrives on its own
+    vertical datum. The hard case is an inversion — elevation change
+    reconstructed from radar amplitude by a least-squares shape-from-shading
+    fit, say — which constrains the SHAPE of the change field far better than
+    its absolute level, so the product carries a DC offset that nothing
+    upstream removes. Volume is LINEAR in that offset: half a metre of residual
+    bias over a 1 km² outline integrates to 500,000 m³, a large fraction of a
+    real event's whole volume, reported as signal.
 
     `difference_dems` already solves this for a pair it computed itself
     (coregister_offset over the whole AOI). An imported Δh never went through

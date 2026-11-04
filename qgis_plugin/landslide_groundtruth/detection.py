@@ -16,22 +16,15 @@ having exactly once instead of retyped into four tabs.
     Vol       = 1.3 M m³
     Vol range = 0.9 - 1.7 M m³
 
-Two fields in there are load-bearing and the plugin used to ignore both:
-
-* **loc_error_km** is the radius the scar is actually somewhere inside. A 17 km
-  error against the tabs' 5 km default search radius is about one twelfth of the
-  uncertainty area, so the default quietly looks in the wrong place and an empty
-  result reads as "no landslide" when it means "never searched there".
-* **vol_best_m3** is an INDEPENDENT volume estimate. The Volume tab derives a
-  second one from the digitized scar area, and DEM differencing a third. Two or
-  three independent volumes of the same event is the actual validation, and it
-  cannot happen if the seismic one has nowhere to live.
+The Detection box takes the event ID, origin time and epicentre. It used to
+take the location error (which set the search radius) and the seismic volume
+(the Volume tab's cross-check) too; both were dropped on 2026-10-30, with the
+cross-check, and each tab now gets its own fixed radius from SEARCH_RADIUS_KM.
 
 The record arrives as a FIGURE — a station map with the numbers printed in the
 corner — so there is nothing to paste and no text to parse. The analyst reads
 the values off the image; this class exists so they do that ONCE instead of
-four times across four tabs, and so the two fields the plugin used to discard
-(location error, seismic volume) reach the code that needs them.
+four times across four tabs.
 
 Nothing here imports Qt — it is plain stdlib, so it can be unit-tested outside
 QGIS.
@@ -75,19 +68,36 @@ def to_alaska(utc_dt):
     return utc_dt.replace(tzinfo=None) + off, name
 
 
+# ---------------------------------------------------------------- search radius
+
+# The radius 'Use it in every tab' gives each tab, in km — Ethan's choice of
+# 2026-10-30, when the location error left the Detection box. SAR and the 3D
+# viewer take Sentinel-2's, as their own copy-from-Sentinel-2 does.
+SEARCH_RADIUS_KM = {
+    "sentinel2": 15.0,
+    "planet": 10.0,
+    "maxar": 15.0,
+    "sar": 15.0,
+    "viewer3d": 15.0,
+}
+
+
+def radius_summary():
+    """'Sentinel-2 15 km · PlanetScope 10 km · Maxar 15 km' for the read-back."""
+    r = SEARCH_RADIUS_KM
+    return (f"Sentinel-2 {r['sentinel2']:g} km · PlanetScope {r['planet']:g} km · "
+            f"Maxar {r['maxar']:g} km")
+
+
 # ---------------------------------------------------------------- the record
 
 @dataclass
 class Detection:
-    """One seismic landslide detection. All distances in km, volumes in m³."""
+    """One seismic landslide detection."""
     event_id: str = ""
     origin_utc: datetime = None
     lat: float = None
     lon: float = None
-    loc_error_km: float = None
-    vol_best_m3: float = None
-    vol_low_m3: float = None
-    vol_high_m3: float = None
     # provenance only — displayed so the analyst can judge how hard to look,
     # never used to compute anything.
     coherency: float = None
@@ -99,17 +109,6 @@ class Detection:
     # ---- derived -------------------------------------------------------
     def is_locatable(self):
         return self.lat is not None and self.lon is not None
-
-    def suggested_radius_km(self, floor=3.0, cap=50.0):
-        """The search radius that actually covers the uncertainty.
-
-        The scar is somewhere in a disc of radius `loc_error_km`; a radius
-        smaller than that is searching a fraction of it. Falls back to the
-        historical 5 km only when the record carries no error at all, and is
-        clamped to the spinboxes' own 0.2-50 km range."""
-        if not self.loc_error_km:
-            return 5.0
-        return max(floor, min(cap, float(self.loc_error_km)))
 
     def local_str(self):
         """'2026-02-03 23:48 AKST (previous day)' — the timezone trap, spelled out."""
@@ -123,15 +122,6 @@ class Detection:
             day = " (next day)"
         return f"{loc:%Y-%m-%d %H:%M} {name}{day}"
 
-    def vol_str(self):
-        """'1.3 ×10⁶ m³ (0.9 – 1.7)' — or '' when the record carries no volume."""
-        if self.vol_best_m3 is None:
-            return ""
-        s = f"{self.vol_best_m3 / 1e6:.3g} ×10⁶ m³"
-        if self.vol_low_m3 is not None and self.vol_high_m3 is not None:
-            s += f" ({self.vol_low_m3 / 1e6:.2g} – {self.vol_high_m3 / 1e6:.2g})"
-        return s
-
     def summary_lines(self):
         """The read-back block. Echoing the local time is the point: an analyst
         reading 23:48 off the figure and typing it into a UTC field moves the
@@ -143,13 +133,7 @@ class Detection:
         if self.origin_utc:
             out.append(f"{self.origin_utc:%Y-%m-%d %H:%M:%S} UTC   =   {self.local_str()}")
         if self.is_locatable():
-            pos = f"{self.lat:.4f}, {self.lon:.4f}"
-            if self.loc_error_km:
-                pos += f"  ± {self.loc_error_km:g} km"
-            out.append(pos)
-        v = self.vol_str()
-        if v:
-            out.append(f"Seismic volume {v}")
+            out.append(f"{self.lat:.4f}, {self.lon:.4f}")
         q = []
         if self.detection:
             q.append(f"Detection {self.detection}")
@@ -163,19 +147,14 @@ class Detection:
 
     def as_row(self):
         """Flat dict for the CSV export, prefixed so it never collides with the
-        measured columns — the whole point is that the seismic estimate and the
-        area-derived estimate never share a column."""
+        measured columns."""
         return {
             "event_id": self.event_id or "",
             "origin_utc": self.origin_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if self.origin_utc else "",
             "det_lat": "" if self.lat is None else f"{self.lat:.6f}",
             "det_lon": "" if self.lon is None else f"{self.lon:.6f}",
-            "det_loc_error_km": "" if self.loc_error_km is None else f"{self.loc_error_km:g}",
             "det_coherency": "" if self.coherency is None else f"{self.coherency:g}",
             "det_hf_lf": "" if self.hf_lf is None else f"{self.hf_lf:g}",
-            "vol_seismic_m3": "" if self.vol_best_m3 is None else f"{self.vol_best_m3:.0f}",
-            "vol_seismic_lo_m3": "" if self.vol_low_m3 is None else f"{self.vol_low_m3:.0f}",
-            "vol_seismic_hi_m3": "" if self.vol_high_m3 is None else f"{self.vol_high_m3:.0f}",
         }
 
     def to_dict(self):

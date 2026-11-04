@@ -1,0 +1,295 @@
+"""Every outline the Volume tab creates is saved in the project's folder, not memory.
+
+Run with tests/run_all.sh, or directly with QGIS's bundled python:
+    /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_outline_saved.py
+
+A memory layer loses the afternoon's digitizing to any QGIS restart, and the
+project that reopens has nothing to measure. Each outline role's New button —
+total, source best, source low, source high — writes a GeoPackage beside the
+.qgz instead (dock.results_dir), names it for its role and assigns it to that
+role in one press.
+
+Checks: the file is really on disk and the layer reads from it; the role is set
+and pinned; the name carries the role so a reopened project re-matches it; a
+second press never writes over the first outline; and an unsaved project with no
+Results folder set saves into the default one (Documents/Landslide Ground-Truthing,
+redirected to a temp folder here) rather than refusing or using a temp dir.
+"""
+import os, sys, tempfile
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = os.path.join(ROOT, "qgis_plugin")
+sys.path.insert(0, PKG)
+
+from qgis.core import Qgis, QgsApplication, QgsProject, QgsVectorLayer, QgsWkbTypes
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
+app = QgsApplication([], True); app.initQgis()
+from qgis.PyQt.QtWidgets import QMainWindow, QWidget
+from qgis.PyQt.QtCore import QObject
+
+OK = FAIL = 0
+
+
+def check(msg, cond):
+    global OK, FAIL
+    if cond:
+        OK += 1
+        print(f"  ok   {msg}")
+    else:
+        FAIL += 1
+        print(f"  FAIL {msg}")
+
+
+class FakeBar(QObject):
+    def pushMessage(s, *a, **k): pass
+    def pushInfo(s, *a): pass
+    def pushWarning(s, *a): pass
+    def pushCritical(s, *a): pass
+class FakeCanvas(QWidget):
+    def mapSettings(s):
+        from qgis.core import QgsMapSettings
+        return QgsMapSettings()
+    def mapTool(s): return None
+    def setMapTool(s, t): pass
+    def unsetMapTool(s, t): pass
+class FakeIface(QObject):
+    def __init__(s):
+        super().__init__(); s._bar = FakeBar(); s._c = FakeCanvas(); s._w = QMainWindow()
+        s.active = None
+    def messageBar(s): return s._bar
+    def mapCanvas(s): return s._c
+    def mainWindow(s): return s._w
+    def addDockWidget(s, *a): pass
+    def removeDockWidget(s, *a): pass
+    def activeLayer(s): return s.active
+    def setActiveLayer(s, l): s.active = l
+
+
+from qgis.core import QgsSettings
+_KEYS = ("landslide/python", "landslide/project", "landslide/out")
+_saved = {k: QgsSettings().value(k, "", type=str) for k in _KEYS}
+
+
+def _restore_settings():
+    s = QgsSettings()
+    for k, v in _saved.items():
+        s.setValue(k, v)
+    s.sync()
+
+
+import atexit
+atexit.register(_restore_settings)
+
+from landslide_groundtruth.dock import LandslideDock
+from landslide_groundtruth.volume_tab import ROLE_LAYERS, AREA_FIELD, AREA_EXPRESSION
+
+dock = LandslideDock(FakeIface())
+tab = dock.volume_tab
+project = QgsProject.instance()
+dock.out_edit.setText("")
+dock.project_edit.setText("")
+
+print("=== unsaved, no Results folder: the default results folder, not a temp dir ===")
+from landslide_groundtruth import environment
+DEFAULT = tempfile.mkdtemp(prefix="default results ")
+environment.default_results_dir = lambda: DEFAULT   # never the real ~/Documents
+project.clear()
+tab.name_edit.setText("test slide")
+tab._new_role_layer("total")
+unsaved = tab._role_layer("total")
+src0 = unsaved.source().split("|", 1)[0] if unsaved is not None else ""
+check(f"an unsaved project's outline is saved in the default folder ({src0})",
+      os.path.isfile(src0) and os.path.dirname(src0) == DEFAULT)
+project.clear()
+
+print("\n=== New total area: a GeoPackage in the project's folder ===")
+A = tempfile.mkdtemp(prefix="proj outline ")     # a space, like the real folders
+project.write(os.path.join(A, "event A.qgz"))
+tab._new_role_layer("total")
+total = tab._role_layer("total")
+check("the Total area role is filled in", isinstance(total, QgsVectorLayer))
+src = total.source().split("|", 1)[0] if total is not None else ""
+check(f"it reads from a file, not memory ({total.providerType() if total else None})",
+      total is not None and total.providerType() == "ogr")
+check(f"the file is in the project's folder ({src})",
+      os.path.isfile(src) and os.path.dirname(src) == A)
+check(f"named for the slide and the role ({os.path.basename(src)})",
+      os.path.basename(src) == "test_slide_total_area.gpkg")
+check("the layer is a polygon layer, with a slide field",
+      total is not None
+      and total.geometryType() == Qgis.GeometryType.Polygon
+      and total.fields().indexOf("slide") >= 0)
+check("the role is pinned, so a layer loaded later can't take it over",
+      tab._role_pinned.get("total"))
+check("and QGIS is digitizing into it", dock.iface.activeLayer() is total
+      and total.isEditable())
+
+print("\n=== the NAME carries the role, so a reopened project re-matches it ===")
+name = total.name()
+check(f"the layer name ends in the role words ({name})",
+      name == "test slide Total Area")
+check("name matching alone would assign it to total",
+      tab._match_role_layers([total]).get("total") is total)
+
+print("\n=== New source area (best): its own file, its own role ===")
+tab._new_role_layer("best")
+best = tab._role_layer("best")
+bsrc = best.source().split("|", 1)[0] if best is not None else ""
+check("the Source area (best) role is filled in", isinstance(best, QgsVectorLayer))
+check(f"a second, separate GeoPackage ({os.path.basename(bsrc)})",
+      os.path.isfile(bsrc) and bsrc != src
+      and os.path.basename(bsrc) == "test_slide_source_area_best.gpkg")
+check("it did not disturb the total role", tab._role_layer("total") is total)
+check("name matching alone would assign it to best",
+      tab._match_role_layers([best]).get("best") is best)
+
+print("\n=== total is a red outline, best source a blue one, no fill ===")
+from qgis.PyQt.QtCore import Qt
+
+
+def outline(layer):
+    sl = layer.renderer().symbol().symbolLayer(0)
+    return sl.strokeColor().name(), sl.brushStyle() == Qt.BrushStyle.NoBrush
+
+
+check(f"total: red outline, no fill {outline(total)}", outline(total) == ("#dc1e1e", True))
+check(f"best: blue outline, no fill {outline(best)}", outline(best) == ("#1e5ae6", True))
+probe = QgsVectorLayer(f"{src}|layername={os.path.splitext(os.path.basename(src))[0]}",
+                       "probe", "ogr")
+check(f"the colour is stored IN the GeoPackage, so it opens red anywhere {outline(probe)}",
+      outline(probe) == ("#dc1e1e", True))
+del probe
+
+print("\n=== the outline carries its own area, kept current by QGIS ===")
+from qgis.core import (QgsGeometry, QgsVectorLayerUtils, QgsCoordinateReferenceSystem,
+                       QgsCoordinateTransform)
+idx = total.fields().indexOf(AREA_FIELD)
+dv = total.defaultValueDefinition(idx)
+check(f"an {AREA_FIELD} field on both outlines",
+      idx >= 0 and best.fields().indexOf(AREA_FIELD) >= 0)
+check("filled by an expression that is re-applied on every reshape",
+      dv.expression() == AREA_EXPRESSION and dv.applyOnUpdate())
+check("read-only in the attribute form (an edit would be recomputed anyway)",
+      total.editFormConfig().readOnly(idx))
+# Digitize the way the Add Polygon tool does: createFeature evaluates defaults.
+# ~2.8 km² beside Iliamna.
+g = QgsGeometry.fromWkt("POLYGON((-153.10 60.02,-153.07 60.02,-153.07 60.035,"
+                        "-153.09 60.04,-153.10 60.02))")
+g.transform(QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                   total.crs(), project))
+total.addFeature(QgsVectorLayerUtils.createFeature(total, g, {},
+                                                   total.createExpressionContext()))
+total.commitChanges()
+feat = next(total.getFeatures())
+want = tab._measure_area(g, total.crs()) / 1e6
+check(f"drawn polygon: {AREA_FIELD}={feat[AREA_FIELD]} vs measured {want:.4f} km²",
+      feat[AREA_FIELD] is not None and abs(feat[AREA_FIELD] - want) < 5e-4)
+g2 = QgsGeometry(feat.geometry())        # drag one corner out by half the width
+v0 = g2.vertexAt(1)
+g2.moveVertex(v0.x() + g2.boundingBox().width() * 0.5, v0.y(), 1)
+total.startEditing()
+total.changeGeometry(feat.id(), g2)
+total.commitChanges()
+after = total.getFeature(feat.id())[AREA_FIELD]
+want2 = tab._measure_area(g2, total.crs()) / 1e6
+check(f"reshaped: {AREA_FIELD}={after} vs measured {want2:.4f} km²",
+      after is not None and abs(after - want2) < 5e-4 and abs(after - feat[AREA_FIELD]) > 0.01)
+total.startEditing()                     # leave it as the button did
+
+print("\n=== a second press never writes over the first outline ===")
+stamp = os.path.getmtime(src)
+tab._new_role_layer("total")
+again = tab._role_layer("total")
+check("a new layer takes the role", again is not None and again is not total)
+asrc = again.source().split("|", 1)[0]
+check(f"written to a different file ({os.path.basename(asrc)})",
+      os.path.isfile(asrc) and asrc != src)
+check("the first file is untouched", os.path.isfile(src)
+      and os.path.getmtime(src) == stamp)
+check("both files are still there",
+      {os.path.basename(p) for p in (src, asrc, bsrc)}
+      <= set(os.listdir(A)))
+
+print("\n=== the files survive the project: reopening finds them ===")
+ids = {l.source().split("|", 1)[0] for l in project.mapLayers().values()}
+project.write(os.path.join(A, "event A.qgz"))
+project.clear()
+check("clearing the project does not delete the outlines",
+      all(os.path.isfile(p) for p in (src, asrc, bsrc)))
+project.read(os.path.join(A, "event A.qgz"))
+reloaded = {l.source().split("|", 1)[0] for l in project.mapLayers().values()}
+check("and the reopened project still points at them",
+      {src, asrc, bsrc} <= reloaded)
+tab._refresh_layers()
+check("with the roles matched back from the layer names",
+      tab._role_layer("total") is not None and tab._role_layer("best") is not None)
+check("still red and blue after the reopen",
+      outline(tab._role_layer("total"))[0] == "#dc1e1e"
+      and outline(tab._role_layer("best"))[0] == "#1e5ae6")
+
+print("\n=== source low / high: their own files, dashed and dotted blue ===")
+tab._new_role_layer("low")
+low = tab._role_layer("low")
+lsrc = low.source().split("|", 1)[0] if low is not None else ""
+check(f"New beside Source (low) fills that role ({os.path.basename(lsrc)})",
+      low is not None and os.path.basename(lsrc) == "test_slide_source_area_low.gpkg"
+      and os.path.dirname(lsrc) == A)
+tab._new_role_layer("high")
+high = tab._role_layer("high")
+hsrc = high.source().split("|", 1)[0] if high is not None else ""
+check(f"New beside Source (high) fills that role ({os.path.basename(hsrc)})",
+      high is not None and os.path.basename(hsrc) == "test_slide_source_area_high.gpkg")
+check("neither disturbed the total or best roles",
+      tab._role_layer("best") is not None and tab._role_layer("total") is not None
+      and tab._role_layer("low") is not tab._role_layer("best"))
+from qgis.PyQt.QtCore import Qt as _Qt
+pen = lambda l: l.renderer().symbol().symbolLayer(0).strokeStyle()
+check(f"low and high are blue, dashed and dotted {outline(low)} {outline(high)}",
+      outline(low)[0] == "#1e5ae6" and outline(high)[0] == "#1e5ae6"
+      and pen(low) == _Qt.PenStyle.DashLine and pen(high) == _Qt.PenStyle.DotLine)
+check("name matching alone would give each its role",
+      tab._match_role_layers([low]).get("low") is low
+      and tab._match_role_layers([high]).get("high") is high)
+
+print("\n=== a layer the tab made takes the colour of whatever role it is given ===")
+tab._total_combo.setCurrentIndex(tab._total_combo.findData(low.id()))
+check(f"the low outline moved to Total area turns red {outline(low)}",
+      outline(low)[0] == "#dc1e1e")
+mine = QgsVectorLayer("Polygon?crs=EPSG:4326", "my own outline", "memory")
+from qgis.core import Qgis, QgsFillSymbol
+mine.renderer().setSymbol(QgsFillSymbol.createSimple(
+    {"color": "0,200,0,80", "outline_color": "0,120,0"}))
+project.addMapLayer(mine)
+tab._refresh_layers()
+tab._total_combo.setCurrentIndex(tab._total_combo.findData(mine.id()))
+check(f"a layer the tab did NOT create keeps its own style {outline(mine)}",
+      tab._role_layer("total") is mine and outline(mine) == ("#007800", False))
+
+print("\n=== Draw digitizes into the role's own layer ===")
+dock.iface.setActiveLayer(None)
+tab._draw_role("high")
+check("Draw beside Source (high) arms editing on that layer",
+      dock.iface.activeLayer() is high and high.isEditable())
+tab._low_combo.setCurrentIndex(0)                 # — none —
+tab._draw_role("low")
+check("Draw with no layer assigned says so instead of guessing one",
+      "No layer is assigned to Source (low)" in tab.log.toPlainText())
+
+print("\n=== every role button knows where it writes ===")
+check("ROLE_LAYERS covers the four outline roles",
+      set(ROLE_LAYERS) == {"total", "best", "low", "high"})
+check("each entry is (label, layer suffix, file stem, style)",
+      all(len(v) == 4 and isinstance(v[3], dict) for v in ROLE_LAYERS.values()))
+
+project.clear()
+dock.teardown()
+_restore_settings()
+print(f"\n{OK} passed, {FAIL} failed")
+print("ALL PASS" if not FAIL else "FAILURES")
+# Shut down in QGIS's own order. Left to interpreter exit, QGIS 4 destroys the
+# dock's editing layers after its providers and segfaults (exit 139, after this
+# file has already passed); the real application unloads plugins first.
+del dock, tab
+import gc; gc.collect()
+app.exitQgis()
+sys.exit(1 if FAIL else 0)

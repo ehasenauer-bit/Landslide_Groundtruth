@@ -12,7 +12,7 @@ sys.path.insert(0, PKG)
 
 import traceback, warnings
 from qgis.core import QgsApplication, QgsProject
-QgsApplication.setPrefixPath("/Applications/QGIS-LTR.app/Contents/MacOS", True)
+QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app=QgsApplication([],True); app.initQgis()
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget
 from qgis.PyQt.QtCore import QObject, pyqtSignal
@@ -69,36 +69,48 @@ iface=FakeIface()
 dock=LandslideDock(iface)
 print("   dock built:", dock.windowTitle())
 
-print("\nSTEP 3 — all six tabs present")
+print("\nSTEP 3 — all seven tabs present")
 from qgis.PyQt.QtWidgets import QTabWidget
 tabs=dock.findChild(QTabWidget)
 names=[tabs.tabText(i) for i in range(tabs.count())]
 print("   tabs:", names)
-assert len(names)==6, names
+assert len(names)==7, names
+assert names.index("Maxar VHR (GEGD)")==names.index("PlanetScope")+1, names
 
 print("\nSTEP 4 — the new boxes are on screen")
 from qgis.PyQt.QtWidgets import QGroupBox
 boxes=[b.title() for b in dock.findChildren(QGroupBox)]
-for want in ("Environment", "Detection"):
+for want in ("Setup", "Detection"):
     hit=[b for b in boxes if want in b]
     print(f"   {want:12s} -> {hit[0] if hit else 'MISSING'}")
     assert hit, (want, boxes)
 
 print("\nSTEP 5 — exercise the new controls on the real dock")
 dock.det_lat_edit.setText("60.50"); dock.det_lon_edit.setText("-140.60")
-dock.det_err_spin.setValue(17.0); dock.det_vol_edit.setText("1.3")
-print("   detection read:", (dock.detection.event_id, dock.detection.lat,
-                             dock.detection.suggested_radius_km()))
-assert dock.detection.suggested_radius_km()==17.0
+print("   detection read:", (dock.detection.event_id, dock.detection.lat, dock.detection.lon))
 dock._apply_detection()
-print("   radius pushed to S2 tab:", dock.radius_spin.value())
-assert dock.radius_spin.value()==17.0
+radii=(dock.radius_spin.value(), dock.planet_tab.radius_spin.value(),
+       dock.gegd_tab.radius_spin.value(), dock.sar_tab.radius_spin.value(),
+       dock.viewer3d_tab.radius_spin.value())
+print("   radius pushed to S2 / Planet / Maxar / SAR / 3D:", radii)
+assert radii==(15.0, 10.0, 15.0, 15.0, 15.0), radii
 print("   env status:", dock.env_status.text()[:70])
 print("   env_gate() with no setup:", dock.env_gate())
 assert dock.env_gate() is False
-dock.lat_edit.setText("59.9, -149.8")
-print("   pasted pair split ->", dock.lat_edit.text(), dock.lon_edit.text())
-assert dock.lon_edit.text()=="-149.800000"
+# Every Latitude/Longitude pair in the dock takes a pasted "lat, lon", in either
+# box. insert() is what a paste does (setText never emits textEdited).
+pairs={"S2 / Landsat":dock, "PlanetScope":dock.planet_tab, "Maxar VHR":dock.gegd_tab,
+       "SAR":dock.sar_tab, "3D viewer":dock.viewer3d_tab}
+for name,t in pairs.items():
+    for box in (t.lat_edit, t.lon_edit):
+        t.lat_edit.clear(); t.lon_edit.clear()
+        box.insert("59.9, -149.8")
+        got=(t.lat_edit.text(), t.lon_edit.text())
+        assert got==("59.900000","-149.800000"), (name, box is t.lat_edit, got)
+    print(f"   pasted pair split on {name:12s} ->", *got)
+dock.det_lon_edit.selectAll(); dock.det_lon_edit.insert("60.50, -140.60")
+print("   pasted pair split on Detection    ->", dock.det_lat_edit.text(), dock.det_lon_edit.text())
+assert (dock.detection.lat, dock.detection.lon)==(60.5,-140.6)
 print("   default scenes ticked:", sorted(k for k,cb in dock.scene_checks.items() if cb.isChecked()))
 print("   window warning:", dock.window_warn.text()[:80] or "(none)")
 

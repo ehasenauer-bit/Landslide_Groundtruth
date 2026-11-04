@@ -547,7 +547,7 @@ def split_tails(arr, kind, threshold, fill=np.nan):
 
 
 # ---------- dual-geometry merge (report rec #5) ----------
-def merge_geometries(maps, kind, threshold, agree_min=2):
+def merge_geometries(maps, kind, threshold, agree_min=2, masks=None):
     """Combine per-geometry change maps (ascending + descending) into one, so a
     scar pixel lost to layover in one viewing geometry is recovered from the other.
 
@@ -560,6 +560,30 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
 
     ``threshold`` — significance magnitude: dB or σ for the signed detectors, the
     ``>`` cut for the unsigned correlation family.
+
+    ``masks`` — optional, one per map (or None for a geometry with no mask):
+    True where that geometry's pixel is GEOMETRICALLY UNUSABLE — radar shadow
+    OR layover, ``layover_dim.radar_shadow(...) | radar_layover(...)``. Masked
+    pixels are set aside as if the geometry had no data there, before anything
+    else runs, so the whole selection below is made from usable samples only.
+
+    What this changes is the CONFIDENCE, not (much) the merged values. Left to
+    itself the merge treats a pixel as "blind" only where the other orbit
+    records NaN — in ``sentinel-1-rtc`` that is a frame edge, never a mountain:
+    shadowed and laid-over pixels are finite and look like ordinary data. So
+    where one pass could not see the ground and the other sees a real change,
+    the blind sample counts as a valid orbit that "saw nothing", and the pixel
+    is classed 3, disagree — which the SAR tab's agreeing-only heat map then
+    hides. Masked, the blind pass is set aside, the pixel becomes a 1
+    (recovered, other orbit blind), and it stays on the map; where BOTH passes
+    are masked it is NaN, because neither saw the ground. Measured on a quiet
+    Iliamna pair: ~10% of the AOI blind to one pass, ~2% to both. It also cuts
+    false change where it applies — on the pixels blind to one pass, from 8.7%
+    to 1.9% reading as a >=3 dB change, because the merge stops taking the
+    louder of a blind sample and a seeing one. Blind pixels are not noisier on
+    average (the ~2% that went NaN were quieter than the rest), and the ~88% of
+    the AOI both passes see is untouched, so the whole-AOI background moves
+    only 18.1% -> 17.5%.
 
     Cross-geometry backscatter is NOT directly comparable, so values are never
     averaged across geometries. Per pixel the geometry with the STRONGEST anomaly
@@ -591,6 +615,36 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
     agree_min = max(2, int(agree_min))
     stack = np.stack(arrs)                       # (G, H, W)
     valid = np.isfinite(stack)
+
+    # Geometric masking comes FIRST: every count, contest and confidence class
+    # below has to be computed from the samples a geometry could legitimately
+    # see. np.where builds a new array rather than writing through — `maps` are
+    # the tab's live in-memory change arrays and must not be mutated.
+    mask_meta = {}
+    if masks is not None:
+        if len(masks) != len(arrs):
+            raise ValueError("masks must have one entry per map (None allowed)")
+        bad = np.zeros(stack.shape, dtype=bool)
+        for i, m in enumerate(masks):
+            if m is None:
+                continue
+            m = np.asarray(m, dtype=bool)
+            if m.shape != shape:
+                raise ValueError("a mask does not match the maps' shape")
+            bad[i] = m
+        before = valid.sum(0)
+        stack = np.where(bad, np.float32(np.nan), stack).astype(np.float32)
+        valid = np.isfinite(stack)
+        after = valid.sum(0)
+        mask_meta = dict(
+            n_masked=int((bad & (before > 0)[None]).sum()),
+            # the pixels the mask actually decided: one geometry silenced, the
+            # other left holding the pixel alone. This is the real layover/shadow
+            # recovery the merge could not do before.
+            n_mask_recovered=int(((after == 1) & (before > 1)).sum()),
+            # …and the pixels no geometry can see. Honest NoData, not a guess.
+            n_mask_blind=int(((after == 0) & (before > 0)).sum()),
+        )
     if signed:
         strength = np.where(valid, np.abs(stack), -np.inf)
         anom = valid & (np.abs(stack) >= thr)
@@ -648,5 +702,157 @@ def merge_geometries(maps, kind, threshold, agree_min=2):
         n_agree=int((conf == 2).sum()),
         n_conflict=n_conflict,
         note=note,
+        **mask_meta,
     )
     return merged, conf.astype(np.float32), meta
+
+
+def agreeing_only(merged, conf):
+    """`merged` with the pixels the geometries DISAGREE about knocked out (NaN).
+
+    A display filter, not an analysis one — and the distinction is deliberate.
+    merge_geometries' rule is "strongest anomaly wins", which is right for a
+    layover recovery and reads wrong on the map for a contradiction: at a conf-3
+    pixel one orbit shouted and the other looked at the same ground and saw
+    nothing (or claimed the opposite sign), and the merged raster shows you the
+    shouting orbit with nothing to say the other one disagreed. On ice that is
+    most of the AOI, so the merged heat map renders as change nearly everywhere.
+
+    It is NOT applied to the raster the Fusion tab scores, and must not be.
+    Measured over six truthed events, conf-3 pixels are ENRICHED in the scar
+    (mean lift 2.0; Logan 5.6, Iliamna 4.1) — over a real scar the two look
+    directions genuinely do disagree. Dropping them from the fused score moved
+    scar area detected 90.0% -> 80.5% and the worst candidate rank 3 -> 7, with
+    Valdez worst hit (76.9% -> 48.1% area). So the SAR tab writes this copy for
+    the map and keeps the full max-pooled values on disk for Fusion.
+
+    NaN rather than a substituted value: the point is to show nothing where the
+    orbits contradict each other, and a NoData pixel is the only thing that
+    renders as nothing without also claiming a measurement.
+    """
+    merged = np.asarray(merged, dtype=np.float32)
+    conf = np.asarray(conf, dtype=np.float32)
+    if merged.shape != conf.shape:
+        raise ValueError("merged and confidence differ in shape")
+    out = np.where(conf == 3.0, np.float32(np.nan), merged).astype(np.float32)
+    return out, int(np.count_nonzero(conf == 3.0))
+
+
+# ---------- fill-only merge: one pass, the other fills its blind spots ----------
+def _usable(maps, masks):
+    """Per-geometry (arrays, usable): usable = finite AND not masked blind."""
+    arrs = [np.asarray(m, dtype=np.float32) for m in maps]
+    if not arrs:
+        raise ValueError("need at least one map")
+    shape = arrs[0].shape
+    if any(a.shape != shape for a in arrs):
+        raise ValueError("geometry maps differ in shape")
+    if masks is not None and len(masks) != len(arrs):
+        raise ValueError("masks must have one entry per map (None allowed)")
+    usable = []
+    for i, a in enumerate(arrs):
+        u = np.isfinite(a)
+        m = None if masks is None else masks[i]
+        if m is not None:
+            m = np.asarray(m, dtype=bool)
+            if m.shape != shape:
+                raise ValueError("a mask does not match the maps' shape")
+            u &= ~m
+        usable.append(u)
+    return arrs, usable
+
+
+def choose_primary(maps, kind, masks=None, min_coverage=0.5, min_common=1000):
+    """Which pass fill_geometries should lead with: (index, meta).
+
+    The QUIETER one. Measured on a quiet Iliamna pair, fill-only keeps the false
+    change at the primary pass's own level — 5.5% of the AOI with ascending as
+    primary, 14.2% with descending — so the choice of primary is most of the
+    result. Coverage cannot make it: both passes saw ~93% of that AOI, and the
+    marginally better-covered one was the noisy one.
+
+    Quiet = the median |change| (signed detectors) or median value (the
+    correlation family, where larger means more change), measured over ground
+    BOTH passes can see, so a pass cannot win by happening to cover calmer
+    terrain. A median, because the slide itself is a small part of the AOI and
+    barely moves it. A pass that can see less than `min_coverage` of the AOI is
+    never auto-primary however quiet it is — Knik's ascending frame covered
+    8.6% of the AOI and none of the scar, and that pass is quiet precisely
+    because it is mostly missing. If no pass reaches that coverage, the
+    best-covered one leads.
+    """
+    arrs, usable = _usable(maps, masks)
+    cov = [float(u.mean()) for u in usable]
+    eligible = [i for i, c in enumerate(cov) if c >= min_coverage]
+    meta = {"coverage": cov, "noise": [None] * len(arrs)}
+    if not eligible:
+        best = int(np.argmax(cov))
+        meta["reason"] = (f"no pass sees {min_coverage:.0%} of the AOI; the "
+                          f"best-covered one ({cov[best]:.0%}) leads")
+        return best, meta
+    if len(eligible) == 1:
+        meta["reason"] = (f"the only pass that sees at least {min_coverage:.0%} "
+                          f"of the AOI ({cov[eligible[0]]:.0%})")
+        return eligible[0], meta
+    signed = DEPOSIT_SIGN.get(kind) is not None
+    common = np.logical_and.reduce([usable[i] for i in eligible])
+    on_common = int(common.sum()) >= min_common
+    for i in eligible:
+        v = arrs[i][common if on_common else usable[i]]
+        meta["noise"][i] = float(np.median(np.abs(v) if signed else v))
+    best = min(eligible, key=lambda i: meta["noise"][i])
+    meta["reason"] = ("quietest on ground both passes see" if on_common else
+                      "quietest (too little common ground; each on its own)")
+    return best, meta
+
+
+def fill_geometries(maps, primary, masks=None):
+    """The `primary` pass everywhere it can see; another pass ONLY where it
+    cannot. Returns (filled, source, meta).
+
+    The alternative to merge_geometries' "strongest anomaly wins", which takes
+    the louder of two passes at EVERY pixel and so inherits both passes' false
+    change: on a quiet Iliamna pair it read 17.5% of the AOI as a >=3 dB change
+    where either pass alone read 5.7% or 14.3%. Here no pixel ever compares two
+    samples, so the background stays at the primary's own level (5.5% with
+    ascending as primary), and the other pass contributes only where the
+    primary is blind — NaN (outside its frame) or masked (shadow / layover,
+    layover_dim) — which on that AOI was ~5%.
+
+    The price, and why it is not the default: a real change the primary pass
+    looked at and did not register is NOT rescued by the other pass, where
+    "strongest wins" would have kept it. Not yet benchmarked on the truthed
+    events; the strongest-wins merge has been, and ranks the scar at least as
+    well as the better single pass on all six.
+
+    `source`: 1 = from the primary, 2 = filled from another pass, NaN = no pass
+    could see it. With more than two passes, fill order is by how much each
+    can see. Values are copied unchanged, in native units; inputs are not
+    modified.
+    """
+    arrs, usable = _usable(maps, masks)
+    n = len(arrs)
+    if not 0 <= int(primary) < n:
+        raise ValueError("primary is not one of the maps")
+    primary = int(primary)
+    others = sorted((i for i in range(n) if i != primary),
+                    key=lambda i: -int(usable[i].sum()))
+    shape = arrs[0].shape
+    filled = np.full(shape, np.nan, dtype=np.float32)
+    source = np.full(shape, np.nan, dtype=np.float32)
+    done = np.zeros(shape, dtype=bool)
+    for rank, i in enumerate([primary] + others):
+        take = usable[i] & ~done
+        filled[take] = arrs[i][take]
+        source[take] = 1.0 if rank == 0 else 2.0
+        done |= take
+    any_data = np.logical_or.reduce([np.isfinite(a) for a in arrs])
+    return filled, source, dict(
+        primary=primary,
+        n_primary=int((source == 1).sum()),
+        n_filled=int((source == 2).sum()),
+        # had data somewhere, but every pass that had it was masked blind
+        n_blind=int((any_data & ~done).sum()),
+        # outside every frame
+        n_nodata=int((~any_data).sum()),
+    )

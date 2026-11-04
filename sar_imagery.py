@@ -151,7 +151,7 @@ def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIM
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
-                 post_days=60, seasonal=False, auto_window=False, **_ignored):
+                 post_days=60, auto_window=False, **_ignored):
     """Free dry-run: candidate Sentinel-1 RTC scenes per side, nothing read.
 
     Same windowing as the optical sources (imagery.windows) so the SAR tab's
@@ -161,7 +161,7 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     uniformly. Each side's candidate cap scales with its own window so a widened
     slider returns more scenes (see _limit_for). Returns
     dict(source, pre=[...], post=[...])."""
-    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days)
     pre_lim = 1 if auto_window else _limit_for(pre_days)
     post_lim = 1 if auto_window else _limit_for(post_days)
     pre_items = search_scenes(lat, lon, radius_km, pre0, pre1, event_time,

@@ -10,8 +10,10 @@
 #   (none)      -- Sentinel-2 / Landsat need NO credentials: Microsoft Planetary
 #                  Computer signs STAC requests anonymously.
 #
-# QGIS plugin only: the dock stores the venv-python path, project dir and output
-# dir in QgsSettings (set them once in the Environment box) — see qgis_plugin/.
+# QGIS plugin users don't need this file: the plugin's "Install imagery tools"
+# button builds its own environment from qgis_plugin/landslide_groundtruth/
+# requirements.lock, which is compiled from THIS file — after editing it, re-run
+#   scripts/build_release.py --relock
 #
 # Pins are minimums; the exact known-good set last tested is noted per line.
 
@@ -19,6 +21,9 @@
 pystac-client>=0.7        # tested 0.9.0
 planetary-computer>=1.0   # tested 1.0.0  (signs PC asset URLs)
 stackstac>=0.5            # tested 0.5.1  (windowed COG -> xarray stack)
+dask>=2024.1              # tested 2026.6.0 (imagery.py calls dask.compute directly)
+requests>=2.31            # tested 2.34.2 (nisar_imagery.py)
+urllib3>=2.0              # tested 2.7.0  (imagery.py retry policy)
 
 # --- AOI cloud metric: snow-robust neural cloud+shadow mask ---
 # Measures "cloud over the AOI" from Red/Green/NIR instead of the SCL/QA
@@ -36,12 +41,10 @@ numpy>=1.24               # tested 2.5.0
 
 # --- vector geometry + reprojection (review package, CRS transforms) ---
 geopandas>=0.14           # tested 1.1.3
+pyogrio>=0.7              # tested 0.12.1 (geopandas' GeoPackage writer)
 shapely>=2.0              # tested 2.1.2
 pyproj>=3.6               # tested 3.7.2
-
-# --- inventory spreadsheet + summary table ---
 pandas>=2.0               # tested 2.3.3
-openpyxl>=3.1             # tested 3.1.5  (reads LandslideInventory.xlsx)
 
 # --- PlanetScope: primary high-res source (optional auth, see above) ---
 planet>=3.0               # tested 3.6.0

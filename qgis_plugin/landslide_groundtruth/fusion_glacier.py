@@ -110,8 +110,8 @@ def _edl_opener():
     if not (user and password):
         raise PermissionError(
             "No NASA Earthdata credentials found. Open the 'NASA Earthdata "
-            "Login' box in the plugin's Environment header, enter your username "
-            "and password and press Check — that writes ~/.netrc, which this "
+            "Login' box at the top of the Sentinel-2 / Landsat tab, enter your "
+            "username and password and press Test & save credentials — that writes ~/.netrc, which this "
             f"download reads. A free account: https://{EDL_HOST}/")
 
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -258,8 +258,8 @@ def ensure_rgi_c01(cache_dir, log=None, timeout=600):
         os.remove(tmp)
         raise IOError(
             f"the download returned only {size} bytes — too small to be the "
-            "dataset. Check the Earthdata credentials in the plugin's "
-            "Environment header.")
+            "dataset. Check the Earthdata credentials in the 'NASA "
+            "Earthdata Login' box of the Sentinel-2 / Landsat tab.")
     os.replace(tmp, dest)
     if log:
         log(f"    saved {dest} ({size / 1e6:.0f} MB)")

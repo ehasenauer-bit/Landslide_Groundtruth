@@ -1,4 +1,61 @@
-# Landslide imagery-gathering pipeline
+# Landslide Ground-Truthing
+
+A QGIS plugin for confirming and measuring a landslide that a seismic network has
+detected. Enter the detection (origin time and epicentre) once, then:
+
+- search and compare **pre- and post-event imagery**: Sentinel-2, Landsat,
+  PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1 / NISAR radar;
+- **fuse** optical and radar change into one landslide score;
+- read the scar against the terrain in a **3D viewer** (ArcticDEM or your DEM);
+- turn the outline you digitize into a **volume** (Larsen et al. 2010 area–volume
+  scaling).
+
+## Install (QGIS users)
+
+1. In QGIS (3.44 or later, including QGIS 4): **Plugins → Manage and Install
+   Plugins…**, search for **Landslide Ground-Truthing**, click **Install**.
+   (Or download a release zip and use **Install from ZIP**.)
+2. Open the panel from its toolbar button. At the top, click
+   **Install imagery tools**. It's a one-time download of about 300 MB, 1 GB on
+   disk, usually under 10 minutes.
+   - The plugin downloads [uv](https://docs.astral.sh/uv/) (Astral, MIT/Apache-2.0)
+     from PyPI, a standalone Python 3.12, and a pinned, hash-checked package set
+     (including PyTorch for the snow-robust cloud mask).
+   - All of it goes into your user data folder; nothing is installed into QGIS.
+   - **Remove** deletes it all again.
+   - Volume, Fusion and Maxar VHR work without it.
+3. Click **Try an example** in the Detection box, then open the
+   **Sentinel-2 / Landsat** tab and press **Search**.
+
+### Accounts
+
+| Source | Account needed |
+|---|---|
+| Sentinel-2, Landsat, Sentinel-1, ArcticDEM | none |
+| NISAR radar, RGI glacier outlines | free [NASA Earthdata login](https://urs.earthdata.nasa.gov/), entered in the Sentinel-2 / Landsat tab |
+| PlanetScope | a Planet account (paid), entered in the PlanetScope tab |
+| Maxar VHR | a GEGD Pro API key (US government users), entered in the Maxar VHR tab |
+
+### Platforms
+
+Tested on macOS with QGIS 3.44 LTR and QGIS 4.2. Windows and Linux are expected
+to work but are untested. Please report problems on the
+[issue tracker](https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues).
+
+### License
+
+GPL-2.0-or-later: you can redistribute and/or modify it under the terms of the
+GNU General Public License version 2, or (at your option) any later version. See
+[LICENSE](LICENSE).
+
+---
+
+# For developers: the imagery pipeline
+
+The rest of this file documents the pipeline the plugin runs. A release zip
+carries a copy of it (`scripts/build_release.py` puts it in the plugin's
+`pipeline/` folder). In a checkout it lives here at the repository root, and you
+can run it from the command line.
 
 Takes a predicted location + time (a seismic detection — lat/lon + UTC time) and
 pulls **before/after satellite imagery** for the event —
@@ -12,9 +69,9 @@ confirm the slide and digitize the polygon in QGIS. Once you have, the plugin's
 via the Larsen et al. (2010) scaling — see [Volume from a digitized
 scar](#volume-from-a-digitized-scar).
 
-## Install
+## Developer setup
 
-Python 3.11+ (developed and tested on 3.14).
+Python 3.11+ (developed and tested on 3.14; the plugin's own install uses 3.12).
 
 ```bash
 python -m venv venv && source venv/bin/activate
@@ -58,8 +115,7 @@ python run_single.py --lat 60.465 --lon -142.10 --datetime "2023-08-07 11:19" \
 Key flags: `--prefer {auto,planet,s2,landsat}` (source priority, default `auto`),
 `--pre-days`/`--post-days` (imagery windows), `--radius-km` (imagery
 search/footprint radius around the point, default 3),
-`--seasonal` (winter event — use the prior-year summer as the pre window so snow
-doesn't swamp the signal), `--auto-window` (tightest before/after gap: use only
+`--auto-window` (tightest before/after gap: use only
 the single clear scene nearest the event on each side), `--search-only` (free
 dry-run: list candidate scenes to `<out>/search.json`, no orders/downloads).
 
@@ -157,139 +213,90 @@ Explorer** (stream PlanetScope, order clips), and **Profile Tool** (terrain).
 
 ## Volume from a digitized scar
 
-The plugin's **Volume from area** tab turns the polygons you digitize into a
-volume, using the Larsen et al. (2010) area–volume scaling `V = αA^γ`
-(`larsen_BR_volume.py`). You draw each outline into its own layer and assign
-those layers to roles; nothing depends on what happens to be selected on the map.
+The plugin's **Volume from area** tab turns the source-scar outlines you digitize
+into a volume with **Larsen et al. (2010)** area–volume scaling (Table S1,
+`larsen_BR_volume.py`), from one **Measure**:
 
-**The volume is computed from the TOTAL landslide outline** — the whole affected
-area, source through runout to deposit. A mapped slide usually carries several
-outlines: one total extent, plus two or three interpretations of the source scar
-inside it. Only the total is converted. The source outlines are measured and
-reported beside it, never run through the relation — it answers a question about
-whatever area it is handed, and the source scar is a fraction of what failed, so
-feeding it a source outline silently answers a different question and reads low.
+| Estimate | Converts | Range |
+|----------|----------|-------|
+| **Best** | the **best source** outline — the evacuated scar alone | the published fit spread, widened by source low/high (read as a ±2σ area span) |
+| **Low** | the **source low** outline — a conservative reading of the scar | — |
+| **High** | the **source high** outline — a generous reading of the scar | — |
 
-1. Under **Scar outlines (draw)**, press **New scar layer** — it creates a
-   polygon layer, makes it active, switches it into edit mode and arms QGIS's Add
-   Polygon tool, so you can start drawing immediately. Click each vertex,
-   right-click to finish. Press it once per outline: the first layer is wired to
-   **Total area layer** automatically, since that is the one the volume needs. The
-   **Draw into** drop-down only chooses where the drawing buttons digitize — it
-   does not decide what gets measured.
-2. In **Current measurement**, assign the layers:
+All three use what failed (bedrock or soil). The **total** outline (source + track +
+deposit) is not converted: it gives the implied mean depth, the centerline and the
+feature the numbers are written to. The tab reads top to bottom in the order the
+work is done:
 
-   | Drop-down | Holds | Used for |
-   |-----------|-------|----------|
-   | **Total area layer** | the whole landslide outline | **the volume** |
-   | **Source area (best)** | best source-scar interpretation | reported only |
-   | **Source area (low)** | conservative source interpretation | reported only |
-   | **Source area (high)** | generous source interpretation | reported only |
-
-   Only the total is required. The line under the drop-downs shows every assigned
-   area live, so a mis-assignment is visible before you press **Measure**. Swapped
-   source roles are refused by name, and so is a total that comes out *smaller*
-   than one of the source areas — the total should contain the source, so that
-   almost always means the Total area drop-down is pointing at a source outline.
+1. **Outlines.** Press **New** beside *Total area*, draw the whole affected area
+   (click each vertex, right-click to finish, toggle editing off to save), then
+   **New** beside *Source (best)* for the scar. Each New writes a GeoPackage beside
+   the project's `.qgz`, named for its role (`<slide>_total_area.gpkg`, …), assigns
+   it and arms QGIS's Add Polygon tool; **Draw** adds another polygon to the
+   assigned layer. Then the same for *Source (low)* and *Source (high)*, a
+   conservative and a generous reading of the scar. Total is a red outline, source
+   blue (low dashed, high dotted). The line under the pickers shows
+   every assigned area live; swapped roles, or a total smaller than a source, are
+   refused before Measure rather than measured.
 
    **Layers named for their role are picked up automatically**, so a project that
    already carries the outlines comes up ready to measure:
 
    | Layer name | Fills |
    |------------|-------|
-   | `Total Area`, `Total Landslide Area`, `Landslide Area`, `Total Extent` | **Total area layer** |
-   | `Source Area (low)` | Source area (low) |
-   | `Source Area (high)` | Source area (high) |
-   | `Source Area (best)`, or a plain `Source Area` | Source area (best) |
+   | `Total Area`, `Total Landslide Area`, `Landslide Area`, `Total Extent` | Total area |
+   | `Source Area (best)`, or a plain `Source Area` | Source (best) |
+   | `Source Area (low)` | Source (low) |
+   | `Source Area (high)` | Source (high) |
 
-   Capitalisation, punctuation and bracketing don't matter — `SOURCE AREA (LOW)`,
-   `source_area_low` and `Barry Arm Source Area - low` all match, as do the
-   synonyms *min/minimum/lower/conservative* and *max/maximum/higher/generous*.
-   Matching is on whole words, so a layer called `lowland` is not mistaken for a
-   low estimate, and one layer can never fill two roles. Anything you set (or
-   clear) yourself is left alone from then on; a match the tab made for you stays
-   open to revision, so loading an explicit `Source Area (best)` later still
-   claims that role from a bare `Source Area`. Every automatic assignment is named
-   in the log.
-   - If a role layer holds **more than one polygon**, its largest is used and the
-     others are listed in the log — each role is one interpretation of one
-     outline, so several polygons are alternative attempts at it rather than parts
-     of it, and adding or dissolving them together would inflate the area.
-   - A source outline that isn't inside the total gets a note; the usual cause is
-     layers from two different slides assigned together.
-   - Because only the total is converted, the volume's range is the **published
-     fit uncertainty** — a single outline carries no area uncertainty of its own.
-     The source low/high no longer widen it.
-3. Pick the **Fit** and **Hillslope material**. Material moves the answer a long
-   way — a 60 000 m² bedrock area comes out ~1.3 × 10⁶ m³ against ~2.4 × 10⁵ m³
-   for soil — so choose it from what actually failed, not the surrounding cover.
-   Fit decides both the calibration and what the outline must be; the orange line
-   at the top of the tab always states which:
+   Capitalisation, punctuation and bracketing don't matter, and the synonyms
+   *min/minimum/lower/conservative* and *max/maximum/higher/generous* match. Anything
+   you set yourself is left alone. A role layer holding several polygons is measured
+   by its largest — they are alternative attempts at one outline, not parts of it.
+2. **Settings.** *What failed?* (bedrock/soil) moves the answer a long way —
+   choose it from what actually failed, not the surrounding cover.
+3. **Measure** runs Larsen et al. (2010) on each source outline and records the
+   slide's row — no separate add step. Measuring the same slide name again replaces
+   its row (and keeps its centerline); a new name adds a row. With no source (best)
+   outline the row is still recorded, with its areas and no volume, and the
+   Volumes box says why.
+4. **Volumes** shows the best estimate in bold with its range, the low and high
+   estimates under it, at three significant figures, plus the implied mean depth:
+   the best volume ÷ the **total** outline area, i.e. the mean thickness over the
+   whole footprint that the Larsen volume implies. Rock-avalanche deposits on
+   glaciers run ~2.5 m (Deline et al. 2015); above 5 m the tab warns that the volume
+   is probably too high on ice, and tens of metres means the outline or the
+   material is wrong. Warnings about this measurement show here.
+5. **Centerline & elevation drop.** **Draw centerline** derives the medial-axis
+   spine of the total outline into `Landslide centerlines`, left in edit mode to
+   trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall
+   height and travel angle. Reference only.
+6. **Write to layer** stamps everything — `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3`
+   (best, with its range), `vlowsrc_m3` / `vhisrc_m3` (source low / high),
+   `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
+   own feature. Save the outline layer before writing back: adding fields needs a
+   clean edit buffer, and QGIS renumbers features on save. **Copy results** puts the
+   table on the clipboard as TSV.
 
-   | Fit | Outline must be | Status |
-   |-----|-----------------|--------|
-   | **Source scar** | the evacuated source scar alone | ready — this is the fit `larsen_BR_volume.py` carries |
-   | **Total landslide area** | source + runout track + deposit | needs coefficients (see below) |
-
-   Note the tension worth being deliberate about: the tab measures the **total**
-   outline, but the only calibration that ships is the **source-scar** one. Running
-   the total area through the scar fit reads high. Fill in `LARSEN_TOTAL` below to
-   pair the total outline with a total-area calibration.
-
-4. Optionally open **Centerline** and press **Draw centerline** for a slide
-   length. It derives the medial-axis spine of the **total** outline — following
-   the slide's bends rather than cutting across them, which a bounding box or
-   longest chord does not — into a scratch layer left in edit mode, so you can
-   trim the ends with the Vertex Tool and **Re-measure**. Length is reported for
-   reference; the volume comes from area alone.
-5. **Add to results ↓** appends a row and moves on to the next slide. The table
-   accumulates across a session; **Export CSV** writes raw unrounded values, and
-   **Write to layer** stamps `area_m2` (the total), `src_m2` / `src_lo_m2` /
-   `src_hi_m2` (the source areas), `vol_m3`, `vol_lo_m3`, `vol_hi_m3` and the rest
-   onto the *total* outline's own feature, so the numbers travel with the
-   geometry. **Save the scar layer before writing back** — adding fields needs a
-   clean edit buffer, and QGIS renumbers features when a layer is saved, so the
-   tab refuses rather than committing your digitizing behind your back or
-   stamping the numbers onto the wrong feature.
-
-Both scratch layers the tab creates (`Landslide scars`, `Landslide centerlines`)
-are memory-backed and vanish when QGIS closes — use *Export ▸ Save Features As…*
-to keep them.
+The results table (with **Export CSV**) and the log sit collapsed at the bottom.
+The explanations are behind the **? Help** toggle in the tab's header, remembered
+per user; tooltips carry the detail either way.
 
 Areas are ellipsoidal plan-view area — the same quantity `$area` reports and the
 same one Larsen et al. measured from imagery, so the published coefficients stay
-valid. Slope-corrected true surface area would be larger and is deliberately not
-what is fed to the relation.
+valid. The Larsen arithmetic is read from the project's own `larsen_BR_volume.py`,
+so editing the coefficients there changes what the tab reports; the log names the
+implementation that ran, and the tab falls back to a built-in copy when the
+project dir isn't configured.
 
-The volume arithmetic itself is read from the project's own
-`larsen_BR_volume.py`, so editing the coefficients there changes what the tab
-reports; the tab says which implementation and which fit produced each number
-("Calculated by"), and falls back to a built-in copy when the project dir isn't
-configured.
-
-### Enabling the total-area fit
-
-`larsen_BR_volume.py` carries only the **source-scar** fit — its function is
-`volume_source` and its constants are labelled *soil scar* / *bedrock scar*.
-Running those on a total-area outline applies a source-area calibration to a
-larger polygon and reads high, so the tab does **not** quietly reuse them: pick
-*Total landslide area* without coefficients and it refuses, naming what to add.
-
-Larsen et al. publish separate constants for total landslide area. Those values
-are not reproduced here — guessing published constants would be worse than
-refusing — so paste them in yourself, either in `larsen_BR_volume.py`:
-
-```python
-LARSEN_TOTAL = {
-    "bedrock": (log10_alpha, std_log10_alpha, gamma, std_gamma),
-    "soil":    (log10_alpha, std_log10_alpha, gamma, std_gamma),
-}
-```
-
-or in `LARSEN_TOTAL` in `qgis_plugin/landslide_groundtruth/volume_calc.py`. The
-project file wins, so the constants can live with the rest of the science. Either
-way the error propagation is the same code path as the scar fit — only the four
-coefficients change.
+**No longer in the tab:** deposit area × thickness (Toney et al. 2021), removed
+2026-11-04 because its thickness, unlike the Larsen et al. relation earlier
+studies used, had not been checked against measured volumes — parked verbatim in
+`parked/thickness/` with the recipe for putting it back; the elevation-change
+(`∫Δh`) fit and DEM differencing (2026-10-23), parked the same way in
+`parked/ddem/`; and the total-area Larsen fit, whose coefficients ship empty
+(`LARSEN_TOTAL` in `volume_calc.py` / `larsen_BR_volume.py` is still read by
+`volume_calc.volume_source(fit="total")`).
 
 ## Module map
 
@@ -297,7 +304,7 @@ coefficients change.
 |------|------|
 | `planet_imagery.py` | **primary source.** Planet Data API search + Orders API clip/download of PlanetScope (~3 m) surface reflectance; UDM2 cloud-masked median composite; same return contract as `imagery.py`. Checks the order cache before ordering, and `recall_preview` loads earlier orders back for free |
 | `planet_cache.py` | shared cache + ledger of Planet orders already paid for, so a scene is ordered once. Pure stdlib (the QGIS plugin imports it directly) — see [Ordering a scene once](#ordering-a-scene-once-quota) |
-| `imagery.py` | the STAC sources (Sentinel-2, Landsat): median composites of the chosen scenes **as acquired** — only fill/nodata is dropped, never cloud — plus dNDVI, dNDSI, dBrightness (albedo change); falls back S2→Landsat; `--seasonal` for winter |
+| `imagery.py` | the STAC sources (Sentinel-2, Landsat): median composites of the chosen scenes **as acquired** — only fill/nodata is dropped, never cloud — plus dNDVI, dNDSI, dBrightness (albedo change); falls back S2→Landsat |
 | `review_package.py` | export the per-event QGIS review package (true/false-colour pre+post, dNDVI, dBrightness, predicted point) + `metadata.json` |
 | `run_groundtruth.py` | library module: `process_one(ev, args)`, the per-event pipeline (fetch imagery → export review package). Imported by `run_single.py`; no CLI of its own |
 | `run_single.py` | single-event entry point/CLI: takes `--lat/--lon/--datetime` directly, calls `run_groundtruth.process_one`, writes a `result.json` (or `search.json` with `--search-only`); used by the QGIS plugin |
@@ -309,8 +316,10 @@ coefficients change.
 The **QGIS plugin** in `qgis_plugin/` gives a dock panel: click the
 event location on the map, set the date and the *days before/after* sliders, pick
 an imagery source, and the results load straight into your project. The plugin
-keeps the heavy dependencies in this venv (it shells out to `run_single.py`),
-so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.md`.
+keeps the heavy dependencies out of QGIS: it runs `run_single.py` in a separate
+Python. That's the one its Setup box installs, or this venv if you set it under
+*Use my own Python (advanced)*. Developer setup and release builds:
+`qgis_plugin/README.md`.
 
 ## Important caveats
 
@@ -320,8 +329,8 @@ so nothing extra needs installing into QGIS. Install/usage: `qgis_plugin/README.
   roughly 50 m across can only be confirmed present/absent. The `sensor` field
   in each `metadata.json` (and the plugin's **SATELLITE USED** banner) tells you
   which source was used.
-- **Snow and clouds.** Alaska coastal/winter events are the hard case. Use
-  `--seasonal`, widen `--post-days` to reach the next clear/snow-free window,
+- **Snow and clouds.** Alaska coastal/winter events are the hard case. Widen
+  `--post-days` to reach the next clear/snow-free window,
   and always do the QGIS visual check.
 - **`--auto-window` and scene coverage.** Auto-window uses the single scene
   nearest the event date on each side. A Sentinel-2 scene can be returned by the

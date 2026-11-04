@@ -42,12 +42,15 @@ def parse_dt(value):
 
 
 def _same_geometry(a, b):
-    """Same relative orbit (track) AND same pass direction -> comparable geometry."""
+    """Same radar, same relative orbit (track) AND same pass direction ->
+    comparable geometry. The radar comes first: NISAR and Sentinel-1 both number
+    their tracks from 1, and NISAR t150 has nothing in common with S1 t150."""
     if not a or not b:
         return False
     ro = a.get("relative_orbit")
     return ro is not None and ro == b.get("relative_orbit") \
-        and a.get("orbit_state") == b.get("orbit_state")
+        and a.get("orbit_state") == b.get("orbit_state") \
+        and (a.get("source") or "Sentinel-1") == (b.get("source") or "Sentinel-1")
 
 
 def _geo_label(pre, post):
@@ -55,7 +58,8 @@ def _geo_label(pre, post):
     state = (c.get("orbit_state") or "").lower()
     orb = "ASC" if state.startswith("asc") else "DESC" if state.startswith("desc") else "?"
     track = c.get("relative_orbit")
-    return orb + (f"·T{track}" if track is not None else "")
+    radar = "NISAR " if c.get("source") == "NISAR" else ""
+    return radar + orb + (f"·T{track}" if track is not None else "")
 
 
 def _fmt(d):

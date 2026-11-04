@@ -1,0 +1,25 @@
+{
+ "_synthetic": true,
+ "_generator": "tests/fixtures/gegd/make_fixtures.py",
+ "_note": "SYNTHETIC test fixture: made-up values in the real GEGD schema. Not a captured response.",
+ "_event": {
+  "name": "Peters-Dome-shaped (synthetic)",
+  "lat": 63.07,
+  "lon": -151.0,
+  "origin_utc": "2023-09-13T12:00:00Z",
+  "r_km": 5.0,
+  "pre_days": 365,
+  "post_days": 90
+ },
+ "type": "FeatureCollection",
+ "features": [],
+ "totalFeatures": "unknown",
+ "numberReturned": 0,
+ "timeStamp": "2026-10-13T00:00:00.000Z",
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "urn:ogc:def:crs:EPSG::4326"
+  }
+ }
+}

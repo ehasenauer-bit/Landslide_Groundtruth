@@ -64,6 +64,19 @@ CLOUD_GREEN_MAX = 10.0
 CLOUD_AMBER_MAX = 40.0
 
 # --------------------------------------------------------------------------
+# Maxar VHR table — warnings that are NOT about cloud
+# --------------------------------------------------------------------------
+# A visual-only off-nadir value (coarse DEM / steep view: look, don't trace) and a
+# footprint that misses the epicentre. Same amber and red as above because they
+# are drawn on the same PRE_BG / POST_BG tints and so keep the same measured
+# contrast (4.66:1 / 4.90:1 and 4.75:1 / 4.99:1) — but under names that say what
+# they mean, so a Cloud column's amber keeps meaning cloud. Text carries both as
+# well (the angle and level, "(misses epicentre)", the row tooltip); the colour
+# only flags them.
+GRADE_VISUAL_FG = CLOUD_SOME
+MISSES_EPICENTRE_FG = CLOUD_HEAVY
+
+# --------------------------------------------------------------------------
 # Status — one vocabulary for every panel, in BOTH QGIS themes
 # --------------------------------------------------------------------------
 # No single colour can clear 4.5:1 against both the QGIS light default (#F0F0F0)

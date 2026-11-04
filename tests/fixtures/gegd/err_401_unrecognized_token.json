@@ -1,0 +1,9 @@
+{
+ "title": "Unauthorized",
+ "status": "401",
+ "detail": "Unrecognized token",
+ "parameters": {
+  "correlationId": "Root=1-00000000-000000000000000000000000"
+ },
+ "_synthetic": true
+}

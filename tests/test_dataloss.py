@@ -67,7 +67,7 @@ i=src.index("def _write_to_layer")
 body=src[i:i+2200]
 assert "explicit = sorted({i.row() for i in self.table.selectedIndexes()})" in body
 assert "if not explicit and len(self._rows) > 1:" in body
-assert "QMessageBox.Cancel)" in body and "QMessageBox.Yes" in body
+assert "QMessageBox.StandardButton.Cancel)" in body and "QMessageBox.StandardButton.Yes" in body
 print("   confirms only when nothing is selected AND >1 row")
 # read-only consumers must NOT have been made harder
 for fn in ("_copy_table","_export_csv"):

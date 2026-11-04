@@ -10,7 +10,19 @@ Geometry-aware, not hard-coded to "east": Sentinel-1 is right-looking, so the
 illumination arrives from —
   descending pass → from the EAST  → east-facing slopes lay over (bright)
   ascending  pass → from the WEST  → west-facing slopes lay over (bright)
-so the layover-facing aspect is picked from the scene's orbit_state.
+so the layover-facing aspect is picked from the scene's orbit_state. "East" and
+"west" are only the latitude-free approximation: at 60°N the real look at the
+target is ~10° off it (the tilted ground track, minus the meridian convergence
+between nadir and the target), and every function here that is given a latitude
+uses the true geometry (look_azimuth_deg) instead.
+
+All of that is a model of Sentinel-1 alone. Another radar passes its own look
+direction instead — `look_azimuth=` on illumination_aspect_deg, layover_alpha,
+radar_shadow and radar_layover — and the orbit model is skipped. NISAR does: it
+looks LEFT (so an ascending NISAR pass is lit from the east, like a DESCENDING
+Sentinel-1 one), flies a different orbit and swath, and its GCOV granule ships
+the true line of sight at the target (nisar_read reads it). Without the
+argument nothing changes, so Sentinel-1 output stays byte-identical.
 
 A pixel is dimmed only when it is (a) on a slope FACING the illumination, (b)
 STEEP enough to actually foreshorten/lay over (flat ground of any aspect is
@@ -19,21 +31,241 @@ per the user's choice. Pure numpy so it unit-tests without QGIS/GDAL.
 """
 import numpy as np
 
-__all__ = ["illumination_aspect_deg", "slope_aspect_deg", "metric_pixel_size",
-           "layover_alpha"]
+__all__ = ["ground_heading_deg", "look_azimuth_deg", "illumination_aspect_deg",
+           "range_azimuth_deg", "iw_incidence_deg", "slope_aspect_deg",
+           "metric_pixel_size", "layover_alpha", "radar_shadow", "radar_layover",
+           "IW_INCIDENCE_DEG", "IW_NEAR_DEG", "IW_FAR_DEG"]
+
+# Sentinel-1 IW incidence angle, mid-swath — now only the FALLBACK. The real
+# value runs 29.1° at near range to 46.0° at far range and `sentinel-1-rtc`
+# carries neither a per-pixel incidence band nor a scene-level angle, but the
+# scene footprint says where a point sits across the swath, and iw_incidence_deg
+# turns that into an angle. Use this constant only when there is no footprint.
+# It matters: shadow starts at (90° - incidence), i.e. 61° slopes at near range
+# but 44° at far range, and the shadowed fraction of an AOI swings ~70x across
+# the swath (Iliamna 0.03% at 29°, 2.1% at 46°).
+IW_INCIDENCE_DEG = 39.0
+IW_NEAR_DEG, IW_FAR_DEG = 29.1, 46.0
+
+# Sentinel-1's orbit, for the look DIRECTION. Sun-synchronous at 98.18° and
+# ~693 km, so the ground track is not north-south: it leans west of north on an
+# ascending pass, by an amount that grows with latitude, and the Earth turning
+# underneath leans it further. Net of the convergence back at the target (see
+# look_azimuth_deg), treating the look as due east/west put it ~10° wrong at
+# 60°N — on real Iliamna terrain that alone moved ~22% of the shadow mask.
+S1_INCLINATION_DEG = 98.18
+_S1_ALTITUDE_KM = 693.0
+_EARTH_RADIUS_KM = 6371.0
+# speed of the SUB-SATELLITE point in the inertial frame: 7.5 km/s orbital,
+# scaled down to the ground by R / (R + h)
+_S1_GROUND_SPEED_KMS = 7.5 * _EARTH_RADIUS_KM / (_EARTH_RADIUS_KM + _S1_ALTITUDE_KM)
+_EARTH_SURFACE_KMS = 0.4651          # equatorial rotation speed
 
 
-def illumination_aspect_deg(orbit_state):
-    """Compass aspect (deg, 0=N 90=E 180=S 270=W) of the slopes that face the
-    radar and therefore lay over, from the pass direction. None if unknown —
-    the caller then does not dim anything (no reliable geometry)."""
-    if not orbit_state:
+def _direction(orbit_state):
+    """'asc' / 'desc' from whatever the STAC item carried, else None."""
+    s = str(orbit_state or "").strip().lower()
+    return "asc" if s.startswith("asc") else "desc" if s.startswith("desc") else None
+
+
+def ground_heading_deg(orbit_state, lat):
+    """Compass heading of the Sentinel-1 ground track at latitude `lat`, or None.
+
+    Spherical orbit geometry, not a lookup: the inertial heading of a circular
+    orbit of inclination i at latitude φ satisfies sin ψ = cos i / cos φ (the
+    track is most tilted near the orbit's turning latitude, 81.8° for S1), and
+    the ground heading is the direction of the satellite's velocity RELATIVE to
+    the ground, i.e. minus the eastward speed of the Earth's surface at φ.
+
+    ~348° / ~192° at the equator, ~342° / ~198° at 60°N. This is the
+    heading OF THE NADIR TRACK, and the target is not on it: see
+    look_azimuth_deg for the correction that matters at the target. Checked
+    against two real Iliamna footprints, whose track-parallel edges extrapolate
+    back to nadir at ~343° for this model's 341.6°.
+    """
+    d = _direction(orbit_state)
+    if d is None or lat is None:
         return None
-    s = str(orbit_state).lower()
-    if s.startswith("desc"):
-        return 90.0        # descending, right-looking → illuminated from the east
-    if s.startswith("asc"):
-        return 270.0       # ascending,  right-looking → illuminated from the west
+    phi = np.radians(float(lat))
+    ratio = np.cos(np.radians(S1_INCLINATION_DEG)) / max(np.cos(phi), 1e-9)
+    psi = float(np.arcsin(np.clip(ratio, -1.0, 1.0)))     # ascending: west of north
+    h = psi if d == "asc" else np.pi - psi
+    east = _S1_GROUND_SPEED_KMS * np.sin(h) - _EARTH_SURFACE_KMS * np.cos(phi)
+    north = _S1_GROUND_SPEED_KMS * np.cos(h)
+    return float(np.degrees(np.arctan2(east, north)) % 360.0)
+
+
+def look_azimuth_deg(orbit_state, lat=None, incidence_deg=None):
+    """Compass azimuth the radar LOOKS along AT THE TARGET — from the sensor out
+    across the ground, the direction of increasing ground range. None if unknown.
+
+    Right-looking, so it is 90° clockwise of the along-track direction — but the
+    along-track direction AT THE TARGET, not at nadir. The target sits 340-620 km
+    across-track from the nadir point, and over that many degrees of longitude
+    local north itself rotates (meridian convergence, Δλ·sin φ): the target
+    lies to the right of the track, i.e. east of it ascending and west of it
+    descending, so the track-parallel direction there is turned by
+    ± x·tan φ / R for a cross-track ground range x. At 60°N mid-swath that is
+    ~7.5°, and leaving it out over-corrects the old due-E/W assumption by about
+    as much as the tilt it was fixing. With it the model matches the track-
+    parallel edges of real Iliamna footprints to within ~0.5°, where due-E/W
+    is ~10° out and the nadir heading alone ~8° out the other way.
+
+    `incidence_deg` places the target across the swath (the same information:
+    see iw_incidence_deg); without it the target is assumed at IW_INCIDENCE_DEG.
+    ~79° (ENE) ascending and ~281° (WNW) descending at 60°N.
+
+    Without a latitude it falls back to the old due-east / due-west (90° / 270°)
+    approximation — what a caller with only a projected grid and no lat_hint
+    gets. Second-order terms left out: the nadir point is ~1° of latitude south
+    of the target (~0.5° of heading), and the ellipsoid.
+    """
+    d = _direction(orbit_state)
+    if d is None:
+        return None
+    head = ground_heading_deg(d, lat)
+    if head is None:
+        return 90.0 if d == "asc" else 270.0
+    theta = IW_INCIDENCE_DEG if incidence_deg is None else float(incidence_deg)
+    x_km = _ground_range_at_incidence(theta)
+    turn = np.degrees(x_km * np.tan(np.radians(float(lat))) / _EARTH_RADIUS_KM)
+    along = head + (turn if d == "asc" else -turn)
+    return float((along + 90.0) % 360.0)
+
+
+def _explicit_look(look_azimuth):
+    """A caller's measured look azimuth, normalised to [0, 360). Non-finite is
+    an error, not 'unknown': a radar whose geometry could not be read must pass
+    None and be skipped by its caller, never fall through to the Sentinel-1
+    model, which would put a left-looking radar's layover on the wrong side."""
+    v = float(look_azimuth)
+    if not np.isfinite(v):
+        raise ValueError(f"look_azimuth must be finite, got {look_azimuth!r}")
+    return v % 360.0
+
+
+def illumination_aspect_deg(orbit_state, lat=None, incidence_deg=None,
+                            look_azimuth=None):
+    """Compass aspect (deg, 0=N 90=E 180=S 270=W) of the slopes that FACE the
+    radar and therefore lay over — the look azimuth turned around. None if
+    unknown, and the caller then does not dim anything (no reliable geometry).
+
+    Descending is lit from the east and ascending from the west; with a latitude
+    that becomes ~101° / ~259° at 60°N rather than exactly 90° / 270°.
+
+    `look_azimuth` (compass deg, sensor out across the ground) replaces the
+    Sentinel-1 model with a measured direction, and orbit_state / lat /
+    incidence_deg are then ignored — what NISAR passes."""
+    look = (_explicit_look(look_azimuth) if look_azimuth is not None
+            else look_azimuth_deg(orbit_state, lat, incidence_deg))
+    return None if look is None else (look + 180.0) % 360.0
+
+
+def _incidence_at_ground_range(x_km):
+    """Incidence angle (deg) at ground distance `x_km` from nadir, on a sphere.
+    The look angle α off nadir and the Earth-central angle γ = x/R sum to it."""
+    g = float(x_km) / _EARTH_RADIUS_KM
+    rs = _EARTH_RADIUS_KM + _S1_ALTITUDE_KM
+    alpha = np.arctan2(_EARTH_RADIUS_KM * np.sin(g), rs - _EARTH_RADIUS_KM * np.cos(g))
+    return float(np.degrees(alpha + g))
+
+
+def _ground_range_at_incidence(theta_deg):
+    """Inverse of _incidence_at_ground_range, by bisection (it is monotonic)."""
+    lo, hi = 0.0, 1500.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if _incidence_at_ground_range(mid) < theta_deg:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+# where the IW swath's two edges sit on the ground, from nadir: ~343 and ~617
+# km on this sphere, a 274 km swath. Real footprints measure ~252 km (two
+# Iliamna scenes, geodesic), essentially ESA's published 250 km, so the model is
+# ~8% wide: the footprint edges probably sit a little inside 29.1/46.0, or the
+# altitude/sphere simplification shows. iw_incidence_deg only uses the target's
+# FRACTIONAL position across the footprint, so this costs up to ~1 deg right at
+# the swath edges and nothing at mid-swath.
+_IW_NEAR_KM = _ground_range_at_incidence(IW_NEAR_DEG)
+_IW_FAR_KM = _ground_range_at_incidence(IW_FAR_DEG)
+
+
+def _outer_ring(geometry):
+    """Outer ring [(lon, lat), ...] of a GeoJSON Polygon / MultiPolygon, or []."""
+    try:
+        coords = geometry["coordinates"]
+        ring = coords[0][0] if geometry["type"] == "MultiPolygon" else coords[0]
+        return [(float(x), float(y)) for x, y, *_ in ring]
+    except (KeyError, TypeError, IndexError, ValueError):
+        return []
+
+
+def _bearing_km(lon0, lat0, lon1, lat1):
+    """(initial bearing deg, great-circle distance km) from point 0 to point 1.
+
+    Footprint corners are up to ~300 km from the target, far enough that a flat
+    lon/lat projection using the TARGET's local north puts them a few degrees
+    off in bearing — the same meridian convergence look_azimuth_deg corrects
+    for, at a smaller scale."""
+    p0, p1 = np.radians(lat0), np.radians(lat1)
+    dl = np.radians(((lon1 - lon0 + 180.0) % 360.0) - 180.0)   # antimeridian-safe
+    y = np.sin(dl) * np.cos(p1)
+    x = np.cos(p0) * np.sin(p1) - np.sin(p0) * np.cos(p1) * np.cos(dl)
+    a = np.sin((p1 - p0) / 2) ** 2 + np.cos(p0) * np.cos(p1) * np.sin(dl / 2) ** 2
+    dist = 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(min(1.0, a)))
+    return float(np.degrees(np.arctan2(y, x)) % 360.0), float(dist)
+
+
+def iw_incidence_deg(footprint, lon, lat, orbit_state):
+    """Incidence angle (deg) at (lon, lat) inside an IW scene, or None.
+
+    `footprint` is the scene's GeoJSON geometry (the STAC item's `geometry`,
+    which the SAR tab's candidates already carry). Its extremes along the look
+    direction are the swath's near and far edges; where the point falls between
+    them fixes its ground range, and the spherical model turns that into an
+    angle. Only the EXTREMES are used, so an irregular or truncated footprint —
+    the last slice of a datatake — still measures the full swath correctly.
+
+    None when the orbit direction or footprint is missing, or when the footprint
+    does not span something swath-shaped along the look direction (then the
+    caller should fall back to IW_INCIDENCE_DEG rather than trust a number).
+    Longitudes are unwrapped around `lon`, so a scene over the Aleutians that
+    straddles the antimeridian measures the same as any other.
+    """
+    ring = _outer_ring(footprint) if footprint else []
+    if _direction(orbit_state) is None or len(ring) < 3 or lat is None:
+        return None
+    swath = _IW_FAR_KM - _IW_NEAR_KM
+    # every corner as (bearing, distance) from the target, measured in the
+    # target's own frame — an azimuthal-equidistant projection centred on it
+    polar = [_bearing_km(lon, lat, x, y) for x, y in ring]
+    # The look direction at the target depends on where the target sits across
+    # the swath (look_azimuth_deg), which is what this is measuring. Two passes
+    # settle it: a corner ~85 km along-track moves by 85 km x sin(error), so the
+    # first pass's ~0.1 deg residual shifts the answer by ~0.01 deg.
+    inc = None
+    for _ in range(2):
+        look = look_azimuth_deg(orbit_state, lat, inc)
+        proj = [d * np.cos(np.radians(b - look)) for b, d in polar]
+        near, far = min(proj), max(proj)
+        if not 0.6 * swath <= far - near <= 1.5 * swath:
+            return None
+        frac = float(np.clip(-near / (far - near), 0.0, 1.0))
+        inc = _incidence_at_ground_range(_IW_NEAR_KM + frac * swath)
+    return inc
+
+
+def _grid_lat(gt, n_rows, lat_hint=None):
+    """Latitude for the look geometry: `lat_hint` when given, else the centre of
+    a geographic (degrees) grid, else None — a projected grid carries no
+    latitude of its own, and guessing one would be worse than the E/W fallback."""
+    if lat_hint is not None:
+        return float(lat_hint)
+    if abs(gt[1]) < 0.5:
+        return float(gt[3] + gt[5] * (n_rows / 2.0))
     return None
 
 
@@ -89,7 +321,7 @@ def _box_mean(a, k):
 def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
                   mode="amplitude", thr=None, high_percentile=75.0,
                   dim=0.25, slope_min_deg=12.0, aspect_tol_deg=55.0,
-                  dem_smooth=3, feather=5):
+                  dem_smooth=3, feather=5, look_azimuth=None):
     """Per-pixel opacity in [dim, 1] (float32): `dim` where a pixel is layover-
     facing AND steep AND high-valued, else 1.0.
 
@@ -97,13 +329,17 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
     aspect; if it is unknown the whole array is opaque (no dimming). `mode`:
       'amplitude' → high = value ≥ its `high_percentile` among valid pixels
       'change'    → high = |value| ≥ `thr` (the detector's significance cut)
+    `look_azimuth` overrides the Sentinel-1 orbit model with a measured look
+    direction (see illumination_aspect_deg).
     Returns (alpha, meta). meta reports the layover aspect and dimmed-pixel count.
     """
     value = np.asarray(value, dtype=np.float32)
     valid = np.asarray(valid, dtype=bool)
     alpha = np.ones(value.shape, dtype=np.float32)
 
-    lay_aspect = illumination_aspect_deg(orbit_state)
+    lay_aspect = illumination_aspect_deg(
+        orbit_state, _grid_lat(gt, value.shape[0], lat_hint),
+        look_azimuth=look_azimuth)
     if lay_aspect is None:
         return alpha, {"orbit_state": orbit_state, "layover_aspect": None,
                        "n_dimmed": 0, "note": "unknown orbit — not dimmed"}
@@ -134,6 +370,208 @@ def layover_alpha(value, valid, dem, gt, orbit_state, *, lat_hint=None,
                    "n_dimmed": int(dim_mask.sum()),
                    "note": f"dimmed layover-facing (aspect~{lay_aspect:.0f}°) "
                            f"steep high-value pixels to {dim:.0%}"}
+
+
+def range_azimuth_deg(orbit_state, lat=None, incidence_deg=None):
+    """Compass azimuth (deg) the beam TRAVELS across the ground — the direction of
+    increasing ground range, pointing AWAY from the sensor. None if unknown.
+
+    The same thing as look_azimuth_deg, named for what radar_shadow marches
+    along: ~79° ascending and ~281° descending at 60°N, or exactly 90° / 270°
+    without a latitude."""
+    return look_azimuth_deg(orbit_state, lat, incidence_deg)
+
+
+def _shift(a, drow, dcol, fill):
+    """`a` translated by (drow, dcol) with `fill` in the vacated border, i.e.
+    out[r, c] = a[r - drow, c - dcol]. No wraparound (np.roll would wrap a ridge
+    on one edge of the AOI into a shadow on the other)."""
+    out = np.full(a.shape, fill, dtype=a.dtype)
+    h, w = a.shape
+    if abs(drow) >= h or abs(dcol) >= w:
+        return out
+    out[max(0, drow):h - max(0, -drow), max(0, dcol):w - max(0, -dcol)] = \
+        a[max(0, -drow):h - max(0, drow), max(0, -dcol):w - max(0, dcol)]
+    return out
+
+
+def radar_shadow(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
+                 lat_hint=None, dem_smooth=3, max_steps=400, look_azimuth=None):
+    """Boolean mask: True where terrain hides the pixel from the radar.
+
+    What shadow does to a change map is NOT what you might expect, and this was
+    built on the wrong expectation first. Measured on a quiet Iliamna pair
+    (2026-08-31 -> 09-12, same tracks, no slide), shadowed pixels are ~10x
+    QUIETER than lit ground, not noisier: after a 5x5 speckle filter 0.8-0.9% of
+    them read as a >=3 dB change against 5.7-14.5% of lit ground, and their
+    before-vs-after correlation (0.86-0.91) matches lit ground's. The noise
+    floor is steady from pass to pass on one track, so noise over noise is ~1,
+    not a heavy-tailed outlier. A shadowed sample therefore rarely wins the
+    merge's "strongest anomaly wins", and masking it does not reduce noise (the
+    merged background moved 17.91% -> 17.89%).
+
+    What the mask IS for is the merge's confidence label — see
+    sar_change.merge_geometries(masks=...). A shadowed pass has not "seen no
+    change"; it has not seen the ground at all, and the mask says so. Use it
+    WITH radar_layover, never alone: 97-98% of one pass's shadow is layover in
+    the other (measured, Iliamna), so a shadow mask on its own hands those
+    pixels to a pass that folded them over and calls it a recovery.
+
+    Shadow is a deterministic function of terrain and look geometry, so it is
+    PREDICTED from the DEM rather than inferred from the pixels — which is the
+    only way to find it at all, since `sentinel-1-rtc` leaves shadowed pixels
+    finite and ordinary-looking rather than NoData.
+
+    Method (Pairman & McNeill's horizon test, the standard one): the ray from the
+    sensor descends toward far range at (90° - incidence) above the horizontal,
+    so a pixel at height h is shadowed when some point d metres back TOWARD the
+    radar rises above h + d·cot(incidence). Marching outward in one-pixel steps
+    and OR-ing that test catches both self-shadow (a slope tilted away by more
+    than 90° - incidence) and cast shadow behind a ridge, in one pass. The march
+    stops once the ray has climbed past the AOI's total relief, beyond which
+    nothing can block it.
+
+    `dem` and `gt` must describe the same grid; `orbit_state` picks the look
+    direction, and an unknown one masks nothing (no reliable geometry) rather
+    than guessing. `look_azimuth` (compass deg) replaces that Sentinel-1 model
+    with a measured look direction — NISAR's, read from its granule — and then
+    `incidence_deg` should be that radar's too. Returns (mask, meta).
+
+    Known limit: only terrain INSIDE the DEM can cast a shadow, so a ridge just
+    outside the AOI is not seen. Pure numpy, like the rest of this module.
+    """
+    dem = np.asarray(dem, dtype=np.float32)
+    mask = np.zeros(dem.shape, dtype=bool)
+    az = (_explicit_look(look_azimuth) if look_azimuth is not None else
+          range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
+                            incidence_deg))
+    finite = np.isfinite(dem)
+    if az is None or not finite.any():
+        return mask, {"orbit_state": str(orbit_state), "range_azimuth": az,
+                      "n_shadow": 0, "n_steps": 0,
+                      "note": ("unknown orbit direction — nothing masked"
+                               if az is None else "no usable DEM — nothing masked")}
+    theta = float(incidence_deg)
+    if not 1.0 <= theta <= 89.0:
+        raise ValueError("incidence_deg must be between 1 and 89")
+    cot = 1.0 / np.tan(np.radians(theta))
+
+    # same DEM smoothing as layover_alpha: a bilinear-upsampled tile is a lattice
+    # of flat facets, and its noise would speckle the mask with one-pixel shadows
+    dem_s = _box_mean(dem, dem_smooth) if dem_smooth and dem_smooth > 1 else dem
+    lo = float(np.nanmin(dem_s))
+    ground = np.where(np.isfinite(dem_s), dem_s, lo).astype(np.float64)
+
+    dx, dy = metric_pixel_size(gt, dem.shape[0], lat_hint)
+    step = float(min(dx, dy))
+    # unit vector pointing TOWARD the radar = opposite the ground-range direction
+    a = np.radians(az)
+    east, north = -np.sin(a), -np.cos(a)
+    relief = float(ground.max() - ground.min())
+    # once the ray has risen by more than the AOI's total relief, no ground left
+    # in the scene can reach it — every further step is wasted work
+    n_steps = int(min(max_steps, max(1, np.ceil(relief / (cot * step)))))
+
+    for k in range(1, n_steps + 1):
+        d = k * step
+        # out[r, c] must hold the ground d metres back toward the radar, so the
+        # shift is the NEGATIVE of that pixel offset (see _shift)
+        drow = int(round(north * d / dy))
+        dcol = int(round(-east * d / dx))
+        blocker = _shift(ground, drow, dcol, fill=-np.inf)
+        mask |= blocker > (ground + d * cot)
+
+    return mask, {
+        "orbit_state": str(orbit_state), "range_azimuth": az,
+        "incidence_deg": theta, "n_steps": n_steps,
+        "n_shadow": int(mask.sum()),
+        "frac_shadow": float(mask.mean()),
+        "note": (f"look azimuth {az:.0f}°, {theta:.1f}° incidence (slopes "
+                 f"tilted >{90.0 - theta:.0f}° away, plus cast shadow): "
+                 f"{mask.mean():.1%} of the AOI"),
+    }
+
+
+def radar_layover(dem, gt, orbit_state, *, incidence_deg=IW_INCIDENCE_DEG,
+                  lat_hint=None, dem_smooth=3, max_steps=600, look_azimuth=None):
+    """Boolean mask: True where the pixel is mixed with other ground by layover.
+
+    Layover is the mirror of radar_shadow. A slope that faces the radar and
+    rises faster than the beam descends puts its upper part CLOSER in slant
+    range than its foot, so the radar receives the top before the bottom and
+    the returns from several places land in the same cells. In a geocoded
+    product that shows up in map space as the slope itself (active layover),
+    the ground in front of it and the ground just behind its crest (passive
+    layover): every pixel whose slant range falls inside the interval the slope
+    folded over.
+
+    Method: slant range grows with ground range x as x·sin(θ) - h·cos(θ), and
+    layover is exactly where that stops being monotonic. For two points on one
+    look line, a nearer one at height h_a and a farther one at h_b a ground
+    distance d apart, the order flips when h_b - h_a > d·tan(θ), and BOTH
+    points are then mixed. So the same one-pixel march as radar_shadow, with
+    tan(θ) where shadow has cot(θ), testing each pixel against its nearer and
+    its farther neighbours. Locally that is the familiar rule, a radar-facing
+    slope steeper than the incidence angle; the march adds the passive zones,
+    which a slope test alone misses. It stops once d·tan(θ) exceeds the AOI's
+    relief, beyond which no pair can flip.
+
+    Which geometry sees it: descending is lit from the east, so east-facing
+    slopes lay over there and are looked at from BEHIND by ascending — lit if
+    they are gentler than 90° - θ, shadowed if steeper. A steep east- or
+    west-facing face can therefore be lost to both passes (layover in one,
+    shadow in the other); north- and south-facing ones are seen the same way
+    by both.
+
+    Same conventions as radar_shadow: `dem` and `gt` share a grid, an unknown
+    orbit masks nothing, `look_azimuth` overrides the Sentinel-1 look model,
+    only terrain inside the DEM counts. Returns (mask, meta).
+    """
+    dem = np.asarray(dem, dtype=np.float32)
+    mask = np.zeros(dem.shape, dtype=bool)
+    az = (_explicit_look(look_azimuth) if look_azimuth is not None else
+          range_azimuth_deg(orbit_state, _grid_lat(gt, dem.shape[0], lat_hint),
+                            incidence_deg))
+    if az is None or not np.isfinite(dem).any():
+        return mask, {"orbit_state": str(orbit_state), "range_azimuth": az,
+                      "n_layover": 0, "n_steps": 0,
+                      "note": ("unknown orbit direction — nothing masked"
+                               if az is None else "no usable DEM — nothing masked")}
+    theta = float(incidence_deg)
+    if not 1.0 <= theta <= 89.0:
+        raise ValueError("incidence_deg must be between 1 and 89")
+    tan_t = float(np.tan(np.radians(theta)))
+
+    dem_s = _box_mean(dem, dem_smooth) if dem_smooth and dem_smooth > 1 else dem
+    lo = float(np.nanmin(dem_s))
+    ground = np.where(np.isfinite(dem_s), dem_s, lo).astype(np.float64)
+
+    dx, dy = metric_pixel_size(gt, dem.shape[0], lat_hint)
+    step = float(min(dx, dy))
+    a = np.radians(az)
+    east, north = -np.sin(a), -np.cos(a)          # unit vector TOWARD the radar
+    relief = float(ground.max() - ground.min())
+    n_steps = int(min(max_steps, max(1, np.ceil(relief / (tan_t * step)))))
+
+    for k in range(1, n_steps + 1):
+        d = k * step
+        drow = int(round(north * d / dy))
+        dcol = int(round(-east * d / dx))
+        # off-grid neighbours are filled so that they can never trigger
+        nearer = _shift(ground, drow, dcol, fill=np.inf)
+        farther = _shift(ground, -drow, -dcol, fill=-np.inf)
+        mask |= (ground - nearer) > d * tan_t     # this pixel folds onto nearer ground
+        mask |= (farther - ground) > d * tan_t    # farther ground folds onto this pixel
+
+    return mask, {
+        "orbit_state": str(orbit_state), "range_azimuth": az,
+        "incidence_deg": theta, "n_steps": n_steps,
+        "n_layover": int(mask.sum()),
+        "frac_layover": float(mask.mean()),
+        "note": (f"look azimuth {az:.0f}°, {theta:.1f}° incidence (radar-facing "
+                 f"slopes steeper than {theta:.0f}°, plus the ground they fold "
+                 f"onto): {mask.mean():.1%} of the AOI in layover"),
+    }
 
 
 def as_alpha_band(alpha):

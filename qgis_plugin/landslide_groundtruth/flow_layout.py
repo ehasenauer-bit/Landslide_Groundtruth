@@ -107,7 +107,7 @@ class FlowRow(QWidget):
     def __init__(self, parent=None, hspacing=6, vspacing=6):
         super().__init__(parent)
         self.flow = FlowLayout(self, 0, hspacing, vspacing)
-        policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
 

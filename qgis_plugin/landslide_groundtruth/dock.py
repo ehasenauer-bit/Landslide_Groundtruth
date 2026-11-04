@@ -1,15 +1,14 @@
 """The dock panel: location pick, date, pre/post sliders, source preference, run."""
 import base64
 import json
-import re
 import math
 import os
 import platform
 import tempfile
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import Qt, QDateTime, QUrl, QUrlQuery, QSize, QVariant
-from qgis.PyQt.QtGui import QDoubleValidator, QColor, QBrush, QPixmap, QIcon
+from qgis.PyQt.QtCore import QMetaType, Qt, QDateTime, QUrl, QUrlQuery, QSize
+from qgis.PyQt.QtGui import QColor, QBrush, QPixmap, QIcon, QImage
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel,
@@ -18,7 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem, QSplitter, QToolButton, QScrollArea, QGridLayout,
     QTabWidget,
 )
-from qgis.core import (
+from qgis.core import (Qgis, 
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsSettings,
     QgsRectangle, QgsNetworkAccessManager,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -29,7 +28,12 @@ from qgis.core import (
 from qgis.gui import (QgsDockWidget, QgsCollapsibleGroupBox,
                       QgsMapToolEmitPoint)
 
+import numpy as np
+from osgeo import gdal
+
 from .task import PipelineTask
+from . import coord_paste
+from . import hdr_render
 from . import layer_group as lg
 from .flow_layout import FlowRow
 
@@ -43,21 +47,16 @@ SOURCES = [
 ]
 
 # Downloadable review "scenes": (--scenes token, checkbox label, tooltip).
-# Keys must match review_package.SCENE_KEYS. Only HONC (highlight_natural) is
-# ticked by default — the one layer wanted on nearly every run — so a Run stays
-# light; tick more products before running to download the rest.
-# What a run downloads unless the user says otherwise. It used to be
-# highlight_natural ALONE — one attractive picture and not a single piece of
-# change evidence, so the default run could not answer the question the plugin
-# exists to answer, and the layers that do answer it were an opt-in the user had
-# to know to look for.
+# Keys must match review_package.SCENE_KEYS.
 #
-# The set is the three CHANGE rasters plus one context image. dNDSI and
-# dBright are the validated detectors — fusion_core scores an event as
-# mean(dNDSI, dBright, SAR), benchmarked across Iliamna/Hubbard/Valdez, and
-# carries a floor for each (0.10, 0.05). dNDVI is the weakest of the three
-# above the treeline but is the one that works for the vegetated coastal
-# events, and it is a rendering of bands already fetched.
+# What a run downloads unless the user says otherwise: one picture and one
+# change raster (chosen 2026-10-21). HDR is the picture — it keeps detail in
+# deep shadow AND sunlit snow, where HONC's cube root flattens most of a glacier
+# frame — and dBright is the change evidence, the optical measure Fusion
+# recommends and preselects. Before this it was HONC + dNDVI + dNDSI + dBright,
+# and before that HONC alone, which could not answer the question the plugin
+# exists to answer. dNDSI and dNDVI stay one tick away: dNDSI for snow and ice
+# that dBright misses, dNDVI for the vegetated coastal events.
 #
 # swir_falsecolor is deliberately NOT here despite being excellent to look at.
 # It is a single-date 3-band composite, not a change detector: Fusion never
@@ -65,7 +64,7 @@ SOURCES = [
 # has no SWIR bands at all, so defaulting it on does nothing on a Planet run.
 # It stays one tick away for interpreting a scene by eye.
 DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
-DEFAULT_SCENES = ("highlight_natural", "dndvi", "dndsi", "dbright")
+DEFAULT_SCENES = ("highlight_hdr", "dbright")
 SCENES = [
     ("true_color", "True colour (RGB)",
      "Natural-colour red/green/blue, linear 0–0.3 stretch. The context layer and "
@@ -76,6 +75,17 @@ SCENES = [
      "detail and tames blown-out snow/cloud so one stretch reads across the whole "
      "scene. Sentinel Hub custom script by Marko Repše, CC BY-SA 4.0 — not a "
      "separate download, just a second rendering of the same scene."),
+    ("highlight_hdr", "HDR (one global curve)",
+     "The same true-colour bands as HONC, but pushed through a curve fitted to the "
+     "scene — a highlight rolloff with a log shadow lift — so a frame with both "
+     "deep shadow and sunlit snow keeps detail at BOTH ends, and no pixel comes out "
+     "pure black or pure white on any scene. On glacier scenes it "
+     "resolves noticeably more terrain than HONC inside the bright zone where the "
+     "cube-root curve flattens out — which is most of the frame. It does NOT make "
+     "a scar easier to spot than HONC; it makes the ground around one readable. "
+     "Memory-hungry — it holds the whole AOI in float, several GB on a 20 km one — "
+     "so it is the one layer that skips itself rather than failing the run when "
+     "it can't fit."),
     ("false_color", "False colour (NIR-R-G)",
      "NIR-red-green: vegetation pops bright red, fresh bare scar reads dark."),
     ("swir_falsecolor", "SWIR false colour (12-11-4)",
@@ -110,7 +120,7 @@ SENSOR_TAG = {"planet": "PlanetScope", "s2": "S2", "landsat": "Landsat"}
 # The value becomes the folder's product suffix, e.g. "S2 7-20/7-21 NDVI".
 CORE_PRODUCTS = [
     ("dndvi", "dNDVI"), ("dndsi", "dNDSI"), ("dbright", "dBright"),
-    ("highlight", "HONC"), ("falsecolor", "False-color"),
+    ("highlight", "HONC"), ("hdr", "HDR"), ("falsecolor", "False-color"),
     ("swir", "SWIR"), ("ndvi", "NDVI"), ("rgb", "TC"),
 ]
 
@@ -162,46 +172,45 @@ PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
 # Planetary Computer data API (public titiler; no SAS token needed — it signs
 # blob reads server-side, same service the rendered_preview thumbnails come from).
-# We use it to render BOTH the scene-preview PNG and the on-map AOI GeoTIFF from
+# We use it to fetch BOTH the scene-preview image and the on-map AOI GeoTIFF from
 # the raw surface-reflectance bands, so we control the stretch instead of
 # inheriting a pre-baked 'visual' TCI, which clips bright snow/ice to flat white.
 #
-# The render reproduces the project's "Highlight Optimized Natural Color" look
-# (see review_package): a cube-root tone curve cbrt(0.6 * reflectance). In data-
-# API terms that's gamma 3 (output = input**(1/3)) applied to reflectance scaled
-# by 0.6. Same tone curve for every source; only the band names and the rescale
-# (because each collection stores reflectance differently) change per source.
+# Sentinel-2 comes back as RAW DN and is tone-mapped here by hdr_render — the same
+# HDR curve as the PlanetScope tab (rolloff + tapered shadow lift, white anchored
+# on the scene's bright tail), so shadowed slopes and sunlit snow both keep their
+# texture. It used to be the data API's cube-root "Highlight Optimized Natural
+# Color" formula, which on a same-day Denali pair kept ~30% less snow texture and
+# painted MPC's un-removed +1000 BOA offset (baseline 04.00+) as a grey haze over
+# every shadow. Landsat still uses that cube-root formula, server-side.
 PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
 _HIGHLIGHT_FORMULA = "gamma RGB 3.0, saturation 1.2"
 
-# Per-source highlight render config for the data API. `query` is the assets +
-# colour_formula + rescale (+ unscale for Landsat), percent-encoded ONCE here so
-# the call site appends it verbatim. PlanetScope is absent: it has no single
-# streamable COG, so it can't be rendered on the map / from the data API.
-#   Sentinel-2 L2A: SR is uint16 reflectance×10000 (no offset), so the rescale is
-#     in raw DN — 16667 = 10000 / 0.6 bakes in the 0.6 scale with white headroom.
+# Per-source render config for the data API; `query` is appended verbatim.
+# `hdr` True = the query returns raw uint16 bands (+ a mask band) as GeoTIFF and the
+# tone curve runs locally (hdr_render); False = the server renders a colour image.
+# PlanetScope is absent: it has no single streamable COG.
+#   Sentinel-2 L2A: uint16 DN = reflectance×10000, +1000 from baseline 04.00 on
+#     (hdr_render.s2_boa_offset removes it per scene).
 #   Landsat C2 L2: SR carries scale/offset (r = DN×2.75e-5 − 0.2); unscale=true so
-#     the rescale below is in reflectance units (0..1/0.6), mirroring S2. Tune the
-#     rescale here if Landsat scenes read too dark/bright.
+#     the rescale below is in reflectance units (0..1/0.6). Tune it if Landsat
+#     scenes read too dark/bright.
 HIGHLIGHT_RENDER = {
     "Sentinel-2": {
         "collection": "sentinel-2-l2a",
-        "query": ("assets=B04&assets=B03&assets=B02"
-                  f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
-                  "&rescale=0,16667&nodata=0"),
+        "query": "assets=B04&assets=B03&assets=B02&nodata=0",
+        "hdr": True,
     },
     "Landsat": {
         "collection": "landsat-c2-l2",
         "query": ("assets=red&assets=green&assets=blue&unscale=true"
                   f"&color_formula={quote(_HIGHLIGHT_FORMULA)}"
                   "&rescale=0,1.6667&nodata=0"),
+        "hdr": False,
     },
 }
 # sources renderable on the map / in the gallery via the data API (preview order)
 STREAMABLE = ("Sentinel-2", "Landsat")
-
-# muted text for table rows the run will NOT composite (ranked below the cutoff)
-MUTED_FG = QColor(120, 120, 120)
 
 # QGIS network-request timeout (ms) while previewing PC tiler layers: the on-
 # demand tiler can be slow to render the first tiles of a fresh scene, and the
@@ -216,12 +225,6 @@ NETWORK_TIMEOUT_MS = 180000
 EARTHDATA_TOKENS_URL = "https://urs.earthdata.nasa.gov/api/users/tokens"
 EARTHDATA_HOST = "urs.earthdata.nasa.gov"
 EARTHDATA_REGISTER_URL = "https://urs.earthdata.nasa.gov/"
-
-# status-line colours shared by the login panel (green ok / red fail / amber hint)
-STATUS_COLORS = {
-    "success": "#2e7d32", "error": "#c62828",
-    "warn": "#e65100", "info": "palette(mid)",
-}
 
 # Responsive text: the dock rescales its base font with its own size so the panel
 # stays readable whether it's a cramped side dock or a large floating window. The
@@ -266,6 +269,7 @@ class LandslideDock(QgsDockWidget):
         self._tif_replies = []       # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0        # AOI downloads still outstanding this preview
         self._tif_fallbacks = []     # (label, cog_url) whose AOI render failed
+        self._hdr_raw = []           # (label, raw_path, offset, cog_url) awaiting HDR
         self._preview_added = []     # raster layers added by the current preview
         self._preview_tmpfiles = []  # temp GeoTIFFs backing those layers (to unlink)
         self._preview_failed = []    # labels that failed to sign/load
@@ -281,6 +285,7 @@ class LandslideDock(QgsDockWidget):
         self._last_font_scale = None
         self.setWidget(self._wrap_scrollable(self._build_dock()))
         self._init_project_state()
+        self._init_results_dir()
 
     # ---------- per-project persistence ----------
     def _init_project_state(self):
@@ -309,19 +314,20 @@ class LandslideDock(QgsDockWidget):
         inner.setMinimumWidth(360)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(inner)
         return scroll
 
     # ---------- top-level layout: shared Environment + tabbed sources ----------
     def _build_dock(self):
-        """Shared Environment header over a QTabWidget: a Sentinel-2/Landsat tab
+        """Shared Setup header over a QTabWidget: a Sentinel-2/Landsat tab
         (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
-        Data/Orders/Tiles system). Environment (venv/project/out) is shared because
-        both tabs launch the SAME venv subprocess."""
+        Data/Orders/Tiles system). Setup is shared because every imagery tab
+        launches the SAME pipeline subprocess (pipeline_launch)."""
         from .fusion_tab import FusionTab
+        from .gegd_tab import GegdTab
         from .planet_tab import PlanetTab
         from .sar_tab import SarTab
         from .viewer3d_tab import Viewer3DTab
@@ -336,6 +342,10 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
         self.planet_tab = PlanetTab(self)
         tabs.addTab(self.planet_tab, "PlanetScope")
+        # Maxar/Vantor VHR through NGA's GEGD Pro: catalog search + streamed strips,
+        # keyed by the user's own API key (gegd_auth), so no venv subprocess.
+        self.gegd_tab = GegdTab(self)
+        tabs.addTab(self.gegd_tab, "Maxar VHR (GEGD)")
         self.sar_tab = SarTab(self)
         tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
         # Consumes the two tabs above rather than searching for imagery itself:
@@ -354,109 +364,378 @@ class LandslideDock(QgsDockWidget):
         return container
 
     def _build_env_box(self):
-        """Shared environment settings (paths to the venv + project + output).
+        """Setup: install the imagery tools once (environment.py), or use your own.
 
-        This is a HARD GATE: eleven code paths across five tabs refuse to run
-        until these are set, and the first click a new user makes (the 3D tab's
-        pre-selected "Auto-fetch a DEM") lands on one of them. So it opens itself
-        when unconfigured, states what each path is in words the audience has,
-        shows an example of a correct value, and validates live rather than at
-        the next button press. Read by every tab (see _collect and PlanetTab)."""
-        env = QgsCollapsibleGroupBox("Environment — set these three up once")
+        This is a HARD GATE: the Sentinel-2/Landsat, PlanetScope, SAR and 3D
+        DEM-fetch searches refuse to run until it passes (env_gate), and the first
+        click a new user makes (the 3D tab's pre-selected "Auto-fetch a DEM")
+        lands on one of them. So it opens itself until the tools can run, says up
+        front what works without it and what the install costs, and does the
+        install itself — one button, a progress bar, Cancel — instead of asking
+        for a venv path a plugin-repository user has never heard of.
+
+        "Use my own Python" keeps the old behaviour for a developer checkout:
+        a filled-in Python wins over the managed install (pipeline_python)."""
+        from . import environment
+        env = QgsCollapsibleGroupBox("Setup — imagery tools")
         env.setSaveCollapsedState(False)
         self.env_box = env          # tabs call env_box.setCollapsed(False) to point here
-        ef = QFormLayout(env)
+        v = QVBoxLayout(env)
+        intro = QLabel(
+            "Sentinel-2/Landsat, PlanetScope, SAR and the 3D viewer's DEM download "
+            "run in a separate Python that the plugin installs once: about "
+            f"{environment.DOWNLOAD_MB} MB to download, "
+            f"{environment.DISK_GB:.1f} GB on disk, usually under 10 minutes. "
+            "Volume, Fusion, Maxar VHR (with a GEGD key) and the 3D viewer on a DEM "
+            "you load work without it.")
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        # live status: says whether the tools can run right now, instead of
+        # making the user press Search to find out.
+        self.env_status = QLabel()
+        self.env_status.setWordWrap(True)
+        v.addWidget(self.env_status)
+
+        self.setup_btn = QPushButton("Install imagery tools")
+        f = self.setup_btn.font(); f.setBold(True); self.setup_btn.setFont(f)
+        self.setup_btn.setToolTip(
+            "Downloads uv (Astral's Python installer), a private Python "
+            f"{environment.PYTHON_VERSION} and the pinned imagery packages into "
+            f"{environment.data_dir()}. Nothing is installed into QGIS itself, "
+            "and Remove deletes all of it.")
+        self.setup_btn.clicked.connect(self._start_setup)
+        self.setup_cancel_btn = QPushButton("Cancel")
+        self.setup_cancel_btn.setToolTip("Stop the install. Nothing half-installed "
+                                         "is left marked as ready.")
+        self.setup_cancel_btn.clicked.connect(self._cancel_setup)
+        self.setup_remove_btn = QPushButton("Remove…")
+        self.setup_remove_btn.setToolTip(
+            f"Delete the installed imagery tools ({environment.data_dir()}). Your "
+            "results are not touched; you can install again at any time.")
+        self.setup_remove_btn.clicked.connect(self._remove_setup)
+        row = FlowRow()
+        for b in (self.setup_btn, self.setup_cancel_btn, self.setup_remove_btn):
+            row.addWidget(b)
+        v.addWidget(row)
+        self.setup_progress = QProgressBar()
+        self.setup_progress.setRange(0, 100)
+        v.addWidget(self.setup_progress)
+        self.setup_log = QPlainTextEdit()
+        self.setup_log.setReadOnly(True)
+        self.setup_log.setMaximumHeight(140)
+        self.setup_log.setPlaceholderText("Install log")
+        v.addWidget(self.setup_log)
+        self._setup_task = None
+
         self.python_edit = QLineEdit(self.settings.value(
             "landslide/python", "", type=str))
         self.project_edit = QLineEdit(self.settings.value(
             "landslide/project", "", type=str))
         self.out_edit = QLineEdit(self.settings.value(
             "landslide/out", "", type=str))
-        for label, edit, picker, placeholder, tip in (
-            ("Python for the imagery tools", self.python_edit, self._pick_python,
-             "…/landslide_groundtruth/venv/bin/python3",
-             "The python program inside the project's venv folder — 'python3' in "
-             "venv/bin (macOS/Linux) or python.exe in venv\\Scripts (Windows). "
-             "The plugin runs the imagery tools with it, so they stay out of QGIS. "
-             "Called 'venv python' in the documentation."),
-            ("Folder with the imagery tools", self.project_edit, self._pick_project,
-             "…/landslide_groundtruth   (the folder containing run_single.py)",
-             "The folder you downloaded the pipeline into. It must contain "
-             "run_single.py."),
-            ("Where to save results", self.out_edit, self._pick_out,
-             "leave blank for <project folder>/out/interactive",
-             "Imagery, change rasters and the SAR change files the Fusion tab "
-             "reads. Leave blank to use out/interactive inside the project "
-             "folder."),
-        ):
+        adv = QgsCollapsibleGroupBox("Use my own Python (advanced)")
+        adv.setSaveCollapsedState(False)
+        self.env_adv_box = adv
+        af = QFormLayout(adv)
+        rows = (
+            (af, "Python for the imagery tools", self.python_edit, self._pick_python,
+             "leave blank to use the imagery tools installed above",
+             "Only for running the pipeline from your own environment, e.g. a "
+             "development checkout: the python program inside that venv — "
+             "'python3' in venv/bin (macOS/Linux) or python.exe in venv\\Scripts "
+             "(Windows). When this is filled in it is used instead of the "
+             "installed imagery tools."),
+            (af, "Folder with the imagery tools", self.project_edit, self._pick_project,
+             "leave blank to use the scripts that come with the plugin",
+             "A folder containing run_single.py (a checkout of the repository) to "
+             "run instead of the copy shipped with the plugin."),
+        )
+        of = QFormLayout()
+        rows += (
+            (of, "Results (unsaved projects)", self.out_edit, self._pick_out,
+             "leave blank for Documents/Landslide Ground-Truthing",
+             "A SAVED project keeps every tab's results — PlanetScope, Sentinel-2/"
+             "Landsat, SAR, Fusion, volume, 3D — in its own folder, beside its "
+             ".qgz, so switching projects switches the files with it. This folder "
+             "is used only until the project is saved, and for data every project "
+             "shares (the RGI glacier outlines)."),
+        )
+        for form, label, edit, picker, placeholder, tip in rows:
             edit.setPlaceholderText(placeholder)
             edit.setToolTip(tip)
             edit.textChanged.connect(self._refresh_env_status)
-            row = QHBoxLayout()
-            row.addWidget(edit)
+            edit.textChanged.connect(self._save_settings)
+            line = QHBoxLayout()
+            line.addWidget(edit)
             btn = QPushButton("Browse…")
             btn.setToolTip("Choose " + label[0].lower() + label[1:])
             btn.clicked.connect(picker)
-            row.addWidget(btn)
-            ef.addRow(label, row)
-        # live status: says whether what is typed actually works, instead of
-        # making the user press Search to find out.
-        self.env_status = QLabel()
-        self.env_status.setWordWrap(True)
-        ef.addRow("", self.env_status)
+            line.addWidget(btn)
+            form.addRow(label, line)
+        adv.setCollapsed(not (self.python_edit.text().strip()
+                              or self.project_edit.text().strip()))
+        # Where results land right now — this project's folder once it's saved (see
+        # results_dir), so the field above only matters until then.
+        self.results_label = QLabel()
+        self.results_label.setWordWrap(True)
+        self.results_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        of.addRow("Results now go to", self.results_label)
+        v.addLayout(of)
+        v.addWidget(adv)
         self._refresh_env_status()
-        # Opens itself when unconfigured. setSaveCollapsedState(False) means the
-        # collapse state is recomputed every session, so a configured user still
-        # gets it out of the way and an unconfigured one cannot miss it.
+        # Opens itself until the tools can run. setSaveCollapsedState(False) means
+        # the collapse state is recomputed every session, so a configured user
+        # still gets it out of the way and an unconfigured one cannot miss it.
         env.setCollapsed(self._env_ok()[0])
         return env
 
-    def _env_ok(self):
-        """(ok, message) for the current Environment paths.
+    # ---------- which Python runs the pipeline ----------
+    def pipeline_python(self):
+        """The user's own Python when one is set (advanced), else the installed one."""
+        from . import environment
+        return self.python_edit.text().strip() or environment.env_python()
 
-        Checked in the order the user fills them in, so the message always names
-        the FIRST thing still wrong rather than the last."""
+    def pipeline_dir(self):
+        """The folder holding run_single.py: the user's own (advanced), else the
+        scripts shipped with the plugin."""
+        from . import environment
+        return self.project_edit.text().strip() or environment.bundled_pipeline_dir()
+
+    def pipeline_launch(self):
+        """(python, script, cwd) for a run_single.py subprocess, or None.
+
+        None means the tools can't run yet; env_gate has already said why and
+        opened the Setup box, so a caller just returns."""
+        if not self.env_gate():
+            return None
+        d = self.pipeline_dir()
+        return self.pipeline_python(), os.path.join(d, "run_single.py"), d
+
+    def _env_ok(self):
+        """(ok, message) for whatever will run the pipeline.
+
+        Own Python set: check it the old way, in the order the fields are filled
+        in, so the message names the FIRST thing still wrong. Otherwise: the state
+        of the installed imagery tools (environment.status)."""
+        from . import environment
         py = self.python_edit.text().strip()
-        proj = self.project_edit.text().strip()
-        if not py:
-            return False, "Choose the Python program that has the imagery tools installed."
-        if not os.path.exists(py):
-            return False, "There is no file at that Python path."
-        if not proj:
-            return False, "Choose the folder you downloaded the pipeline into."
-        if not os.path.exists(os.path.join(proj, "run_single.py")):
-            return False, "That folder has no run_single.py in it — pick the folder that does."
-        return True, "Ready — the imagery tools can be run."
+        d = self.pipeline_dir()
+        if py and not os.path.exists(py):
+            return False, "There is no file at the Python path in 'Use my own Python'."
+        if not d or not os.path.exists(os.path.join(d, "run_single.py")):
+            return False, ("The folder in 'Use my own Python' has no run_single.py in "
+                           "it — pick the folder that does, or clear it.")
+        if py:
+            return True, "Ready — using your own Python (advanced)."
+        state, msg = environment.status()
+        return environment.usable(state), msg
 
     def _refresh_env_status(self, *_):
-        """Repaint the status line, and clear any red border once a path is fixed."""
+        """Repaint the status line and the buttons, and clear any red border once a
+        path is fixed."""
+        from . import environment
         ok, msg = self._env_ok()
-        kind = "success" if ok else "warn"
+        state, _ = environment.status()
+        running = self._setup_task is not None
+        own = bool(self.python_edit.text().strip())
+        kind = "success" if ok and state != environment.STALE else "warn"
+        if running:
+            kind, msg = "info", "Installing the imagery tools…"
         self.env_status.setText(status_text(kind, msg))
         self.env_status.setStyleSheet(status_css(kind))
+        label = {environment.STALE: "Update imagery tools",
+                 environment.BROKEN: "Repair imagery tools"}.get(
+            state, "Install imagery tools")
+        self.setup_btn.setText(label)
+        self.setup_btn.setVisible(not own and state != environment.READY)
+        self.setup_btn.setEnabled(not running)
+        self.setup_cancel_btn.setVisible(running)
+        self.setup_remove_btn.setVisible(
+            not running and state != environment.MISSING)
+        self.setup_progress.setVisible(running)
+        self.setup_log.setVisible(running or bool(self.setup_log.toPlainText()))
         for edit in (self.python_edit, self.project_edit, self.out_edit):
             if edit.styleSheet() and edit.text().strip():
                 edit.setStyleSheet("")
+        self._refresh_results_dir()
+
+    # ---------- installing the imagery tools ----------
+    def _pipeline_running(self):
+        """True while any tab's run_single.py subprocess is going."""
+        from qgis.core import QgsTask
+        for owner in (self, getattr(self, "planet_tab", None),
+                      getattr(self, "sar_tab", None),
+                      getattr(self, "viewer3d_tab", None)):
+            t = getattr(owner, "task", None)
+            try:
+                if t is not None and t.status() in (QgsTask.TaskStatus.Queued,
+                                                    QgsTask.TaskStatus.OnHold,
+                                                    QgsTask.TaskStatus.Running):
+                    return True
+            except RuntimeError:        # finished task, C++ side already deleted
+                pass
+        return False
+
+    def _start_setup(self):
+        from .environment import SetupTask
+        if self._setup_task is not None:
+            return
+        if self._pipeline_running():
+            self._warn("Wait for the running search to finish, then install.")
+            return
+        task = SetupTask()
+        task.logLine.connect(self._setup_line)
+        task.progressChanged.connect(
+            lambda p: self.setup_progress.setValue(int(p)))
+        task.taskCompleted.connect(lambda: self._setup_done(True))
+        task.taskTerminated.connect(lambda: self._setup_done(False))
+        self._setup_task = task
+        self.setup_log.clear()
+        self.setup_progress.setValue(0)
+        self._refresh_env_status()
+        QgsApplication.taskManager().addTask(task)
+
+    def _setup_line(self, line):
+        self.setup_log.appendPlainText(line)
+
+    def _cancel_setup(self):
+        if self._setup_task is not None:
+            self._setup_task.cancel()
+
+    def _setup_done(self, ok):
+        task, self._setup_task = self._setup_task, None
+        cancelled = task is not None and task.isCanceled()
+        error = getattr(task, "error", "") if task is not None else ""
+        self._refresh_env_status()
+        if ok:
+            self.iface.messageBar().pushSuccess(
+                "Landslide", "The imagery tools are installed — Sentinel-2/Landsat, "
+                "PlanetScope, SAR and DEM download can run now.")
+            self.env_box.setCollapsed(True)
+        elif cancelled:
+            self.iface.messageBar().pushInfo(
+                "Landslide", "Install cancelled. Click Install imagery tools to "
+                "start again; anything already downloaded is reused.")
+        else:
+            self._warn("Installing the imagery tools failed. " + (error or "")
+                       + " The install log in the Setup box has the details.")
+
+    def _remove_setup(self):
+        from qgis.PyQt.QtWidgets import QMessageBox
+        from . import environment
+        if self._setup_task is not None:
+            return
+        if self._pipeline_running():
+            self._warn("Wait for the running search to finish, then remove.")
+            return
+        size = environment.installed_size_bytes() / 1e9
+        answer = QMessageBox.question(
+            self, "Remove the imagery tools",
+            f"Delete the imagery tools ({size:.1f} GB in {environment.data_dir()})?"
+            "\n\nYour results are not touched, and you can install the tools "
+            "again at any time.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            environment.remove()
+        except OSError as e:
+            self._warn(f"Could not remove everything: {e}")
+        self.setup_log.clear()
+        self._refresh_env_status()
+        self.env_box.setCollapsed(False)
+
+    # ---------- where results are saved ----------
+    def results_dir(self):
+        """Where every tab saves its results: the folder of the open QGIS project.
+
+        Each project then keeps its files beside its .qgz, and opening another
+        project moves new results with it. A project that hasn't been saved has no
+        folder yet, so it falls back to shared_dir(). Tabs add their own subfolder
+        (planet/, sar/, fusion/, viewer3d/ …) exactly as they did under
+        out/interactive."""
+        project = QgsProject.instance()
+        path = project.absolutePath()
+        if project.fileName() and path:
+            return path
+        return self.shared_dir()
+
+    def shared_dir(self):
+        """The Setup box's 'Results (unsaved projects)' folder: results of a project
+        not saved yet, and data every project reuses (the RGI glacier archive, which
+        needs an Earthdata login to fetch again).
+
+        Blank falls back to <tools folder>/out/interactive when an own tools folder
+        is set (a development checkout, as before), else to
+        Documents/Landslide Ground-Truthing — never to a path inside the plugin,
+        which a plugin update replaces."""
+        from . import environment
+        out = self.out_edit.text().strip()
+        proj = self.project_edit.text().strip()
+        if out:
+            return out
+        if proj:
+            return os.path.join(proj, "out", "interactive")
+        return environment.default_results_dir()
+
+    def _refresh_results_dir(self, *_):
+        """Say where results go right now (see results_dir)."""
+        label = getattr(self, "results_label", None)
+        if label is None:
+            return
+        try:
+            project = QgsProject.instance()
+            saved = bool(project.fileName() and project.absolutePath())
+            path = self.results_dir()
+        except RuntimeError:            # project/widgets torn down mid-signal
+            return
+        if saved:
+            label.setText(f"{path}\n(this project's folder — its results stay beside "
+                          f"its .qgz)")
+        elif path:
+            label.setText(f"{path}\n(the project isn't saved yet — save it to keep its "
+                          f"results in its own folder)")
+        else:
+            label.setText("— choose the folder with the imagery tools first")
+
+    def _init_results_dir(self):
+        """Keep 'Results now go to' in step with the project: opening one, saving it
+        under a new name, or starting a new one all move where results land."""
+        project = QgsProject.instance()
+        self._results_signals = ((project.readProject, self._refresh_results_dir),
+                                 (project.cleared, self._refresh_results_dir),
+                                 (project.fileNameChanged, self._refresh_results_dir))
+        for signal, slot in self._results_signals:
+            signal.connect(slot)
+        self._refresh_results_dir()
 
     def env_gate(self, edit=None):
-        """Refuse an action that needs the Environment, and POINT AT IT.
+        """Refuse an action that needs the imagery tools, and POINT AT the fix.
 
-        One shared refusal for every tab: opens the box, marks the offending
-        field, focuses it, and says what to do — instead of the old
-        "Set a valid venv python path." into a collapsed box the user has never
-        seen. Returns False so callers can `if not self.dock.env_gate(): return`."""
+        One shared refusal for every tab: opens the Setup box and says what to do.
+        Not installed yet: focuses Install imagery tools. Own Python set but
+        broken: opens 'Use my own Python' and marks the offending field. Returns
+        False so callers can `if not self.dock.env_gate(): return`."""
+        from . import environment
         ok, msg = self._env_ok()
         if ok:
             return True
-        self._warn("Before searching, open the Environment box at the top of this "
-                   "panel and set it up. " + msg + " Ask whoever installed the "
-                   "plugin if you are not sure.")
+        own = bool(self.python_edit.text().strip() or self.project_edit.text().strip())
+        if not own and environment.status()[0] == environment.MISSING:
+            msg += (" Click Install imagery tools in the Setup box at the top of this "
+                    "panel — a one-time download.")
+        self._warn(msg)
         try:
             self.env_box.setCollapsed(False)
+            if not own:
+                self.setup_btn.setFocus()
+                return False
+            self.env_adv_box.setCollapsed(False)
             target = edit
             if target is None:
-                target = (self.python_edit
-                          if not os.path.exists(self.python_edit.text().strip() or "\0")
+                py = self.python_edit.text().strip()
+                target = (self.python_edit if py and not os.path.exists(py)
                           else self.project_edit)
             target.setStyleSheet(invalid_field_css())
             target.setFocus()
@@ -468,11 +747,10 @@ class LandslideDock(QgsDockWidget):
     def _build_detection_box(self):
         """The plugin's front door: the detection record, entered ONCE.
 
-        The analyst arrives holding a seismic detection — epicentre, origin time,
-        LOCATION ERROR, and a volume estimate. Before this box the first three had
-        to be retyped into four separate tabs and the last two had nowhere to go at
-        all, so the search radius ignored the uncertainty it was supposed to cover
-        and the seismic volume could never be compared against the digitized one.
+        The analyst arrives holding a seismic detection — epicentre and origin
+        time. Before this box they had to be retyped into four separate tabs.
+        The location error and seismic volume were taken here too until
+        2026-10-30; each tab now gets a fixed radius (detection.SEARCH_RADIUS_KM).
 
         Typed fields rather than a paste box: the record arrives as a FIGURE (a
         station map with the numbers printed in the corner), so there is no text
@@ -484,10 +762,9 @@ class LandslideDock(QgsDockWidget):
         v = QVBoxLayout(box)
 
         hint = QLabel(
-            "Copy the numbers off the detection figure once. They fill in every "
-            "tab below, set a search radius that actually covers the location "
-            "error, and give the Volume tab something to check its own answer "
-            "against.")
+            "Copy the time and epicentre off the detection figure once. 'Use it "
+            "in every tab' fills them into every tab below, each with its own "
+            "search radius.")
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(hint)
@@ -514,64 +791,42 @@ class LandslideDock(QgsDockWidget):
         self.det_lat_edit.setPlaceholderText("60.50")
         self.det_lon_edit = QLineEdit()
         self.det_lon_edit.setPlaceholderText("-140.60   (negative in Alaska/Yukon)")
+        coord_paste.link_pair(self.det_lat_edit, self.det_lon_edit)
         form.addRow("Latitude", self.det_lat_edit)
         form.addRow("Longitude", self.det_lon_edit)
-
-        self.det_err_spin = QDoubleSpinBox()
-        self.det_err_spin.setRange(0.0, 200.0)
-        self.det_err_spin.setDecimals(1)
-        self.det_err_spin.setSingleStep(1.0)
-        self.det_err_spin.setSuffix(" km")
-        self.det_err_spin.setSpecialValueText("not given")
-        self.det_err_spin.setToolTip(
-            "The 'Loc error' on the figure — the radius the scar is somewhere "
-            "inside. This drives the search radius: at 17 km of error, the old "
-            "5 km default covered about a twelfth of the ground the slide could "
-            "be on, so an empty result meant 'never looked there'.")
-        form.addRow("Location error", self.det_err_spin)
-
-        self.det_vol_edit = QLineEdit()
-        self.det_vol_edit.setPlaceholderText("1.3        million m³")
-        self.det_vol_edit.setToolTip(
-            "The seismic volume estimate, in millions of m³ — the 'Vol' line. "
-            "The Volume tab compares its own area-derived volume against this.")
-        self.det_vol_lo_edit = QLineEdit()
-        self.det_vol_lo_edit.setPlaceholderText("0.9")
-        self.det_vol_hi_edit = QLineEdit()
-        self.det_vol_hi_edit.setPlaceholderText("1.7")
-        form.addRow("Volume (M m³)", self.det_vol_edit)
-        rng = QHBoxLayout()
-        rng.addWidget(self.det_vol_lo_edit)
-        rng.addWidget(QLabel("to"))
-        rng.addWidget(self.det_vol_hi_edit)
-        form.addRow("Volume range", rng)
         v.addLayout(form)
 
-        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
-                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit):
             w.textChanged.connect(self._read_detection)
         self.det_time_edit.dateTimeChanged.connect(self._read_detection)
-        self.det_err_spin.valueChanged.connect(self._read_detection)
 
         self.det_apply_btn = QPushButton("Use it in every tab")
         self.det_apply_btn.setEnabled(False)
         f = self.det_apply_btn.font(); f.setBold(True); self.det_apply_btn.setFont(f)
         self.det_apply_btn.setToolTip(
-            "Copy the epicentre, the event time and a radius covering the "
-            "location error into the Sentinel-2, PlanetScope, SAR and 3D tabs, "
-            "so they cannot drift apart.")
+            "Copy the epicentre and the event time into the Sentinel-2, "
+            "PlanetScope, Maxar VHR, SAR and 3D tabs, so they cannot drift apart, "
+            "and set each one's search radius: Sentinel-2, Maxar, SAR and 3D "
+            "15 km, PlanetScope 10 km.")
         self.det_apply_btn.clicked.connect(self._apply_detection)
         clear_btn = QPushButton("Clear")
         clear_btn.setToolTip("Forget the current detection.")
         clear_btn.clicked.connect(self._clear_detection)
+        example_btn = QPushButton("Try an example")
+        example_btn.setToolTip(
+            "Fill in a real event — the 8 August 2026 landslide on Iliamna Volcano — "
+            "and copy it into every tab, to see the workflow before using your own "
+            "detection.")
+        example_btn.clicked.connect(self._load_example)
         row = FlowRow()
         row.addWidget(self.det_apply_btn)
         row.addWidget(clear_btn)
+        row.addWidget(example_btn)
         v.addWidget(row)
 
         self.det_summary = QLabel()
         self.det_summary.setWordWrap(True)
-        self.det_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.det_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(self.det_summary)
         self._read_detection()
         box.setCollapsed(False)
@@ -605,23 +860,33 @@ class LandslideDock(QgsDockWidget):
         det = Detection(
             event_id=self.det_id_edit.text().strip(),
             origin_utc=self.det_time_edit.dateTime().toPyDateTime(),
-            lat=lat, lon=lon,
-            loc_error_km=(self.det_err_spin.value() or None),
-            vol_best_m3=self._num_or_none(self.det_vol_edit, 1e6),
-            vol_low_m3=self._num_or_none(self.det_vol_lo_edit, 1e6),
-            vol_high_m3=self._num_or_none(self.det_vol_hi_edit, 1e6))
+            lat=lat, lon=lon)
         if not det.event_id and det.origin_utc:
             det.event_id = f"AK{det.origin_utc:%Y-%m%d}"
         self.detection = det if det.is_locatable() else None
         self._render_detection(warn)
 
     def _clear_detection(self):
-        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit,
-                  self.det_vol_edit, self.det_vol_lo_edit, self.det_vol_hi_edit):
+        for w in (self.det_id_edit, self.det_lat_edit, self.det_lon_edit):
             w.clear()
-        self.det_err_spin.setValue(0.0)
         self.detection = None
         self._render_detection()
+
+    # "Try an example": the Iliamna Volcano landslide of 2026-08-08, the event the
+    # plugin's Volume, Fusion and SAR work was developed on (event id, origin time
+    # UTC, lat, lon).
+    EXAMPLE_EVENT = ("AK2026-0808", "2026-08-08 13:00:00", "60.0265", "-153.0559")
+
+    def _load_example(self):
+        eid, when, lat, lon = self.EXAMPLE_EVENT
+        self.det_id_edit.setText(eid)
+        self.det_time_edit.setDateTime(QDateTime.fromString(when, "yyyy-MM-dd HH:mm:ss"))
+        self.det_lat_edit.setText(lat)
+        self.det_lon_edit.setText(lon)
+        self._apply_detection()
+        self.iface.messageBar().pushInfo(
+            "Landslide", "Example loaded: the 8 August 2026 landslide on Iliamna "
+            "Volcano. Next: the Sentinel-2 / Landsat tab → Search.")
 
     def _render_detection(self, warn=None):
         """Echo the record back — above all the LOCAL time.
@@ -644,19 +909,12 @@ class LandslideDock(QgsDockWidget):
                 self.det_summary.setText(
                     self.det_summary.text() + "<br>" + status_html("warn", w))
             return
+        from .detection import radius_summary
         lines = ["<b>" + (det.event_id or "Detection") + "</b>"]
         if det.origin_utc:
             lines.append(f"{det.origin_utc:%Y-%m-%d %H:%M:%S} UTC   =   {det.local_str()}")
-        pos = f"{det.lat:.4f}, {det.lon:.4f}"
-        if det.loc_error_km:
-            pos += f"  ± {det.loc_error_km:g} km"
-        lines.append(pos)
-        v = det.vol_str()
-        if v:
-            lines.append(f"Seismic volume {v}")
-        r = det.suggested_radius_km()
-        lines.append(f"<b>Search radius suggested: {r:g} km</b>"
-                     + ("" if det.loc_error_km else " (no location error entered)"))
+        lines.append(f"{det.lat:.4f}, {det.lon:.4f}")
+        lines.append(f"<b>Search radius: {radius_summary()}</b>")
         html = "<br>".join(lines)
         for w in (warn or []):
             html += "<br>" + status_html("warn", w)
@@ -669,9 +927,9 @@ class LandslideDock(QgsDockWidget):
         """Push the record into every tab that has its own event fields.
 
         The four tabs keep independent lat/lon/time widgets and nothing syncs
-        them, so this is the one place that makes them agree. The radius is set
-        from the LOCATION ERROR, not left at the 5 km default: at 17 km of error
-        a 5 km radius covers about a twelfth of the ground the scar could be on."""
+        them, so this is the one place that makes them agree. Each tab's radius
+        comes from SEARCH_RADIUS_KM rather than staying at its 5 km default."""
+        from .detection import SEARCH_RADIUS_KM, radius_summary
         det = getattr(self, "detection", None)
         if det is None:
             self._warn("Read a detection record first.")
@@ -679,24 +937,24 @@ class LandslideDock(QgsDockWidget):
         if not det.is_locatable():
             self._warn("That record has no usable latitude/longitude.")
             return
-        radius = det.suggested_radius_km()
         when = None
         if det.origin_utc:
             when = QDateTime.fromString(
                 det.origin_utc.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
-        targets = [self]
-        for name in ("planet_tab", "sar_tab", "viewer3d_tab"):
+        targets = [(self, "sentinel2")]
+        for name, key in (("planet_tab", "planet"), ("gegd_tab", "maxar"),
+                          ("sar_tab", "sar"), ("viewer3d_tab", "viewer3d")):
             t = getattr(self, name, None)
             if t is not None:
-                targets.append(t)
+                targets.append((t, key))
         touched = 0
-        for t in targets:
+        for t, key in targets:
             try:
                 if hasattr(t, "lat_edit"):
                     t.lat_edit.setText(f"{det.lat:.6f}")
                     t.lon_edit.setText(f"{det.lon:.6f}")
                 if hasattr(t, "radius_spin"):
-                    t.radius_spin.setValue(radius)
+                    t.radius_spin.setValue(SEARCH_RADIUS_KM[key])
                 if when is not None and when.isValid() and hasattr(t, "dt_edit"):
                     t.dt_edit.setDateTime(when)
                 touched += 1
@@ -704,9 +962,8 @@ class LandslideDock(QgsDockWidget):
                 continue
         self.iface.messageBar().pushInfo(
             "Detection", f"{det.event_id or 'Detection'} applied to {touched} tabs — "
-            f"search radius {radius:g} km"
-            + (f" (location error {det.loc_error_km:g} km)" if det.loc_error_km else ""))
-        self._append_log(f"Detection applied to {touched} tabs; radius {radius:g} km.")
+            f"search radius {radius_summary()}")
+        self._append_log(f"Detection applied to {touched} tabs; radius {radius_summary()}.")
 
     # ---------- Sentinel-2 / Landsat tab ----------
     def _build_ui(self):
@@ -723,14 +980,16 @@ class LandslideDock(QgsDockWidget):
         # No QDoubleValidator here on purpose. It rejected any string containing a
         # separator, and Qt drops a rejected paste SILENTLY — so pasting a
         # "lat, lon" pair from a detection record, a spreadsheet or a map site
-        # left the box empty with no message at all. The pair is split below and
-        # the value is validated in _collect, which can explain what is wrong.
-        self.lat_edit.textChanged.connect(self._split_pasted_pair)
+        # left the box empty with no message at all. The pair is split by
+        # coord_paste and the value is validated in _collect, which can explain
+        # what is wrong.
         form.addRow("Latitude", self.lat_edit)
 
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("e.g. -149.823317")
         form.addRow("Longitude", self.lon_edit)
+        coord_paste.link_pair(self.lat_edit, self.lon_edit,
+                              on_split=self._log_pasted_pair)
 
         # Pick the epicentre off the canvas. The docs have promised this since
         # the first release (metadata.txt, both READMEs) and it was never
@@ -794,22 +1053,6 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Days after", self._slider_row(self.post_slider, self.post_lbl))
         self._update_day_labels()
 
-        # run_single.py has accepted --seasonal since the beginning and the README
-        # calls it the fix for a winter event, but nothing in the UI could set it:
-        # the flag was reachable only from the command line. For a February event
-        # at 60 N the "before" window is dark and snow-covered, and the honest
-        # comparison is against the PREVIOUS SUMMER, not against three weeks
-        # earlier.
-        self.seasonal_check = QCheckBox(
-            "Winter event — compare against last summer instead")
-        self.seasonal_check.setToolTip(
-            "For an event in the dark, snow-covered months, use the previous "
-            "summer as the 'before' imagery so snow cover does not swamp the "
-            "change signal. Ticked automatically when the event date falls "
-            "between October and March; you can override it.")
-        self.seasonal_check.setChecked(False)
-        form.addRow("", self.seasonal_check)
-
         # Warn as soon as the date makes the run impossible or pointless, rather
         # than after a download that returns nothing.
         self.window_warn = QLabel()
@@ -863,8 +1106,9 @@ class LandslideDock(QgsDockWidget):
         # --- which review layers to export ---
         # These are OUTPUT products (renderings), not satellite acquisitions — the
         # "scene" word is reserved for the Candidate scenes table below. Each checked
-        # product is written by the run; only HONC is ticked by default, so tick the
-        # extra products you want before running. The predicted-epicentre point layer
+        # product is written by the run; HDR and dBright are ticked by default
+        # (DEFAULT_SCENES), so tick the extra products you want before running.
+        # The predicted-epicentre point layer
         # is always included. Expanded by default so the choice is visible (a primary
         # control).
         scenes_box = QgsCollapsibleGroupBox("Layers to export")
@@ -894,8 +1138,9 @@ class LandslideDock(QgsDockWidget):
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
         self.map_preview_btn.setToolTip(
-            "Render the TICKED scene(s) in Highlight Optimized Natural Color "
-            "straight onto the QGIS canvas (clipped to the AOI) — no download, no "
+            "Render the TICKED scene(s) in true colour — Sentinel-2 with the HDR "
+            "curve (shadow and snow detail both kept), Landsat in Highlight "
+            "Optimized Natural Color — straight onto the QGIS canvas (clipped to the AOI) — no download, no "
             "order. Tick the scenes you want in the table, or double-click a row to "
             "preview just that one; with nothing ticked the ★ best before & after "
             "scenes are used. Works for Sentinel-2 and Landsat; run Search / "
@@ -942,7 +1187,7 @@ class LandslideDock(QgsDockWidget):
         # --- outputs: candidate scenes (top) + run log (bottom) ---
         # A draggable splitter so the user can grow whichever pane matters now,
         # instead of the old fixed 50/50 split that left both cramped.
-        out_split = QSplitter(Qt.Vertical)
+        out_split = QSplitter(Qt.Orientation.Vertical)
 
         scenes = QWidget()
         scenes_box = QVBoxLayout(scenes)
@@ -967,11 +1212,11 @@ class LandslideDock(QgsDockWidget):
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Source", "Scene ID"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Extended, like the PlanetScope tab: select one scene to isolate its
         # footprint and browse image, Ctrl/Shift-click to compare several.
-        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
@@ -993,7 +1238,7 @@ class LandslideDock(QgsDockWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.gallery_scroll.setWidget(self.gallery_inner)
         g_layout.addWidget(self.gallery_scroll, 1)
         out_split.addWidget(gallerybox)
@@ -1006,7 +1251,7 @@ class LandslideDock(QgsDockWidget):
         previewbox.setCollapsed(True)
         pv_layout = QVBoxLayout(previewbox)
         self.preview = QLabel("Select a scene to preview its browse image.")
-        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
         pv_layout.addWidget(self.preview, 1)
@@ -1067,7 +1312,7 @@ class LandslideDock(QgsDockWidget):
         form.addRow("Username", self.ed_user_edit)
 
         self.ed_pass_edit = QLineEdit()
-        self.ed_pass_edit.setEchoMode(QLineEdit.Password)
+        self.ed_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.ed_pass_edit.setPlaceholderText("NASA Earthdata password")
         self.ed_pass_edit.returnPressed.connect(self._earthdata_login)
         form.addRow("Password", self.ed_pass_edit)
@@ -1121,10 +1366,10 @@ class LandslideDock(QgsDockWidget):
             return
         self._ed_reply = None
         self.ed_login_btn.setEnabled(True)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         err = reply.error()
         reply.deleteLater()
-        if err == QNetworkReply.NoError and status == 200:
+        if err == QNetworkReply.NetworkError.NoError and status == 200:
             try:
                 self._earthdata_save_netrc(user, password)
             except OSError as e:
@@ -1202,7 +1447,7 @@ class LandslideDock(QgsDockWidget):
                 "~/.netrc exists but has no NASA Earthdata entry.", "warn")
 
     def _day_slider(self, value):
-        s = QSlider(Qt.Horizontal)
+        s = QSlider(Qt.Orientation.Horizontal)
         s.setRange(1, 365)
         s.setValue(value)
         return s, QLabel()
@@ -1221,17 +1466,17 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- path pickers ----------
     def _pick_python(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Select venv python")
+        p, _ = QFileDialog.getOpenFileName(self, "Python for the imagery tools")
         if p:
             self.python_edit.setText(p)
 
     def _pick_project(self):
-        p = QFileDialog.getExistingDirectory(self, "Select project dir")
+        p = QFileDialog.getExistingDirectory(self, "Folder with the imagery tools")
         if p:
             self.project_edit.setText(p)
 
     def _pick_out(self):
-        p = QFileDialog.getExistingDirectory(self, "Select output dir")
+        p = QFileDialog.getExistingDirectory(self, "Results folder for unsaved projects")
         if p:
             self.out_edit.setText(p)
 
@@ -1240,8 +1485,8 @@ class LandslideDock(QgsDockWidget):
 
         Two cases actually bite. The event time defaults to NOW, so an untouched
         form asks for imagery from the future and comes back empty with no
-        explanation. And a winter event at these latitudes needs the seasonal
-        comparison, which the analyst has no way of knowing to tick."""
+        explanation. And a winter event at these latitudes gets dark,
+        snow-covered optical imagery, which is worth saying up front."""
         from datetime import datetime, timedelta
         msgs = []
         try:
@@ -1265,39 +1510,14 @@ class LandslideDock(QgsDockWidget):
             lat = 0.0
         if when.month in (10, 11, 12, 1, 2, 3) and lat >= 55.0:
             msgs.append("A winter event this far north: optical imagery will be "
-                        "dark and snow-covered. Tick the winter box above, and "
-                        "consider the SAR tab, which sees through cloud and "
-                        "darkness.")
-            if not self.seasonal_check.isChecked() and not getattr(
-                    self, "_seasonal_touched", False):
-                self.seasonal_check.setChecked(True)
-                self._seasonal_touched = True
+                        "dark and snow-covered. Consider the SAR tab, which "
+                        "sees through cloud and darkness.")
         self.window_warn.setText("  ".join(msgs))
         self.window_warn.setVisible(bool(msgs))
 
     # ---------- picking the epicentre off the canvas ----------
-    def _split_pasted_pair(self, text):
-        """Accept a whole 'lat, lon' pair pasted into the Latitude box.
-
-        Coordinates travel as a pair everywhere the analyst gets them, so
-        requiring two separate paste actions (and silently discarding the pair if
-        they try one) is friction for nothing."""
-        t = (text or "").strip()
-        if not t or not any(c in t for c in ",;\t"):
-            return
-        parts = [p for p in re.split(r"[,;\t]+", t) if p.strip()]
-        if len(parts) != 2:
-            return
-        try:
-            lat, lon = float(parts[0].strip()), float(parts[1].strip())
-        except ValueError:
-            return
-        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            return
-        self.lat_edit.blockSignals(True)          # avoid re-entering on setText
-        self.lat_edit.setText(f"{lat:.6f}")
-        self.lat_edit.blockSignals(False)
-        self.lon_edit.setText(f"{lon:.6f}")
+    def _log_pasted_pair(self, lat, lon):
+        """coord_paste split a pasted 'lat, lon' pair across the two boxes."""
         self._append_log(f"Pasted coordinate pair split: {lat:.6f}, {lon:.6f}")
 
 
@@ -1391,15 +1611,13 @@ class LandslideDock(QgsDockWidget):
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             self._warn("Latitude must be -90..90 and longitude -180..180.")
             return None
-        python = self.python_edit.text().strip()
-        project = self.project_edit.text().strip()
-        out = self.out_edit.text().strip() or os.path.join(project, "out", "interactive")
-        script = os.path.join(project, "run_single.py")
-        # One shared, actionable refusal that opens the Environment box and marks
-        # the offending field, instead of two dead-end strings naming a "venv".
-        if not self.env_gate():
+        out = self.results_dir()        # this project's folder once it's saved
+        # One shared, actionable refusal that opens the Setup box, instead of
+        # dead-end strings naming a "venv".
+        launch = self.pipeline_launch()
+        if launch is None:
             return None
-        self._save_settings()
+        python, script, project = launch
         os.makedirs(out, exist_ok=True)
 
         when = self.dt_edit.dateTime().toString("yyyy-MM-dd HH:mm")
@@ -1428,8 +1646,6 @@ class LandslideDock(QgsDockWidget):
         det = getattr(self, "detection", None)
         if det is not None and det.event_id:
             args += ["--event-id", det.event_id]
-        if self.seasonal_check.isChecked():
-            args += ["--seasonal"]
         return python, script, project, out, args
 
     def _busy(self, on):
@@ -1459,11 +1675,11 @@ class LandslideDock(QgsDockWidget):
         sources = set()
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell is None or cell.checkState() != Qt.Checked:
+            if cell is None or cell.checkState() != Qt.CheckState.Checked:
                 continue
-            source = cell.data(Qt.UserRole + 1)
-            cid = cell.data(Qt.UserRole + 2)
-            side = cell.data(Qt.UserRole + 3)
+            source = cell.data(Qt.ItemDataRole.UserRole + 1)
+            cid = cell.data(Qt.ItemDataRole.UserRole + 2)
+            side = cell.data(Qt.ItemDataRole.UserRole + 3)
             if source not in STREAMABLE or not cid or side not in picked:
                 continue   # PlanetScope / id-less rows aren't hand-pickable
             picked[side].append(cid)
@@ -1629,6 +1845,7 @@ class LandslideDock(QgsDockWidget):
         rows = [("pre", c) for c in pre] + [("post", c) for c in post]
         self.table.setRowCount(len(rows))
         off_point = 0                    # scenes whose footprint misses the epicentre
+        n_bad = 0                        # scenes whose pixels are corrupt (bad_data)
         for r, (side, c) in enumerate(rows):
             info = sel[side]
             cid = c.get("id")
@@ -1678,17 +1895,17 @@ class LandslideDock(QgsDockWidget):
             # stash the browse URL + source + scene id + side on the row, for the
             # preview and the manual run-selection checkbox.
             side_item = self.table.item(r, 0)
-            side_item.setData(Qt.UserRole, c.get("thumb_url"))
-            side_item.setData(Qt.UserRole + 1, c.get("source", ""))
-            side_item.setData(Qt.UserRole + 2, c.get("id"))
-            side_item.setData(Qt.UserRole + 3, side)
+            side_item.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
+            side_item.setData(Qt.ItemDataRole.UserRole + 1, c.get("source", ""))
+            side_item.setData(Qt.ItemDataRole.UserRole + 2, c.get("id"))
+            side_item.setData(Qt.ItemDataRole.UserRole + 3, side)
             # checkbox = use this scene — 'Preview on map' renders the ticked rows
             # and a Run downloads exactly them. NOTHING starts ticked: pre-ticking
             # the ★ meant a Run silently composited it alongside whatever you had
             # picked, so the only way to run one chosen scene was to notice the ★
             # and untick it. Hand-pickable for Sentinel-2 / Landsat.
-            side_item.setFlags(side_item.flags() | Qt.ItemIsUserCheckable)
-            side_item.setCheckState(Qt.Unchecked)
+            side_item.setFlags(side_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            side_item.setCheckState(Qt.CheckState.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 6).setToolTip(c["thumb_url"])
             # colour the Cloud number itself: green/amber/red by AOI cloud, grey
@@ -1777,6 +1994,27 @@ class LandslideDock(QgsDockWidget):
                     "in a nodata gap, so it is ranked last and won't be the "
                     "Preview-on-map default. It still lists in case you want the "
                     "surrounding area.")
+            bad = c.get("bad_data")
+            if bad:
+                # Corrupt pixels (see imagery.WRAPPED_DN_MAX): never ★/✓ (dropped in
+                # _rank_like_run) and not tickable — a Run on it can only fail. Its
+                # cloud % was measured on noise, so the number is replaced, not shown.
+                n_bad += 1
+                for col in range(self.table.columnCount()):
+                    it = self.table.item(r, col)
+                    if it is not None:
+                        it.setForeground(QBrush(MUTED_FG))
+                cloud_item.setText("bad data")
+                cloud_item.setForeground(QBrush(CLOUD_HEAVY))
+                cloud_item.setToolTip(bad)
+                side_item.setFlags(side_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                side_item.setData(Qt.ItemDataRole.CheckStateRole, None)    # no checkbox at all
+                side_item.setToolTip(f"✕ {bad}")
+        if n_bad:
+            self._append_log(
+                f"note: {n_bad} of {len(rows)} candidate scene(s) are corrupt on "
+                f"Planetary Computer (bands cut to 8 bits — they render black); "
+                f"they are greyed out and can't be ticked or starred.")
         if off_point:
             self._append_log(
                 f"note: {off_point} of {len(rows)} candidate scene(s) do not cover "
@@ -1817,7 +2055,13 @@ class LandslideDock(QgsDockWidget):
           4. gap_days, nearest the event last, as a final tiebreaker.
         cloud_weight / auto_window no longer reshuffle this: coverage of the point
         and the area is what makes a review scene usable, so it leads regardless of
-        which Run mode produced the candidates."""
+        which Run mode produced the candidates.
+
+        A scene flagged bad_data (corrupt pixels, see imagery.WRAPPED_DN_MAX) is left
+        out entirely, so it can never be the ★, a ✓ or the Preview-on-map default —
+        its cloud % was read off noise and once came out 0%, winning the ★."""
+        cands = [c for c in cands if not c.get("bad_data")]
+
         def covers(c):
             return 0 if self._covers_event(c) else 1        # point-covering first
 
@@ -1880,8 +2124,8 @@ class LandslideDock(QgsDockWidget):
         if not cell:
             return
         primary = self._scene_preview_url(cell)
-        baked = cell.data(Qt.UserRole)
-        baked = self._auth_thumb_url(baked, cell.data(Qt.UserRole + 1)) if baked else None
+        baked = cell.data(Qt.ItemDataRole.UserRole)
+        baked = self._auth_thumb_url(baked, cell.data(Qt.ItemDataRole.UserRole + 1)) if baked else None
         url = primary or baked
         if not url:
             self._preview_pix = None
@@ -1895,34 +2139,80 @@ class LandslideDock(QgsDockWidget):
     def _preview_url_for(self, source, item_id, thumb_url, max_size=1024):
         """Browse-image URL for a scene, shared by the table preview and the gallery.
 
-        Sentinel-2 / Landsat: a data-API Highlight Optimized Natural Color render
-        from the raw SR bands (so ice keeps its texture instead of a 'visual' TCI's
-        blown-out white, and no SAS signing is needed). PlanetScope (and anything
-        with no data-API render): its baked rendered_preview/thumbnail, signed for
-        Planet. The colour_formula is percent-encoded once in HIGHLIGHT_RENDER, so
-        the query is appended verbatim here."""
+        Sentinel-2: the raw SR bands as a GeoTIFF, tone-mapped locally with the HDR
+        curve when it lands (see _pixmap_from). Landsat: a data-API Highlight
+        Optimized Natural Color PNG. Either way ice keeps its texture instead of a
+        'visual' TCI's blown-out white, and no SAS signing is needed. PlanetScope
+        (and anything with no data-API render): its baked rendered_preview/thumbnail,
+        signed for Planet."""
         cfg = HIGHLIGHT_RENDER.get(source)
         if cfg and item_id:
-            return (f"{PC_DATA_URL}/item/preview.png?collection={cfg['collection']}"
+            ext = "tif" if cfg.get("hdr") else "png"
+            return (f"{PC_DATA_URL}/item/preview.{ext}?collection={cfg['collection']}"
                     f"&item={item_id}&{cfg['query']}&max_size={max_size}")
         return self._auth_thumb_url(thumb_url, source) if thumb_url else None
 
     def _scene_preview_url(self, cell):
         """Browse-image URL for the selected table row's scene (large preview)."""
-        return self._preview_url_for(cell.data(Qt.UserRole + 1),
-                                     cell.data(Qt.UserRole + 2),
-                                     cell.data(Qt.UserRole), max_size=1024)
+        return self._preview_url_for(cell.data(Qt.ItemDataRole.UserRole + 1),
+                                     cell.data(Qt.ItemDataRole.UserRole + 2),
+                                     cell.data(Qt.ItemDataRole.UserRole), max_size=1024)
 
     def _auth_thumb_url(self, url, source):
         # Planet browse PNGs need the API key; STAC rendered previews are public.
-        # Prefer the stored (account/pasted) key over the ambient PL_API_KEY env var,
-        # matching the PlanetScope tab so a signed-in account outranks a stray env key.
+        # Ask the PlanetScope tab, which owns the key and where it is saved: its
+        # account/pasted key outranks a stray PL_API_KEY env var, as it does there.
         if source == "PlanetScope" and "api_key=" not in url:
-            key = (self.settings.value("landslide/planet_api_key", "", type=str)
-                   or os.environ.get("PL_API_KEY"))
+            tab = getattr(self, "planet_tab", None)
+            key = tab._api_key() if tab is not None else os.environ.get("PL_API_KEY")
             if key:
                 url += ("&" if "?" in url else "?") + "api_key=" + key
         return url
+
+    def _s2_offset_for(self, item_id):
+        """BOA offset (DN) for a Sentinel-2 scene in the last search, by id."""
+        info = self._candidate_by_id(item_id)
+        return hdr_render.s2_boa_offset(info[1] if info else None)
+
+    @staticmethod
+    def _read_raw_rgb(ds, offset):
+        """Reflectance (3, H, W), NaN = nodata, from a raw data-API GeoTIFF: three
+        uint16 bands plus the mask band the API appends (0 = outside the scene)."""
+        dn = ds.ReadAsArray()
+        refl = hdr_render.s2_reflectance(dn[:3], offset)
+        if dn.shape[0] >= 4:
+            refl[:, dn[3] == 0] = np.nan
+        return refl
+
+    def _pixmap_from(self, data, qurl):
+        """QPixmap for a preview/gallery reply, or None if it won't decode.
+
+        A GeoTIFF is a raw Sentinel-2 band fetch (HIGHLIGHT_RENDER 'hdr'): tone-map it
+        with the HDR curve, per-scene white anchor. Anything else is an already-
+        rendered image (Landsat PNG, Planet thumbnail) and loads as-is."""
+        raw = bytes(data)
+        if raw[:4] not in (b"II*\x00", b"MM\x00*"):
+            pix = QPixmap()
+            return pix if pix.loadFromData(data) else None
+        item_id = QUrlQuery(qurl).queryItemValue("item")
+        vsi = f"/vsimem/landslide_preview_{id(raw)}.tif"
+        try:
+            gdal.FileFromMemBuffer(vsi, raw)
+            ds = gdal.Open(vsi)
+            if ds is None or ds.RasterCount < 3:
+                return None
+            refl = self._read_raw_rgb(ds, self._s2_offset_for(item_id))
+            ds = None
+        finally:
+            gdal.Unlink(vsi)
+        white, _ = hdr_render.hdr_white([refl])
+        rgb = hdr_render.hdr_rgb(refl, white)
+        h, w = rgb.shape[1:]
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = np.moveaxis(rgb, 0, -1)
+        rgba[..., 3] = np.where(np.any(rgb > 0, axis=0), 255, 0)
+        img = QImage(rgba.tobytes(), w, h, 4 * w, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(img.copy())   # copy: detach from the bytes buffer
 
     def _fetch_preview(self, url, fallback=None):
         self._preview_pix = None
@@ -1938,11 +2228,11 @@ class LandslideDock(QgsDockWidget):
             reply.deleteLater()
             return
         self._preview_reply = None
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
-        pix = QPixmap()
-        if not ok or data.isEmpty() or not pix.loadFromData(data):
+        pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
+        if pix is None:
             fb = self._preview_fallback
             if fb:  # render URL failed — fall back to the baked thumbnail once
                 self._preview_fallback = None
@@ -1959,7 +2249,7 @@ class LandslideDock(QgsDockWidget):
             return
         self.preview.setPixmap(self._preview_pix.scaled(
             max(self.preview.width(), 1), max(self.preview.height(), 1),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2046,11 +2336,14 @@ class LandslideDock(QgsDockWidget):
             cloud = f"~{scene_cloud:.0f}%"
         else:
             cloud = "—"
+        bad = c.get("bad_data")          # corrupt pixels: no cloud % worth showing
+        if bad:
+            cloud = "bad data"
         gap = "" if c.get("gap_days") is None else f"{c['gap_days']}d"
         src = c.get("source", "")
         cid = c.get("id")
         tile = QToolButton()
-        tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
@@ -2065,6 +2358,8 @@ class LandslideDock(QgsDockWidget):
         elif snow_swamped:
             tip += (f"\n{CLOUD_SNOW_MARK} snow-swamped AOI ({aoi_snow:.0f}% "
                     f"snow/ice) — cloud % is a lower bound; judge by the thumbnail.")
+        if bad:
+            tip = f"{src}\n{cid}\n{date}\n✕ {bad}"
         tile.setToolTip(tip)
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._preview_url_for(src, cid, c.get("thumb_url"), max_size=512)
@@ -2086,11 +2381,11 @@ class LandslideDock(QgsDockWidget):
     def _gallery_thumb_loaded(self, reply, tile, fallback):
         if reply in self._gallery_replies:
             self._gallery_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = reply.readAll()
         reply.deleteLater()
-        pix = QPixmap()
-        if ok and not data.isEmpty() and pix.loadFromData(data):
+        pix = self._pixmap_from(data, reply.url()) if ok and not data.isEmpty() else None
+        if pix is not None:
             try:
                 tile.setIcon(QIcon(pix))
             except RuntimeError:
@@ -2111,7 +2406,7 @@ class LandslideDock(QgsDockWidget):
             return
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell and cell.data(Qt.UserRole + 2) == cid:
+            if cell and cell.data(Qt.ItemDataRole.UserRole + 2) == cid:
                 self.table.selectRow(r)
                 self.table.scrollToItem(cell)
                 break
@@ -2210,8 +2505,8 @@ class LandslideDock(QgsDockWidget):
         ids = set()
         for idx in self.table.selectionModel().selectedRows():
             cell = self.table.item(idx.row(), 0)
-            if cell is not None and cell.data(Qt.UserRole + 2):
-                ids.add(cell.data(Qt.UserRole + 2))
+            if cell is not None and cell.data(Qt.ItemDataRole.UserRole + 2):
+                ids.add(cell.data(Qt.ItemDataRole.UserRole + 2))
         return ids
 
     def _draw_footprints(self, log=False):
@@ -2236,11 +2531,11 @@ class LandslideDock(QgsDockWidget):
                                  f"Scene footprints — {side}", "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
-                QgsField("source", QVariant.String),
-                QgsField("scene_id", QVariant.String),
-                QgsField("date", QVariant.String),
-                QgsField("gap_days", QVariant.Int),
-                QgsField("cloud_pct", QVariant.Double),
+                QgsField("source", QMetaType.Type.QString),
+                QgsField("scene_id", QMetaType.Type.QString),
+                QgsField("date", QMetaType.Type.QString),
+                QgsField("gap_days", QMetaType.Type.Int),
+                QgsField("cloud_pct", QMetaType.Type.Double),
             ])
             lyr.updateFields()
             feats = []
@@ -2296,7 +2591,7 @@ class LandslideDock(QgsDockWidget):
                 f"Drew {added} scene footprint(s) + AOI on the map. Select rows in "
                 f"the table to show only those scenes' footprints.")
 
-    # ---------- preview on map (Highlight Optimized Natural Color AOI render) ----------
+    # ---------- preview on map (true-colour AOI render) ----------
     def _best_streamable(self, side):
         """The scene Preview-on-map would lead with on `side` ('pre'/'post').
 
@@ -2339,11 +2634,11 @@ class LandslideDock(QgsDockWidget):
         picks = []
         for r in range(self.table.rowCount()):
             cell = self.table.item(r, 0)
-            if cell is None or cell.checkState() != Qt.Checked:
+            if cell is None or cell.checkState() != Qt.CheckState.Checked:
                 continue
-            if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+            if cell.data(Qt.ItemDataRole.UserRole + 1) not in STREAMABLE:
                 continue
-            info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+            info = self._candidate_by_id(cell.data(Qt.ItemDataRole.UserRole + 2))
             if info:
                 picks.append((info[0], info[1], "ticked"))
         if not picks:                    # nothing ticked -> the run's pick per side
@@ -2392,10 +2687,10 @@ class LandslideDock(QgsDockWidget):
         cell = self.table.item(item.row(), 0)
         if cell is None:
             return
-        if cell.data(Qt.UserRole + 1) not in STREAMABLE:
+        if cell.data(Qt.ItemDataRole.UserRole + 1) not in STREAMABLE:
             self._warn("Only Sentinel-2 / Landsat scenes can be rendered on the map.")
             return
-        info = self._candidate_by_id(cell.data(Qt.UserRole + 2))
+        info = self._candidate_by_id(cell.data(Qt.ItemDataRole.UserRole + 2))
         if info:
             self._render_picks([(info[0], info[1], "double-clicked")])
 
@@ -2406,10 +2701,11 @@ class LandslideDock(QgsDockWidget):
     def _render_picks(self, picks):
         """Render [(side, candidate, why), …] onto the canvas, clipped to the AOI.
 
-        Downloads a Highlight Optimized Natural Color GeoTIFF clipped to the search
-        box from the Planetary Computer data API (raw SR bands + our stretch — no
-        'visual' TCI white-out, no SAS signing) and loads each as a georeferenced
-        raster, then zooms to the AOI. Covers the AOI box only; Sentinel-2 falls
+        Downloads a GeoTIFF clipped to the search box from the Planetary Computer
+        data API (raw SR bands + our stretch — no 'visual' TCI white-out, no SAS
+        signing): raw Sentinel-2 DN tone-mapped here with the HDR curve, or Landsat
+        rendered server-side in Highlight Optimized Natural Color. Loads each as a
+        georeferenced raster, then zooms to the AOI. Covers the AOI box only; Sentinel-2 falls
         back to the signed visual COG if the render fails (Landsat has none)."""
         bbox = self._aoi_bbox()
         if bbox is None:
@@ -2429,8 +2725,9 @@ class LandslideDock(QgsDockWidget):
             scenes.append((f"{short} {side} {date}".strip(), c["id"],
                            c.get("cog_url"), c.get("source"), why))
         self._append_log(
-            f"Preview on map: rendering Highlight Optimized Natural Color over the "
-            f"AOI for {len(scenes)} scene(s)…")
+            f"Preview on map: rendering true colour over the AOI for {len(scenes)} "
+            f"scene(s) (Sentinel-2: HDR curve; Landsat: Highlight Optimized Natural "
+            f"Color)…")
         if off_point:
             # the render still covers the AOI box, but this scene has no pixels at
             # the epicentre — say so rather than leave the user reading a nodata gap
@@ -2450,6 +2747,9 @@ class LandslideDock(QgsDockWidget):
         self._clear_preview_layers()   # replace the previous preview, don't pile up
         self._preview_failed = []
         self._tif_fallbacks = []
+        for _l, stale, _o, _c in self._hdr_raw:   # parked by an aborted batch
+            self._unlink_quiet(stale)
+        self._hdr_raw = []
         self._tif_pending = len(scenes)
         for label, item_id, cog_url, source, why in scenes:
             self._append_log(f"  {label} ({why})")
@@ -2492,7 +2792,7 @@ class LandslideDock(QgsDockWidget):
         return (lon - dlon, lat - dlat, lon + dlon, lat + dlat, radius)
 
     def _download_aoi_tif(self, label, item_id, cog_url, bbox, source):
-        """Fetch a Highlight Optimized Natural Color GeoTIFF clipped to the AOI.
+        """Fetch a true-colour (or raw Sentinel-2) GeoTIFF clipped to the AOI.
 
         Single async GET to the data API's bbox endpoint (same mechanism as the
         working scene-preview pane), using the per-source render config (collection
@@ -2512,14 +2812,18 @@ class LandslideDock(QgsDockWidget):
                f"&width={px}&height={px}")
         reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
         self._tif_replies.append(reply)
+        hdr = (self._s2_offset_for(item_id) if cfg.get("hdr") else None)
         reply.finished.connect(
-            lambda r=reply, l=label, cu=cog_url: self._tif_loaded(r, l, cu))
+            lambda r=reply, l=label, cu=cog_url, o=hdr: self._tif_loaded(r, l, cu, o))
 
-    def _tif_loaded(self, reply, label, cog_url):
+    def _tif_loaded(self, reply, label, cog_url, hdr_offset=None):
+        """One AOI download landed. A rendered image loads straight onto the map;
+        a raw Sentinel-2 fetch (`hdr_offset` not None) is parked in _hdr_raw until the
+        whole batch is in, so pre and post share one HDR white anchor."""
         if reply in self._tif_replies:
             self._tif_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NoError and status == 200
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
         data = bytes(reply.readAll())
         reply.deleteLater()
         added = False
@@ -2528,6 +2832,12 @@ class LandslideDock(QgsDockWidget):
                 fd, path = tempfile.mkstemp(suffix=".tif", prefix="landslide_preview_")
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
+                if hdr_offset is not None:
+                    self._hdr_raw.append((label, path, hdr_offset, cog_url))
+                    self._tif_pending -= 1
+                    if self._tif_pending <= 0:
+                        self._after_tif_downloads()
+                    return
                 lyr = QgsRasterLayer(path, label)
                 if lyr.isValid():
                     lg.add_to_group(lyr, "Imagery preview")
@@ -2550,7 +2860,60 @@ class LandslideDock(QgsDockWidget):
         if self._tif_pending <= 0:
             self._after_tif_downloads()
 
+    def _render_hdr_batch(self):
+        """Tone-map every parked raw Sentinel-2 AOI GeoTIFF with ONE pooled white
+        anchor (hdr_render.hdr_white over the whole batch — a per-scene anchor would
+        put a brightness step between before and after that no change on the ground
+        made) and load each onto the map. A scene that won't read degrades to the
+        signed-COG fallback like a failed download."""
+        batch, self._hdr_raw = self._hdr_raw, []
+        refls = []
+        for label, path, offset, cog_url in batch:
+            ds = gdal.Open(path)
+            if ds is None or ds.RasterCount < 3:
+                refls.append(None)
+                continue
+            refls.append((self._read_raw_rgb(ds, offset), ds.GetGeoTransform(),
+                          ds.GetProjection()))
+            ds = None
+        white, note = hdr_render.hdr_white([r[0] for r in refls if r is not None])
+        if any(r is not None for r in refls):
+            self._append_log(f"  Sentinel-2 {note} (shared by the {len(batch)} scene(s))")
+        for (label, path, _offset, cog_url), r in zip(batch, refls):
+            self._unlink_quiet(path)
+            lyr = None
+            if r is not None:
+                refl, gt, proj = r
+                rgb = hdr_render.hdr_rgb(refl, white)
+                fd, out = tempfile.mkstemp(suffix=".tif", prefix="landslide_preview_")
+                os.close(fd)
+                dst = gdal.GetDriverByName("GTiff").Create(
+                    out, rgb.shape[2], rgb.shape[1], 3, gdal.GDT_Byte,
+                    options=["COMPRESS=DEFLATE", "PHOTOMETRIC=RGB"])
+                dst.SetGeoTransform(gt)
+                dst.SetProjection(proj)
+                for b in range(3):
+                    band = dst.GetRasterBand(b + 1)
+                    band.SetNoDataValue(0)   # BEFORE WriteArray (GDAL 3.12 drops
+                    band.WriteArray(rgb[b])  # all-zero blocks otherwise)
+                dst = None
+                lyr = QgsRasterLayer(out, label)
+                if lyr.isValid():
+                    lg.add_to_group(lyr, "Imagery preview")
+                    self._preview_added.append(lyr)
+                    self._preview_tmpfiles.append(out)
+                    self._append_log(f"  loaded {label} (AOI render, HDR)")
+                    continue
+                self._unlink_quiet(out)
+            if cog_url:
+                self._tif_fallbacks.append((label, cog_url))
+            else:
+                self._preview_failed.append(label)
+                self._append_log(f"  could not render {label}")
+
     def _after_tif_downloads(self):
+        if self._hdr_raw:
+            self._render_hdr_batch()
         if self._tif_fallbacks:
             self._append_log(f"  AOI render failed for {len(self._tif_fallbacks)} "
                              f"scene(s); falling back to signed COG stream")
@@ -2572,7 +2935,7 @@ class LandslideDock(QgsDockWidget):
     def _cog_signed(self, reply, label):
         if reply in self._sign_replies:
             self._sign_replies.remove(reply)
-        ok = reply.error() == QNetworkReply.NoError
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
         data = bytes(reply.readAll())
         reply.deleteLater()
         href = None
@@ -2622,8 +2985,8 @@ class LandslideDock(QgsDockWidget):
         if self._preview_added:
             self._zoom_to_aoi()
             n = len(self._preview_added)
-            msg = (f"Loaded {n} scene(s) over the AOI (Highlight Optimized Natural "
-                   f"Color). Toggle the layers to compare before vs after.")
+            msg = (f"Loaded {n} scene(s) over the AOI (true colour). Toggle the "
+                   f"layers to compare before vs after.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("Landslide", msg)
@@ -2810,7 +3173,7 @@ class LandslideDock(QgsDockWidget):
             c = QColor(color)
             c.setAlpha(alpha)
             items.append(QgsColorRampShader.ColorRampItem(value, c, text))
-        fn = QgsColorRampShader(lo, 0.0, None, QgsColorRampShader.Interpolated)
+        fn = QgsColorRampShader(lo, 0.0, None, Qgis.ShaderInterpolationMethod.Linear)
         fn.setColorRampItemList(items)
         shader = QgsRasterShader()
         shader.setRasterShaderFunction(fn)
@@ -2941,7 +3304,8 @@ class LandslideDock(QgsDockWidget):
         self.iface.messageBar().pushWarning("Landslide", text.replace("\n", " "))
         self._append_log(text)
 
-    def _save_settings(self):
+    def _save_settings(self, *_):
+        # On every edit: the paths live only here, not in the project (project_state)
         self.settings.setValue("landslide/python", self.python_edit.text().strip())
         self.settings.setValue("landslide/project", self.project_edit.text().strip())
         self.settings.setValue("landslide/out", self.out_edit.text().strip())
@@ -2966,6 +3330,12 @@ class LandslideDock(QgsDockWidget):
                 except TypeError:
                     pass
             self.project_state = None
+        for signal, slot in getattr(self, "_results_signals", ()):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
+        self._results_signals = ()
         for attr in ("_preview_reply", "_ed_reply"):
             reply = getattr(self, attr, None)
             if reply is not None:
@@ -2986,6 +3356,8 @@ class LandslideDock(QgsDockWidget):
             self.task.cancel()
         if getattr(self, "planet_tab", None) is not None:
             self.planet_tab.teardown()
+        if getattr(self, "gegd_tab", None) is not None:
+            self.gegd_tab.teardown()
         if getattr(self, "sar_tab", None) is not None:
             self.sar_tab.teardown()
         if getattr(self, "fusion_tab", None) is not None:

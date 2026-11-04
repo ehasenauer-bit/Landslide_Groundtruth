@@ -1,5 +1,5 @@
 """Elevation-change volumes must carry an uncertainty, a coverage fraction, and
-a bias correction — the three things an imported MOSART Δh needs to be trusted.
+a bias correction — the three things an imported Δh needs to be trusted.
 
 Run with tests/run_all.sh, or directly with QGIS's bundled python:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_dh_uncertainty.py
@@ -62,7 +62,7 @@ print(f"   coverage {r['coverage_frac']:.3f}   net {r['v_net']:,.0f}")
 assert abs(abs(r["v_erosion"]) - TRUE_EROSION) / TRUE_EROSION < 0.02
 assert abs(r["coverage_frac"] - 1.0) < 0.05
 
-print("\n=== 2. THE MOSART CASE: a 0.5 m DC bias is pure signal without a fix ===")
+print("\n=== 2. THE IMPORTED-Δh CASE: a 0.5 m DC bias is pure signal without a fix ===")
 p = write_dh(scar_field(bias=0.5), os.path.join(tmp, "biased.tif"))
 raw = D.integrate_dh(p, OUTLINE, EPSG, BOUNDS, RES, outline_area_m2=OUTLINE_AREA)
 err = abs(abs(raw["v_erosion"]) - TRUE_EROSION)

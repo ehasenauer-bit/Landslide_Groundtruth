@@ -1,0 +1,508 @@
+"""NISAR GCOV window reads land on the SAR tab's AOI grid, in the right place
+(nisar_read.py — the QGIS half).
+
+Run with tests/run_all.sh, or directly with QGIS's bundled python:
+    /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_nisar_read.py
+
+No network: a SYNTHETIC GCOV-shaped file is written with GDAL's netCDF driver
+(netCDF-4 is HDF5) and opened with the HDF5 multidimensional driver — the same
+code path that reads the real 6 GB granule remotely. It mirrors the real
+layout measured on the Iliamna granule (2026-10-19): /science/LSAR/GCOV/grids/
+frequencyA/{HHHH, HVHV, mask, xCoordinates, yCoordinates, projection@epsg_code},
+pixel-centre coordinates, EPSG:3413 at 60N.
+
+What it protects:
+  * georeferencing rebuilt from the coordinate arrays — a half-pixel slip or a
+    flipped axis puts a scar in the wrong place on the map;
+  * the AOI grid is exactly the Planetary Computer render's, so a NISAR scene
+    and a Sentinel-1 scene of one AOI line up pixel for pixel;
+  * the product's own subswath mask (0 and 255) becomes NaN, not dark ground;
+  * the look geometry for the layover fade / terrain masks comes from the
+    granule's radarGrid cube: LOS read as local east/north (NOT the 3413 grid's
+    axes, ~108 deg apart here), bilinear at the AOI centre on the 2 km layer,
+    refused when it contradicts lookDirection, and cached with the window;
+  * the display stretch matches the Sentinel-1 one, with 0 kept for nodata;
+  * the raw-float output is what sar_change.read_band expects.
+"""
+import math
+import os
+import shutil
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = os.path.join(ROOT, "qgis_plugin")
+sys.path.insert(0, PKG)
+
+import numpy as np  # noqa: E402
+from osgeo import gdal, osr  # noqa: E402
+from landslide_groundtruth import nisar_read as nr  # noqa: E402
+from landslide_groundtruth import sar_change as sc  # noqa: E402
+
+OK = FAIL = 0
+
+
+def check(msg, cond):
+    global OK, FAIL
+    if cond:
+        OK += 1
+        print(f"  ok   {msg}")
+    else:
+        FAIL += 1
+        print(f"  FAIL {msg}")
+
+
+TMP = tempfile.mkdtemp(prefix="test_nisar_read_")
+LAT, LON = 60.0, -153.0
+N, RES = 600, 10.0                       # 6 km of 10 m grid around the point
+
+
+def to3413(lon, lat):
+    s4326, s3413 = osr.SpatialReference(), osr.SpatialReference()
+    s4326.ImportFromEPSG(4326)
+    s3413.ImportFromEPSG(3413)
+    for s in (s4326, s3413):
+        s.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    x, y, _ = osr.CoordinateTransformation(s4326, s3413).TransformPoint(lon, lat)
+    return x, y
+
+
+CX, CY = to3413(LON, LAT)
+# pixel CENTRES, north-up: y decreasing, as in the real granule
+XS = CX - N / 2 * RES + RES / 2 + np.arange(N) * RES
+YS = CY + N / 2 * RES - RES / 2 - np.arange(N) * RES
+# A bright 300 m square whose CENTRE is the event point, on a -10 dB background,
+# a masked-invalid strip (mask 0) on the west, fill (255) on the north edge,
+# and a NaN hole.
+HH = np.full((N, N), 0.1, np.float32)
+HH[285:315, 285:315] = 1.0
+HH[500:520, 500:520] = np.nan
+MASK = np.ones((N, N), np.uint8)
+MASK[:, :200] = 0                       # 2 km wide: reaches into the rotated AOI
+MASK[:20, :] = 255
+
+# The radarGrid look-geometry cube, shaped like the real one (heights x y x x on
+# the granule's EPSG grid, 500 m spacing, y decreasing). Its nodes are offset
+# from the AOI centre (170 m east, 120 m south of a node), so only a true
+# bilinear read lands on the field's centre value. The LOS is ENU, target ->
+# sensor, for the Iliamna track-150 geometry measured 2026-10-19: looks 241.4
+# deg (WSW), along-track 331.4 deg, i.e. LEFT-looking on an ascending pass.
+LOOK, ALONG = 241.4, 331.4
+RG_X = CX - 3000.0 + 170.0 + np.arange(13) * 500.0
+RG_Y = CY + 3000.0 - 120.0 - np.arange(13) * 500.0
+RG_H = np.array([-1000.0, 0.0, 2000.0, 4000.0, 9000.0])
+_hh, _yy, _xx = np.meshgrid(RG_H, RG_Y, RG_X, indexing="ij")
+# incidence varies across the cube in x, y AND height: at the AOI centre on
+# the 2 km layer it is 45 + 0.5 x 2 = 46.0 exactly; a nearest-node read is 0.2
+# deg off, the 0 m layer 1.0 deg, and an average over every layer 0.4 deg
+RG_INC = (45.0 + 0.002 * (_xx - CX) + 0.001 * (_yy - CY)
+          + 0.5 * _hh / 1000.0).astype(np.float32)
+WANT_INC = 46.0
+
+
+def build(path, radar_grid=True, look_dir="Left", los_sign=1.0):
+    with gdal.ExceptionMgr(useExceptions=True):
+        ds = gdal.GetDriverByName("netCDF").CreateMultiDimensional(path)
+        science = ds.GetRootGroup().CreateGroup("science")
+        lsar = science.CreateGroup("LSAR")
+        gcov = lsar.CreateGroup("GCOV")
+        g = gcov.CreateGroup("grids").CreateGroup("frequencyA")
+        dy = g.CreateDimension("yCoordinates", None, None, N)
+        dx = g.CreateDimension("xCoordinates", None, None, N)
+        f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
+        f32 = gdal.ExtendedDataType.Create(gdal.GDT_Float32)
+        u8 = gdal.ExtendedDataType.Create(gdal.GDT_Byte)
+        i32 = gdal.ExtendedDataType.Create(gdal.GDT_Int32)
+        g.CreateMDArray("xCoordinates", [dx], f64).Write(XS)
+        g.CreateMDArray("yCoordinates", [dy], f64).Write(YS)
+        g.CreateMDArray("HHHH", [dy, dx], f32).Write(HH)
+        g.CreateMDArray("HVHV", [dy, dx], f32).Write(HH * 0.1)
+        g.CreateMDArray("mask", [dy, dx], u8).Write(MASK)
+        pr = g.CreateMDArray("projection", [], i32)
+        pr.Write(np.array(3413, dtype=np.int32))
+        pr.CreateAttribute("epsg_code", [], i32).Write(3413)
+        ident = lsar.CreateGroup("identification")
+        sd = gdal.ExtendedDataType.CreateString()
+        try:
+            ident.CreateMDArray("lookDirection", [], sd).Write([look_dir])
+        except Exception:                    # noqa: BLE001 — metadata is a bonus
+            pass
+        if not radar_grid:
+            return
+        rg = gcov.CreateGroup("metadata").CreateGroup("radarGrid")
+        dh = rg.CreateDimension("heightAboveEllipsoid", None, None, RG_H.size)
+        ry = rg.CreateDimension("yCoordinates", None, None, RG_Y.size)
+        rx = rg.CreateDimension("xCoordinates", None, None, RG_X.size)
+        rg.CreateMDArray("xCoordinates", [rx], f64).Write(RG_X)
+        rg.CreateMDArray("yCoordinates", [ry], f64).Write(RG_Y)
+        rg.CreateMDArray("heightAboveEllipsoid", [dh], f64).Write(RG_H)
+        s_inc = np.sin(np.radians(RG_INC))
+        a = np.radians(LOOK)
+        cube = {"incidenceAngle": RG_INC,
+                # target -> sensor: the horizontal part points BACK along the look
+                "losUnitVectorX": los_sign * -np.sin(a) * s_inc,
+                "losUnitVectorY": los_sign * -np.cos(a) * s_inc,
+                "alongTrackUnitVectorX": np.full(RG_INC.shape, np.sin(np.radians(ALONG))),
+                "alongTrackUnitVectorY": np.full(RG_INC.shape, np.cos(np.radians(ALONG)))}
+        for name, v in cube.items():
+            rg.CreateMDArray(name, [dh, ry, rx], f32).Write(v.astype(np.float32))
+        rp = rg.CreateMDArray("projection", [], i32)
+        rp.Write(np.array(3413, dtype=np.int32))
+        rp.CreateAttribute("epsg_code", [], i32).Write(3413)
+
+
+SRC = os.path.join(TMP, "synthetic_gcov.nc")
+build(SRC)
+
+
+def aoi(radius_km):
+    """The SAR tab's _aoi_bbox, without the radius."""
+    dlat = radius_km / 111.32
+    dlon = radius_km / (111.32 * math.cos(math.radians(LAT)))
+    return (LON - dlon, LAT - dlat, LON + dlon, LAT + dlat)
+
+
+print("=== georeferencing from pixel-centre coordinates ===")
+gt = nr.grid_geotransform(XS, YS)
+check("corner is half a pixel out from the first centre",
+      abs(gt[0] - (XS[0] - 5.0)) < 1e-6 and abs(gt[3] - (YS[0] + 5.0)) < 1e-6)
+check("north-up: +10 m east, -10 m north", gt[1] == 10.0 and gt[5] == -10.0)
+check("'hh' -> HHHH, 'hv' -> HVHV",
+      nr.covariance_term("hh") == "HHHH" and nr.covariance_term("HV") == "HVHV")
+
+print("\n=== a window lands on the AOI grid ===")
+bbox, px = aoi(2.0), 200
+out, ogt, wkt, info = nr.read_aoi(SRC, "hh", bbox, px)
+want = nr.aoi_geotransform(bbox, px)
+check("px x px", out.shape == (px, px))
+check("geotransform == the Planetary Computer render's grid",
+      all(abs(a - b) < 1e-9 for a, b in zip(ogt, want)))
+srs = osr.SpatialReference(wkt=wkt)
+check("EPSG:4326", srs.GetAuthorityCode(None) == "4326")
+check("granule CRS read from the file, not assumed", info["epsg"] == 3413)
+check("look direction read when present", info["look"] in ("Left", None))
+r = c = px // 2                           # the AOI centre is the event point
+check("the bright square sits at the event point (AOI centre)",
+      abs(float(np.nanmean(out[r - 3:r + 4, c - 3:c + 4])) - 1.0) < 0.05)
+check("background reads -10 dB (0.1 linear)",
+      abs(float(np.nanmedian(out)) - 0.1) < 1e-3)
+
+print("\n=== validity: the product's mask, NaN, non-positive ===")
+big = aoi(2.0)
+o2, g2, _w, i2 = nr.read_aoi(SRC, "hh", big, 400)
+
+
+def at_grid(row, col):
+    """The AOI-grid value at a granule pixel — found through the real transform:
+    EPSG:3413 at 153W is rotated ~108 deg from north, so 'west strip of the
+    granule' is not the AOI's west edge."""
+    s3413, s4326 = osr.SpatialReference(), osr.SpatialReference()
+    s3413.ImportFromEPSG(3413)
+    s4326.ImportFromEPSG(4326)
+    for s_ in (s3413, s4326):
+        s_.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    lon, lat, _ = osr.CoordinateTransformation(s3413, s4326).TransformPoint(
+        float(XS[col]), float(YS[row]))
+    c = int((lon - g2[0]) / g2[1])
+    r = int((lat - g2[3]) / g2[5])
+    if 0 <= r < o2.shape[0] and 0 <= c < o2.shape[1]:
+        return o2[r, c]
+    return None
+
+
+inside = [at_grid(r, c) for r in range(150, 450, 30) for c in (150, 180)]
+inside = [v for v in inside if v is not None]
+check("pixels inside the mask-0 strip sampled", len(inside) >= 3)
+check("  mask 0 (partially focused) -> NaN, not dark ground",
+      all(np.isnan(v) for v in inside))
+ok_side = [at_grid(r, c) for r in range(150, 450, 30) for c in (230, 260)]
+ok_side = [v for v in ok_side if v is not None]
+check("  just outside the strip -> valid -10 dB",
+      ok_side and all(abs(v - 0.1) < 1e-3 for v in ok_side))
+hole = at_grid(510, 510)
+check("a NaN in the product stays NaN", hole is None or np.isnan(hole))
+check("valid fraction reported below 1", i2["valid_frac"] < 1.0)
+
+print("\n=== the look geometry comes from the granule's own radarGrid ===")
+# NISAR looks LEFT, so the SAR tab's Sentinel-1 orbit model would put layover on
+# the opposite slopes; the fade and the merge masks use these numbers instead.
+check("look direction 'Left' read from identification", info["look"] == "Left")
+az = info["look_azimuth_deg"]
+check(f"look azimuth {az}: the LOS read as local EAST/NORTH, turned around "
+      f"(want {LOOK})", az is not None and abs(az - LOOK) < 0.05)
+# the trap: the cube sits on the EPSG:3413 grid, which at 153 W is rotated
+# ~108 deg from north — reading the LOS as grid components would put the look
+# here instead, and the layover on slopes facing the wrong way entirely
+s3413, s4326 = osr.SpatialReference(), osr.SpatialReference()
+s3413.ImportFromEPSG(3413)
+s4326.ImportFromEPSG(4326)
+for s_ in (s3413, s4326):
+    s_.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+_ct = osr.CoordinateTransformation(s3413, s4326)
+_e = -math.sin(math.radians(LOOK + 180.0)) * 1000.0
+_n = -math.cos(math.radians(LOOK + 180.0)) * 1000.0
+_l0, _p0, _ = _ct.TransformPoint(CX, CY)
+_l1, _p1, _ = _ct.TransformPoint(CX + _e, CY + _n)
+grid_reading = math.degrees(math.atan2(
+    (_l1 - _l0) * math.cos(math.radians(_p0)), _p1 - _p0)) % 360.0
+check(f"  and NOT as grid components ({grid_reading:.0f} deg: 3413 is rotated "
+      f"~108 deg here)", az is not None and abs((az - grid_reading + 180) % 360 - 180) > 90)
+inc = info["incidence_deg"]
+check(f"incidence {inc}: bilinear at the AOI centre, on the 2 km layer only "
+      f"(want {WANT_INC})", inc is not None and abs(inc - WANT_INC) < 0.01)
+check("the note says where it came from and which way it looks",
+      "radarGrid" in (info["geometry_note"] or "")
+      and "Left-looking" in (info["geometry_note"] or ""))
+with gdal.ExceptionMgr(useExceptions=True):
+    _ds = gdal.OpenEx(SRC, gdal.OF_MULTIDIM_RASTER, allowed_drivers=["HDF5"])
+    _root = _ds.GetRootGroup()
+    with nr._HDF5_LOCK:
+        far = nr.look_geometry(_root, (10.0, 10.0, 10.1, 10.1), "Left", 3413)
+    del _root, _ds
+check("an AOI centre off the cube -> no geometry, said so",
+      far[0] is None and "outside" in far[2])
+
+NOGEOM = os.path.join(TMP, "synthetic_gcov_no_radargrid.nc")
+build(NOGEOM, radar_grid=False)
+o5, _g5, _w5, i5 = nr.read_aoi(NOGEOM, "hh", bbox, px)
+check("a granule without a radarGrid: no geometry, the reason given",
+      i5["look_azimuth_deg"] is None and i5["incidence_deg"] is None
+      and "radarGrid" in (i5["geometry_note"] or ""))
+check("  and the pixels still read (geometry never fails the read)",
+      o5.shape == (px, px) and np.isfinite(o5).any())
+
+FLIP = os.path.join(TMP, "synthetic_gcov_flipped_los.nc")
+build(FLIP, los_sign=-1.0)                # LOS stored sensor -> target
+i6 = nr.read_aoi(FLIP, "hh", bbox, px)[3]
+check("an LOS that contradicts lookDirection (sensor->target convention) is "
+      f"refused, not trusted: {i6['geometry_note']}",
+      i6["look_azimuth_deg"] is None and "Right" in (i6["geometry_note"] or ""))
+
+print("\n=== cache: one remote read per granule/pol/AOI ===")
+cache = os.path.join(TMP, "cache")
+logs = []
+a1, *_ = nr.read_aoi(SRC, "hh", bbox, 120, cache_dir=cache, log=logs.append)
+a2, _g2, _w2, ic = nr.read_aoi(SRC, "hh", bbox, 120, cache_dir=cache, log=logs.append)
+check("second read comes from the cache", any("cached window" in m for m in logs))
+check("  and is the same pixels", np.allclose(a1, a2, equal_nan=True))
+check("  and carries the same look geometry, exactly",
+      ic["look_azimuth_deg"] == info["look_azimuth_deg"]
+      and ic["incidence_deg"] == info["incidence_deg"]
+      and ic["geometry_note"] == info["geometry_note"])
+# the key the cache used before the look geometry existed: a window stored
+# under it has no geometry metadata, and finding it would answer "no geometry"
+# for that scene forever, so the new key must never collide with it
+import hashlib  # noqa: E402
+_legacy = "|".join([os.path.basename(SRC), "hh", ",".join(f"{v:.5f}" for v in bbox),
+                    str(nr.MAX_SIDE)])
+_legacy = os.path.join(cache, hashlib.sha1(_legacy.encode()).hexdigest()[:20] + ".tif")
+check("  under a new key: a window cached before the geometry existed is "
+      "re-read, not trusted to have none",
+      nr._cache_path(cache, SRC, "hh", bbox, nr.MAX_SIDE) != _legacy)
+a3, *_ = nr.read_aoi(SRC, "hh", bbox, 60, cache_dir=cache, log=logs.append)
+check("  a new Pixel size reuses the cached window too",
+      a3.shape == (60, 60) and sum("cached window" in m for m in logs) == 2)
+hv, *_ = nr.read_aoi(SRC, "hv", bbox, 120, cache_dir=cache)
+check("another polarization is its own read",
+      abs(float(np.nanmedian(hv)) - 0.01) < 1e-3)
+
+print("\n=== big AOIs are read strided, still onto the full grid ===")
+nat = nr.read_native(SRC, "hh", aoi(2.5), max_side=100)
+check("step > 1 when the window exceeds max_side", nat["step"] > 1)
+check("  native pixel scaled by the step", abs(nat["gt"][1] - 10.0 * nat["step"]) < 1e-9)
+o4, *_ = nr.warp_to_aoi(nat["arr"], nat["gt"], nat["wkt"], aoi(2.5), 50)
+check("  and still warps to px x px", o4.shape == (50, 50))
+
+print("\n=== two background tasks reading at once ===")
+# A Preview task and a change-detection task can read side by side. Without
+# nisar_read's HDF5 lock, four threads like these SEGFAULT this GDAL build
+# (measured: exit 139) — so a regression here kills the process, and the runner
+# reports the file as failed rather than any single check.
+import threading  # noqa: E402
+errs, done = [], []
+shared = os.path.join(TMP, "shared_cache")
+
+
+def worker(pol):
+    for _ in range(10):
+        try:
+            o, *_r = nr.read_aoi(SRC, pol, bbox, 80, cache_dir=shared)
+            done.append(abs(float(np.nanmedian(o)) - (0.1 if pol == "hh" else 0.01)) < 1e-3)
+        except Exception as e:               # noqa: BLE001
+            errs.append(repr(e))
+
+
+threads = [threading.Thread(target=worker, args=(p,)) for p in ("hh", "hv", "hh", "hv")]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check(f"40 concurrent reads, shared cache: no crash, no error ({errs[:1]})",
+      not errs and len(done) == 40 and all(done))
+check("  no half-written cache file left behind",
+      not [f for f in os.listdir(shared) if f.endswith(".part.tif")])
+
+print("\n=== failures say what is wrong ===")
+try:
+    nr.read_aoi(SRC, "vv", bbox, 50)
+    check("a missing polarization raises", False)
+except LookupError as e:
+    check("a missing polarization raises, naming what IS there",
+          "VVVV" in str(e) and "HHHH" in str(e))
+try:
+    nr.read_aoi(SRC, "hh", (10.0, 10.0, 10.1, 10.1), 50)
+    check("an AOI off the grid raises", False)
+except LookupError as e:
+    check("an AOI off the grid raises", "does not reach" in str(e))
+
+print("\n=== a failed remote open says WHY, not 'does not exist' ===")
+# GDAL words every failed /vsicurl open the same way. Seen 2026-10-19 on four
+# Seaward granules that read fine minutes later: the analyst could not tell an
+# ASF outage from a refused login from a missing file. Synthetic curl traces,
+# shaped like real CPL_CURL_VERBOSE output (checked against live ones).
+SECRET = "Basic dGVzdC11c2VyOm5vdC1hLXBhc3N3b3Jk"   # test-user:not-a-password
+COOKIE = "asf-urs=FAKE-SESSION-COOKIE-VALUE"
+
+
+def req(host, method="GET"):
+    return (f"CURL_INFO_HEADER_OUT: {method} /NISAR/x.h5 HTTP/1.1\r\nHost: {host}\r\n"
+            f"Authorization: {SECRET}\r\nCookie: {COOKIE}\r\n")
+
+
+def resp(code, reason, ctype=None):
+    m = [f"CURL_INFO_HEADER_IN: HTTP/1.1 {code} {reason}\r\n"]
+    if ctype:
+        m.append(f"CURL_INFO_HEADER_IN: Content-Type: {ctype}\r\n")
+    m.append(f"CURL_INFO_HEADER_IN: Set-Cookie: {COOKIE}; Path=/\r\n")
+    return m
+
+
+ASF, CF, URS = ("nisar.asf.earthdatacloud.nasa.gov", "d1mv8zhcvry6x4.cloudfront.net",
+                "urs.earthdata.nasa.gov")
+cases = {
+    "ASF outage (503)": ([req(ASF, "HEAD")] + resp(503, "Service Unavailable"), b"",
+                         "server is failing", True),
+    "login refused (401)": ([req(ASF), *resp(302, "Found"), req(URS),
+                             *resp(401, "Unauthorized")], b"", "refused the credentials", False),
+    "sign-in page served with 200": ([req(ASF), *resp(302, "Found"), req(URS),
+                                      *resp(200, "OK", "text/html; charset=utf-8")],
+                                     b"<!DOCTYPE", "web page came back", False),
+    "missing file, even with an HTML 404 body": ([req(ASF), *resp(404, "Not Found", "text/html")],
+                                                 b"<html>", "no file at that address", False),
+    "redirect loop": ([m for _ in range(6) for m in [req(ASF), *resp(302, "Found"),
+                                                     req(URS), *resp(302, "Found")]],
+                      b"", "kept redirecting", False),
+    "DNS failure": (["CURL_INFO_TEXT: Could not resolve host: nisar.asf.earthdatacloud.nasa.gov"],
+                    b"", "could not reach ASF", True),
+    "no answer at all": ([], None, "no answer from ASF", True),
+    "the normal HEAD-link detour, file fine now": (
+        [req(ASF, "HEAD"), *resp(303, "See Other"), req(CF, "HEAD"), *resp(200, "OK"),
+         req(CF), *resp(403, "Forbidden"), req(ASF), *resp(303, "See Other"), req(CF),
+         *resp(206, "Partial Content")], b"\x89HDF\r\n\x1a\n", "reads fine now", True),
+}
+for name, (msgs, head, want, worth) in cases.items():
+    reason, w = nr.explain_http(msgs, head)
+    check(f"{name} -> '{want}'" + ("" if want in reason else f" (got: {reason[:80]})"),
+          want in reason and w == worth)
+    check(f"  and no credential or cookie leaks into the message",
+          SECRET not in reason and "FAKE-SESSION" not in reason and "Basic" not in reason)
+reason, _w = nr.explain_http(cases["login refused (401)"][0])
+check("the hosts are named, so the analyst sees WHO refused",
+      ASF in reason and URS in reason)
+
+print("\n=== a failed open is retried once, after clearing GDAL's cache ===")
+import osgeo.gdal as _g  # noqa: E402
+real_open, calls = _g.OpenEx, []
+
+
+def flaky(path, *a, **k):
+    calls.append(path)
+    if len(calls) == 1:
+        raise RuntimeError("`" + path + "' does not exist in the file system")
+    return real_open(SRC, *a, **k)
+
+
+nr.RETRY_PAUSE_S = 0.0
+_g.OpenEx = flaky
+try:
+    with _g.ExceptionMgr(useExceptions=True):
+        ds = nr._open_granule("https://nisar.example.test/NISAR/x.h5")
+    check("a one-off failure is absorbed by the retry", ds is not None and len(calls) == 2)
+    ds = None
+    calls.clear()
+    _g.OpenEx = lambda path, *a, **k: (_ for _ in ()).throw(RuntimeError("nope"))
+    real_probe = nr._traced_probe
+    nr._traced_probe = lambda path: (cases["ASF outage (503)"][0], b"")
+    try:
+        with _g.ExceptionMgr(useExceptions=True):
+            nr._open_granule("https://nisar.example.test/NISAR/x.h5")
+        check("a lasting failure raises", False)
+    except RuntimeError as e:
+        check("a lasting failure raises with the diagnosis, naming the file",
+              "x.h5" in str(e) and "server is failing" in str(e))
+    finally:
+        nr._traced_probe = real_probe
+    _g.OpenEx = flaky
+    calls.clear()
+    try:
+        with _g.ExceptionMgr(useExceptions=True):
+            nr._open_granule("/no/such/local/file.h5")
+    except RuntimeError:
+        pass
+    check("a LOCAL file is not retried (no network to wait for)", len(calls) == 1)
+finally:
+    _g.OpenEx = real_open
+
+print("\n=== outputs ===")
+fpath = os.path.join(TMP, "float.tif")
+nr.write_float(fpath, out, ogt, wkt)
+arr, valid, fgt, _p = sc.read_band(fpath)
+check("raw float reads back through sar_change.read_band",
+      arr.shape == out.shape and bool(valid.sum() == np.isfinite(out).sum()))
+d = nr.to_display(np.array([[0.1, np.nan, 50.0, 1e-6, 0.0]]), "db", -25.0, 0.0)
+check("dB stretch: -10 dB on -25..0 -> 153", int(d[0, 0]) == 153)
+check("  nodata/NaN and non-positive -> 0", int(d[0, 1]) == 0 and int(d[0, 4]) == 0)
+check("  above white clips to 255, below black to 1",
+      int(d[0, 2]) == 255 and int(d[0, 3]) == 1)
+d = nr.to_display(np.array([[0.1]]), "linear", stretch=0.2)
+check("linear stretch: 0.1 of 0.2 -> 128", int(d[0, 0]) == 128)
+dpath = os.path.join(TMP, "disp.tif")
+nr.write_display(dpath, nr.to_display(out), ogt, wkt)
+ds = gdal.Open(dpath)
+check("display GeoTIFF: one byte band, nodata 0",
+      ds.RasterCount == 1 and ds.GetRasterBand(1).DataType == gdal.GDT_Byte
+      and ds.GetRasterBand(1).GetNoDataValue() == 0)
+ds = None
+
+print("\n=== credentials are scoped and never guessed ===")
+home, tok = os.environ.get("HOME"), os.environ.pop("EARTHDATA_TOKEN", None)
+os.environ["HOME"] = TMP                  # a home with no ~/.netrc
+try:
+    how, detail = nr.credentials()
+    check("no netrc, no token -> None, with the fix spelled out",
+          how is None and "Earthdata Login" in detail)
+    try:
+        nr.configure_auth("https://nisar.example.test/x.h5")
+        check("a remote read without credentials refuses", False)
+    except PermissionError:
+        check("a remote read without credentials refuses", True)
+    check("a local file needs none", nr.configure_auth(SRC) == "local")
+    os.environ["EARTHDATA_TOKEN"] = "not-a-real-token"
+    check("a token is used when set", nr.configure_auth(
+        "https://nisar.example.test/x.h5") == "token")
+    check("  scoped to that host only", gdal.GetPathSpecificOption(
+        "/vsicurl/https://nisar.example.test/x.h5", "GDAL_HTTP_AUTH") == "BEARER"
+        and gdal.GetPathSpecificOption(
+            "/vsicurl/https://other.example.test/y.tif", "GDAL_HTTP_AUTH") is None)
+finally:
+    gdal.ClearPathSpecificOptions("/vsicurl/https://nisar.example.test/")
+    os.environ.pop("EARTHDATA_TOKEN", None)
+    if tok:
+        os.environ["EARTHDATA_TOKEN"] = tok
+    if home:
+        os.environ["HOME"] = home
+
+shutil.rmtree(TMP, ignore_errors=True)
+print(f"\n{OK} passed, {FAIL} failed")
+sys.exit(1 if FAIL else 0)

@@ -436,7 +436,7 @@ def _nearest_outside_note(lat, lon, radius_km, event_time, side):
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=1825,
-                 post_days=730, seasonal=False, auto_window=False, **_ignored):
+                 post_days=730, auto_window=False, **_ignored):
     """Free dry-run: candidate pre/post DEM strips, nothing downloaded.
 
     Same windowing helper as every other source (imagery.windows) so the day
@@ -447,7 +447,7 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=1825,
     source uniformly. Returns dict(source, pre=[...], post=[...], notes=[...])
     — when a side is empty, notes says whether widening the slider would help
     (see _nearest_outside_note)."""
-    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days, seasonal)
+    pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days)
     lim = 1 if auto_window else DEFAULT_LIMIT
     pre_items = search_scenes(lat, lon, radius_km, pre0, pre1, event_time, limit=lim)
     post_items = search_scenes(lat, lon, radius_km, post0, post1, event_time, limit=lim)
