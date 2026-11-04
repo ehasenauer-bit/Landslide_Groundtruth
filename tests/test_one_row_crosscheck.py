@@ -1,9 +1,11 @@
 """One Measure, one row, every volume.
 
-The Fit combo used to run one calibration per Measure, so comparing area ×
-thickness with the source-scar fit meant measuring twice and reading two rows —
-and the export only ever saw one of them. Now one Measure runs both and the row
-carries both, each in its own field and column.
+The Fit combo used to run one calibration per Measure, so comparing estimates
+meant measuring twice and reading two rows — and the export only ever saw one of
+them. Now one Measure runs Larsen et al. (2010) on every source outline and the
+row carries all three — best (with its range), source low, source high — each in
+its own field and column. (Area × thickness rode along too until it was parked on
+2026-11-04.)
 
 Run with tests/run_all.sh.
 """
@@ -34,23 +36,22 @@ s.dock.detection = det
 ROW = {"name": "Iliamna", "material": "bedrock", "material_label": "Bedrock",
        "v_larsen": 1.30e6, "v_larsen_lo": 0.7e6, "v_larsen_hi": 2.4e6,
        "larsen_area_m2": 4.2e5, "src_best": 4.2e5,
-       "v_thick": 2.0e6, "v_thick_lo": 1.2e6, "v_thick_hi": 2.8e6,
-       "thick_area_m2": 8.0e5, "a_total": 8.0e5, "t_best": 2.5, "t_low": 1.5,
-       "t_high": 3.5, "thick_setting": "Glacier, far date (ice melted)"}
+       "v_larsen_srclo": 0.9e6, "v_larsen_srchi": 2.0e6,
+       "src_low": 3.1e5, "src_high": 5.6e5, "a_total": 8.0e5}
 
-print("=== 1. ONE row carrying both estimates ===")
+print("=== 1. ONE row carrying the volume ===")
 s._rows = [dict(ROW)]
-thick, larsen, src = s._estimates()
-print(f"   thickness {thick:,.0f}   source scar {larsen:,.0f}   from row {src['name']!r}")
-assert thick == 2.0e6 and larsen == 1.30e6
-print("   both from a SINGLE Measure")
+larsen, src = s._estimates()
+print(f"   Larsen {larsen:,.0f}   from row {src['name']!r}")
+assert larsen == 1.30e6
+print("   from a SINGLE Measure")
 
 print("\n=== 2. the slide on screen wins over older rows ===")
 s._rows = [dict(ROW, name="old", v_larsen=9.9e7), dict(ROW)]
 s._current = s._rows[0]
-assert s._estimates()[1] == 9.9e7, "the export is about the slide on screen"
+assert s._estimates()[0] == 9.9e7, "the export is about the slide on screen"
 s._current = None
-assert s._estimates()[1] == 1.30e6, "with nothing on screen, the last row"
+assert s._estimates()[0] == 1.30e6, "with nothing on screen, the last row"
 print("   _current first, else the last row")
 
 print("\n=== 3. implied depth spreads the scar volume over the TOTAL outline ===")
@@ -62,7 +63,7 @@ s._rows = [dict(ROW, a_total=None)]
 assert s._event_row()["implied_depth"] == "", "no total outline -> no depth, not the scar's"
 print("   and none at all without a total outline")
 
-print("\n=== 4. the CSV carries both volumes on one line ===")
+print("\n=== 4. the CSV carries all three volumes on one line ===")
 s._rows = [dict(ROW)]
 stamp = s._event_row()
 merged = dict(s._rows[0])
@@ -72,23 +73,26 @@ buf = _io.StringIO(); w = csv.writer(buf)
 w.writerow([h for h, _k in VT.CSV_FIELDS])
 w.writerow(["" if merged.get(k) is None else merged.get(k) for _h, k in VT.CSV_FIELDS])
 buf.seek(0); out = list(csv.DictReader(buf))[0]
-for c in ("vol_thickness_m3", "vol_larsen_m3",
-          "thickness_m", "thickness_setting", "implied_depth_m", "event_id"):
+for c in ("vol_larsen_m3", "vol_larsen_src_low_m3", "vol_larsen_src_high_m3",
+          "source_low_m2", "source_high_m2", "implied_depth_m", "event_id"):
     print(f"   {c:24s} {out[c]!r}")
     assert out[c] != "", c
-assert out["vol_thickness_m3"] != out["vol_larsen_m3"], \
-    "the two volumes must not collapse into one column"
+assert len({out["vol_larsen_m3"], out["vol_larsen_src_low_m3"],
+            out["vol_larsen_src_high_m3"]}) == 3, \
+    "the three volumes must not collapse into one column"
 hdrs = [h for h, _ in VT.CSV_FIELDS]
 assert len(hdrs) == len(set(hdrs)), "duplicate CSV header"
 for gone in ("verdict", "analyst", "analyst_note", "recorded_utc", "vol_seismic_m3",
-             "agreement", "det_loc_error_km", "offset_vs_loc_error"):
+             "agreement", "det_loc_error_km", "offset_vs_loc_error",
+             "vol_thickness_m3", "thickness_m", "thickness_setting"):
     assert gone not in hdrs, gone
-print(f"   {len(hdrs)} columns, two distinct volumes, no verdict or seismic columns")
+print(f"   {len(hdrs)} columns, three distinct volumes, no verdict, seismic or "
+      "thickness columns")
 
 print("\n=== 5. no estimates at all -> no crash ===")
 s._rows = []
-t, l, src = s._estimates()
-assert t is None and l is None and src == {}
+l, src = s._estimates()
+assert l is None and src == {}
 assert s._event_row()["implied_depth"] == ""
 print("   empty table handled")
 

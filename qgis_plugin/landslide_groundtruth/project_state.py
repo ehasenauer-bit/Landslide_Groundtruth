@@ -72,6 +72,9 @@ RETIRED_DEFAULTS = {
         # (Deline et al. 2015, Table 9.1), so the default became 2.5 / 1.5 / 3.5 m. An
         # Iliamna project that meant 1.5 m can't be told apart from the old default and
         # opens on 2.5 m too; re-enter 1.5 there.
+        # Dormant since 2026-11-04: the thickness fields went with area × thickness
+        # to parked/thickness/, so no widget has these keys and nothing is swapped.
+        # Kept so the migration still applies if the fit is put back.
         "volume/thick_best_edit": "1.5",
         "volume/thick_low_edit": "1.0",
         "volume/thick_high_edit": "2.5",

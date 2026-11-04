@@ -1973,11 +1973,10 @@ class Viewer3DTab(QWidget):
             self.det_cl_length.setText(f"{ln/1000:.2f} km" if ln >= 1000 else f"{ln:.0f} m")
         if dr is not None:
             self.det_cl_drop.setText(f"{dr:.0f} m")
-        # The Volume tab measures two volumes and makes neither the headline, so
-        # the figure carries both, each named.
+        # The Volume tab's volume is Larsen et al. (2010) on the best source
+        # outline (area × thickness, which used to sit beside it, is parked).
         vols = []
-        for key, label in (("v_thick", "area × thickness"),
-                           ("v_larsen", "Larsen et al.")):
+        for key, label in (("v_larsen", "Larsen et al."),):
             vb = num(cur.get(key))
             if vb is None:
                 continue

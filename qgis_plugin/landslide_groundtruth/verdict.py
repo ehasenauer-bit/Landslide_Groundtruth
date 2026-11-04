@@ -41,7 +41,7 @@ def implied_depth_m(volume_m3, area_m2):
 
 
 # Columns appended to the Volume tab's CSV: who the event was and where the scar
-# sits. The tab's own columns carry vol_thickness_* and vol_larsen_*.
+# sits. The tab's own columns carry vol_larsen_*.
 EVENT_CSV_FIELDS = [
     # identity — from the Detection, never typed
     ("event_id", "event_id"),

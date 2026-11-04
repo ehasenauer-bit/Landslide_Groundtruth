@@ -4,7 +4,14 @@ Every number the Volume tab can print, the equation behind it, the paper it
 comes from, and the reason that method is (or is no longer) the one to reach
 for. Written 2026-09-21.
 
-Where each one stands:
+> **Status 2026-11-04:** the tab now runs §1 only, Larsen et al. (2010) on the
+> best, low and high source outlines, because that is the method earlier studies
+> of these landslides used and §3's thickness had not been checked against
+> measured volumes. §2 is parked at `parked/ddem/` (2026-10-23) and §3 at
+> `parked/thickness/` (2026-11-04). The rest of this page is as written on
+> 2026-09-21.
+
+Where each one stood on 2026-09-21:
 
 * **§1, Larsen et al. (2010) area–volume scaling `V = αA^γ` — the previous
   default.** Still in the plugin, but no longer the method to quote for an

@@ -8,7 +8,7 @@ detected. Enter the detection (origin time and epicentre) once, then:
 - **fuse** optical and radar change into one landslide score;
 - read the scar against the terrain in a **3D viewer** (ArcticDEM or your DEM);
 - turn the outline you digitize into a **volume** (Larsen et al. 2010 area–volume
-  scaling, or deposit area × thickness).
+  scaling).
 
 ## Install (QGIS users)
 
@@ -213,25 +213,29 @@ Explorer** (stream PlanetScope, order clips), and **Profile Tool** (terrain).
 
 ## Volume from a digitized scar
 
-The plugin's **Volume from area** tab turns the outlines you digitize into two
-independent volumes, side by side, from one **Measure**:
+The plugin's **Volume from area** tab turns the source-scar outlines you digitize
+into a volume with **Larsen et al. (2010)** area–volume scaling (Table S1,
+`larsen_BR_volume.py`), from one **Measure**:
 
-| Fit | Converts | Needs | Range from |
-|-----|----------|-------|------------|
-| **Area × thickness** (Toney et al. 2021) | the **total** outline (source + track + deposit) | a mean deposit thickness | the low/high thickness |
-| **Larsen et al. (2010)** (Table S1, `larsen_BR_volume.py`) | the **best source** outline — the evacuated scar alone | what failed: bedrock or soil | the published fit spread, widened by source low/high |
+| Estimate | Converts | Range |
+|----------|----------|-------|
+| **Best** | the **best source** outline — the evacuated scar alone | the published fit spread, widened by source low/high (read as a ±2σ area span) |
+| **Low** | the **source low** outline — a conservative reading of the scar | — |
+| **High** | the **source high** outline — a generous reading of the scar | — |
 
-Neither is the headline: each keeps its own fields in the row, the CSV and the
-written attributes. The tab reads top to bottom in the order the work is done:
+All three use what failed (bedrock or soil). The **total** outline (source + track +
+deposit) is not converted: it gives the implied mean depth, the centerline and the
+feature the numbers are written to. The tab reads top to bottom in the order the
+work is done:
 
 1. **Outlines.** Press **New** beside *Total area*, draw the whole affected area
    (click each vertex, right-click to finish, toggle editing off to save), then
    **New** beside *Source (best)* for the scar. Each New writes a GeoPackage beside
    the project's `.qgz`, named for its role (`<slide>_total_area.gpkg`, …), assigns
    it and arms QGIS's Add Polygon tool; **Draw** adds another polygon to the
-   assigned layer. Total is a red outline, source blue. A conservative/generous
-   pair of source outlines goes under the collapsed *Source low / high* box — the
-   Larsen et al. (2010) reads them as a ±2σ area span. The line under the pickers shows
+   assigned layer. Then the same for *Source (low)* and *Source (high)*, a
+   conservative and a generous reading of the scar. Total is a red outline, source
+   blue (low dashed, high dotted). The line under the pickers shows
    every assigned area live; swapped roles, or a total smaller than a source, are
    refused before Measure rather than measured.
 
@@ -249,27 +253,27 @@ written attributes. The tab reads top to bottom in the order the work is done:
    *min/minimum/lower/conservative* and *max/maximum/higher/generous* match. Anything
    you set yourself is left alone. A role layer holding several polygons is measured
    by its largest — they are alternative attempts at one outline, not parts of it.
-2. **Settings.** The *Deposit thickness* setting fills mean/low/high from published
-   values (near date = imagery soon after the event, snow and ice still in the
-   deposit; far date = after a melt season); edit any number and it reads Custom.
-   *What failed?* (bedrock/soil) is read by Larsen et al. (2010) only and moves it a
-   long way — choose it from what actually failed, not the surrounding cover.
-3. **Measure** runs both fits and records the slide's row — no separate add step.
-   Measuring the same slide name again replaces its row (and keeps its centerline);
-   a new name adds a row. If one fit cannot run — no source outline, say — the other
-   still does and the Volumes box says why.
-4. **Volumes** shows both, at three significant figures, plus the implied mean
-   depth: the Larsen et al. volume ÷ the **total** outline area, i.e. the mean
-   thickness over the whole footprint that the Larsen volume implies. It compares
-   directly with the deposit thickness under Settings — several times it means the
-   two fits disagree, tens of metres means the outline or the material is wrong. Warnings about this measurement show here.
+2. **Settings.** *What failed?* (bedrock/soil) moves the answer a long way —
+   choose it from what actually failed, not the surrounding cover.
+3. **Measure** runs Larsen et al. (2010) on each source outline and records the
+   slide's row — no separate add step. Measuring the same slide name again replaces
+   its row (and keeps its centerline); a new name adds a row. With no source (best)
+   outline the row is still recorded, with its areas and no volume, and the
+   Volumes box says why.
+4. **Volumes** shows the best estimate in bold with its range, the low and high
+   estimates under it, at three significant figures, plus the implied mean depth:
+   the best volume ÷ the **total** outline area, i.e. the mean thickness over the
+   whole footprint that the Larsen volume implies. Rock-avalanche deposits on
+   glaciers run ~2.5 m (Deline et al. 2015); above 5 m the tab warns that the volume
+   is probably too high on ice, and tens of metres means the outline or the
+   material is wrong. Warnings about this measurement show here.
 5. **Centerline & elevation drop.** **Draw centerline** derives the medial-axis
    spine of the total outline into `Landslide centerlines`, left in edit mode to
    trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall
    height and travel angle. Reference only.
-6. **Write to layer** stamps everything — `vthk_m3` / `vthk_lo_m3` / `vthk_hi_m3`
-   (area × thickness), `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3` (Larsen et al.), the
-   thickness, `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
+6. **Write to layer** stamps everything — `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3`
+   (best, with its range), `vlowsrc_m3` / `vhisrc_m3` (source low / high),
+   `total_m2`, `src_m2` …, length and drop — onto the **total** outline's
    own feature. Save the outline layer before writing back: adding fields needs a
    clean edit buffer, and QGIS renumbers features on save. **Copy results** puts the
    table on the clipboard as TSV.
@@ -285,9 +289,12 @@ so editing the coefficients there changes what the tab reports; the log names th
 implementation that ran, and the tab falls back to a built-in copy when the
 project dir isn't configured.
 
-**No longer in the tab (2026-10-23):** the elevation-change (`∫Δh`) fit and DEM
-differencing, parked verbatim in `parked/ddem/` with the recipe for putting them
-back; and the total-area Larsen fit, whose coefficients ship empty
+**No longer in the tab:** deposit area × thickness (Toney et al. 2021), removed
+2026-11-04 because its thickness, unlike the Larsen et al. relation earlier
+studies used, had not been checked against measured volumes — parked verbatim in
+`parked/thickness/` with the recipe for putting it back; the elevation-change
+(`∫Δh`) fit and DEM differencing (2026-10-23), parked the same way in
+`parked/ddem/`; and the total-area Larsen fit, whose coefficients ship empty
 (`LARSEN_TOTAL` in `volume_calc.py` / `larsen_BR_volume.py` is still read by
 `volume_calc.volume_source(fit="total")`).
 

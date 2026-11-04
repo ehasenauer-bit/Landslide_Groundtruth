@@ -12,8 +12,10 @@ showed never came back. RETIRED_DEFAULTS swaps exactly those stored values for
 today's defaults, once, in any project stamped before VERSION 2. The seeded
 strings below are the ones that project file actually holds.
 
-VERSION 3 retires the Volume tab's 1.5 / 1.0 / 2.5 m deposit thickness the same
-way, for the measured 2.5 / 1.5 / 3.5 m.
+VERSION 3 retired the Volume tab's 1.5 / 1.0 / 2.5 m deposit thickness the same
+way, for the measured 2.5 / 1.5 / 3.5 m. Area × thickness was parked on 2026-11-04
+(parked/thickness/, with the checks that drove those fields), so no widget holds
+those keys now and the entry is dormant: a project storing them opens untouched.
 
 "Cover the exact epicentre" became the default again on 2026-10-21, so it is no
 longer swapped: St. Elias now keeps it and only the cloud cap and quality move.
@@ -154,34 +156,16 @@ check("retired_since tolerates garbage", len(ps.retired_since("x")) == 5)
 check("the coverage default is no longer retired anywhere",
       "planet/coverage_combo" not in ps.retired_since("1"))
 
-print("\n=== Volume: the old 1.5 / 1.0 / 2.5 m thickness opens on 2.5 / 1.5 / 3.5 ===")
-vol = dock.volume_tab
-
-
-def thickness():
-    return (vol.thick_best_edit.text(), vol.thick_low_edit.text(),
-            vol.thick_high_edit.text())
-
-
-project.clear(); state._restore_now()
-check(f"a new project opens on 2.5 / 1.5 / 3.5 (got {thickness()})",
-      thickness() == ("2.5", "1.5", "3.5"))
+print("\n=== Volume: the thickness entry is dormant since area × thickness was parked ===")
+check("no widget holds a volume/thick_* key any more",
+      not [k for k, _w in state._widgets if k.startswith("volume/thick")])
 OLD_THICK = {"volume/thick_best_edit": "1.5", "volume/thick_low_edit": "1.0",
              "volume/thick_high_edit": "2.5"}
 seed("2", OLD_THICK)
-check(f"a v2 project on the old defaults -> 2.5 / 1.5 / 3.5 (got {thickness()})",
-      thickness() == ("2.5", "1.5", "3.5"))
 ver, _ = project.readEntry(SCOPE, ps.VERSION_KEY, "")
 best, _ = project.readEntry(SCOPE, "volume/thick_best_edit", "")
-check(f"the swap is written at once, stamped v{ps.VERSION} (got v{ver}, {best})",
-      ver == ps.VERSION and best == "2.5")
-seed("2", {"volume/thick_best_edit": "4", "volume/thick_low_edit": "3",
-           "volume/thick_high_edit": "8"})
-check(f"a v2 project that chose 4 / 3 / 8 m keeps them (got {thickness()})",
-      thickness() == ("4", "3", "8"))
-seed(ps.VERSION, OLD_THICK)
-check(f"a v{ps.VERSION} project that CHOSE 1.5 / 1.0 / 2.5 (Iliamna) keeps them "
-      f"(got {thickness()})", thickness() == ("1.5", "1.0", "2.5"))
+check(f"a v2 project storing them opens untouched — still v2, still 1.5 (got v{ver}, {best})",
+      ver == "2" and best == "1.5")
 
 project.clear()
 dock.teardown()

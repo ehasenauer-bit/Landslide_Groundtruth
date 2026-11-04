@@ -4,18 +4,20 @@ Run with tests/run_all.sh, or directly with QGIS's bundled python:
     /Applications/QGIS-LTR.app/Contents/Frameworks/bin/python3 tests/test_volume_flow.py
 
 The tab was rebuilt (2026-10-23) around how it is actually used: the outlines
-are drawn here, total + source best, one slide per project, and BOTH area ×
-thickness and the source-scar fit are wanted on every slide. So:
+are drawn here, one slide per project. Since 2026-11-04 its volume is Larsen et
+al. (2010) — area × thickness is parked at parked/thickness/ — and the source
+low and high outlines sit beside total and best in the Outlines box, each giving
+its own Larsen volume. So:
 
   * the sections run in working order — Outlines, Settings, Measure, Volumes,
     Centerline & drop, then Write to layer / Copy results — with the results
     table and log collapsed below (the Verdict box went on 2026-10-30);
-  * one Measure runs both fits, neither the headline, and records the row (no
+  * one Measure runs Larsen on every source outline and records the row (no
     "Add to results"); re-measuring the same slide replaces its row and keeps
     its centerline;
   * Write to layer stamps everything onto the TOTAL outline;
   * the explanatory text sits behind one "? Help" toggle, remembered per user;
-  * the Fit combo, ∫Δh and DEM differencing are gone from the tab.
+  * the Fit combo, ∫Δh, DEM differencing and area × thickness are gone.
 """
 import os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -115,15 +117,24 @@ check("Measure sits between Settings and Volumes",
 check("results table and log start collapsed; the working sections open",
       boxes[4].isCollapsed() and boxes[5].isCollapsed()
       and not any(b.isCollapsed() for b in boxes[:4]))
-check("the thickness setting is ABOVE Measure (it used to sit below the answer)",
-      vol.layout().indexOf(boxes[1]) < mi)
+check("the material setting is ABOVE Measure (it used to sit below the answer)",
+      vol.layout().indexOf(boxes[1]) < mi
+      and boxes[1].isAncestorOf(vol.material_combo))
+check("no area × thickness widgets are left on the tab",
+      not any(hasattr(vol, a) for a in ("thick_best_edit", "thick_low_edit",
+                                        "thick_high_edit", "_thick_setting_combo",
+                                        "_thick_note_lbl", "vol_thick_out")))
+check("source low and high sit in the Outlines box itself, not a collapsed box",
+      boxes[0].isAncestorOf(vol._low_combo) and boxes[0].isAncestorOf(vol._high_combo)
+      and not boxes[0].findChildren(QgsCollapsibleGroupBox)
+      and vol._low_combo.isVisibleTo(vol) and vol._high_combo.isVisibleTo(vol))
 check("no Fit combo, no ∫Δh or DEM-differencing widgets, no Add-to-results",
       not any(hasattr(vol, a) for a in ("fit_combo", "_ddem_combo", "_pre_dem_combo",
                                         "diff_btn", "add_btn", "_layer_combo")))
 
 print("\n=== explanatory text behind one toggle ===")
 check(f"the tab registers its prose ({len(vol._help_labels)} labels)",
-      len(vol._help_labels) >= 6)
+      len(vol._help_labels) >= 4)
 check("off: every help label hidden", not any(l.isVisibleTo(vol) for l in vol._help_labels))
 vol._help_btn.setChecked(True)
 check("on: every help label shown", all(l.isVisibleTo(vol) for l in vol._help_labels
@@ -154,22 +165,28 @@ check("Total Area → total, Source Area (best) → best",
 check(f"the readout shows both areas ({vol.role_lbl.text()!r})",
       "TOTAL 1 km²" in vol.role_lbl.text() and "src best 0.1 km²" in vol.role_lbl.text())
 
-print("\n=== one Measure: both fits, one row ===")
+print("\n=== one Measure: Larsen et al., one row ===")
 vol.name_edit.setText("Test slide")
 vol._measure()
 c = vol._current
-check(f"area × thickness: 1 km² × 2.5 m = {c and c.get('v_thick'):.4g} m³",
-      c is not None and abs(c["v_thick"] - 2.5e6) / 2.5e6 < 0.01
-      and c["thick_from"] == "total")
-check(f"source scar on the 0.1 km² scar: {c['v_larsen']:.4g} m³ "
+want = VC.volume_source(1.0e5, material="bedrock")[0]
+check(f"Larsen on the 0.1 km² scar: {c and c['v_larsen']:.4g} m³ "
       f"({c['v_larsen_lo']:.3g}–{c['v_larsen_hi']:.3g})",
-      c["v_larsen"] > 0 and c["v_larsen_lo"] < c["v_larsen"] < c["v_larsen_hi"]
+      c is not None and abs(c["v_larsen"] - want) / want < 0.01
+      and c["v_larsen_lo"] < c["v_larsen"] < c["v_larsen_hi"]
       and abs(c["larsen_area_m2"] - 1.0e5) / 1.0e5 < 0.01)
+check("no area × thickness volume on the row",
+      not [k for k in c if k.startswith(("v_thick", "thick", "t_"))])
 check("recorded as the slide's row without another click",
       vol._rows == [c] and vol.table.rowCount() == 1)
-check(f"both on screen ({vol.vol_thick_out.text()!r} / {vol.vol_scar_out.text()!r})",
-      vol.vol_thick_out.text().startswith("2.5 Mm³")
-      and "Mm³" in vol.vol_scar_out.text() and "bedrock" in vol.vol_scar_out.text())
+check(f"on screen, bold ({vol.vol_scar_out.text()!r})",
+      vol.vol_scar_out.text().startswith(f"{c['v_larsen'] / 1e6:,.3g} Mm³")
+      and "bedrock" in vol.vol_scar_out.text() and vol.vol_scar_out.font().bold())
+check(f"no source low/high yet, and the readouts say so "
+      f"({vol.vol_src_low_out.text()!r})",
+      c["v_larsen_srclo"] is None and c["v_larsen_srchi"] is None
+      and "no source low outline" in vol.vol_src_low_out.text()
+      and "no source high outline" in vol.vol_src_high_out.text())
 check(f"implied depth spreads the scar volume over the TOTAL ({vol.depth_out.text()!r})",
       vol.depth_out.text().startswith(f"{c['v_larsen'] / 1.0e6:,.1f} m")
       and "total 1 km²" in vol.depth_out.text())
@@ -183,33 +200,77 @@ check(f"length {c.get('length')} m, in the table too",
       and vol.table.item(0, VT.TABLE_COLS.index("Length (m)")).text() != "—")
 
 print("\n=== re-measuring the same slide replaces its row and keeps the centerline ===")
-vol.thick_best_edit.setText("3"); vol.thick_low_edit.setText("2")
-vol.thick_high_edit.setText("4")
+vol.material_combo.setCurrentIndex(vol.material_combo.findText("Soil"))
 length = c["length"]
 vol.log.clear()
 vol._measure()
 c2 = vol._current
-check(f"still one row, now 1 km² × 3 m ({c2['v_thick']:.4g})",
-      len(vol._rows) == 1 and vol._rows[0] is c2 and abs(c2["v_thick"] - 3e6) < 3e4)
+soil = VC.volume_source(1.0e5, material="soil")[0]
+check(f"still one row, now soil ({c2['v_larsen']:.4g} m³)",
+      len(vol._rows) == 1 and vol._rows[0] is c2
+      and abs(c2["v_larsen"] - soil) / soil < 0.01 and c2["material"] == "soil")
 check("the centerline length carried over", c2.get("length") == length
       and vol.remeasure_btn.isEnabled())
 check("and the log says so", "centerline was kept" in vol.log.toPlainText())
+vol.material_combo.setCurrentIndex(vol.material_combo.findText("Bedrock"))
+vol._measure()
+c2 = vol._current
 
 print("\n=== Write to layer stamps everything on the TOTAL outline ===")
 vol._write_to_layer()
 f = next(total.getFeatures())
-check(f"vthk_m3 = {f['vthk_m3']}, vsrc_m3 = {f['vsrc_m3']}",
-      abs(f["vthk_m3"] - c2["v_thick"]) < 1 and abs(f["vsrc_m3"] - c2["v_larsen"]) < 1)
-check("with the thickness, both areas, the length and the slide name",
-      f["thick_m"] == 3 and abs(f["src_m2"] - 1e5) < 1e3 and f["length_m"]
-      and f["slide"] == "Test slide")
-check("the source outline is left alone", source.fields().indexOf("vthk_m3") < 0)
+check(f"vsrc_m3 = {f['vsrc_m3']}", abs(f["vsrc_m3"] - c2["v_larsen"]) < 1)
+check("with both areas, the length and the slide name",
+      abs(f["src_m2"] - 1e5) < 1e3 and abs(f["total_m2"] - 1e6) < 1e4
+      and f["length_m"] and f["slide"] == "Test slide")
+check("no area × thickness fields are added",
+      total.fields().indexOf("vthk_m3") < 0 and total.fields().indexOf("thick_m") < 0)
+check("the source outline is left alone", source.fields().indexOf("vsrc_m3") < 0)
 
-print("\n=== the 3D viewer pulls both volumes, each named ===")
+print("\n=== the 3D viewer pulls the Larsen volume ===")
 v3 = dock.viewer3d_tab
 v3._pull_volume_details()
 txt = v3.det_volume.text()
-check(f"figure volume: {txt!r}", "area × thickness" in txt and "Larsen et al." in txt)
+check(f"figure volume: {txt!r}", "Larsen et al." in txt and "thickness" not in txt)
+
+print("\n=== source low and high: their own volumes, and a wider best range ===")
+low = poly("Source Area (low)", "POLYGON((350 1000800, 650 1000800, "
+                                "650 1001000, 350 1001000, 350 1000800))")    # 0.06 km²
+high = poly("Source Area (high)", "POLYGON((250 1000700, 750 1000700, "
+                                  "750 1001000, 250 1001000, 250 1000700))")  # 0.15 km²
+check("matched by name to Source (low) / Source (high)",
+      vol._role_layer("low") is low and vol._role_layer("high") is high)
+vol.log.clear()
+vol._measure()
+c5 = vol._current
+lo_want = VC.volume_source(6.0e4, material="bedrock")[0]
+hi_want = VC.volume_source(1.5e5, material="bedrock")[0]
+check(f"low {c5['v_larsen_srclo']:.4g} < best {c5['v_larsen']:.4g} < "
+      f"high {c5['v_larsen_srchi']:.4g} m³, each Larsen on its own outline",
+      abs(c5["v_larsen_srclo"] - lo_want) / lo_want < 0.01
+      and abs(c5["v_larsen_srchi"] - hi_want) / hi_want < 0.01
+      and c5["v_larsen_srclo"] < c5["v_larsen"] < c5["v_larsen_srchi"])
+check(f"the best estimate's range widens with the area span "
+      f"({c2['v_larsen_lo']:.3g}–{c2['v_larsen_hi']:.3g} → "
+      f"{c5['v_larsen_lo']:.3g}–{c5['v_larsen_hi']:.3g})",
+      c5["v_larsen_lo"] < c2["v_larsen_lo"] and c5["v_larsen_hi"] > c2["v_larsen_hi"])
+check(f"on screen ({vol.vol_src_low_out.text()!r} / {vol.vol_src_high_out.text()!r})",
+      vol.vol_src_low_out.text().startswith(f"{lo_want / 1e6:,.3g} Mm³")
+      and "0.06 km²" in vol.vol_src_low_out.text()
+      and vol.vol_src_high_out.text().startswith(f"{hi_want / 1e6:,.3g} Mm³")
+      and "0.15 km²" in vol.vol_src_high_out.text())
+check("in the table", vol.table.item(0, VT.TABLE_COLS.index("V src low (m³)")).text()
+      != "—" and vol.table.item(0, VT.TABLE_COLS.index("V src high (m³)")).text() != "—")
+check("and the log", "the low estimate" in vol.log.toPlainText()
+      and "the high estimate" in vol.log.toPlainText())
+vol._write_to_layer()
+f = next(total.getFeatures())
+check(f"written back: vlowsrc_m3 {f['vlowsrc_m3']:.4g}, vhisrc_m3 {f['vhisrc_m3']:.4g}",
+      abs(f["vlowsrc_m3"] - c5["v_larsen_srclo"]) < 1
+      and abs(f["vhisrc_m3"] - c5["v_larsen_srchi"]) < 1)
+vol._low_combo.setCurrentIndex(0)                  # — none — (and pinned there)
+vol._high_combo.setCurrentIndex(0)
+vol._measure()
 
 print("\n=== a new slide name adds a row ===")
 vol.name_edit.setText("Second slide")
@@ -218,23 +279,26 @@ check("two rows now", len(vol._rows) == 2 and vol.table.rowCount() == 2)
 check("a new slide starts without a centerline",
       vol._current.get("length") is None and not vol.remeasure_btn.isEnabled())
 
-print("\n=== only one outline: the other fit says why it did not run ===")
+print("\n=== only a total outline: no volume, but the slide is still recorded ===")
 vol._best_combo.setCurrentIndex(0)                 # — none —
+check(f"the readout warns before Measure ({vol.role_lbl.text()[-60:]!r})",
+      "No source (best) outline" in vol.role_lbl.text())
 vol._measure()
 c3 = vol._current
-check("area × thickness still runs", c3["v_thick"] and c3["v_larsen"] is None)
+check("a row with the areas and no volume",
+      c3["v_larsen"] is None and c3["a_total"] and c3["name"] == "Second slide")
 check(f"the skipped fit is explained on screen ({vol.vol_warn_lbl.text()[:50]!r}…)",
       vol.vol_warn_lbl.isVisibleTo(vol) and "Larsen et al. (2010) skipped" in vol.vol_warn_lbl.text()
       and "not run" in vol.vol_scar_out.text())
+check("its centerline can still be drawn", vol.centerline_btn.isEnabled())
 vol._total_combo.setCurrentIndex(0)
 vol._best_combo.setCurrentIndex(vol._best_combo.findData(source.id()))
-vol.thick_best_edit.setText("2.5"); vol.thick_low_edit.setText("1.5")
-vol.thick_high_edit.setText("3.5")             # back on a deposit setting
 vol._measure()
 c4 = vol._current
-check("no total: area × thickness falls back to the scar, and warns that a "
-      "deposit thickness there reads low",
-      c4["thick_from"] == "source" and "reads low" in vol.vol_warn_lbl.text())
+check("no total: Larsen still runs, Write to layer falls back to the scar",
+      c4["v_larsen"] and c4["out_role"] == "source")
+check(f"and there is no implied depth to show ({vol.depth_out.text()!r})",
+      "no total outline" in vol.depth_out.text())
 
 print("\n=== swapped outlines are refused, not measured ===")
 vol._total_combo.setCurrentIndex(vol._total_combo.findData(source.id()))
@@ -250,7 +314,8 @@ print("\n=== removing the slide on screen clears it ===")
 vol.table.selectRow(vol._rows.index(vol._current))
 vol._remove_rows()
 check("the readouts clear rather than edit a row that is gone",
-      vol._current is None and vol.vol_thick_out.text() == "press Measure"
+      vol._current is None and vol.vol_scar_out.text() == "press Measure"
+      and vol.vol_src_low_out.text() == ""
       and not vol.centerline_btn.isEnabled())
 
 print("\n=== another project: the last one's slide does not follow it ===")
@@ -285,7 +350,7 @@ check("back on the small scar the note goes away",
 project.clear()
 check("rows and readouts cleared, so no export mixes two events",
       vol._rows == [] and vol._current is None
-      and vol.vol_thick_out.text() == "press Measure")
+      and vol.vol_scar_out.text() == "press Measure")
 
 project.clear()
 dock.teardown()

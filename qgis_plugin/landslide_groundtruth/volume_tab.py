@@ -6,19 +6,17 @@ change; this one turns the polygons you digitize over that imagery into numbers.
 The tab reads top to bottom in the order the work is done — one slide per
 project is the normal case:
 
-  Outlines  Draw (or assign) the TOTAL outline and the BEST SOURCE scar; each
-            has its own New / Draw buttons. Source low/high, for an area range
-            on Larsen et al. (2010), sit in a collapsed box under them.
-  Settings  The deposit thickness for area × thickness, and what failed
-            (bedrock/soil) for Larsen et al. (2010).
-  Measure   Runs BOTH fits at once and records the result row:
-              Area × thickness (Toney et al. 2021) — the TOTAL outline's plan
-                area × the mean deposit thickness, the low/high thickness giving
-                the range. Falls back to the source outline when no total is
-                drawn (then the thickness is a scar depth).
-              Larsen et al. (2010), Table S1 — the BEST SOURCE outline through the
-                calibrated relation; source low/high widen the range.
-            Neither is "the" volume: each keeps its own fields everywhere.
+  Outlines  Draw (or assign) the TOTAL outline and the source scar three ways —
+            BEST, LOW (conservative) and HIGH (generous); each has its own
+            New / Draw buttons.
+  Settings  What failed (bedrock/soil), for Larsen et al. (2010).
+  Measure   Larsen et al. (2010), Table S1 — THE volume — and records the row:
+              the BEST source outline through the calibrated relation, its range
+                the published fit spread widened by source low/high;
+              source low and source high each through the same relation, a
+                volume per reading of the scar.
+            The total outline gives the implied mean depth (Larsen ÷ total
+            area), the centerline and the feature Write to layer stamps.
   Centerline & drop  A medial-axis centerline of the total outline (see
             centerline.py) and, with an elevation raster assigned, the crown-to-
             toe fall height and travel angle read along it. A HILLSHADE is
@@ -31,9 +29,8 @@ project is the normal case:
 The explanatory text lives behind the "? Help" toggle in the header; tooltips
 carry the detail either way, and live warnings always show.
 
-WHICH OUTLINE EACH FIT READS is fixed, because each calibration is defined
-against a particular outline: feeding Larsen et al. a total outline reads high,
-and a deposit thickness over a source scar reads low.
+WHICH OUTLINE LARSEN READS is fixed: the relation is calibrated on source-scar
+area, so feeding it a total outline reads high.
 
 Roles are assigned by layer rather than by map selection, so the input is
 explicit and re-measurable, and layers named for their role — "Total Area",
@@ -52,6 +49,12 @@ The elevation-change (∫Δh) fit and DEM differencing were removed from this ta
 on 2026-10-23 and parked verbatim in parked/ddem/ (dem_diff.py stays — the 3D
 viewer uses it). The total-area Larsen fit, whose coefficients ship empty, is
 no longer offered either; volume_calc still carries it.
+
+Deposit area × thickness (Toney et al. 2021), which ran beside Larsen with
+neither the headline, was removed on 2026-11-04 and parked verbatim in
+parked/thickness/: unlike Larsen et al.'s relation, which earlier studies of
+these landslides used, its thickness had not been checked against measured
+volumes.
 
 The volume arithmetic itself lives in volume_calc, which prefers the project's
 canonical larsen_BR_volume.py and names whichever implementation ran.
@@ -189,22 +192,21 @@ NEW_TIPS = {
              "the outline Larsen et al. (2010) converts. Drawn as a blue outline, "
              f"with the same “{AREA_FIELD}” field.\n\n" + _SAVED),
     "low": ("Create the CONSERVATIVE (smaller) source-scar outline, assign it to "
-            "“Source (low)” and start digitizing. Dashed blue.\n\n" + _SAVED),
+            "“Source (low)” and start digitizing. Larsen et al. (2010) gives it "
+            "its own volume, the low estimate. Dashed blue.\n\n" + _SAVED),
     "high": ("Create the GENEROUS (larger) source-scar outline, assign it to "
-             "“Source (high)” and start digitizing. Dotted blue.\n\n" + _SAVED),
+             "“Source (high)” and start digitizing. Larsen et al. (2010) gives it "
+             "its own volume, the high estimate. Dotted blue.\n\n" + _SAVED),
 }
 
 # Attribute fields the write-back adds to the TOTAL outline. (name, type, source
 # key in a results row.) Kept short and lower-case so they survive a Shapefile
-# round-trip (10-character field-name limit) as well as GeoPackage. Both fits get
-# their own volume fields — vthk_* for area × thickness, vsrc_* for the source
-# scar — so neither is stored as "the" volume.
+# round-trip (10-character field-name limit) as well as GeoPackage. vsrc_* is the
+# Larsen et al. volume of the best source outline with its range; vlowsrc_m3 and
+# vhisrc_m3 are the same relation on the source low and high outlines.
 WRITEBACK_FIELDS = [
     ("slide", QMetaType.Type.QString, "name"),
     ("material", QMetaType.Type.QString, "material_label"),
-    ("thick_m", QMetaType.Type.Double, "t_best"),
-    ("thick_lo_m", QMetaType.Type.Double, "t_low"),
-    ("thick_hi_m", QMetaType.Type.Double, "t_high"),
     ("total_m2", QMetaType.Type.Double, "a_total"),
     ("src_m2", QMetaType.Type.Double, "src_best"),
     ("src_lo_m2", QMetaType.Type.Double, "src_low"),
@@ -214,18 +216,20 @@ WRITEBACK_FIELDS = [
     ("z_bot_m", QMetaType.Type.Double, "z_bottom"),
     ("drop_m", QMetaType.Type.Double, "drop"),
     ("reach_deg", QMetaType.Type.Double, "reach_angle"),
-    ("vthk_m3", QMetaType.Type.Double, "v_thick"),
-    ("vthk_lo_m3", QMetaType.Type.Double, "v_thick_lo"),
-    ("vthk_hi_m3", QMetaType.Type.Double, "v_thick_hi"),
     ("vsrc_m3", QMetaType.Type.Double, "v_larsen"),
     ("vsrc_lo_m3", QMetaType.Type.Double, "v_larsen_lo"),
     ("vsrc_hi_m3", QMetaType.Type.Double, "v_larsen_hi"),
+    ("vlowsrc_m3", QMetaType.Type.Double, "v_larsen_srclo"),
+    ("vhisrc_m3", QMetaType.Type.Double, "v_larsen_srchi"),
 ]
-# What an older write-back (one fit per Measure) left on a layer. Never touched
-# now — just named in the log, so a stale vol_m3 beside the new fields is
-# explained rather than mistaken for one of them.
+# What an older write-back left on a layer: one fit per Measure (to 2026-10-23),
+# then area × thickness beside Larsen (to 2026-11-04, parked/thickness/). Never
+# touched now — just named in the log, so a stale vol_m3 or vthk_m3 beside the
+# current fields is explained rather than mistaken for one of them.
 LEGACY_WRITEBACK = ("fit", "area_m2", "area_lo_m2", "area_hi_m2", "vol_m3",
-                    "vol_lo_m3", "vol_hi_m3", "vol_ero_m3", "vol_dep_m3")
+                    "vol_lo_m3", "vol_hi_m3", "vol_ero_m3", "vol_dep_m3",
+                    "thick_m", "thick_lo_m", "thick_hi_m",
+                    "vthk_m3", "vthk_lo_m3", "vthk_hi_m3")
 
 # Measurement units we refuse to convert from. Square degrees because QGIS only
 # has one crude global factor for them, and "unknown" because that is what a CRS
@@ -236,28 +240,24 @@ UNUSABLE_AREA_UNITS = (Qgis.AreaUnit.SquareDegrees, Qgis.AreaUnit.Unknown)
 UNUSABLE_LENGTH_UNITS = (Qgis.DistanceUnit.Degrees,
                          Qgis.DistanceUnit.Unknown)
 
-TABLE_COLS = ["Slide", "Material", "Thickness (m)",
-              "V thick (m³)", "V thick low", "V thick high",
+TABLE_COLS = ["Slide", "Material",
               "V Larsen (m³)", "V Larsen low", "V Larsen high",
+              "V src low (m³)", "V src high (m³)",
               "Total area (m²)", "Src best (m²)", "Src low (m²)", "Src high (m²)",
               "Length (m)", "Drop (m)", "Layers"]
 # columns right-aligned as numbers
-TABLE_NUMERIC = range(2, 15)
+TABLE_NUMERIC = range(2, 13)
 
 # CSV header + the row keys behind it, so the export carries raw numbers rather
-# than the table's thousands-separated display strings. Each fit's volume, area
-# and inputs in its own columns.
+# than the table's thousands-separated display strings. vol_larsen_lo/hi are the
+# best outline's range; vol_larsen_src_low/high the volumes of the other two
+# source outlines.
 CSV_FIELDS = [
     ("slide", "name"), ("material", "material"),
-    ("thickness_setting", "thick_setting"),
-    ("thickness_m", "t_best"), ("thickness_low_m", "t_low"),
-    ("thickness_high_m", "t_high"),
-    ("thickness_outline", "thick_from"),
-    ("thickness_area_m2", "thick_area_m2"),
-    ("vol_thickness_m3", "v_thick"), ("vol_thickness_lo_m3", "v_thick_lo"),
-    ("vol_thickness_hi_m3", "v_thick_hi"),
     ("vol_larsen_m3", "v_larsen"), ("vol_larsen_lo_m3", "v_larsen_lo"),
     ("vol_larsen_hi_m3", "v_larsen_hi"),
+    ("vol_larsen_src_low_m3", "v_larsen_srclo"),
+    ("vol_larsen_src_high_m3", "v_larsen_srchi"),
     ("total_area_m2", "a_total"),
     ("source_best_m2", "src_best"), ("source_low_m2", "src_low"),
     ("source_high_m2", "src_high"),
@@ -268,7 +268,7 @@ CSV_FIELDS = [
     ("total_layer", "total_layer"), ("source_best_layer", "best_layer"),
     ("source_low_layer", "low_layer"), ("source_high_layer", "high_layer"),
     ("written_layer", "layer_name"), ("written_feature_id", "fid"),
-    ("thickness_calculator", "thick_calc"), ("larsen_calculator", "larsen_calc"),
+    ("larsen_calculator", "larsen_calc"),
 ]
 
 # The event columns: who the event was and where the scar sits relative to it.
@@ -302,7 +302,7 @@ class VolumeTab(QWidget):
     # ---------- UI ----------
     def _build_ui(self):
         """Top to bottom in the order the work is done: outlines, settings,
-        Measure, the two volumes, centerline & drop, Write to layer. The results
+        Measure, the volumes, centerline & drop, Write to layer. The results
         table and the log are collapsed underneath — with one slide per project
         the Volumes box already shows the row."""
         root = QVBoxLayout(self)
@@ -332,11 +332,11 @@ class VolumeTab(QWidget):
         root.addLayout(head)
 
         root.addWidget(self._help(
-            "Draw the TOTAL outline and the BEST SOURCE scar, set the deposit "
-            "thickness and what failed, then Measure. One Measure runs both fits "
-            "— area × thickness on the total outline (Toney et al. 2021) and "
-            "Larsen et al. (2010) on the source outline — and "
-            "records the slide's row. Neither is the headline."))
+            "Draw the TOTAL outline and the source scar — best, and a low and "
+            "high reading of it — set what failed, then Measure. The volume is "
+            "Larsen et al. (2010): the best source outline gives the estimate, "
+            "source low and high give the low and high estimates. Measure also "
+            "records the slide's row."))
 
         root.addWidget(self._build_outline_box())
         root.addWidget(self._build_settings_box())
@@ -344,10 +344,11 @@ class VolumeTab(QWidget):
         btns = FlowRow()
         self.measure_btn = QPushButton("Measure")
         self.measure_btn.setToolTip(
-            "Measure the assigned outlines and run both fits: area × thickness "
-            "on the TOTAL outline, Larsen et al. (2010) on the BEST SOURCE "
-            "outline (source low/high widen its range). Records the result as "
-            "this slide's row — measuring the same slide again replaces it.")
+            "Measure the assigned outlines and run Larsen et al. (2010) on each "
+            "source outline: BEST for the estimate (source low/high widen its "
+            "range), LOW and HIGH for their own volumes. The TOTAL outline gives "
+            "the implied mean depth. Records the result as this slide's row — "
+            "measuring the same slide again replaces it.")
         self.measure_btn.clicked.connect(self._measure)
         f = self.measure_btn.font()
         f.setBold(True)
@@ -362,8 +363,9 @@ class VolumeTab(QWidget):
         act = FlowRow()
         self.write_btn = QPushButton("Write to layer")
         self.write_btn.setToolTip(
-            "Stamp the slide's numbers — both volumes with their ranges, the "
-            "thickness, every area, length and drop — onto the TOTAL outline's "
+            "Stamp the slide's numbers — the Larsen et al. volumes (best with "
+            "its range, source low, source high), every area, length and drop — "
+            "onto the TOTAL outline's "
             "own feature as attributes (fields are added if missing), so they "
             "travel with the geometry. The source outline stands in when no "
             "total is drawn. Needs a layer that accepts attribute edits.")
@@ -419,13 +421,15 @@ class VolumeTab(QWidget):
         box.setSaveCollapsedState(False)
         v = QVBoxLayout(box)
         v.addWidget(self._help(
-            "TOTAL (red) — the whole affected area: source scar, runout track "
-            "and deposit; area × thickness converts it. SOURCE best (blue) — the "
-            "evacuated scar alone; Larsen et al. (2010) converts it, and taking in "
-            "the track or deposit inflates that volume. New makes the outline as "
-            "a GeoPackage beside the project, assigned and ready to draw; Draw "
-            "adds another polygon to the assigned layer (a layer is measured by "
-            "its largest polygon)."))
+            "SOURCE (blue) — the evacuated scar alone, three ways: best, low "
+            "(conservative, dashed) and high (generous, dotted). Larsen et al. "
+            "(2010) converts each into a volume, and taking in the track or "
+            "deposit inflates it. TOTAL (red) — the whole affected area: source "
+            "scar, runout track and deposit; it gives the implied mean depth, "
+            "the centerline, and the feature Write to layer stamps. New makes "
+            "the outline as a GeoPackage beside the project, assigned and ready "
+            "to draw; Draw adds another polygon to the assigned layer (a layer "
+            "is measured by its largest polygon)."))
 
         form = QFormLayout()
         self.name_edit = QLineEdit("slide 1")
@@ -442,8 +446,9 @@ class VolumeTab(QWidget):
         self._total_combo = QComboBox()
         self._total_combo.setToolTip(
             "Layer holding the TOTAL landslide outline — the whole affected "
-            "area, source through runout to deposit. Area × thickness converts "
-            "it; the centerline is spined from it and Write to layer stamps it.\n\n"
+            "area, source through runout to deposit. The Larsen et al. volume "
+            "is spread over it for the implied mean depth; the centerline is "
+            "spined from it and Write to layer stamps it.\n\n"
             "Filled in automatically from a layer named “Total Area”, “Total "
             "Landslide Area” or “Landslide Area”. Capitalisation and punctuation "
             "don't matter.")
@@ -455,34 +460,29 @@ class VolumeTab(QWidget):
             "Filled in automatically from “Source Area (best)”, or a plain "
             "“Source Area”.")
         form.addRow("Source (best)", self._role_row("best", self._best_combo))
+        # In the main form, not a collapsed box, since 2026-11-04: with Larsen et
+        # al. the tab's one volume, the low and high readings of the scar are the
+        # low and high estimates, not an optional extra.
+        self._low_combo = QComboBox()
+        self._low_combo.setToolTip(
+            "Layer holding the CONSERVATIVE (smaller) source-scar "
+            "interpretation, from “Source Area (low)”. Larsen et al. (2010) "
+            "converts it into the LOW estimate; paired with source high it also "
+            "widens the best estimate's range.")
+        form.addRow("Source (low)", self._role_row("low", self._low_combo))
+        self._high_combo = QComboBox()
+        self._high_combo.setToolTip(
+            "Layer holding the GENEROUS (larger) source-scar interpretation, "
+            "from “Source Area (high)”. Larsen et al. (2010) converts it into the "
+            "HIGH estimate; paired with source low it also widens the best "
+            "estimate's range.")
+        form.addRow("Source (high)", self._role_row("high", self._high_combo))
         v.addLayout(form)
 
         self.role_lbl = QLabel()
         self.role_lbl.setWordWrap(True)
         self.role_lbl.setStyleSheet("QLabel { color: palette(mid); }")
         v.addWidget(self.role_lbl)
-
-        rng = QgsCollapsibleGroupBox("Source low / high (optional range)")
-        rng.setSaveCollapsedState(False)
-        rng.setCollapsed(True)
-        rf = QFormLayout(rng)
-        rf.addRow(self._help(
-            "A conservative and a generous reading of the source scar. "
-            "Larsen et al. (2010) reads them as a ±2σ area span and folds it into its "
-            "range; area × thickness ignores them."))
-        self._low_combo = QComboBox()
-        self._low_combo.setToolTip(
-            "Optional. Layer holding the CONSERVATIVE (smaller) source-scar "
-            "interpretation, from “Source Area (low)”. Lowers the Larsen et al. "
-            "volume range (paired with source high).")
-        rf.addRow("Source (low)", self._role_row("low", self._low_combo))
-        self._high_combo = QComboBox()
-        self._high_combo.setToolTip(
-            "Optional. Layer holding the GENEROUS (larger) source-scar "
-            "interpretation, from “Source Area (high)”. Raises the Larsen et al. "
-            "volume range (paired with source low).")
-        rf.addRow("Source (high)", self._role_row("high", self._high_combo))
-        v.addWidget(rng)
 
         for role, combo in (("total", self._total_combo),
                             ("best", self._best_combo), ("low", self._low_combo),
@@ -824,11 +824,12 @@ class VolumeTab(QWidget):
             self.role_lbl.setStyleSheet(status_css("error"))
             return
         note = ""
-        if "total" not in areas and "best" in areas:
-            note = ("No total outline — area × thickness will convert the source "
-                    "scar instead, which only suits the Source-scar setting.")
-        elif "best" not in areas and "total" in areas:
-            note = ("No source (best) outline — only area × thickness will run.")
+        if "best" not in areas:
+            note = ("No source (best) outline — Larsen et al. (2010) needs it, "
+                    "so Measure will record the areas but no volume.")
+        elif "total" not in areas:
+            note = ("No total outline — no implied mean depth, and the "
+                    "centerline and Write to layer fall back to the source scar.")
         self.role_lbl.setText(f"{text}\n{note}" if note else text)
         self.role_lbl.setStyleSheet(status_css("warn") if note
                                     else "QLabel { color: palette(mid); }")
@@ -1063,80 +1064,14 @@ class VolumeTab(QWidget):
                 "Feature tool to draw the outline.")
 
     def _build_settings_box(self):
-        """What the two fits need beyond the outlines.
+        """What Larsen et al. (2010) needs beyond the outlines: what failed.
 
-        Deposit thickness for area × thickness (Toney et al. 2021): V = the total
-        outline's plan area × mean thickness, the low/high thickness giving the
-        range. The mean thickness is the dominant uncertainty, which is why it's
-        carried as an explicit low/best/high rather than hidden in a
-        coefficient. What failed (bedrock/soil) for Larsen et al. (2010) — read
-        by that fit only."""
+        The deposit thickness for area × thickness sat here too until
+        2026-11-04; it is parked, with the rest of that fit, in
+        parked/thickness/."""
         box = QgsCollapsibleGroupBox("Settings")
         box.setSaveCollapsedState(False)
         form = QFormLayout(box)
-        # Underscored so project_state does not store it: the setting is read back
-        # off the three numbers (_sync_thickness_setting), which ARE stored.
-        self._thick_setting_combo = QComboBox()
-        for label, key, *_rest in volume_calc.THICKNESS_SETTINGS:
-            self._thick_setting_combo.addItem(label, key)
-            # the closed combo elides (below), so the full label rides along
-            self._thick_setting_combo.setItemData(
-                self._thick_setting_combo.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
-        self._thick_setting_combo.addItem("Custom — your own values", "custom")
-        self._thick_setting_combo.setToolTip(
-            "What kind of deposit the TOTAL outline is, for area × thickness. "
-            "Fills the mean thickness and its low/high from the published values "
-            "for that setting; edit any of them and this reads Custom.\n\n"
-            "Near date / far date is when the imagery you outlined was taken: "
-            "soon after the event the deposit still holds the snow and ice it "
-            "picked up, as a seismic volume does; after a melt season only the "
-            "rock is left.")
-        # The labels carry their numbers, so the longest would set the dock's
-        # minimum width; let the closed combo elide instead (the list still opens
-        # full width).
-        self._thick_setting_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self._thick_setting_combo.setMinimumContentsLength(12)
-        self._thick_setting_combo.activated.connect(self._apply_thickness_setting)
-        form.addRow("Deposit thickness", self._thick_setting_combo)
-
-        _label, _key, best, low, high, _note = volume_calc.THICKNESS_SETTINGS[0]
-        self.thick_best_edit = QLineEdit(f"{best:g}")
-        self.thick_best_edit.setToolTip(
-            "Mean deposit thickness in metres, averaged over the whole outline "
-            "(thick in the source/deposit, thin along the track).")
-        self.thick_low_edit = QLineEdit(f"{low:g}")
-        self.thick_low_edit.setToolTip(
-            "Low thickness → low volume. Must be less than the mean; blank for no "
-            "lower bound.")
-        self.thick_high_edit = QLineEdit(f"{high:g}")
-        self.thick_high_edit.setToolTip(
-            "High thickness → high volume. Must be greater than the mean; blank "
-            "for no upper bound.")
-        # its own full-width row: sharing the field column with the "Deposit
-        # thickness" label squeezed the three boxes until "2.5" read ".5"
-        nums_w = QWidget()
-        nums = QHBoxLayout(nums_w)
-        nums.setContentsMargins(0, 0, 0, 0)
-        nums.setSpacing(4)
-        nums.addStretch(1)
-        for text, edit in (("Mean", self.thick_best_edit),
-                           ("low", self.thick_low_edit),
-                           ("high", self.thick_high_edit)):
-            edit.setMinimumWidth(40)
-            edit.setMaximumWidth(64)
-            nums.addWidget(QLabel(text))
-            nums.addWidget(edit)
-        nums.addWidget(QLabel("m"))
-        form.addRow(nums_w)
-        self._thick_note_lbl = self._help()
-        form.addRow(self._thick_note_lbl)     # spans both columns: it is prose
-        form.addRow(self._help(
-            "These are means over the deposit. The total outline also holds the "
-            "source scar and track — Bessette-Kirton & Coe (2020) take the "
-            "deposit as ~80% of it — so the volume reads somewhat high; the low "
-            "end covers that."))
-
         self.material_combo = QComboBox()
         for label, _key in volume_calc.MATERIALS:
             self.material_combo.addItem(label)
@@ -1156,32 +1091,23 @@ class VolumeTab(QWidget):
             "volume is a mass divided by an assumed density, so check both "
             "numbers assume the same thing before comparing them."))
 
-        for edit in (self.thick_best_edit, self.thick_low_edit,
-                     self.thick_high_edit):
-            edit.textChanged.connect(self._sync_thickness_setting)
-        self._sync_thickness_setting()
         return box
 
     def _build_volumes_box(self):
-        """What Measure found — both fits side by side, read-only and copyable.
+        """What Measure found — Larsen et al. (2010) on each source outline,
+        read-only and copyable. The best outline's volume is the answer and is
+        bold; source low and high give the low and high estimates under it.
 
         Read-only output, which is also why the per-project state save skips it
         (see project_state._persistable). The warnings line under the numbers is
         not help text: it says what is wrong with THIS measurement (a skipped
-        fit, a setting that doesn't suit the outline), so it always shows."""
+        fit, an implausible implied depth), so it always shows."""
         box = QgsCollapsibleGroupBox("Volumes")
         box.setSaveCollapsedState(False)
         f = QFormLayout(box)
-        self.vol_thick_out = self._ro("press Measure")
-        self.vol_thick_out.setToolTip(
-            "Total outline's plan area × the mean deposit thickness, with the "
-            "low/high thickness as its range — the dominant uncertainty in an "
-            "area × thickness estimate. Exact m³ are in the results table, the "
-            "CSV and the written attributes.")
-        f.addRow("Area × thickness", self.vol_thick_out)
-        self.vol_scar_out = self._ro()
-        for out in (self.vol_thick_out, self.vol_scar_out):   # the answer
-            bold = out.font(); bold.setBold(True); out.setFont(bold)
+        self.vol_scar_out = self._ro("press Measure")
+        bold = self.vol_scar_out.font(); bold.setBold(True)   # the answer
+        self.vol_scar_out.setFont(bold)
         scar_tip = (
             "Larsen et al. (2010), Table S1, on the best source outline. "
             "The range in brackets is NOT a prediction interval for this "
@@ -1195,29 +1121,47 @@ class VolumeTab(QWidget):
             "calls it a standard deviation and the supplement calls it a "
             "standard error.\n\n"
             "Your low/high outlines are also read as a ±2σ span, so a narrower "
-            "pair tightens this range faster than you may intend.")
+            "pair tightens this range faster than you may intend. Their own "
+            "volumes are the two lines below. Exact m³ are in the results "
+            "table, the CSV and the written attributes.")
         self.vol_scar_out.setToolTip(scar_tip)
         scar_lbl = QLabel("Larsen et al. (2010)")
+        scar_lbl.setFont(bold)
         scar_lbl.setToolTip(scar_tip)
         f.addRow(scar_lbl, self.vol_scar_out)
+        # One volume per reading of the scar: the same relation, material and
+        # implementation as the best estimate, at its central value — the
+        # coefficient spread is already shown once, on the line above.
+        self.vol_src_low_out = self._ro()
+        self.vol_src_high_out = self._ro()
+        for out, word, role in ((self.vol_src_low_out, "LOW", "low"),
+                                (self.vol_src_high_out, "HIGH", "high")):
+            tip = (f"Larsen et al. (2010) on the source {role} outline — the "
+                   f"{word} estimate: the volume this reading of the scar gives "
+                   "through the same relation and material as the best one, at "
+                   "the fit's central value.")
+            out.setToolTip(tip)
+            lbl = QLabel(f"Source {role}")
+            lbl.setToolTip(tip)
+            f.addRow(lbl, out)
         # V/A — the cheapest sanity check in the tab. Taken over the TOTAL outline
         # (Ethan's call, 2026-10-23), so it is the mean thickness the Larsen
-        # volume implies across the whole footprint — the same quantity as the
-        # deposit thickness area × thickness multiplies by, and directly
-        # comparable with it.
+        # volume implies across the whole footprint, comparable with measured
+        # deposit thicknesses.
         self.depth_out = self._ro()
         self.depth_out.setToolTip(
             "Larsen et al. (2010) volume ÷ TOTAL outline area: the mean thickness "
             "over the whole landslide footprint that the Larsen volume implies. "
-            "Directly comparable with the deposit thickness under Settings — "
-            "area × thickness is that thickness over the same area — so a value "
-            "several times it means the two fits disagree, and tens of metres "
-            "means the outline or the material is wrong.")
+            "Rock-avalanche deposits on glaciers run ~2.5 m (middle half "
+            "1.9–3.0 m; Deline et al. 2015, Table 9.1), and above "
+            f"{volume_calc.LARSEN_DEPTH_FLAG_M:g} m the tab warns that the volume "
+            "is probably too high on ice. Tens of metres means the outline or "
+            "the material is wrong.")
         f.addRow("Implied mean depth", self.depth_out)
         self.areas_out = self._ro()
         self.areas_out.setToolTip(
             "Ellipsoidal plan-view areas of the assigned outlines — the quantity "
-            "both calibrations were fitted to.")
+            "Larsen et al. measured from imagery.")
         f.addRow("Areas", self.areas_out)
         self.vol_warn_lbl = QLabel()
         self.vol_warn_lbl.setWordWrap(True)
@@ -1366,59 +1310,6 @@ class VolumeTab(QWidget):
         v.addWidget(self.log)
         return box
 
-    def _apply_thickness_setting(self, index):
-        """Fill mean/low/high from the setting picked at `index`.
-
-        Wired to the combo's `activated` — a user's pick only — so the
-        programmatic moves made by _sync_thickness_setting never refill the
-        numbers. Custom leaves them for the analyst to type."""
-        key = self._thick_setting_combo.itemData(index)
-        entry = next((s for s in volume_calc.THICKNESS_SETTINGS if s[1] == key),
-                     None)
-        if entry is None:
-            self._show_thickness_note()
-            self.thick_best_edit.setFocus()
-            return
-        _label, _key, best, low, high, _note = entry
-        for edit, val in ((self.thick_best_edit, best), (self.thick_low_edit, low),
-                          (self.thick_high_edit, high)):
-            edit.setText(f"{val:g}")
-        # setText only signals a CHANGE, so sync once more for a pick whose
-        # numbers were already in the fields (Custom, then the same setting).
-        self._sync_thickness_setting()
-
-    def _sync_thickness_setting(self, *_args):
-        """Point the Setting combo at whichever setting the three numbers are, or
-        Custom when they are none of them. Runs on every edit and on project
-        restore, which is why the combo itself never needs storing."""
-        entry = volume_calc.thickness_setting(*self._thickness_values())
-        combo = self._thick_setting_combo
-        combo.setCurrentIndex(combo.findData(entry[1] if entry else "custom"))
-        self._show_thickness_note()
-
-    def _show_thickness_note(self):
-        """The selected setting's evidence, under the combo."""
-        key = self._thick_setting_combo.currentData()
-        entry = next((s for s in volume_calc.THICKNESS_SETTINGS if s[1] == key),
-                     None)
-        self._thick_note_lbl.setText(
-            entry[5] if entry else
-            "Your own mean/low/high — none of the settings above. Pick a setting "
-            "to fill them from the published values again.")
-
-    def _thickness_values(self):
-        """(t_best, t_low, t_high) in metres from the thickness fields, or
-        (None, None, None) if the mean is blank/invalid. Low/high come back None
-        unless they parse to a positive number."""
-        def _f(edit):
-            try:
-                val = float(edit.text().strip())
-                return val if val > 0 else None
-            except (ValueError, AttributeError):
-                return None
-        return (_f(self.thick_best_edit), _f(self.thick_low_edit),
-                _f(self.thick_high_edit))
-
     def _ro(self, text=""):
         """A read-only readout: a label rather than a line edit, so the whole
         value wraps into view on a narrow dock (a line edit scrolls to its end
@@ -1472,15 +1363,18 @@ class VolumeTab(QWidget):
         return area, feature, layer
 
     def _measure(self):
-        """Both volumes, each from the outline its calibration is defined on.
+        """The Larsen et al. (2010) volumes, from the source outlines its
+        calibration is defined on.
 
-        Area × thickness converts the TOTAL outline (the deposit footprint the
-        published thicknesses are means over), or the source scar when no total
-        is drawn; Larsen et al. (2010) converts the BEST SOURCE outline, widened
-        by source low/high when they are assigned. Either runs without the other
-        — a slide with only a total outline still gets its area × thickness
-        volume — and the result is recorded as this slide's row straight away
-        (_record: re-measuring the same slide name replaces it)."""
+        The BEST source outline gives the estimate, its range widened by source
+        low/high when both are assigned; source low and source high each go
+        through the same relation for the low and high estimates. The TOTAL
+        outline is not converted — it gives the implied mean depth, and it is
+        what the centerline is spined from and Write to layer stamps. A slide
+        with only a total outline is still recorded, with its areas and no
+        volume, so its centerline and drop can be taken. The result is this
+        slide's row straight away (_record: re-measuring the same slide name
+        replaces it)."""
         if not self._polygon_layers():
             self._notify(
                 "This project has no polygon layer yet — press New beside Total "
@@ -1506,13 +1400,7 @@ class VolumeTab(QWidget):
             return
 
         warnings = []
-        thick = self._thickness_volume(a_total, a_best, warnings)
         scar = self._scar_volume(a_best, a_low, a_high, warnings)
-        if not thick and not scar:
-            self._show_warnings(warnings)
-            for w in warnings:
-                self._append_log(w)
-            return
         if total_feat is not None and best_feat is not None:
             note = self._warn_if_total_excludes_source(
                 total_feat, total_layer, best_layer)
@@ -1532,11 +1420,9 @@ class VolumeTab(QWidget):
             "material_label": self.material_combo.currentText(),
             "a_total": a_total,
             "src_best": a_best, "src_low": a_low, "src_high": a_high,
-            # each fit's own numbers, None where it could not run
-            "v_thick": None, "v_thick_lo": None, "v_thick_hi": None,
-            "thick_area_m2": None, "thick_from": "", "thick_setting": "",
-            "t_best": None, "t_low": None, "t_high": None, "thick_calc": "",
+            # None where Larsen et al. could not run (no source best outline)
             "v_larsen": None, "v_larsen_lo": None, "v_larsen_hi": None,
+            "v_larsen_srclo": None, "v_larsen_srchi": None,
             "larsen_area_m2": None, "larsen_calc": "",
             "length": None, "length_method": "",
             "z_top": None, "z_bottom": None, "drop": None,
@@ -1550,7 +1436,6 @@ class VolumeTab(QWidget):
             "low_layer": low_layer.name() if a_low is not None else "",
             "high_layer": high_layer.name() if a_high is not None else "",
         }
-        row.update(thick)
         row.update(scar)
         depth_note = volume_calc.implied_depth_note(_implied_depth(row)[0])
         if depth_note:
@@ -1558,19 +1443,19 @@ class VolumeTab(QWidget):
         row["warnings"] = warnings          # on screen only; not a CSV column
         kept = self._record(row)
 
-        if thick:
-            src = "Total" if row["thick_from"] == "total" else "Source best"
-            self._append_log(
-                f"Area × thickness: {src} {_fmt(row['thick_area_m2'])} m² × "
-                f"{row['t_best']:g} m = {_fmt(row['v_thick'])} m³ "
-                f"({_fmt(row['v_thick_lo'])} – {_fmt(row['v_thick_hi'])}); "
-                f"{row['thick_calc']}.")
         if scar:
             self._append_log(
                 f"Larsen et al. (2010): {_fmt(a_best)} m² from “{best_layer.name()}” → "
                 f"{_fmt(row['v_larsen'])} m³ ({_fmt(row['v_larsen_lo'])} – "
                 f"{_fmt(row['v_larsen_hi'])}), {row['material_label'].lower()}; "
                 f"via {row['larsen_calc']}.")
+            for word, area, layer, key in (
+                    ("low", a_low, low_layer, "v_larsen_srclo"),
+                    ("high", a_high, high_layer, "v_larsen_srchi")):
+                if row.get(key) is not None:
+                    self._append_log(
+                        f"  Source {word}: {_fmt(area)} m² from “{layer.name()}” → "
+                        f"{_fmt(row[key])} m³ — the {word} estimate.")
             if a_low is not None and a_high is not None:
                 self._append_log(
                     "  Its range combines the published fit uncertainty with the "
@@ -1589,69 +1474,42 @@ class VolumeTab(QWidget):
                 f"Replaced “{row['name']}” in the results — its centerline was "
                 "kept; Re-measure it if you reshaped the outline.")
 
-    def _thickness_volume(self, a_total, a_best, warnings):
-        """{v_thick…} from area × thickness, or {} with the reason in `warnings`.
-
-        The TOTAL outline is the deposit footprint the published thicknesses
-        are means over; with no total drawn the source scar stands in, which
-        only makes sense with the Source-scar (detachment depth) setting."""
-        t, t_lo, t_hi = self._thickness_values()
-        if t is None:
-            warnings.append(
-                "Area × thickness skipped: enter a mean deposit thickness (m) "
-                "under Settings, or pick a setting there.")
-            return {}
-        if a_total is not None:
-            area, role = a_total, "total"
-        elif a_best is not None:
-            area, role = a_best, "source"
-        else:
-            return {}
-        v, v_lo, v_hi, calc = volume_calc.volume_thickness(
-            area, t, t_low=t_lo, t_high=t_hi)
-        setting = volume_calc.thickness_setting(t, t_lo, t_hi)
-        key = setting[1] if setting else "custom"
-        if v_lo is None or v_hi is None:
-            warnings.append(
-                "Single thickness given, so area × thickness has no range — set "
-                "a low and high thickness to bracket it.")
-        if key == "ice_rich_far":
-            warnings.append(
-                "Far-date ice-rich setting: this is the rock left after the ice "
-                "melted. Over half of what failed at Red Glacier was ice, so the "
-                "failed volume can be 2–3× this — use the near-date setting to "
-                "compare with a seismic volume.")
-        if key == "scar" and role == "total":
-            warnings.append(
-                "The Source-scar thickness setting is a detachment depth, but "
-                "area × thickness converts the TOTAL outline — that reads several "
-                "times too high. Pick a deposit setting.")
-        elif key not in ("scar", "custom") and role == "source":
-            warnings.append(
-                "No total outline, so area × thickness converted the SOURCE scar "
-                "with a deposit thickness — that reads low. Draw the total "
-                "outline, or pick the Source-scar setting.")
-        return {"v_thick": v, "v_thick_lo": v_lo, "v_thick_hi": v_hi,
-                "thick_area_m2": area, "thick_from": role,
-                "thick_setting": setting[0] if setting else "custom",
-                "t_best": t, "t_low": t_lo, "t_high": t_hi, "thick_calc": calc}
-
     def _scar_volume(self, a_best, a_low, a_high, warnings):
-        """{v_larsen…} from Larsen et al. (2010), or {} with the reason."""
+        """{v_larsen…} from Larsen et al. (2010), or {} with the reason.
+
+        v_larsen with its range is the best outline (low/high folded in as an
+        area span when both are there); v_larsen_srclo / _srchi are the low and
+        high outlines run through the same relation on their own, at the fit's
+        central value. Those two are only taken beside a best estimate: on
+        their own they would be a range with nothing in it."""
         if a_best is None:
             warnings.append(
                 "Larsen et al. (2010) skipped: no Source (best) outline — draw the "
-                "evacuated scar to get the second estimate.")
+                "evacuated scar to get the volume.")
             return {}
+        material, project_dir = self._material(), self.dock.pipeline_dir()
         try:
             v, v_lo, v_hi, calc = volume_calc.volume_source(
-                a_best, A_low=a_low, A_high=a_high, material=self._material(),
-                fit="scar", project_dir=self.dock.pipeline_dir())
+                a_best, A_low=a_low, A_high=a_high, material=material,
+                fit="scar", project_dir=project_dir)
         except Exception as e:
             warnings.append(f"Larsen et al. (2010) calculation failed: {e}")
             return {}
-        return {"v_larsen": v, "v_larsen_lo": v_lo, "v_larsen_hi": v_hi,
-                "larsen_area_m2": a_best, "larsen_calc": calc}
+        out = {"v_larsen": v, "v_larsen_lo": v_lo, "v_larsen_hi": v_hi,
+               "larsen_area_m2": a_best, "larsen_calc": calc,
+               "v_larsen_srclo": None, "v_larsen_srchi": None}
+        for key, area, word in (("v_larsen_srclo", a_low, "low"),
+                                ("v_larsen_srchi", a_high, "high")):
+            if area is None:
+                continue
+            try:
+                out[key] = volume_calc.volume_source(
+                    area, material=material, fit="scar",
+                    project_dir=project_dir)[0]
+            except Exception as e:
+                warnings.append(
+                    f"Larsen et al. (2010) on the source {word} outline failed: {e}")
+        return out
 
     def _show_warnings(self, warnings):
         self.vol_warn_lbl.setText("\n".join(f"⚠ {w}" for w in warnings))
@@ -1694,23 +1552,18 @@ class VolumeTab(QWidget):
         lands in the table without another click.
 
         3 significant figures of Mm³, not 4 decimal places: the honest spread on
-        either estimate is a factor of 2-3, so printing 1.3021 Mm³ asserts a
-        precision neither method has. Exact m³ are in the table and the CSV."""
+        a Larsen et al. estimate is a factor of 2-3, so printing 1.3021 Mm³
+        asserts a precision the method does not have. Exact m³ are in the table
+        and the CSV."""
         c = self._current
         if c is None:
-            self.vol_thick_out.setText("press Measure")
-            for e in (self.vol_scar_out, self.depth_out, self.areas_out,
+            self.vol_scar_out.setText("press Measure")
+            for e in (self.vol_src_low_out, self.vol_src_high_out,
+                      self.depth_out, self.areas_out,
                       self.length_out, self.drop_out):
                 e.clear()
             self._show_warnings([])
         else:
-            if c.get("v_thick") is not None:
-                where = "" if c.get("thick_from") == "total" else " (source)"
-                self.vol_thick_out.setText(
-                    f"{_vol_range(c['v_thick'], c['v_thick_lo'], c['v_thick_hi'])}"
-                    f"   ·  {_km2(c['thick_area_m2'])}{where} × {c['t_best']:g} m")
-            else:
-                self.vol_thick_out.setText("— not run (see the note below)")
             if c.get("v_larsen") is not None:
                 self.vol_scar_out.setText(
                     f"{_vol_range(c['v_larsen'], c['v_larsen_lo'], c['v_larsen_hi'])}"
@@ -1718,6 +1571,15 @@ class VolumeTab(QWidget):
                     f"{(c.get('material_label') or '').lower()}")
             else:
                 self.vol_scar_out.setText("— not run (see the note below)")
+            for out, key, area_key, word in (
+                    (self.vol_src_low_out, "v_larsen_srclo", "src_low", "low"),
+                    (self.vol_src_high_out, "v_larsen_srchi", "src_high", "high")):
+                if c.get(key) is not None:
+                    out.setText(f"{c[key] / 1e6:,.3g} Mm³   ·  {_km2(c[area_key])}")
+                elif c.get("v_larsen") is None:
+                    out.clear()
+                else:
+                    out.setText(f"— (no source {word} outline)")
             self._show_depth(c)
             areas = []
             if c.get("a_total") is not None:
@@ -2199,7 +2061,7 @@ class VolumeTab(QWidget):
         with no separate "add" step to forget before Write to layer can see it.
 
         A centerline already drawn for the slide survives a re-measure (changing
-        the thickness, say): its length and drop carry over to the new row, and
+        the material, say): its length and drop carry over to the new row, and
         True is returned so _measure can say so. Re-measure it if the outline
         itself moved."""
         kept = False
@@ -2232,11 +2094,9 @@ class VolumeTab(QWidget):
             layers = row["layer_name"] + (f"  + {', '.join(others)}" if others else "")
             values = [
                 row["name"], row.get("material_label", ""),
-                _fmt(row.get("t_best")),
-                _fmt(row.get("v_thick")), _fmt(row.get("v_thick_lo")),
-                _fmt(row.get("v_thick_hi")),
                 _fmt(row.get("v_larsen")), _fmt(row.get("v_larsen_lo")),
                 _fmt(row.get("v_larsen_hi")),
+                _fmt(row.get("v_larsen_srclo")), _fmt(row.get("v_larsen_srchi")),
                 _fmt(row.get("a_total")),
                 _fmt(row.get("src_best")), _fmt(row.get("src_low")),
                 _fmt(row.get("src_high")),
@@ -2289,15 +2149,16 @@ class VolumeTab(QWidget):
 
     # ---------- event columns for the CSV ----------
     def _estimates(self):
-        """(thickness, larsen, row) — the slide's two area-based volumes.
+        """(larsen, row) — the slide's Larsen et al. volume and its row.
 
-        From the slide on screen, else the last row. Each is read from its OWN
-        field, never from a shared "best" — neither is the headline."""
+        From the slide on screen, else the last row. Read from v_larsen, never
+        from a shared "best": under the old one-fit-per-Measure rows that field
+        meant whatever the row's fit made it mean."""
         row = getattr(self, "_current", None)
         if not row:
             rows = list(getattr(self, "_rows", None) or [])
             row = rows[-1] if rows else {}
-        return _num(row.get("v_thick")), _num(row.get("v_larsen")), row
+        return _num(row.get("v_larsen")), row
 
     def _scar_centroid(self):
         """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
@@ -2343,7 +2204,7 @@ class VolumeTab(QWidget):
         from . import verdict as V
         det = getattr(self.dock, "detection", None)
         row = det.as_row() if det is not None else {}
-        _thick, _larsen, src = self._estimates()
+        _larsen, src = self._estimates()
         depth, _area = _implied_depth(src)
         row["implied_depth"] = "" if depth is None else f"{depth:.2f}"
         lat, lon = self._scar_centroid()
@@ -2502,9 +2363,9 @@ class VolumeTab(QWidget):
         if legacy:
             self._append_log(
                 f"“{layer.name()}” also has {', '.join(legacy)} from an earlier "
-                "write-back, when one Measure ran one fit — left as they were. "
-                "The current numbers are vthk_* (area × thickness) and vsrc_* "
-                "(Larsen et al. 2010).")
+                "write-back (an older fit, or area × thickness) — left as they "
+                "were. The current volumes are vsrc_* (Larsen et al. 2010, best "
+                "source outline), vlowsrc_m3 and vhisrc_m3 (source low / high).")
         return ok
 
 
@@ -2548,8 +2409,8 @@ def _implied_depth(row):
     """(depth_m, area_m2): the Larsen et al. volume spread over the TOTAL outline.
 
     Depth is None when either is missing. Over the total rather than the scar,
-    so it is a mean thickness for the whole slide — comparable with the deposit
-    thickness — instead of a scar depth fixed by the area alone (V/A of the
+    so it is a mean thickness for the whole slide — comparable with measured
+    deposit thicknesses — instead of a scar depth fixed by the area alone (V/A of the
     Larsen fit on its own outline is just αA^(γ−1))."""
     from . import verdict as V
     area = _num(row.get("a_total"))
