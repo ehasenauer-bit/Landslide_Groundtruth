@@ -104,18 +104,17 @@ assert '"map_location.png"' in mapfig
 d3 = JS[JS.index("function exportFigure()"):JS.index("function composeFigure(")]
 assert "hideDetails" not in d3, "the 3D figure lost its Details block too"
 assert "if (!opts.hideDetails) {" in JS, "the details cell is no longer optional"
-assert "drawFigureLegend(g, L, g.measureText(ttl).width)" in JS, \
+assert "if (opts.hideDetails) drawFigureLegend(g, L, titleW)" in JS, \
     "nothing moves the overlay legend into the title bar when Details goes away"
 
-# The locator frame must line up with the map frame in the cell beside it, which
-# only holds while both derive their top/bottom margins the same way.
-def margins(fn):
-    body = re.search(r"function %s\(pxW, pxH\) \{(.*?)\n  \}" % fn, JS, re.S).group(1)
-    return (re.search(r"var mT = ([^;]+);", body).group(1),
-            re.search(r"var mB = ([^;]+);", body).group(1))
-assert margins("locLayout") == margins("mapLayout"), \
-    "locLayout and mapLayout no longer reserve the same top/bottom margins:\n  %r\n  %r" % (
-        margins("locLayout"), margins("mapLayout"))
+# The locator frame must line up with the map frame in the cell beside it: the
+# figure crops all four panels to the same rows, so that only holds while the
+# locator takes its frame's height and top from mapLayout itself.
+loc = re.search(r"function locLayout\(pxW, pxH\) \{(.*?)\n  \}", JS, re.S).group(1)
+assert "M = mapLayout(pxW, pxH)" in loc and "M.ih" in loc and "M.y0" in loc, \
+    "locLayout no longer takes its frame from mapLayout — it will drift off the maps' rows"
+assert "y0: R.y0" in mapfig and "y1: R.y1" in mapfig, \
+    "the locator is no longer cropped to the same rows as the map panels"
 
 print("locator OK — Alaska: %d polygons / %d points / %d graticule lines, %.0f KB; "
       "antimeridian split keeps land on both sides; open water degrades to a "

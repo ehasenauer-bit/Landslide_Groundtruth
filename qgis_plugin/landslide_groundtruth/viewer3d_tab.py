@@ -2197,6 +2197,11 @@ class Viewer3DTab(QWidget):
         loc = self._locator_cfg(scene_crs, extent)
         if loc:
             cfg["locator"] = loc
+        # Degree ticks for the map figure's frames. Without them (a CRS that
+        # will not transform) the panels fall back to distance axes.
+        grat = self._map_graticule(w3d, scene_crs, extent)
+        if grat:
+            cfg["map_grat"] = grat
         if polys or lines or points:
             self._log(f"Overlays draped: {len(polys)} polygon, {len(lines)} line, "
                       f"{len(points)} point layer(s).")
@@ -2307,6 +2312,29 @@ class Viewer3DTab(QWidget):
             self._busy(False)
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _map_graticule(self, w3d, scene_crs, extent):
+        """Meridians/parallels over the scene in its local metres (see
+        web3d_export.map_graticule), or [] on any failure."""
+        try:
+            proj = QgsProject.instance()
+            wgs84 = QgsCoordinateReferenceSystem.fromEpsgId(4326)
+            fwd = QgsCoordinateTransform(wgs84, scene_crs, proj)
+            inv = QgsCoordinateTransform(scene_crs, wgs84, proj)
+            cx, cy = extent.center().x(), extent.center().y()
+
+            def to_local(lon, lat):
+                p = fwd.transform(QgsPointXY(lon, lat))
+                return p.x() - cx, p.y() - cy
+
+            def to_lonlat(x, y):
+                p = inv.transform(QgsPointXY(x + cx, y + cy))
+                return p.x(), p.y()
+
+            return w3d.map_graticule(to_local, to_lonlat, extent.width(), extent.height())
+        except Exception as e:
+            self._log(f"Map figure keeps distance axes ({type(e).__name__}: {e}).")
+            return []
 
     def _locator_cfg(self, scene_crs, extent):
         """Location-panel geometry for the scene centre, or None on any failure —
