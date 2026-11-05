@@ -1288,6 +1288,23 @@ class GegdTab(QWidget):
             f = pick.font(); f.setBold(True); pick.setFont(f)
         return items
 
+    def strip_cells(self, feature_id):
+        """One strip as this tab's table prints it, or None when the current
+        search does not list it (hidden rows included).
+
+        {"side", "acq_utc", "gap_days"} plus the cell text under each COLUMNS
+        heading. For the 3D viewer's scene CSV: a streamed strip has no file to
+        read its metadata back from, so its row comes from here."""
+        ranked = self._ranked
+        if ranked is None or not feature_id:
+            return None
+        for r in list(ranked.pre) + list(ranked.post):
+            if r.strip.feature_id == feature_id:
+                cells = {h: it.text() for h, it in zip(COLUMNS, self._row_items(r))}
+                cells.update(side=r.side, acq_utc=r.strip.acq_utc, gap_days=r.gap_days)
+                return cells
+        return None
+
     def _row_tip(self, r):
         """Everything the seven columns leave out, for the row tooltip."""
         s = r.strip

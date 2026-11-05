@@ -320,6 +320,7 @@ _HTML_MID = """
          color: #dfe6f2; padding: 8px 14px; border-radius: 8px; font-size: 14px;
          font-weight: 600; cursor: pointer; user-select: none; }
   .btn.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+  .btn:disabled { opacity: .45; cursor: default; }
   /* the back-link is navigation, not a control: quieter than the flip
      buttons so it never reads as the primary action. */
   .btn.ghost { background: transparent; color: #aeb9cc; font-weight: 500;
@@ -379,6 +380,7 @@ _HTML_MID = """
   <button id="afterBtn" class="btn">After ▶</button>
   <button id="exportBtn" class="btn">⬇ Export 3D figure</button>
   <button id="exportMapBtn" class="btn">⬇ Export map figure</button>
+  <button id="csvBtn" class="btn">⬇ Export metadata CSV</button>
 </div>
 <div id="tag"></div>
 <div id="help">
@@ -412,6 +414,30 @@ _VIEWER_JS = r'''
   var CFG;
   try { CFG = JSON.parse(document.getElementById("cfg").textContent); }
   catch (ex) { return fail("Could not read scene data: " + ex); }
+
+  // ---------- metadata CSV: every scene the project downloaded ----------
+  // CFG.scene_csv is built by the plugin at export time (scene_manifest.py):
+  // one row per downloaded scene under the imagery tabs' table headings. Wired
+  // before WebGL starts, so the table still saves where the 3D view cannot run.
+  (function () {
+    var b = document.getElementById("csvBtn"), S = CFG.scene_csv;
+    if (!S || !S.n) {
+      b.disabled = true;
+      b.title = S ? "No downloaded scenes were found in the project folder when this viewer was exported."
+                  : "This viewer was exported without a scene list.";
+      return;
+    }
+    b.title = S.n + " downloaded scene" + (S.n === 1 ? "" : "s") +
+              ": Side, Date, Gap, Cloud, Coverage, Source, Radar, Orbit, Track, Sensor, ... Scene ID";
+    b.onclick = function () {
+      // The BOM is for Excel, which otherwise reads this UTF-8 (° ❄ —) as Latin-1.
+      var blob = new Blob(["\ufeff" + S.csv], {type: "text/csv;charset=utf-8"});
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = S.name || "scenes.csv";
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
+    };
+  })();
 
   var canvas = document.getElementById("gl");
   var glopt = { preserveDrawingBuffer: true, antialias: true };
