@@ -25,7 +25,7 @@ class Stub:
     def __init__(self): self.dock=FakeDock(); self._rows=[]
     def _role_layer(self,r): return None
     def _append_log(self,t): pass
-for m in ("_estimates","_scar_centroid","_event_row"):
+for m in ("_estimates","_scar_centroid","_outline_centroid","_event_row"):
     setattr(Stub,m,getattr(VT.VolumeTab,m))
 s=Stub()
 det=DET.Detection(event_id="AK2026-0204", lat=60.5, lon=-140.6,

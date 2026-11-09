@@ -26,7 +26,7 @@ class Stub:
     def __init__(s): s.dock = FakeDock(); s._rows = []; s._current = None
     def _role_layer(s, r): return None
     def _append_log(s, t): pass
-for m in ("_estimates", "_scar_centroid", "_event_row"):
+for m in ("_estimates", "_scar_centroid", "_outline_centroid", "_event_row"):
     setattr(Stub, m, getattr(VT.VolumeTab, m))
 
 s = Stub()

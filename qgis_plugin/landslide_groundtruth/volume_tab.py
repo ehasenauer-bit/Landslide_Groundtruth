@@ -2164,22 +2164,35 @@ class VolumeTab(QWidget):
         """(lat, lon) of the digitized scar, in EPSG:4326, or (None, None).
 
         Compared against the detection's epicentre, this is the number that says
-        whether the seismic location was any good."""
+        whether the seismic location was any good. The SOURCE scar if one is
+        assigned, else the total outline — the same polygons the volume was
+        measured from, not the draw target."""
+        lat, lon, _role = self._outline_centroid(("best", "total"))
+        return lat, lon
+
+    def landslide_centre(self):
+        """(lat, lon, role) of the whole landslide's centre in EPSG:4326: the
+        TOTAL outline's centroid, else the source scar's when no total is
+        drawn; (None, None, None) without either. For the 3D viewer's
+        seismic-offset row."""
+        return self._outline_centroid(("total", "best"))
+
+    def _outline_centroid(self, roles):
+        """(lat, lon, role) of the first assigned role layer's centroid."""
         try:
             from qgis.core import (QgsCoordinateReferenceSystem,
                                    QgsCoordinateTransform, QgsProject)
-            # the SOURCE scar if one is assigned, else the total outline — the
-            # same polygons the volume was measured from, not the draw target.
-            lyr = None
-            for role in ("best", "total"):
-                lyr = self._role_layer(role)
+            lyr = role = None
+            for r in roles:
+                lyr = self._role_layer(r)
                 if lyr is not None:
+                    role = r
                     break
             if lyr is None:
-                return None, None
+                return None, None, None
             feats = list(lyr.getSelectedFeatures()) or list(lyr.getFeatures())
             if not feats:
-                return None, None
+                return None, None, None
             geom = None
             for f in feats:
                 g = f.geometry()
@@ -2187,16 +2200,16 @@ class VolumeTab(QWidget):
                     continue
                 geom = g if geom is None else geom.combine(g)
             if geom is None:
-                return None, None
+                return None, None, None
             c = geom.centroid().asPoint()
             src = lyr.crs()
             dst = QgsCoordinateReferenceSystem("EPSG:4326")
             if src.isValid() and src != dst:
                 c = QgsCoordinateTransform(
                     src, dst, QgsProject.instance()).transform(c)
-            return c.y(), c.x()
+            return c.y(), c.x(), role
         except Exception:
-            return None, None
+            return None, None, None
 
     def _event_row(self):
         """The event-level columns stamped onto every exported row: the
