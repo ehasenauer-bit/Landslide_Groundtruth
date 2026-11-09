@@ -20,7 +20,9 @@ email=ehasenauer@alaska.edu
 homepage=https://github.com/ehasenauer-bit/Landslide_Groundtruth#readme
 repository=https://github.com/ehasenauer-bit/Landslide_Groundtruth
 tracker=https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues
-changelog=1.0.1 - Seismic offset in the 3D viewer.
+changelog=1.0.1 - Faster scene search; seismic offset in the 3D viewer.
+    * The Sentinel-2 / Landsat scene search is several times faster (about 20 s where it took 1 to 8 minutes on a slow link): the cloud check now reads each scene through Planetary Computer's data API instead of downloading image tiles.
+    * Fixed: the cloud % of a scene that only clips the edge of the search box could read far too low.
     * The 3D viewer's figure details, and the exported figures, show how far and which way the landslide's centre lies from the detection's epicentre, e.g. "2.31 km SW of seismic location".
     * A warning when that offset is over 50 km, usually a dropped minus sign in the longitude.
     1.0.0 - First public release.
