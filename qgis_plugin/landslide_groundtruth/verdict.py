@@ -26,6 +26,40 @@ def haversine_km(lat1, lon1, lat2, lon2):
         return None
 
 
+COMPASS8 = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Initial great-circle bearing from point 1 to point 2, 0-360° clockwise
+    from north, or None."""
+    try:
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dl = math.radians(lon2 - lon1)
+        x = math.sin(dl) * math.cos(p2)
+        y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+        return math.degrees(math.atan2(x, y)) % 360.0
+    except (TypeError, ValueError):
+        return None
+
+
+def seismic_offset_text(det_lat, det_lon, lat, lon):
+    """'2.31 km SW of seismic location' for a slide centre at (lat, lon), or ''.
+
+    How far, and which way, the digitized slide sits from where the seismic
+    record put it: the ground truth for the detection's location. The
+    direction is the one you would walk from the seismic point to the slide,
+    so a run of events all reading 'NE' shows a systematic bias. Kept short:
+    it is one line of the 3D figure's Details block."""
+    d = haversine_km(det_lat, det_lon, lat, lon)
+    if d is None:
+        return ""
+    dist = f"{d * 1000:.0f} m" if d < 1 else (f"{d:.2f} km" if d < 10 else f"{d:.1f} km")
+    if d < 0.05:                               # too close for a direction to mean anything
+        return f"{dist} from seismic location"
+    b = bearing_deg(det_lat, det_lon, lat, lon)
+    return f"{dist} {COMPASS8[int((b + 22.5) // 45) % 8]} of seismic location"
+
+
 def implied_depth_m(volume_m3, area_m2):
     """Mean scar depth V/A — the cheapest sanity check there is.
 

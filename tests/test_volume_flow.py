@@ -233,6 +233,61 @@ v3._pull_volume_details()
 txt = v3.det_volume.text()
 check(f"figure volume: {txt!r}", "Larsen et al." in txt and "thickness" not in txt)
 
+print("\n=== the seismic offset: Detection lat/lon to the landslide's centre ===")
+import re                                                               # noqa: E402
+from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY  # noqa: E402
+from landslide_groundtruth import verdict as V                         # noqa: E402
+from landslide_groundtruth.detection import Detection                  # noqa: E402
+to_ll = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:3338"),
+                               QgsCoordinateReferenceSystem("EPSG:4326"), project)
+check(f"no detection: the field stays empty and the log says why "
+      f"({v3.det_seis_offset.text()!r})",
+      dock.detection is None and v3.det_seis_offset.text() == ""
+      and "Detection box" in v3.log.toPlainText())
+# the seismic location 2 km due south (grid) of the total outline's centre (500, 1000500)
+seis = to_ll.transform(QgsPointXY(500, 998500))
+dock.detection = Detection(event_id="AK2099-0001", lat=seis.y(), lon=seis.x())
+v3._pull_volume_details()
+off = v3.det_seis_offset.text()
+m = re.match(r"([\d.]+) km N of seismic location$", off)
+check(f"2 km south of the TOTAL outline's centre reads ~2.00 km N ({off!r})",
+      m is not None and abs(float(m.group(1)) - 2.0) < 0.02)
+lat, lon, role = vol.landslide_centre()
+c = to_ll.transform(QgsPointXY(500, 1000500))
+check("landslide_centre is the total outline's centroid",
+      role == "total" and abs(lat - c.y()) < 1e-6 and abs(lon - c.x()) < 1e-6)
+s_lat, s_lon = vol._scar_centroid()
+sc = to_ll.transform(QgsPointXY(500, 1000875))
+check("the CSV's scar offset still measures to the SOURCE scar",
+      abs(s_lat - sc.y()) < 1e-6 and abs(s_lon - sc.x()) < 1e-6)
+_lat, _lon, role = vol._outline_centroid(("best",))
+check("a source-only slide is measured to the source outline", role == "best")
+v3.det_seis_offset.setText("typed by hand")
+v3._fill_seismic_offset()
+check("Pull refreshes a stale value", v3.det_seis_offset.text() == off)
+check("a seismic location on the slide has no direction",
+      V.seismic_offset_text(60.0, -150.0, 60.0002, -150.0) == "22 m from seismic location")
+check("east, west, and km to one decimal past 10 km",
+      V.seismic_offset_text(60.0, -150.0, 60.0, -149.9).endswith(" E of seismic location")
+      and V.seismic_offset_text(60.0, -150.0, 60.0, -150.3).startswith("16.7 km W"))
+check("no coordinates, no text", V.seismic_offset_text(None, -150.0, 60.0, -150.0) == "")
+dock.detection = Detection(lat=seis.y(), lon=-seis.x())     # the dropped minus sign
+warned = []
+_orig_warn = v3._warn
+v3._warn = warned.append
+v3._fill_seismic_offset()
+v3._warn = _orig_warn
+check(f"an offset thousands of km long warns about the Detection box "
+      f"({v3.det_seis_offset.text()!r})",
+      len(warned) == 1 and "minus sign" in warned[0])
+dock.detection = Detection(event_id="AK2099-0001", lat=seis.y(), lon=seis.x())
+warned = []
+v3._warn = warned.append
+v3._fill_seismic_offset()
+v3._warn = _orig_warn
+check("a 2 km offset does not", not warned)
+dock.detection = None
+
 print("\n=== source low and high: their own volumes, and a wider best range ===")
 low = poly("Source Area (low)", "POLYGON((350 1000800, 650 1000800, "
                                 "650 1001000, 350 1001000, 350 1000800))")    # 0.06 km²
