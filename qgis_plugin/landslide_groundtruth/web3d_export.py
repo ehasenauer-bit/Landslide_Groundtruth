@@ -15,9 +15,10 @@ and hands the encoded assets here.
 """
 import base64
 import json
+import math
 import struct
 
-__all__ = ["build_viewer_html", "encode_heightfield"]
+__all__ = ["build_viewer_html", "encode_heightfield", "map_graticule"]
 
 
 def encode_heightfield(rows):
@@ -167,6 +168,92 @@ def subdivide_tris(tris, step):
     return out
 
 
+def _wrap180(d):
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def _deg_step(lo, hi, min_lines=3):
+    """The coarsest 1/2/5 x 10^n degree spacing with >= min_lines lines in [lo, hi].
+
+    No 2.5: a quarter step needs one more decimal on every label ("151.075° W")
+    for no more lines. The finest this can be is ~2.5x too many lines (7); the
+    viewer thins the labels to fit and keeps the rest as minor ticks."""
+    for e in range(2, -7, -1):
+        for k in (5, 2, 1):
+            s = k * 10.0 ** e
+            if math.floor(hi / s + 1e-9) - math.ceil(lo / s - 1e-9) + 1 >= min_lines:
+                return s
+    return 1e-6
+
+
+def _deg_dec(step):
+    """Decimals a label at this spacing needs: 0.02 -> 2, 0.005 -> 3, 1 -> 0."""
+    d = 0
+    while d < 6 and abs(step * 10 ** d - round(step * 10 ** d)) > 1e-6:
+        d += 1
+    return d
+
+
+def map_graticule(to_local, to_lonlat, width_m, height_m, min_lines=3, n=12):
+    """Meridians and parallels across the map figure's panels, in scene metres.
+
+    The map panels are labelled in degrees, like the location panel beside them,
+    rather than in distance from a corner. A meridian is only a vertical line in
+    the scene's own CRS by coincidence: at 151° W in UTM zone 5 it leans ~1.7°
+    off grid north, so across a 4 km scene its x at the top and at the bottom
+    differ by ~120 m. The viewer therefore finds where each of these polylines
+    actually crosses the edge it labels, instead of assuming one longitude per
+    column (or latitude per row).
+
+    to_local(lon, lat) -> (x, y): metres east/north of the scene centre, the
+    frame every other overlay in the viewer uses. to_lonlat is its inverse.
+    Returns [{"axis": "lon"|"lat", "lab": "151.08° W", "pts": [[x, y], ...]}].
+    """
+    hw, hh = width_m / 2.0, height_m / 2.0
+    if not (hw > 0 and hh > 0):
+        return []
+    lon_c, _ = to_lonlat(0.0, 0.0)
+    lons, lats = [], []
+    for i in range(n + 1):                     # the frame's edges, not just corners
+        t = -1.0 + 2.0 * i / n
+        for x, y in ((t * hw, -hh), (t * hw, hh), (-hw, t * hh), (hw, t * hh)):
+            lo, la = to_lonlat(x, y)
+            lons.append(lon_c + _wrap180(lo - lon_c))   # unwrapped across 180°
+            lats.append(la)
+    lon_lo, lon_hi, lat_lo, lat_hi = min(lons), max(lons), min(lats), max(lats)
+    dlon = _deg_step(lon_lo, lon_hi, min_lines)
+    dlat = _deg_step(lat_lo, lat_hi, min_lines)
+    # run each line well past the frame so it certainly crosses it; the viewer clips
+    plo, pla = (lon_hi - lon_lo) * 0.25, (lat_hi - lat_lo) * 0.25
+    out = []
+
+    def line(axis, lab, pts):
+        out.append({"axis": axis, "lab": lab,
+                    "pts": [[round(x, 1), round(y, 1)] for x, y in pts]})
+
+    def label(v, pos, neg, dec):
+        if abs(v) < 1e-9 or abs(abs(v) - 180.0) < 1e-9:
+            return "%.*f°" % (dec, abs(v))     # the equator and the 0/180 meridians
+        return "%.*f° %s" % (dec, abs(v), pos if v >= 0 else neg)
+
+    k = int(math.ceil(lon_lo / dlon - 1e-9))
+    while k * dlon <= lon_hi + 1e-9:
+        v = k * dlon
+        a, b = lat_lo - pla, lat_hi + pla
+        line("lon", label(_wrap180(v), "E", "W", _deg_dec(dlon)),
+             [to_local(_wrap180(v), a + (b - a) * i / n) for i in range(n + 1)])
+        k += 1
+    k = int(math.ceil(lat_lo / dlat - 1e-9))
+    while k * dlat <= lat_hi + 1e-9:
+        v = k * dlat
+        if -90.0 < v < 90.0:
+            a, b = lon_lo - plo, lon_hi + plo
+            line("lat", label(v, "N", "S", _deg_dec(dlat)),
+                 [to_local(_wrap180(a + (b - a) * i / n), v) for i in range(n + 1)])
+        k += 1
+    return out
+
+
 def build_viewer_html(cfg):
     """Assemble the standalone viewer HTML from a config dict.
 
@@ -233,6 +320,7 @@ _HTML_MID = """
          color: #dfe6f2; padding: 8px 14px; border-radius: 8px; font-size: 14px;
          font-weight: 600; cursor: pointer; user-select: none; }
   .btn.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+  .btn:disabled { opacity: .45; cursor: default; }
   /* the back-link is navigation, not a control: quieter than the flip
      buttons so it never reads as the primary action. */
   .btn.ghost { background: transparent; color: #aeb9cc; font-weight: 500;
@@ -292,6 +380,7 @@ _HTML_MID = """
   <button id="afterBtn" class="btn">After ▶</button>
   <button id="exportBtn" class="btn">⬇ Export 3D figure</button>
   <button id="exportMapBtn" class="btn">⬇ Export map figure</button>
+  <button id="csvBtn" class="btn">⬇ Export metadata CSV</button>
 </div>
 <div id="tag"></div>
 <div id="help">
@@ -325,6 +414,30 @@ _VIEWER_JS = r'''
   var CFG;
   try { CFG = JSON.parse(document.getElementById("cfg").textContent); }
   catch (ex) { return fail("Could not read scene data: " + ex); }
+
+  // ---------- metadata CSV: every scene the project downloaded ----------
+  // CFG.scene_csv is built by the plugin at export time (scene_manifest.py):
+  // one row per downloaded scene under the imagery tabs' table headings. Wired
+  // before WebGL starts, so the table still saves where the 3D view cannot run.
+  (function () {
+    var b = document.getElementById("csvBtn"), S = CFG.scene_csv;
+    if (!S || !S.n) {
+      b.disabled = true;
+      b.title = S ? "No downloaded scenes were found in the project folder when this viewer was exported."
+                  : "This viewer was exported without a scene list.";
+      return;
+    }
+    b.title = S.n + " downloaded scene" + (S.n === 1 ? "" : "s") +
+              ": Side, Date, Gap, Cloud, Coverage, Source, Radar, Orbit, Track, Sensor, ... Scene ID";
+    b.onclick = function () {
+      // The BOM is for Excel, which otherwise reads this UTF-8 (° ❄ —) as Latin-1.
+      var blob = new Blob(["\ufeff" + S.csv], {type: "text/csv;charset=utf-8"});
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = S.name || "scenes.csv";
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
+    };
+  })();
 
   var canvas = document.getElementById("gl");
   var glopt = { preserveDrawingBuffer: true, antialias: true };
@@ -1195,13 +1308,18 @@ _VIEWER_JS = r'''
                  [Zc[0]?bb.x1:bb.x0, Zc[1]?bb.y1:bb.y0, zData], corner(Zc[0],Zc[1],1),
                  zmin, zCapTop(), "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
   }
-  function drawNorth(ctx, mvp, W, H) {
+  // The compass's square footprint, measured in from the corner it sits in.
+  function northFootprint(W) { return 2*(1.6*Math.max(16, W/42)+6); }
+  // box: the rect the compass pins itself to the top-right corner of -- the
+  // figure's crop (see exportFigure), or the whole panel.
+  function drawNorth(ctx, mvp, W, H, box) {
     var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
     if (!p0 || !p1) return;
+    box = box || {x0:0, y0:0, x1:W, y1:H};
     var ang = Math.atan2(p1[1]-p0[1], p1[0]-p0[0]);
     // inset by the arrow+label reach (~1.6R) so the "N" never clips the panel edge,
     // whatever compass direction north points.
-    var R = Math.max(16, W/42), pad = 1.6*R+6, cx = W-pad, cy = pad, L = R*0.85;
+    var R = Math.max(16, W/42), pad = 1.6*R+6, cx = box.x1-pad, cy = box.y0+pad, L = R*0.85;
     ctx.save();
     ctx.lineWidth = Math.max(2, W/650);
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -1250,33 +1368,51 @@ _VIEWER_JS = r'''
     return { crown:crown, toe:toe, crownZ:crownZ, toeZ:toeZ, crownElev:crownElev,
              toeElev:toeElev, drop:crownElev-toeElev, runout:bestLen, mid:best[(best.length/2)|0] };
   }
-  function drawLandslideAnnotations(ctx, mvp, W, H){
-    var m=landslideMetrics(); if(!m) return;
+  // Where the metrics callout goes and how big it is, without drawing it, so the
+  // figure can make room for it before anything is drawn (exportFigure). box is
+  // the rect it pins itself to a top corner of; onLeft forces the side.
+  function calloutGeom(ctx, mvp, W, H, box, onLeft){
+    var m=landslideMetrics(); if(!m) return null;
     var pc=project(mvp,[m.crown[0],m.crown[1],m.crownZ],W,H);
     var pe=project(mvp,[m.toe[0],m.toe[1],m.toeZ],W,H);
-    if(!pc && !pe) return;
-    var fs=Math.max(12, Math.round(W/85)), CY="rgba(130,225,255,0.95)";
+    if(!pc && !pe) return null;
+    box = box || {x0:0, y0:0, x1:W, y1:H};
+    var fs=Math.max(12, Math.round(W/85));
     function ci(n){ return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
-    ctx.save(); ctx.textBaseline="middle"; ctx.lineJoin="round";
-    // ---- corner callout box: all metrics off the scar ----
     var lines=[
       ["Crown · "+ci(m.crownElev)+" m", "#d6ecff"],
       ["Toe · "+ci(m.toeElev)+" m", "#d6ecff"],
       ["↕ "+ci(m.drop)+" m drop", "#d6ecff"],
       [(m.runout>=1000?(m.runout/1000).toFixed(2)+" km":ci(m.runout)+" m")+" runout", "#f6c9c9"]
     ];
-    ctx.font="bold "+fs+"px sans-serif";
+    ctx.save(); ctx.font="bold "+fs+"px sans-serif";
     var tw=0; lines.forEach(function(l){ tw=Math.max(tw, ctx.measureText(l[0]).width); });
+    ctx.restore();
     var padX=fs*0.7, padY=fs*0.55, lineH=fs*1.5, bw=tw+padX*2, bh=lines.length*lineH+padY*2;
     // place opposite the scar, at the top; the right slot sits below the N compass
-    var midX=((pc?pc[0]:pe[0])+(pe?pe[0]:pc[0]))/2, onLeft=midX > W*0.5;
-    var bx=onLeft ? W*0.035 : W-bw-W*0.035, by=onLeft ? H*0.05 : H*0.20;
+    if (onLeft == null) {
+      var midX=((pc?pc[0]:pe[0])+(pe?pe[0]:pc[0]))/2;
+      onLeft = midX > (box.x0+box.x1)/2;
+    }
+    var inset=Math.round(H*0.02);
+    var dy=onLeft ? inset : northFootprint(W)+Math.round(H*0.012);
+    return { pc:pc, pe:pe, lines:lines, fs:fs, padX:padX, padY:padY, lineH:lineH,
+             bw:bw, bh:bh, onLeft:onLeft, inset:inset, dy:dy,
+             bx:onLeft ? box.x0+inset : box.x1-inset-bw, by:box.y0+dy };
+  }
+  function drawLandslideAnnotations(ctx, mvp, W, H, box, onLeft){
+    var G=calloutGeom(ctx, mvp, W, H, box, onLeft); if(!G) return;
+    var pc=G.pc, pe=G.pe, bx=G.bx, by=G.by, bw=G.bw, bh=G.bh, padX=G.padX, padY=G.padY, lineH=G.lineH;
+    var CY="rgba(130,225,255,0.95)";
+    ctx.save(); ctx.textBaseline="middle"; ctx.lineJoin="round";
+    // ---- corner callout box: all metrics off the scar ----
+    ctx.font="bold "+G.fs+"px sans-serif";
     ctx.fillStyle="rgba(11,14,19,0.86)"; ctx.strokeStyle="rgba(150,185,215,0.55)"; ctx.lineWidth=Math.max(1,W/1500);
     ctx.beginPath(); ctx.rect(bx,by,bw,bh); ctx.fill(); ctx.stroke();
     ctx.textAlign="left";
-    lines.forEach(function(l,i){ ctx.fillStyle=l[1]; ctx.fillText(l[0], bx+padX, by+padY+lineH*(i+0.5)); });
+    G.lines.forEach(function(l,i){ ctx.fillStyle=l[1]; ctx.fillText(l[0], bx+padX, by+padY+lineH*(i+0.5)); });
     // ---- leader lines from the box edge to crown + toe dots ----
-    var ax=onLeft ? bx+bw : bx, ay=by+bh/2;
+    var ax=G.onLeft ? bx+bw : bx, ay=by+bh/2;
     ctx.strokeStyle="rgba(130,225,255,0.75)"; ctx.lineWidth=Math.max(1.1,W/1300);
     function leader(p){ if(!p) return;
       ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(p[0],p[1]); ctx.stroke();
@@ -1426,17 +1562,24 @@ _VIEWER_JS = r'''
   // and the montage cropped it mid-glyph, right where the caption starts.
   function mapAxisMetrics(pxW) {
     var fs = Math.max(13, Math.round(pxW/60)), tl = Math.max(6, pxW/130);
-    // below the map frame: tick mark (tl) + 5 gap + numbers, the title 1.9em under
-    // the numbers' top, a top-baselined glyph box ~1.15em deep, ~0.35em breathing room.
-    return { fs: fs, tl: tl, below: tl + 5 + fs*3.4 };
+    // Degrees (CFG.map_grat, from the plugin) need one row of numbers under the
+    // frame and no axis title -- "151.10° W" already says what it is. Distance
+    // (no graticule: a CRS that would not transform) puts its title 1.9em under
+    // the numbers' top. Either way: tick (tl) + 5 gap + a top-baselined glyph box
+    // ~1.15em deep + ~0.35em breathing room.
+    var ll = !!(CFG.map_grat && CFG.map_grat.length);
+    return { fs: fs, tl: tl, ll: ll, below: tl + 5 + fs*(ll ? 1.5 : 3.4) };
   }
   function mapLayout(pxW, pxH) {
-    var Wm = +CFG.width_m, Hm = +CFG.height_m;
-    // margins: left for the northing labels, bottom for easting, top-right for the
-    // compass, bottom-right for the scale bar.
-    var mL = Math.round(pxW*0.120), mR = Math.round(pxW*0.030);
-    var mT = Math.round(pxH*0.045);
-    var mB = Math.max(Math.round(pxH*0.115), Math.ceil(mapAxisMetrics(pxW).below));
+    var Wm = +CFG.width_m, Hm = +CFG.height_m, A = mapAxisMetrics(pxW);
+    // margins: left for the latitude (northing) labels, bottom for longitude
+    // (easting), right for half the last longitude label. The figure crops off
+    // whatever these leave empty (inkBox), so they only have to be big enough --
+    // the compass and scale bar sit inside the frame.
+    var mL = Math.round(Math.max(pxW*0.120, A.tl + 5 + A.fs*4.6));
+    var mR = Math.round(Math.max(pxW*0.030, A.fs*2.8));
+    var mT = Math.round(Math.max(pxH*0.030, A.fs*0.7));   // a top latitude label's upper half
+    var mB = Math.ceil(A.below);
     var aw = Math.max(10, pxW-mL-mR), ah = Math.max(10, pxH-mT-mB);
     var sc = Math.min(aw/Wm, ah/Hm);                 // pixels per ground metre
     var iw = Wm*sc, ih = Hm*sc;                      // letterboxed: aspect preserved
@@ -1454,6 +1597,29 @@ _VIEWER_JS = r'''
     ctx.lineJoin = "round"; ctx.strokeText(txt, x, y);
     ctx.fillStyle = "#f6f9ff"; ctx.fillText(txt, x, y);
   }
+  // Where each meridian leaves the frame's bottom edge and each parallel its left
+  // edge, in panel px along that edge, sorted. Found by intersecting the real
+  // polylines rather than assuming one longitude per column: the scene's grid
+  // north is not true north (UTM convergence), so meridians lean.
+  function mapGratHits(L, G) {
+    var out = { lon: [], lat: [] };
+    (G || []).forEach(function (ln) {
+      var lon = ln.axis === "lon", pts = ln.pts || [];
+      var c = lon ? L.y0 + L.ih : L.x0;
+      var lo = lon ? L.x0 : L.y0, hi = lon ? L.x0 + L.iw : L.y0 + L.ih;
+      for (var i = 1; i < pts.length; i++) {
+        var a = mapPx(L, pts[i-1][0], pts[i-1][1]), b = mapPx(L, pts[i][0], pts[i][1]);
+        var av = lon ? a[1] : a[0], bv = lon ? b[1] : b[0];
+        if (av === bv || (av-c)*(bv-c) > 0) continue;
+        var t = (c-av)/(bv-av), u = lon ? a[0]+(b[0]-a[0])*t : a[1]+(b[1]-a[1])*t;
+        if (u >= lo-0.5 && u <= hi+0.5) (lon ? out.lon : out.lat).push({ u: u, lab: ln.lab });
+        break;
+      }
+    });
+    out.lon.sort(function (p, q) { return p.u - q.u; });
+    out.lat.sort(function (p, q) { return p.u - q.u; });
+    return out;
+  }
   function drawMapAxes(ctx, L, pxW, pxH) {
     var A = mapAxisMetrics(pxW), fs = A.fs, tl = A.tl;   // same numbers mapLayout reserved
     var fE = mapFmt(L.Wm), fN = mapFmt(L.Hm);
@@ -1461,6 +1627,31 @@ _VIEWER_JS = r'''
     ctx.save();
     ctx.strokeStyle = axC; ctx.lineWidth = lw;
     ctx.strokeRect(L.x0, L.y0, L.iw, L.ih);          // the map frame
+    function tick(x0, y0, x1, y1) {
+      ctx.strokeStyle = axC; ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+    if (A.ll) {                                      // degrees, like the location panel
+      var hits = mapGratHits(L, CFG.map_grat), yb = L.y0 + L.ih, right = -1e9, low = -1e9;
+      // A label that would touch its neighbour is dropped and its line keeps a
+      // shorter, unlabelled minor tick.
+      hits.lon.forEach(function (h) {                // bottom: longitude, W -> E
+        ctx.font = fs + "px sans-serif";
+        var w = ctx.measureText(h.lab).width;
+        if (h.u - w/2 < right + fs*0.8) { tick(h.u, yb, h.u, yb + tl*0.55); return; }
+        right = h.u + w/2;
+        tick(h.u, yb, h.u, yb + tl);
+        mapHalo(ctx, h.lab, h.u, yb + tl + 5, fs, false, "center", "top");
+      });
+      hits.lat.forEach(function (h) {                // left: latitude, top -> bottom
+        if (h.u - fs*0.6 < low) { tick(L.x0, h.u, L.x0 - tl*0.55, h.u); return; }
+        low = h.u + fs*0.6;
+        tick(L.x0, h.u, L.x0 - tl, h.u);
+        mapHalo(ctx, h.lab, L.x0 - tl - 5, h.u, fs, false, "right", "middle");
+      });
+      ctx.restore();
+      return;
+    }
     niceTicks(0, L.Wm, 7).forEach(function (v) {     // bottom: distance east
       if (v < -1 || v > L.Wm+1) return;
       var px = L.x0 + v*L.s;
@@ -1539,14 +1730,13 @@ _VIEWER_JS = r'''
   // the event, y north), so the panel needs no basemap, no tiles and no network
   // -- this file still opens offline, and toDataURL stays untainted.
   function locLayout(pxW, pxH) {
-    // Deliberately the same top/bottom margins as mapLayout: this frame sits
-    // beside the "AFTER + overlays" map, and a locator floating at its own
-    // height reads as a mistake. Square window, centred in the cell.
-    var W = 2*(+CFG.locator.half_m);
-    var mT = Math.round(pxH*0.045);
-    var mB = Math.max(Math.round(pxH*0.115), Math.ceil(mapAxisMetrics(pxW).below));
-    var iw = Math.min(Math.max(10, pxH-mT-mB), pxW*0.92);
-    return { x0: (pxW-iw)/2, y0: mT + (pxH-mT-mB-iw)/2, iw: iw, ih: iw,
+    // Exactly as tall as, and level with, the map frame of the same-sized panel:
+    // this frame sits beside the "AFTER + overlays" map, the figure crops all four
+    // panels to the same rows, and a locator floating at its own height reads as
+    // a mistake. Square window, centred in the panel.
+    var W = 2*(+CFG.locator.half_m), M = mapLayout(pxW, pxH);
+    var iw = Math.max(10, Math.min(M.ih, pxW*0.92));
+    return { x0: (pxW-iw)/2, y0: M.y0 + (M.ih-iw)/2, iw: iw, ih: iw,
              s: iw/W, Wm: W, Hm: W };
   }
   function locTrace(g, L, pts) {
@@ -1724,27 +1914,106 @@ _VIEWER_JS = r'''
     drawMapScaleBar(g, L, pxW, pxH);
     return cc;
   }
+  // ---------- fit-to-content: cut the dead air out of a figure ----------
+  // Every panel is rendered at one fixed 2:1 size (figPanelSize) and nothing in
+  // one is 2:1: a map panel is a square scene plus its labels, the 3D panel an
+  // oblique block. A fixed 16:9 slide letterboxed every one of them in black, so
+  // instead each figure's panels are cropped to what was actually drawn and the
+  // slide is sized to the result (composeFigure).
+  function figPanelSize() {
+    // the old 1920x1080 slide's 2x2 cell, 2x supersampled -- kept because every
+    // font and line weight is sized off the panel, so they come out as before
+    var FW=1920, FH=1080, m=24, TH=54, capH=28;
+    var colW = Math.floor((FW - 3*m)/2), rowH = Math.floor((FH - TH - 3*m)/2);
+    return { pxW: colW*2, pxH: (rowH - capH)*2 };
+  }
+  // Per row, the left-most and right-most pixel that is not the background
+  // (#0b0e13, also the WebGL clear colour), over the UNION of the panels: one
+  // crop for all of them keeps a before/after pair pixel-registered.
+  function inkExtents(canvases) {
+    var W = canvases[0].width, H = canvases[0].height;
+    var lo = new Int32Array(H).fill(W), hi = new Int32Array(H).fill(-1);
+    function ink(d, i) {
+      return Math.abs(d[i]-11) > 8 || Math.abs(d[i+1]-14) > 8 || Math.abs(d[i+2]-19) > 8;
+    }
+    canvases.forEach(function (c) {
+      var d = c.getContext("2d").getImageData(0, 0, W, H).data;
+      for (var y = 0; y < H; y++) {
+        var r = y*W*4, x;
+        for (x = 0; x < lo[y]; x++) if (ink(d, r + x*4)) { lo[y] = x; break; }
+        for (x = W-1; x > hi[y]; x--) if (ink(d, r + x*4)) { hi[y] = x; break; }
+      }
+    });
+    return { W: W, H: H, lo: lo, hi: hi };
+  }
+  function inkBox(E, pad) {                // bounding rect of all of it, + pad
+    var x0 = E.W, x1 = -1, y0 = -1, y1 = -1;
+    for (var y = 0; y < E.H; y++) if (E.hi[y] >= 0) {
+      if (y0 < 0) y0 = y;
+      y1 = y;
+      if (E.lo[y] < x0) x0 = E.lo[y];
+      if (E.hi[y] > x1) x1 = E.hi[y];
+    }
+    if (y0 < 0) return { x0: 0, y0: 0, x1: E.W, y1: E.H };      // blank: keep it all
+    return { x0: Math.max(0, x0-pad), y0: Math.max(0, y0-pad),
+             x1: Math.min(E.W, x1+1+pad), y1: Math.min(E.H, y1+1+pad) };
+  }
+  // Room for furniture pinned to a top corner of the crop instead of to the
+  // terrain (the compass, the metrics callout): w px in from that side, h tall,
+  // dy below the crop's top. If anything drawn in those rows would sit under
+  // it, widen the crop sideways until it clears by gap -- the crop only ever
+  // grows, so nothing that was drawn is cut.
+  function reserveCorner(E, R, w, h, side, dy, gap) {
+    var ya = Math.max(0, Math.floor(R.y0 + dy)), yb = Math.min(E.H, Math.ceil(R.y0 + dy + h));
+    var lo = E.W, hi = -1;
+    for (var y = ya; y < yb; y++) if (E.hi[y] >= 0) {
+      if (E.lo[y] < lo) lo = E.lo[y];
+      if (E.hi[y] > hi) hi = E.hi[y];
+    }
+    if (hi < 0) return R;
+    if (side === "left") R.x0 = Math.max(0, Math.min(R.x0, lo - gap - w));
+    else R.x1 = Math.min(E.W, Math.max(R.x1, hi + 1 + gap + w));
+    return R;
+  }
+  function cropCanvas(src, R) {
+    var c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(R.x1 - R.x0));
+    c.height = Math.max(1, Math.round(R.y1 - R.y0));
+    var g = c.getContext("2d");
+    g.fillStyle = "#0b0e13"; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(src, -Math.round(R.x0), -Math.round(R.y0));
+    return c;
+  }
   function exportMapFigure() {
     if (!srcImgs[0] || !srcImgs[1]) {
       alert("The before/after imagery is still decoding — try again in a moment.");
       return;
     }
-    // identical slide geometry to exportFigure(), so the 3D and map figures stack
-    var FW=1920, FH=1080, m=24, TH=54, capH=28;
-    var colW = Math.floor((FW - 3*m)/2), rowH = Math.floor((FH - TH - 3*m)/2);
-    var imgH = rowH - capH, pxW = colW*2, pxH = imgH*2;   // 2x supersample
+    // the same panel size as exportFigure(), so the 3D and map figures match
+    var P = figPanelSize(), pxW = P.pxW, pxH = P.pxH;
     var shots = [
       { cap: "BEFORE" + (CFG.before_date ? " · " + CFG.before_date : ""), side:0, ov:false },
       { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
       { cap: "AFTER + overlays" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:true }
     ].map(function (pn) { return { img: mapPanel(pn.side, pn.ov, pxW, pxH), cap: pn.cap }; });
+    // One crop for the three maps (they share mapLayout, so it only trims margins)...
+    var pad = Math.round(pxH*0.02);
+    var R = inkBox(inkExtents(shots.map(function (s) { return s.img; })), pad);
+    shots.forEach(function (s) { s.img = cropCanvas(s.img, R); });
     // Fourth cell: the location map, when the export could build one. The dates
     // are already under each panel and the rest of the Details block is on the
     // 3D slide, so the cell is better spent saying WHERE this is. No locator
     // (no world map on this QGIS install) falls back to the old Details block.
     var hasLoc = !!(CFG.locator && +CFG.locator.half_m > 0);
-    if (hasLoc) shots.push({ img: locatorPanel(pxW, pxH), cap: locatorCaption() });
-    composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH}, {
+    if (hasLoc) {
+      // ...and the SAME rows for the locator (locLayout put its frame level with
+      // the maps'), centred on its own frame.
+      var LL = locLayout(pxW, pxH), w = Math.max(R.x1 - R.x0, Math.ceil(LL.iw) + 2*pad);
+      var lx = Math.round(LL.x0 + LL.iw/2 - w/2);
+      shots.push({ img: cropCanvas(locatorPanel(pxW, pxH), {x0: lx, y0: R.y0, x1: lx + w, y1: R.y1}),
+                   cap: locatorCaption() });
+    }
+    composeFigure(shots, {
       title: (CFG.title || "Landslide") + " — map view",
       hideDetails: hasLoc,
       detailRows: [["Coordinate system", CFG.crs || "—"],
@@ -1759,10 +2028,8 @@ _VIEWER_JS = r'''
     });
   }
   function exportFigure() {
-    // 16:9 slide, 2x2 grid: Before | After / After+overlays | Details
-    var FW=1920, FH=1080, m=24, TH=54, capH=28;
-    var colW = Math.floor((FW - 3*m)/2), rowH = Math.floor((FH - TH - 3*m)/2);
-    var imgH = rowH - capH, pxW = colW*2, pxH = imgH*2;   // 2x supersample
+    // 2x2 grid: Before | After / After+overlays | Details, sized to fit (composeFigure)
+    var P = figPanelSize(), pxW = P.pxW, pxH = P.pxH;
     var panels = [
       { cap: "BEFORE" + (CFG.before_date ? " · " + CFG.before_date : ""), side:0, ov:false },
       { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
@@ -1784,33 +2051,51 @@ _VIEWER_JS = r'''
       var mvp = renderScene(true);
       var cc = document.createElement("canvas"); cc.width=pxW; cc.height=pxH;
       var g = cc.getContext("2d"); g.drawImage(canvas, 0, 0);
-      drawAxes(g, mvp, pxW, pxH); drawNorth(g, mvp, pxW, pxH);
-      if (pn.ov) { drawPeakLabels(g, mvp, pxW, pxH); drawLandslideAnnotations(g, mvp, pxW, pxH); }
-      shots.push({ img: cc, cap: pn.cap });
+      drawAxes(g, mvp, pxW, pxH);
+      if (pn.ov) drawPeakLabels(g, mvp, pxW, pxH);
+      shots.push({ img: cc, cap: pn.cap, ov: pn.ov, mvp: mvp });
     });
     active=sa; for (var k in vis) vis[k]=sv[k];
     cam.az=scam.az; cam.el=scam.el; cam.dist=scam.dist; cam.tgt=scam.tgt;
     canvas.width=sw; canvas.height=sh; gl.viewport(0,0,sw,sh);       // restore live view
     positionLabels(renderScene(true));
     draw();
-    composeFigure(shots, {FW:FW,FH:FH,m:m,TH:TH,capH:capH,colW:colW,rowH:rowH,imgH:imgH});
+    // Crop to what the three panels drew (terrain, block, axes, labels), then make
+    // room for the two things pinned to a CORNER rather than to the terrain: the
+    // compass (top-right) and the metrics callout (top, opposite the scar).
+    var E = inkExtents(shots.map(function (s) { return s.img; }));
+    var pad = Math.round(pxH*0.02), gap = Math.round(pxH*0.012), R = inkBox(E, pad);
+    var nb = northFootprint(pxW);
+    reserveCorner(E, R, nb, nb, "right", 0, gap);
+    var ovS = shots.filter(function (s) { return s.ov; })[0];
+    var co = ovS ? calloutGeom(ovS.img.getContext("2d"), ovS.mvp, pxW, pxH, R) : null;
+    if (co) reserveCorner(E, R, co.inset + co.bw, co.bh, co.onLeft ? "left" : "right", co.dy, gap);
+    shots.forEach(function (s) {
+      var g = s.img.getContext("2d");
+      drawNorth(g, s.mvp, pxW, pxH, R);
+      if (s.ov && co) drawLandslideAnnotations(g, s.mvp, pxW, pxH, R, co.onLeft);
+      s.img = cropCanvas(s.img, R);
+    });
+    composeFigure(shots);
   }
   // The overlay legend normally lives in the Details block. When a slide spends
-  // that cell on something else it moves up into the empty right half of the
-  // title bar rather than being dropped: colour is the ONLY thing identifying
+  // that cell on something else it moves up into the title bar -- beside the
+  // title when there is room, on its own row under it when the slide is too
+  // narrow -- rather than being dropped: colour is the ONLY thing identifying
   // what is outlined in the "+ overlays" panel.
+  function legendWidth(g, fs) {
+    var sw = Math.round(fs*0.95), gap = 9, sep = 26, total = -sep;
+    g.font = fs + "px sans-serif";
+    layerMeta.forEach(function (mm) { total += sw + gap + g.measureText(mm.name).width + sep; });
+    return Math.max(0, total);
+  }
   function drawFigureLegend(g, L, titleW) {
     if (!layerMeta.length) return;
-    var avail = L.FW - L.m*2 - titleW - 40, fs = 16, sw = 0, total = 0, gap = 9, sep = 26;
-    function measure() {
-      sw = Math.round(fs*0.95); total = -sep; g.font = fs+"px sans-serif";
-      layerMeta.forEach(function (mm) {
-        total += sw + gap + g.measureText(mm.name).width + sep; });
-    }
-    measure();
-    if (total > avail) { fs = 13; measure(); }
-    var x = L.FW - L.m - Math.min(total, avail), y = L.TH/2 + 4;
-    g.textAlign = "left"; g.textBaseline = "middle";
+    var row = L.legendRow, avail = row ? L.FW - L.m*2 : L.FW - L.m*2 - titleW - 40;
+    var fs = (legendWidth(g, 16) > avail) ? 13 : 16, total = legendWidth(g, fs);
+    var sw = Math.round(fs*0.95), gap = 9, sep = 26;
+    var x = row ? L.m : L.FW - L.m - Math.min(total, avail), y = row ? L.TB + 14 : L.TB/2 + 4;
+    g.font = fs + "px sans-serif"; g.textAlign = "left"; g.textBaseline = "middle";
     layerMeta.forEach(function (mm) {
       var w = sw + gap + g.measureText(mm.name).width;
       if (x + w > L.FW - L.m + 0.5) return;          // out of bar; drop the rest
@@ -1822,21 +2107,62 @@ _VIEWER_JS = r'''
       x += w + sep;
     });
   }
-  function composeFigure(shots, L, opts) {
+  function figureDetailRows(opts) {
+    return (opts.detailRows ||
+            [["Coordinate system", CFG.crs||"—"],
+             ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
+             ["Before image", CFG.before_date||"—"],
+             ["After image", CFG.after_date||"—"]])
+      .concat((CFG.extra_details||[]).filter(function (kv) { return !!kv[1]; }));
+  }
+  function detailsWidth(g, rows) {          // the Details cell's text, widest line
+    g.font = "bold 22px sans-serif";
+    var w = g.measureText("Details").width;
+    g.font = "17px sans-serif";
+    rows.forEach(function (kv) { w = Math.max(w, 210 + g.measureText(String(kv[1])).width); });
+    g.font = "16px sans-serif";
+    layerMeta.forEach(function (mm) { w = Math.max(w, 24 + g.measureText(mm.name).width); });
+    return Math.ceil(w) + 16;
+  }
+  function composeFigure(shots, opts) {
     opts = opts || {};
+    // The slide is sized to its panels instead of the panels being letterboxed
+    // into a fixed 16:9 slide: 1080 px tall as before, and only as wide as the
+    // cropped panels (or the Details text) need. Every panel is scaled to one
+    // row height, so the four line up whatever their own widths.
+    var FH = 1080, m = 24, TB = 54, capH = 28;
+    var ttl = opts.title || (CFG.title||"Landslide 3D");
+    var meas = document.createElement("canvas").getContext("2d");
+    meas.font = "bold 26px sans-serif";
+    var titleW = meas.measureText(ttl).width;
+    var rows = opts.hideDetails ? [] : figureDetailRows(opts);
+    var detW = opts.hideDetails ? 0 : detailsWidth(meas, rows);
+    function geom(TH) {
+      var rowH = Math.floor((FH - TH - 3*m)/2), imgH = rowH - capH, colW = detW;
+      shots.forEach(function (s) {
+        colW = Math.max(colW, Math.ceil(s.img.width * imgH / s.img.height)); });
+      colW = Math.max(colW, Math.ceil((titleW - m)/2));          // the title fits
+      return { FW: 3*m + 2*colW, FH: FH, m: m, TB: TB, TH: TH, capH: capH,
+               colW: colW, rowH: rowH, imgH: imgH, legendRow: false };
+    }
+    var L = geom(TB);
+    if (opts.hideDetails && layerMeta.length &&
+        titleW + 40 + legendWidth(meas, 16) > L.FW - 2*m) {
+      L = geom(TB + 28); L.legendRow = true;      // no room beside the title
+    }
     var fig = document.createElement("canvas"); fig.width=L.FW; fig.height=L.FH;
     var g = fig.getContext("2d");
     g.fillStyle = "#0b0e13"; g.fillRect(0,0,L.FW,L.FH);
     g.fillStyle = "#f2f5fb"; g.font = "bold 26px sans-serif";
     g.textAlign = "left"; g.textBaseline = "middle";
-    var ttl = opts.title || (CFG.title||"Landslide 3D");
-    g.fillText(ttl, L.m, L.TH/2 + 4);
-    if (opts.hideDetails) drawFigureLegend(g, L, g.measureText(ttl).width);
+    g.fillText(ttl, L.m, L.TB/2 + 4);
+    if (opts.hideDetails) drawFigureLegend(g, L, titleW);
     var cells = [ [L.m, L.TH+L.m], [2*L.m+L.colW, L.TH+L.m],
                   [L.m, L.TH+2*L.m+L.rowH], [2*L.m+L.colW, L.TH+2*L.m+L.rowH] ];
     shots.forEach(function (s, i) {
-      var x=cells[i][0], y=cells[i][1];
-      g.drawImage(s.img, x, y, L.colW, L.imgH);
+      var x=cells[i][0], y=cells[i][1], dw=s.img.width*L.imgH/s.img.height;
+      g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
+      g.drawImage(s.img, x + (L.colW-dw)/2, y, dw, L.imgH);
       g.strokeStyle="rgba(255,255,255,0.18)"; g.lineWidth=1; g.strokeRect(x,y,L.colW,L.imgH);
       g.fillStyle="#e6ecf6"; g.font="600 17px sans-serif";
       g.textAlign="center"; g.textBaseline="middle";
@@ -1848,16 +2174,7 @@ _VIEWER_JS = r'''
       g.textAlign="left"; g.textBaseline="top";
       g.fillStyle="#f2f5fb"; g.font="bold 22px sans-serif"; g.fillText("Details", ix, yy); yy+=38;
       g.font="17px sans-serif";
-      (opts.detailRows ||
-       [["Coordinate system", CFG.crs||"—"],
-        ["Vertical exaggeration", "×"+(+CFG.exaggeration||1)],
-        ["Before image", CFG.before_date||"—"],
-        ["After image", CFG.after_date||"—"]]).forEach(function (kv) {
-        g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
-        g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
-      });
-      (CFG.extra_details||[]).forEach(function (kv) {
-        if (!kv[1]) return;
+      rows.forEach(function (kv) {
         g.fillStyle="#8ea0bd"; g.fillText(kv[0]+":", ix, yy);
         g.fillStyle="#e6ecf6"; g.fillText(kv[1], ix+210, yy); yy+=27;
       });

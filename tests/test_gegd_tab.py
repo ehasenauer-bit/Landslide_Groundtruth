@@ -567,6 +567,34 @@ check("double-clicking the shown before-strip again changes nothing",
 check(f"the search-area folder is still above the stream folder ({root_groups()})",
       outlines_on_top())
 
+print("\n=== streamed strips in the 3D viewer's metadata CSV ===")
+from landslide_groundtruth.gegd_tab import COLUMNS as GCOLS            # noqa: E402
+from landslide_groundtruth import scene_manifest as SM                 # noqa: E402
+cells = tab.strip_cells(tab._row_strips[row31].strip.feature_id)
+check("strip_cells gives exactly the table's cells for a strip",
+      cells is not None and [cells[h] for h in GCOLS]
+      == [tab._table.item(row31, c).text() for c in range(len(GCOLS))])
+check("… plus its side and gap", cells["side"] == tab._row_strips[row31].side
+      and cells["gap_days"] == tab._row_strips[row31].gap_days)
+check("a strip the search does not list is None", tab.strip_cells("not-a-strip") is None)
+v3d = dock.viewer3d_tab
+mrows = v3d._maxar_scene_rows([b2], [a2], "AK2099-0001")
+mfids = sorted(r["Scene ID"] for r in mrows)
+check(f"one row per streamed strip ({len(mrows)}/{len(tab._stream_layers)})",
+      mfids == sorted({gegd_layers.get_prop(l, "fid") for l in tab._stream_layers}))
+r31 = next((r for r in mrows if r["Scene ID"] == gegd_layers.get_prop(a2, "fid")), {})
+check(f"the draped strips are marked ({r31.get('In 3D viewer')})",
+      r31.get("In 3D viewer") == "After" and sum(bool(r["In 3D viewer"]) for r in mrows) == 2)
+check(f"a row carries the Maxar table's Sun / cover / cloud ({r31.get('Sun°')}, "
+      f"{r31.get('Coverage (% AOI)')}, {r31.get('Strip cloud %')})",
+      r31.get("Tab") == SM.TAB_MAXAR and r31.get("Sun°") == cells["Sun°"]
+      and r31.get("Strip cloud %") == cells["Strip cloud %"]
+      and r31.get("Coverage (% AOI)") == cells["AOI cover"].replace("%", "", 1)
+      and r31.get("Date (UTC)", "").startswith("2026-08-31"))
+csv_cfg = v3d._scene_csv([b2], [a2])
+check("the viewer's CSV payload lists them", csv_cfg is not None and csv_cfg["n"] >= len(mrows)
+      and csv_cfg["csv"].startswith(",".join(SM.COLUMNS[:3])))
+
 print("\n=== table and footprints select each other ===")
 tab._table.selectRow(row31)
 sel = [f["feature_id"] for f in tab._footprint_layer.selectedFeatures()]
