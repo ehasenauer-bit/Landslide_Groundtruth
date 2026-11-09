@@ -179,7 +179,11 @@ def no_ocm():
     raise RuntimeError("OCM disabled in this test")
 
 
-im._ocm_models = no_ocm
+def api_down(*a, **k):                      # keep the test offline: the direct reads
+    raise ConnectionError("data API unreachable in this test")
+
+
+im._ocm_models, im._api_read = no_ocm, api_down
 frac, _note = im._aoi_cloud_fractions([GOOD_POST, WRAPPED, DARK_OLD], LAT, LON, R, "s2")
 check(all(len(v) == 4 for v in frac.values()), "every row is (cloud, snow, source, bad_data)")
 check(frac[WRAPPED.id][3] and "corrupt" in frac[WRAPPED.id][3],

@@ -358,8 +358,8 @@ _SEARCH_ENV = stackstac.DEFAULT_GDAL_ENV.updated(always=_SEARCH_GDAL)
 # The gain is on slivers — a tile covering <5% of the box — where every-10th-pixel
 # sampling was noisy. The 80 m overview is NOT good enough: one sliver read 3% against a
 # 57% reference. SCL keeps its full-res nearest read, because its overviews hold class
-# values that do not exist. Landsat keeps the stackstac read: it was not measured, and
-# its 30 m read is ~10x smaller to begin with.
+# values that do not exist. This is now the FALLBACK for a scene the data API (see
+# PC_DATA_URL) could not serve; Landsat's fallback is still the stackstac read.
 _OVR_MAX_FRACTION = 0.5
 
 
@@ -380,10 +380,124 @@ def _overview_read(href, epsg, transform, shape, res):
         with rasterio.open(href) as src:
             level = _overview_level(src.overviews(1), src.res[0], res)
         opts = {} if level is None else {"OVERVIEW_LEVEL": level}
+        # src_nodata=0 is not redundant: MPC's COGs declare no nodata value, and
+        # without it the warper treats the off-swath zeros as data, averages them to
+        # 0 and then nudges that to 1 so it can't be mistaken for the output nodata.
+        # OCM then saw a swath-edge sliver as a full frame of valid DN 1 and read a
+        # 32%-cloudy scene (S2B 2026-07-29 R143 T06VUP, 4.6% of the Willow2 box) as 0.5%.
         with rasterio.open(href, **opts) as src, WarpedVRT(
                 src, crs=f"EPSG:{epsg}", transform=transform, width=shape[1],
-                height=shape[0], resampling=Resampling.average, nodata=0) as vrt:
+                height=shape[0], resampling=Resampling.average, src_nodata=0,
+                nodata=0) as vrt:
             return vrt.read(1)
+
+
+# The search's AOI reads go through Planetary Computer's data API first: it reads the
+# COGs inside Azure and sends back only the AOI grid, as a lossless PNG. Measured
+# 2026-11-09 from Fairbanks at Willow2 (15 km): the link did 8.9 MB/s to a CDN but only
+# ~0.5 MB/s per connection to the West Europe blob store the COGs live in, and a
+# Sentinel-2 scene's direct read is ~10 MB (R/G/NIR overview tiles) against ~1-2 MB here
+# (class band ~0.05 MB). The pixels are the same: R/G/NIR asked for at HALF the grid's
+# pixel with average resampling makes the server pick the same overview _overview_level
+# does, and a local 2x2 mean then lands within 1 DN of _overview_read (corr 1.0000); the
+# class band asked for at native resolution, nearest, matched the stackstac read 100%.
+# Landsat goes the same way, which makes its R/G/NIR area-averaged where the stackstac
+# read point-sampled every 3rd pixel: over 30 Willow2 scenes its cloud % moved by a mean
+# of 1.9 points (max 9.5).
+# Any failure (HTTP error, a grid too big for one request) falls back to the direct read
+# for that scene, so the API being down only costs speed.
+PC_DATA_URL = "https://planetarycomputer.microsoft.com/api/data/v1"
+_API_TIMEOUT = (10, 60)                      # (connect, read) seconds
+_API_MAX_PX = 4096                           # longest side of one request
+_API_RETRY = Retry(total=2, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
+                   respect_retry_after_header=True)
+
+
+def _api_session():
+    """One `requests` session per thread (sessions are not thread-safe), so the
+    per-scene reads reuse a connection to the data API."""
+    s = getattr(_local, "api", None)
+    if s is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        s = requests.Session()
+        s.mount("https://", HTTPAdapter(max_retries=_API_RETRY))
+        _local.api = s
+    return s
+
+
+def _api_read(collection, item_id, assets, epsg, transform, shape, width, height,
+              resampling, mask):
+    """`assets` over the grid's extent (epsg, transform, (h, w)) resampled to
+    (height, width) px by the data API, as an (n, height, width) array. mask=True
+    appends a band that is nonzero where the scene has data; otherwise no-data is 0.
+    Raises on anything but a well-formed answer — the caller falls back."""
+    if max(width, height) > _API_MAX_PX:
+        raise ValueError(f"{width}x{height} px is too big for one data-API request")
+    res = transform.a
+    x0, y1 = transform.c, transform.f
+    x1, y0 = x0 + shape[1] * res, y1 - shape[0] * res
+    params = ([("collection", collection), ("item", item_id)]
+              + [("assets", a) for a in assets]
+              + [("coord_crs", f"epsg:{epsg}"), ("dst_crs", f"epsg:{epsg}"),
+                 ("resampling", resampling), ("reproject", resampling),
+                 ("return_mask", "true" if mask else "false")]
+              + ([] if mask else [("nodata", "0")]))
+    r = _api_session().get(
+        f"{PC_DATA_URL}/item/bbox/{x0},{y0},{x1},{y1}/{width}x{height}.png",
+        params=params, timeout=_API_TIMEOUT)
+    r.raise_for_status()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")           # a PNG carries no georeferencing
+        with rasterio.MemoryFile(r.content) as mem, mem.open() as src:
+            a = src.read()
+    if a.shape != (len(assets) + bool(mask), height, width):
+        raise ValueError(f"data API returned {a.shape}")
+    return a
+
+
+def _api_rgn(collection, item_id, bands, epsg, transform, shape):
+    """R/G/NIR area-averaged onto the grid, float32 (3, h, w), 0 = no data. Asked for
+    at half the grid's pixel and 2x2-averaged here (ignoring no-data), which is what
+    reproduces _overview_read — asked for at the grid itself the server drops to the
+    next coarser overview (80 m on a 100 m grid), the one measured as not good enough."""
+    h, w = shape
+    a = _api_read(collection, item_id, bands, epsg, transform, shape, 2 * w, 2 * h,
+                  "average", mask=False).astype("float32")
+    a = a.reshape(len(bands), h, 2, w, 2)
+    n = (a > 0).sum(axis=(2, 4))
+    return (a.sum(axis=(2, 4)) / np.maximum(n, 1)).astype("float32")
+
+
+def _api_class(collection, item_id, band, epsg, transform, shape, native, fill):
+    """The classification band nearest-sampled onto the grid, `fill` off the footprint.
+    Asked for at the band's NATIVE pixel and sampled at each grid cell's centre here,
+    because the COG's overviews hold class values that do not exist. A grid whose
+    native-resolution request would pass _API_MAX_PX (a ~40 km radius and up) is
+    asked for in equal tiles."""
+    h, w = shape
+    k = max(1.0, transform.a / native)
+    n = int(np.ceil(max(h, w) * k / _API_MAX_PX))
+    out = None
+    for r0, r1 in zip(*_splits(h, n)):
+        for c0, c1 in zip(*_splits(w, n)):
+            hh, ww = int(round((r1 - r0) * k)), int(round((c1 - c0) * k))
+            a = _api_read(collection, item_id, [band], epsg,
+                          transform * transform.translation(c0, r0), (r1 - r0, c1 - c0),
+                          ww, hh, "nearest", mask=True)
+            cls = np.where(a[1] > 0, a[0], fill).astype(a.dtype)
+            rows = np.minimum(((np.arange(r1 - r0) + 0.5) * hh / (r1 - r0)).astype(int), hh - 1)
+            cols = np.minimum(((np.arange(c1 - c0) + 0.5) * ww / (c1 - c0)).astype(int), ww - 1)
+            if out is None:
+                out = np.empty((h, w), a.dtype)
+            out[r0:r1, c0:c1] = cls[np.ix_(rows, cols)]
+    return out
+
+
+def _splits(size, n):
+    """(starts, stops) cutting range(size) into n near-equal runs."""
+    edges = [round(i * size / n) for i in range(n + 1)]
+    return edges[:-1], edges[1:]
 
 
 def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
@@ -415,9 +529,11 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     Per scene the classification and R/G/NIR reads share ONE grid (same
     epsg/bounds/resolution, run coarse — ~100 m / ~200 px; see the res comment
     below), so the OCM mask and the SCL 'valid'/'snow' masks align
-    pixel-for-pixel. Sentinel-2's R/G/NIR are read from the COG overview onto the
-    classification read's grid (see _OVR_MAX_FRACTION). Single-item reads also make
-    the old stackstac-sorts-by-time mislabeling impossible. Never raises: any
+    pixel-for-pixel. Both come through Planetary Computer's data API (see
+    PC_DATA_URL), which sends only the grid; a scene whose API read fails is read
+    directly instead — Sentinel-2's R/G/NIR from the COG overview (see
+    _OVR_MAX_FRACTION), everything else through stackstac. Single-item reads also
+    make the old stackstac-sorts-by-time mislabeling impossible. Never raises: any
     read/inference error downgrades to None/fallback so the preview still lists its
     scenes."""
     if not items:
@@ -434,6 +550,7 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     res = min(100.0, max(float(native), (2 * radius_km * 1000.0) / 200.0))
     epsg = _utm_epsg(lat, lon)
     bounds = _bbox(lat, lon, radius_km)
+    coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     cls_band = "SCL" if sensor == "s2" else "qa_pixel"
     # fill_value marks off-footprint pixels as this sensor's own "no measurement"
     # code, so they drop out of the denominator: SCL 0 = nodata, QA_PIXEL bit 0 = fill.
@@ -443,16 +560,30 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
     def _read(item):
         """(id, classification 2-D, R/G/NIR 3-D or None). Never raises — a failed
         read returns None so that scene falls back (SCL) or drops out entirely.
-        Single-item reads (stackstac for the classification band and Landsat, the
-        overview read for Sentinel-2's R/G/NIR) mean `isel(time=0)` is unambiguous,
-        so the stackstac-sorts-by-datetime mislabeling simply cannot happen here."""
+        Data API first, the direct read (stackstac; the overview read for
+        Sentinel-2's R/G/NIR) if that fails. Single-item reads mean `isel(time=0)`
+        is unambiguous, so the stackstac-sorts-by-datetime mislabeling simply
+        cannot happen here."""
         try:
+            # Lazy: building the stack touches no pixels, it only fixes the grid
+            # (transform + shape) that every read below lands on.
             c = stackstac.stack(
                 [item], assets=[cls_band], epsg=epsg, resolution=res,
                 bounds_latlon=bounds, chunksize=2048, rescale=False,
-                fill_value=cls_fill, gdal_env=_SEARCH_ENV).squeeze(
-                    "band", drop=True).compute(scheduler="synchronous")
-            cls_arr = np.asarray(c.isel(time=0).values)
+                fill_value=cls_fill, gdal_env=_SEARCH_ENV).squeeze("band", drop=True)
+            grid, shape = c.attrs["transform"], tuple(c.shape[-2:])
+            # Both data-API requests are in flight at once; the R/G/NIR one is
+            # collected below.
+            rgn_fut = (rgn_ex.submit(_api_rgn, coll, item.id, rgn_bands, epsg, grid,
+                                     shape) if method == "ocm" else None)
+            try:
+                cls_arr = _api_class(coll, item.id, cls_band, epsg, grid, shape,
+                                     native, cls_fill)
+            except Exception as e:
+                print(f"    [aoi-cloud] {sensor} {item.id} data-API {cls_band} read "
+                      f"failed ({type(e).__name__}); direct read")
+                cls_arr = np.asarray(
+                    c.compute(scheduler="synchronous").isel(time=0).values)
         except Exception as e:
             print(f"    [aoi-cloud] {sensor} {getattr(item, 'id', '?')} read failed "
                   f"({type(e).__name__}: {e})")
@@ -460,12 +591,17 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
         rgn_arr = None
         if method == "ocm":
             try:
+                rgn_arr = rgn_fut.result()
+            except Exception as e:
+                print(f"    [aoi-cloud] {sensor} {item.id} data-API R/G/NIR read "
+                      f"failed ({type(e).__name__}); direct read")
+        if method == "ocm" and rgn_arr is None:
+            try:
                 # Raw DN, fill=0: OCM z-score-normalises each band over its NONZERO
                 # pixels, so DN scaling is irrelevant but 0 must mean no-data.
                 if sensor == "s2":
                     rgn_arr = np.stack([
-                        _overview_read(item.assets[b].href, epsg, c.attrs["transform"],
-                                       cls_arr.shape, res)
+                        _overview_read(item.assets[b].href, epsg, grid, shape, res)
                         for b in rgn_bands]).astype("float32")             # (3,H,W)
                 else:
                     r = stackstac.stack(
@@ -480,54 +616,60 @@ def _aoi_cloud_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
         return item.id, cls_arr, rgn_arr
 
     # The reads are network-bound and independent, so fan the scenes across a small
-    # thread pool — ~2x faster than one big stackstac read. Throughput plateaus at
-    # ~8 workers (measured), and the plugin already runs the S2 and Landsat previews
-    # on their own threads, so this nests under that.
+    # thread pool. The direct blob reads' throughput plateaus at ~8 workers (measured),
+    # and the plugin already runs the S2 and Landsat previews on their own threads, so
+    # this nests under that; rgn_ex only ever carries the small data-API requests.
+    # While the reads are in flight this thread loads OmniCloudMask and then takes each
+    # scene as its read lands, so neither the model load nor the inference waits for
+    # the last read.
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(_AOI_READ_WORKERS, len(items))) as ex:
-        reads = list(ex.map(_read, items))
-
-    # Corrupt-band check on the R/G/NIR just read (raw DN, 0 = off-footprint).
     by_id = {i.id: i for i in items}
-    bad = {}
-    for iid, _cls, rgn_arr in reads:
-        if rgn_arr is None:
-            continue
-        v = rgn_arr[rgn_arr > 0]
-        peak = float(v.max()) if v.size else float("nan")
-        if _is_wrapped(peak, v.size, _zero_dn(by_id[iid], sensor)):
-            bad[iid] = WRAPPED_NOTE.format(peak=peak)
-            print(f"    [aoi-cloud] !! {iid}: bands wrapped to 8 bits (peak DN "
-                  f"{peak:.0f}) — corrupt on Planetary Computer, flagged")
+    reads, bad, ocm_masks, ocm_note = [], {}, {}, None
+    workers = min(_AOI_READ_WORKERS, len(items))
+    with ThreadPoolExecutor(max_workers=workers) as ex, \
+            ThreadPoolExecutor(max_workers=workers) as rgn_ex:
+        futures = [ex.submit(_read, i) for i in items]
 
-    # OmniCloudMask inference, run SERIALLY under _OCM_LOCK (torch's MPS backend is
-    # not thread-safe). Cheap next to the reads. ocm_note is set only when OCM
-    # can't load AT ALL (the actionable "wrong venv" case) so the plugin can shout
-    # it; a per-scene read/inference miss just falls that one scene back to SCL.
-    ocm_masks, ocm_note = {}, None
-    if method == "ocm":
+        # ocm_note is set only when OCM can't load AT ALL (the actionable "wrong venv"
+        # case) so the plugin can shout it; a per-scene read/inference miss just falls
+        # that one scene back to SCL.
         predict_from_array = None
-        try:
-            dev, models = _ocm_models()
-            from omnicloudmask import predict_from_array
-        except Exception as e:
-            ocm_note = (f"OmniCloudMask could not load ({type(e).__name__}: {e}) — "
-                        f"cloud % is the SCL/QA lower bound. Check that the plugin's "
-                        f"venv python has omnicloudmask installed.")
-            print(f"    [aoi-cloud] !! {ocm_note}")
-        if predict_from_array is not None:
-            for iid, _cls, rgn_arr in reads:
-                if rgn_arr is None or iid in bad:
-                    continue
-                try:
-                    with _OCM_LOCK:   # concurrent MPS dispatch segfaults; see _OCM_LOCK
-                        mask = predict_from_array(rgn_arr, custom_models=models,
-                                                  inference_device=dev)
-                    m = np.asarray(mask).squeeze()   # (H,W): 0 clear, 1/2/3 cloud/shadow
-                    ocm_masks[iid] = np.isin(m, (1, 2, 3))
-                except Exception as e:
-                    print(f"    [aoi-cloud] OCM inference failed for {iid} "
-                          f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
+        if method == "ocm":
+            try:
+                dev, models = _ocm_models()
+                from omnicloudmask import predict_from_array
+            except Exception as e:
+                ocm_note = (f"OmniCloudMask could not load ({type(e).__name__}: {e}) — "
+                            f"cloud % is the SCL/QA lower bound. Check that the plugin's "
+                            f"venv python has omnicloudmask installed.")
+                print(f"    [aoi-cloud] !! {ocm_note}")
+
+        for fut in futures:
+            iid, cls_arr, rgn_arr = fut.result()          # _read never raises
+            reads.append((iid, cls_arr, rgn_arr))
+            if rgn_arr is None:
+                continue
+            # Corrupt-band check on the R/G/NIR just read (raw DN, 0 = off-footprint).
+            v = rgn_arr[rgn_arr > 0]
+            peak = float(v.max()) if v.size else float("nan")
+            if _is_wrapped(peak, v.size, _zero_dn(by_id[iid], sensor)):
+                bad[iid] = WRAPPED_NOTE.format(peak=peak)
+                print(f"    [aoi-cloud] !! {iid}: bands wrapped to 8 bits (peak DN "
+                      f"{peak:.0f}) — corrupt on Planetary Computer, flagged")
+                continue
+            if predict_from_array is None:
+                continue
+            # OmniCloudMask inference, SERIAL under _OCM_LOCK (torch's MPS backend is
+            # not thread-safe).
+            try:
+                with _OCM_LOCK:   # concurrent MPS dispatch segfaults; see _OCM_LOCK
+                    mask = predict_from_array(rgn_arr, custom_models=models,
+                                              inference_device=dev)
+                m = np.asarray(mask).squeeze()   # (H,W): 0 clear, 1/2/3 cloud/shadow
+                ocm_masks[iid] = np.isin(m, (1, 2, 3))
+            except Exception as e:
+                print(f"    [aoi-cloud] OCM inference failed for {iid} "
+                      f"({type(e).__name__}: {e}); SCL/QA fallback for this scene")
 
     out = {}
     for iid, cls_arr, _rgn in reads:
@@ -637,12 +779,18 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     pre_lim = 1 if auto_window else _preview_limit_for(pre_days)
     post_lim = 1 if auto_window else _preview_limit_for(post_days)
     cloud = 20 if (max_cloud_pct is None and auto_window) else max_cloud_pct
-    pre_items = search_scenes(lat, lon, radius_km, pre0, pre1, coll, event_time,
-                              max_cloud=cloud, limit=pre_lim, cloud_weight=None)
-    post_items = search_scenes(lat, lon, radius_km, post0, post1, coll, event_time,
-                               max_cloud=cloud, limit=post_lim, cloud_weight=None)
-    pre_aoi, pre_note = _aoi_cloud_fractions(pre_items, lat, lon, radius_km, sensor)
-    post_aoi, post_note = _aoi_cloud_fractions(post_items, lat, lon, radius_km, sensor)
+    # The two sides' STAC searches run at once (each thread opens its own client, see
+    # _client), and both sides' scenes then go through ONE read batch, so the short
+    # side's reads never leave workers idle while the other side waits its turn.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_pre = ex.submit(search_scenes, lat, lon, radius_km, pre0, pre1, coll,
+                          event_time, max_cloud=cloud, limit=pre_lim, cloud_weight=None)
+        f_post = ex.submit(search_scenes, lat, lon, radius_km, post0, post1, coll,
+                           event_time, max_cloud=cloud, limit=post_lim, cloud_weight=None)
+        pre_items, post_items = f_pre.result(), f_post.result()
+    aoi, note = _aoi_cloud_fractions(pre_items + post_items, lat, lon, radius_km, sensor)
+    pre_aoi = post_aoi = aoi
     return dict(source=src,
                 pre=[_stac_candidate(i, event_time, src,
                                      *(pre_aoi.get(i.id) or (None, None, None, None)))
@@ -650,7 +798,7 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                 post=[_stac_candidate(i, event_time, src,
                                       *(post_aoi.get(i.id) or (None, None, None, None)))
                       for i in post_items],
-                aoi_cloud_note=pre_note or post_note)
+                aoi_cloud_note=note)
 
 
 def _s2_boa_offset(item):

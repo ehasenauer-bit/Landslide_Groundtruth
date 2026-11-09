@@ -14,8 +14,13 @@ Pinned here, on a synthetic local COG (no network, no licensed pixels):
      come back ~2000, where every-10th-pixel sampling returns 1000 or 3000;
   3. it opens the overview it picked, lands on the grid it was given, and is 0 off the
      footprint (OCM's no-data);
-  4. _aoi_cloud_fractions uses it for Sentinel-2 on the classification read's own grid,
-     keeps stackstac for Landsat, and every search read carries the HTTP timeout.
+  4. with the data API unreachable, _aoi_cloud_fractions uses it for Sentinel-2 on the
+     classification read's own grid, keeps stackstac for Landsat, and every search read
+     carries the HTTP timeout;
+  5. normally the pixels come through Planetary Computer's data API instead (2026-11-09:
+     the blob store did ~0.5 MB/s per connection from Fairbanks, a 15 km search was
+     ~10 MB a scene): class band at native resolution + mask, R/G/NIR at half the grid
+     pixel then a no-data-aware 2x2 mean.
 
 Needs the imagery stack (rasterio/stackstac), which lives in the project venv, not in
 QGIS's Python — so re-exec there if we were started under the wrong one.
@@ -101,7 +106,25 @@ out = im._overview_read(path, 32606, edge, (20, 60), 100.0)
 check(out[:, :28].min() > 0 and out[:, 32:].max() == 0,
       "0 off the footprint (OCM's no-data), data on it")
 
-print("\n=== 4. the search uses it for Sentinel-2 only, on the SCL grid ===")
+# Off-SWATH zeros inside the file (MPC's COGs declare no nodata value). Without
+# src_nodata=0 the warper averages them as data and nudges the result to 1, and OCM
+# took a 4.6% sliver for a full frame (read a 32%-cloudy scene as 0.5%).
+swath = os.path.join(TMP, "swath.tif")
+half = checker.copy()
+half[:, : W // 2] = 0
+with rasterio.open(swath, "w", driver="GTiff", width=W, height=H, count=1, dtype="uint16",
+                   crs="EPSG:32606", transform=Affine(10.0, 0, x0, 0, -10.0, y0),
+                   tiled=True, blockxsize=512, blockysize=512) as dst:
+    dst.write(half, 1)
+    dst.build_overviews(S2, Resampling.average)
+out = im._overview_read(swath, 32606, grid, (60, 60), 100.0)       # cols 0-59 = 2-8 km
+check(out[:, :58].max() == 0,
+      f"off-swath zeros INSIDE the file stay 0, not 1 (max {out[:, :58].max()})")
+wide = im._overview_read(swath, 32606, grid, (60, 120), 100.0)     # cols 0-119 = 2-14 km
+check(wide[:, :58].max() == 0 and abs(float(wide[:, 62:].mean()) - 2000) < 5,
+      "... and the on-swath half still reads ~2000")
+
+print("\n=== 4. data API down: the direct reads, Sentinel-2 overview on the SCL grid ===")
 N = 30
 TF = Affine(100.0, 0, x0, 0, -100.0, y0)
 stacks, overview_calls = [], []
@@ -134,7 +157,13 @@ def no_ocm():
     raise RuntimeError("OCM disabled in this test")
 
 
+def api_down(*a, **k):
+    raise ConnectionError("data API unreachable in this test")
+
+
+real_api_read = im._api_read
 im.stackstac.stack, im._overview_read, im._ocm_models = fake_stack, fake_overview, no_ocm
+im._api_read = api_down                    # section 4 pins the FALLBACK (direct) reads
 im._aoi_cloud_fractions([item("S2", ["B04", "B03", "B08"])], 62.05, -149.2, 15.0, "s2")
 check([c[0].rsplit("/", 1)[1] for c in overview_calls] == ["B04", "B03", "B08"],
       f"Sentinel-2 R/G/NIR via the overview read: {[c[0] for c in overview_calls]}")
@@ -145,11 +174,72 @@ stacks.clear(); overview_calls.clear()
 im._aoi_cloud_fractions([item("LS", ["red", "green", "nir08"])], 62.05, -149.2, 15.0,
                         "landsat")
 check(not overview_calls and [s[0] for s in stacks] == [["qa_pixel"], ["red", "green", "nir08"]],
-      "Landsat keeps its stackstac read (not measured, so not switched)")
+      "Landsat's direct read is still stackstac")
 envs = [s[1] for s in stacks]
 check(all(e is im._SEARCH_ENV for e in envs) and
       im._SEARCH_ENV._always.get("GDAL_HTTP_TIMEOUT") == "60",
       "every search stackstac read carries the 60 s HTTP timeout")
+
+print("\n=== 5. the data API read (the normal path) ===")
+# A fake server: whatever is asked for, answer the right shape and record the request.
+api_calls = []
+
+
+def fake_api(collection, item_id, assets, epsg, transform, shape, width, height,
+             resampling, mask):
+    api_calls.append(dict(collection=collection, assets=list(assets), size=(height, width),
+                          resampling=resampling, mask=mask, transform=transform,
+                          shape=tuple(shape)))
+    if mask:                                    # class band + mask: left half off-swath
+        a = np.zeros((2, height, width), "uint16")
+        a[0] = 4
+        a[1, :, width // 2:] = 255
+        return a
+    a = np.zeros((len(assets), height, width), "uint16")
+    a[:, :, width // 2:] = np.where(np.indices((height, width - width // 2)).sum(0) % 2, 3000, 1000)
+    a[:, :, width // 2] = 0                     # one no-data column inside a 2x2 block
+    return a
+
+
+im._api_read = fake_api
+stacks.clear(); overview_calls.clear()
+out, _note = im._aoi_cloud_fractions([item("S2", ["B04", "B03", "B08"])], 62.05, -149.2,
+                                     15.0, "s2")
+check(not overview_calls, "Sentinel-2 with the API up: no direct overview read")
+# the two requests are in flight at once, so pick them by band, not by order
+cls_call = next(c for c in api_calls if c["assets"] == ["SCL"])
+rgn_call = next(c for c in api_calls if c["assets"] != ["SCL"])
+check(cls_call["assets"] == ["SCL"] and cls_call["resampling"] == "nearest"
+      and cls_call["mask"] and cls_call["size"] == (N * 5, N * 5),
+      f"SCL asked for at its native 20 m, nearest, with a mask: {cls_call['size']}")
+check(rgn_call["assets"] == ["B04", "B03", "B08"] and rgn_call["resampling"] == "average"
+      and rgn_call["size"] == (N * 2, N * 2),
+      f"R/G/NIR asked for at HALF the grid pixel, averaged: {rgn_call['size']}")
+check(all(c["transform"] == TF and c["shape"] == (N, N) for c in api_calls),
+      "... both on the stack's own grid")
+check(out["S2"][0] is not None and out["S2"][2] == "scl",
+      f"off-swath half dropped from the denominator, cloud % still measured: {out['S2']}")
+
+rgn = im._api_rgn("sentinel-2-l2a", "S2", ["B04", "B03", "B08"], 32606, TF, (N, N))
+check(rgn.shape == (3, N, N) and rgn[:, :, : N // 2].max() == 0,
+      "R/G/NIR: 0 where the scene has no data")
+check(abs(float(rgn[:, :, N // 2 + 1:].mean()) - 2000) < 1,
+      "R/G/NIR: 2x2 mean of the 1000/3000 checkerboard is 2000")
+check(float(rgn[:, :, N // 2].min()) >= 1000,
+      "R/G/NIR: a no-data pixel inside a 2x2 block is left out of the mean, not averaged in")
+cls = im._api_class("sentinel-2-l2a", "S2", "SCL", 32606, TF, (N, N), 20, 0)
+check(cls.shape == (N, N) and (cls[:, : N // 2] == 0).all() and (cls[:, N // 2:] == 4).all(),
+      "SCL: sampled back onto the grid, fill value off the footprint")
+api_calls.clear()
+im._api_class("landsat-c2-l2", "LS", "qa_pixel", 32606, TF, (N, N), 30, 1)
+check(api_calls[0]["size"] == (100, 100), f"Landsat QA at its native 30 m: {api_calls[0]['size']}")
+
+im._api_read = real_api_read
+try:
+    im._api_read("sentinel-2-l2a", "S2", ["B04"], 32606, TF, (N, N), 5000, 5000, "nearest", True)
+    check(False, "an over-size request must raise before touching the network")
+except ValueError:
+    check(True, "an over-size request raises (-> direct read) before touching the network")
 
 print(f"\n{'ALL PASS' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)
