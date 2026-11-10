@@ -11,9 +11,10 @@ it, and no layer here is named like a change index.
 
 Workflow (M1): **Use it in every tab** fills the Event box from the seismic
 detection → **Search** lists the strips that actually see the search circle,
-split before/after on the full UTC origin time, graded and ranked → the ★
-before/after pair streams onto the map by itself → **Flip** toggles the after
-strip. Three clicks from a detection to a live comparison.
+split before/after on the full UTC origin time, graded and ranked, with the ★
+before/after pair ticked → **Stream picks** puts the ticked strips on the map
+(nothing streams before that: no tile is fetched until you ask) → **Flip**
+toggles the after strip.
 
 **Origin time.** The split is ``acquired < origin`` = before, on aware UTC
 datetimes. The origin is ``dock.detection.origin_utc`` when the detection matches
@@ -36,8 +37,10 @@ hand (gegd_rank is pure), so changing one costs zero requests.
 **Layers.** Streams are XYZ layers carrying ``authcfg=gegdpro`` only (see
 gegd_layers); **Stream picks** replaces only the previous stream set — never a
 clip, a scar, or anything another tab made. Footprints and the search circle are
-memory layers, rebuilt on each search. On reopen, ``gegd_layers.adopt_layers``
-finds them again by custom property, and ``<project>/gegd/<event_id>/search.json``
+memory layers that exist only while 'Show strip footprints and search circle on
+map' is ticked — off by default, as on the Sentinel-2 and PlanetScope tabs —
+rebuilt on each search while it is, and removed when it is unticked. On reopen,
+``gegd_layers.adopt_layers`` finds them again by custom property, and ``<project>/gegd/<event_id>/search.json``
 (no key, no pixels) restores the table without a request.
 
 **Key hygiene.** The key lives in the QGIS password store (``gegd_auth``); the
@@ -92,7 +95,7 @@ SENSORS = (
     ("GE01", "GeoEye-1"), ("other", "other"),
 )
 
-COLUMNS = ("Pick", "Date UTC (Δd)", "Sensor", "Off-nadir°", "Sun°", "AOI cover",
+COLUMNS = ("Pick", "Date UTC (Δd)", "AOI cover", "Sensor", "Off-nadir°", "Sun°",
            "Strip cloud %")
 COLUMN_TIPS = (
     "Tick the strips to stream with 'Stream picks'. ★ marks the recommended "
@@ -102,6 +105,8 @@ COLUMN_TIPS = (
     "Acquisition time (UTC) and days from the event, negative = before. Before/after "
     "is decided on the full UTC time, so an Alaska-evening strip can carry the next "
     "day's date here; the row tooltip gives the Alaska time.",
+    "Share of the search circle the footprint covers. Red '(misses epicentre)' when "
+    "the epicentre itself lies outside the strip.",
     "WorldView-1 is panchromatic only (grey, ~0.5 m); WorldView-2/3 and GeoEye-1 "
     "stream as pansharpened colour. 'stereo' = an in-track mate seconds apart (one "
     "look from two angles, not two dates). 'ingested' = a strip someone had GEGD "
@@ -115,8 +120,6 @@ COLUMN_TIPS = (
     "sideways: ~21 m at 20° off-nadir, ~34 m at 30°.",
     "Sun elevation. Below ~25° the 8-bit DRA stretch starts to swallow shadowed "
     "slopes; below the Scene-filter minimum a strip is hidden.",
-    "Share of the search circle the footprint covers. Red '(misses epicentre)' when "
-    "the epicentre itself lies outside the strip.",
     "GEGD's cloud estimate for the WHOLE strip (often 15+ km long), not for your "
     "circle: weak evidence either way. A strip 30% cloudy can be clear over the scar, "
     "and snow is not cloud. Look at the stream to judge.",
@@ -303,14 +306,16 @@ class GegdTab(QWidget):
             "touches the search circle in the window, at any map scale. The strips are "
             "split before/after on the full UTC origin time, graded (mapping / visual "
             "only / context), ranked on time gap, view angle, sun, coverage and strip "
-            "cloud, and the recommended ★ pair is streamed if 'Stream the ★ pair' is "
-            "ticked. A side that comes back empty costs one more small request, to say "
-            "where the nearest strip outside the window is. Nothing is downloaded.")
+            "cloud, and the recommended ★ pair is ticked in the Pick column. Nothing "
+            "streams until you press Stream picks. A side that comes back empty costs "
+            "one more small request, to say where the nearest strip outside the window "
+            "is. Nothing is downloaded.")
         self.search_btn.clicked.connect(self._search_clicked)
         self.stream_btn = QPushButton("Stream picks")
         self.stream_btn.setToolTip(
-            "Stream the ticked strips onto the map (the ★ pair if nothing is ticked), "
-            "replacing the previous Maxar STREAMS only — clips, scars and every other "
+            "Stream the ticked strips onto the map (the ★ pair if nothing is ticked). "
+            "Search never streams anything itself: no tile is fetched before this. "
+            "Replaces the previous Maxar STREAMS only — clips, scars and every other "
             "tab's layers are never touched. The top before/after pair is shown, after "
             "on top; any extra picks are added switched off, and a switched-off stream "
             "fetches nothing. Double-click a row to make that one strip the shown "
@@ -599,13 +604,6 @@ class GegdTab(QWidget):
             "Daily Take is collected this far north, X-band SAR may be the only VHR "
             "after-look.")
         form.addRow(self.third_party_check)
-        self.auto_stream_check = QCheckBox("Stream the ★ pair as soon as Search finishes")
-        self.auto_stream_check.setChecked(True)
-        self.auto_stream_check.setToolTip(
-            "After a search, put the recommended before/after pair on the map straight "
-            "away (after on top), replacing the previous Maxar streams. Off: nothing is "
-            "streamed until you press Stream picks.")
-        form.addRow(self.auto_stream_check)
 
         self.ona_max_spin.valueChanged.connect(self._schedule_rerank)
         self.sun_min_spin.valueChanged.connect(self._schedule_rerank)
@@ -624,21 +622,23 @@ class GegdTab(QWidget):
         row = FlowRow()
         self._clear_sel_btn = QPushButton("Clear selection")
         self._clear_sel_btn.setToolTip(
-            "Deselect every row and its footprint on the map. Selecting a row "
-            "highlights that strip's footprint in yellow so you can see where it "
-            "lies; this takes the highlight off again. The map's own 'Deselect "
-            "Features from All Layers' does the same.")
+            "Deselect every row and its footprint on the map. With footprints shown, "
+            "selecting a row highlights that strip's footprint in yellow so you can "
+            "see where it lies; this takes the highlight off again. The map's own "
+            "'Deselect Features from All Layers' does the same.")
         self._clear_sel_btn.clicked.connect(self._clear_selection)
         row.addWidget(self._clear_sel_btn)
-        self.show_outlines_check = QCheckBox("Show footprints and search circle")
-        self.show_outlines_check.setChecked(True)
-        self.show_outlines_check.setToolTip(
-            "The blue (before) and green (after) strip outlines and the red search "
-            "circle with its epicentre cross. Untick for a clean look at the imagery; "
-            "a new Search keeps them hidden until this is ticked again. Hiding them "
-            "also clears the selection, so no yellow highlight is left behind.")
-        self.show_outlines_check.toggled.connect(self._apply_outlines)
-        row.addWidget(self.show_outlines_check)
+        self.footprint_check = QCheckBox("Show strip footprints and search circle on map")
+        self.footprint_check.setChecked(False)
+        self.footprint_check.setToolTip(
+            "Draw the strip outlines (before = blue, after = green) and the red search "
+            "circle with its epicentre cross. Off by default, as on the Sentinel-2 and "
+            "PlanetScope tabs. While ticked they stay on the map and are redrawn after "
+            "each Search and filter change; selecting a row then highlights its "
+            "footprint in yellow, and selecting a footprint selects its row. Untick to "
+            "take them off the map again. No request either way.")
+        self.footprint_check.toggled.connect(self._on_footprint_toggle)
+        row.addWidget(self.footprint_check)
         v.addWidget(row)
         t = QTableWidget(0, len(COLUMNS))
         t.setHorizontalHeaderLabels(list(COLUMNS))
@@ -1157,9 +1157,9 @@ class GegdTab(QWidget):
             + ".")
         for m in ranked.messages:
             self._log_line("  " + m)
-        star = [r for r in (ranked.star_pre, ranked.star_post) if r is not None]
-        if star and self.auto_stream_check.isChecked():
-            self._stream_strips(star, replace=True)
+        if ranked.star_pre is not None or ranked.star_post is not None:
+            self._log_line("The ★ pair is ticked in the Pick column; press Stream picks "
+                           "to put it on the map.")
         self._rebuild_vectors(aoi=True)
         path = self._save_search()
         if path:
@@ -1269,7 +1269,9 @@ class GegdTab(QWidget):
         if not r.covers_epicentre:
             cover += " (misses epicentre)"
         cloud = "—" if s.cloud is None else f"{100.0 * s.cloud:.1f}"
-        items = [pick] + [QTableWidgetItem(x) for x in (date, sensor, ona, sun, cover, cloud)]
+        text = {"Date UTC (Δd)": date, "AOI cover": cover, "Sensor": sensor,
+                "Off-nadir°": ona, "Sun°": sun, "Strip cloud %": cloud}
+        items = [pick] + [QTableWidgetItem(text[h]) for h in COLUMNS[1:]]
         tip = self._row_tip(r)
         muted = r.hidden_reason is not None or r.grade != "mapping"
         for it in items:
@@ -1281,9 +1283,9 @@ class GegdTab(QWidget):
             if muted:
                 f = it.font(); f.setItalic(True); it.setFont(f)
         if r.grade == "visual":
-            items[3].setForeground(QBrush(GRADE_VISUAL_FG))
+            items[COLUMNS.index("Off-nadir°")].setForeground(QBrush(GRADE_VISUAL_FG))
         if not r.covers_epicentre:
-            items[5].setForeground(QBrush(MISSES_EPICENTRE_FG))
+            items[COLUMNS.index("AOI cover")].setForeground(QBrush(MISSES_EPICENTRE_FG))
         if r.star:
             f = pick.font(); f.setBold(True); pick.setFont(f)
         return items
@@ -1416,10 +1418,14 @@ class GegdTab(QWidget):
                        lg.radius_tag(s["r_km"]), "search area")
 
     def _rebuild_vectors(self, aoi=False):
-        """Footprints (and with `aoi`, the search circle) for the current ranking.
-        Memory layers, replaced each time: free, and no scale gate."""
+        """Footprints (and with `aoi`, the search circle) for the current ranking,
+        while the footprint box is ticked; with it unticked there are none on the
+        map. Memory layers, replaced each time: free, and no scale gate."""
         s = self._search
         if s is None or self._ranked is None or self._torn_down:
+            return
+        if not self.footprint_check.isChecked():
+            self._clear_vectors()
             return
         group = self._vector_group()
         if aoi or self._aoi_layer is None:
@@ -1441,24 +1447,35 @@ class GegdTab(QWidget):
         lg.add_to_group(lyr, group)
         self._footprint_layer = lyr
         self._hook_footprints()
-        self._apply_outlines(only_hide=True)
 
-    def _apply_outlines(self, *_, only_hide=False):
-        """Show or hide the footprints and the search circle (layer-tree visibility,
-        so a hidden layer costs nothing to draw). Hiding also clears the selection.
-
-        `only_hide` is for new or adopted layers: they arrive visible, so only an
-        unticked box needs applying, and a layer the user switched off by hand in the
-        Layers panel is not switched back on behind their back."""
-        on = self.show_outlines_check.isChecked()
-        if on and only_hide:
-            return
-        for lyr in (self._footprint_layer, self._aoi_layer):
-            node = self._node(lyr)
-            if node is not None:
-                node.setItemVisibilityChecked(on)
+    def _on_footprint_toggle(self, on):
+        """Tick: draw the footprints and the search circle for the strips in hand,
+        highlighting the rows already selected. Untick: take both off the map, as
+        the Sentinel-2 and PlanetScope tabs do. No request either way."""
         if not on:
-            self._clear_selection()
+            self._clear_vectors()
+            return
+        self._rebuild_vectors(aoi=True)
+        if self._footprint_layer is not None:
+            self._select_footprints({r.strip.feature_id for r in self._selected_rows()})
+
+    def _clear_vectors(self):
+        """Remove the footprints and the search circle — never a stream."""
+        fp, aoi = self._footprint_layer, self._aoi_layer
+        self._footprint_layer = self._aoi_layer = None
+        self._fp_ids = {}
+        self._unhook_footprints()
+        for lyr in (fp, aoi):
+            if lyr is not None:
+                lg.remove_layer(lyr)
+
+    def _unhook_footprints(self):
+        lyr, self._fp_hooked = self._fp_hooked, None
+        if lyr is not None:
+            try:
+                lyr.selectionChanged.disconnect(self._on_fp_selection)
+            except (TypeError, RuntimeError):
+                pass
 
     def _clear_selection(self):
         """Deselect every row and every footprint on the map."""
@@ -1740,7 +1757,7 @@ class GegdTab(QWidget):
         before, after = self._compare
         node_a = self._node(after)
         if node_a is None:
-            self._warn("Stream a before/after pair first (Search, or Stream picks).")
+            self._warn("Stream a before/after pair first (Search, then Stream picks).")
             self._update_buttons()
             return
         node_b = self._node(before)
@@ -1934,7 +1951,10 @@ class GegdTab(QWidget):
                 self._stream_group = parent.name()
                 break
         self._hook_footprints()
-        self._apply_outlines(only_hide=True)
+        if not self.footprint_check.isChecked():
+            # a project saved with them shown (before 1.0.1 they always were):
+            # off means no footprint layers at all
+            self._clear_vectors()
         self._update_buttons()
 
     def _pair_from(self, layers):
@@ -2103,10 +2123,4 @@ class GegdTab(QWidget):
             except (TypeError, RuntimeError):
                 pass
         self._signals = []
-        lyr = self._fp_hooked
-        self._fp_hooked = None
-        if lyr is not None:
-            try:
-                lyr.selectionChanged.disconnect(self._on_fp_selection)
-            except (TypeError, RuntimeError):
-                pass
+        self._unhook_footprints()

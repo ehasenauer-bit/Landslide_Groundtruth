@@ -20,13 +20,16 @@ email=ehasenauer@alaska.edu
 homepage=https://github.com/ehasenauer-bit/Landslide_Groundtruth#readme
 repository=https://github.com/ehasenauer-bit/Landslide_Groundtruth
 tracker=https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues
-changelog=1.0.1 - Faster scene search; SAR change map from full-detail scenes; seismic offset in the 3D viewer.
+changelog=1.0.1 - Faster scene search; SAR change map from full-detail scenes; seismic offset in the 3D viewer; Maxar strips stream only when asked.
     * SAR: Compute change map uses only scenes rendered with Run (full detail), reading the data that Run saved in the project folder, so it downloads nothing and a scene is never fetched twice.
     * SAR: full-detail layers go in an "amplitude full" folder and stay on the map; quick previews go in "amplitude preview" and replace only the previous preview.
     * The Sentinel-2 / Landsat scene search is several times faster (about 20 s where it took 1 to 8 minutes on a slow link): the cloud check now reads each scene through Planetary Computer's data API instead of downloading image tiles.
     * Fixed: the cloud % of a scene that only clips the edge of the search box could read far too low.
     * The 3D viewer's figure details, and the exported figures, show how far and which way the landslide's centre lies from the detection's epicentre, e.g. "2.31 km SW of seismic location".
     * A warning when that offset is over 50 km, usually a dropped minus sign in the longitude.
+    * Maxar VHR: Search no longer streams the recommended before/after pair by itself. It is ticked in the Pick column, and no tile is fetched until you press Stream picks.
+    * Maxar VHR: the AOI cover column sits right after the date.
+    * Maxar VHR: strip footprints and the search circle are off by default; tick "Show strip footprints and search circle on map" to draw them and untick it to remove them, as on the Sentinel-2 and PlanetScope tabs.
     1.0.0 - First public release.
     * One-click "Install imagery tools": the plugin builds its own Python environment; no venv to make by hand.
     * The imagery pipeline ships inside the plugin.

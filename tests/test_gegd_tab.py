@@ -268,7 +268,7 @@ EXPECT = {
     "gegd/show_visual_check", "gegd/sun_min_spin", "gegd/cloud_max_spin",
     "gegd/sensor_checks/GE01", "gegd/sensor_checks/WV01", "gegd/sensor_checks/WV02",
     "gegd/sensor_checks/WV03", "gegd/sensor_checks/other", "gegd/third_party_check",
-    "gegd/auto_stream_check", "gegd/show_outlines_check",
+    "gegd/footprint_check",
 }
 keys = {k for k, _w in dock.project_state._widgets if k.startswith("gegd/")}
 check(f"persisted widget set is exactly the pinned one (extra {sorted(keys - EXPECT)}, "
@@ -282,11 +282,12 @@ defaults = (d["gegd/radius_spin"].value(), d["gegd/pre_days_spin"].value(),
             d["gegd/show_visual_check"].isChecked(), d["gegd/sun_min_spin"].value(),
             d["gegd/cloud_max_spin"].value(),
             all(cb.isChecked() for cb in tab.sensor_checks.values()),
-            d["gegd/third_party_check"].isChecked(), d["gegd/auto_stream_check"].isChecked(),
-            d["gegd/show_outlines_check"].isChecked())
+            d["gegd/third_party_check"].isChecked(), d["gegd/footprint_check"].isChecked())
 check(f"defaults 5 km / 365 d / 90 d / 30° / visual on / 15° / 100% (no strip-cloud cap) / "
-      f"all sensors / no third-party / auto-stream / outlines shown ({defaults})",
-      defaults == (5.0, 365, 90, 30.0, True, 15.0, 100, True, False, True, True))
+      f"all sensors / no third-party / footprints off ({defaults})",
+      defaults == (5.0, 365, 90, 30.0, True, 15.0, 100, True, False, False))
+check("there is no 'stream as soon as Search finishes' option (Stream picks only)",
+      not hasattr(tab, "auto_stream_check"))
 
 print("\n=== results go beside the project ===")
 # The unsaved-project fallback is <tools folder>/out/interactive (dock.shared_dir);
@@ -369,7 +370,8 @@ pump(0.3)
 check("no key -> 'No … GEGD Pro key is stored' and no request",
       "key is stored" in tab._summary_label.text() and n_requests() == n0)
 
-print("\n=== Save key, Search: the ★ pair, footprints, streams ===")
+print("\n=== Save key, Search: the ★ pair; Stream picks; footprints ===")
+from landslide_groundtruth.gegd_tab import COLUMNS as GCOLS            # noqa: E402
 tab.key_edit.setText(DUMMY)
 tab._save_key()
 check("Save key stores it and clears the field", gegd_auth.has_key() and tab.key_edit.text() == "")
@@ -411,23 +413,45 @@ check(f"table: 7 columns; exactly the two ★ rows, both ticked ({starred})",
       and all(tab._table.item(i, 0).checkState() == Qt.CheckState.Checked for i in starred)
       and sum(tab._table.item(i, 0).checkState() == Qt.CheckState.Checked
               for i in range(tab._table.rowCount())) == 2)
+heads = [tab._table.horizontalHeaderItem(c).text() for c in range(tab._table.columnCount())]
+check(f"AOI cover is the column right of the date ({heads})",
+      heads == list(GCOLS) and heads[1:3] == ["Date UTC (Δd)", "AOI cover"])
+c_cover = GCOLS.index("AOI cover")
+check("… and holds the cover, not the sensor",
+      all(tab._table.item(i, c_cover).text().split("%")[0].isdigit()
+          for i in range(tab._table.rowCount())))
 stereo_rows = [i for i, r in enumerate(tab._row_strips) if r.stereo]
 check("stereo mates carry a badge", stereo_rows and all(
-    "stereo" in tab._table.item(i, 2).text() for i in stereo_rows))
+    "stereo" in tab._table.item(i, GCOLS.index("Sensor")).text() for i in stereo_rows))
 tip = tab._table.item(0, 0).toolTip()
 check("row tooltip: Alaska time, the 50 m shift line, featureId",
       "AKDT" in tip and "50 m" in tip and "featureId" in tip)
+
+
+def kinds_on_map(*kinds):
+    return [l for l in project.mapLayers().values() if gegd_layers.get_prop(l, "kind") in kinds]
+
+
+check("Search streams nothing by itself: no stream layer until Stream picks",
+      not tab._stream_layers and not kinds_on_map("stream") and tab._compare == (None, None))
+check("footprints are off by default: no footprint or search-circle layer after Search",
+      tab._footprint_layer is None and tab._aoi_layer is None
+      and not kinds_on_map("footprints", "aoi"))
+n0 = n_requests()
+tab._stream_picks()
+streams = list(tab._stream_layers)
+names = [l.name() for l in streams]
+check(f"Stream picks streams the ticked ★ pair ({names})",
+      names == ["Maxar before · 2026-08-01 WV01 · ONA 30° (stream)",
+                "Maxar after · 2026-08-26 WV02 · ONA 20° (stream)"])
+tab.footprint_check.setChecked(True)
 fp, aoi = tab._footprint_layer, tab._aoi_layer
-check("footprints and search circle are on the map (memory layers, tagged)",
+check("ticking the box draws the footprints and search circle (memory layers, tagged), "
+      "with no request",
       fp is not None and aoi is not None and fp.featureCount() == len(tab._row_strips)
       and gegd_layers.get_prop(fp, "kind") == "footprints"
       and gegd_layers.get_prop(aoi, "kind") == "aoi"
-      and project.mapLayer(fp.id()) is not None)
-streams = list(tab._stream_layers)
-names = [l.name() for l in streams]
-check(f"the ★ pair streamed ({names})",
-      names == ["Maxar before · 2026-08-01 WV01 · ONA 30° (stream)",
-                "Maxar after · 2026-08-26 WV02 · ONA 20° (stream)"])
+      and project.mapLayer(fp.id()) is not None and n_requests() == n0)
 check("stream names carry no _pre_/_post_ token (3D never pairs them)",
       not any(re.search(r"_(pre|post)_", n) for n in names))
 srcs = [l.source() for l in streams]
@@ -568,7 +592,6 @@ check(f"the search-area folder is still above the stream folder ({root_groups()}
       outlines_on_top())
 
 print("\n=== streamed strips in the 3D viewer's metadata CSV ===")
-from landslide_groundtruth.gegd_tab import COLUMNS as GCOLS            # noqa: E402
 from landslide_groundtruth import scene_manifest as SM                 # noqa: E402
 cells = tab.strip_cells(tab._row_strips[row31].strip.feature_id)
 check("strip_cells gives exactly the table's cells for a strip",
@@ -621,24 +644,33 @@ check("Clear selection empties both the table and the map selection",
       not tab._table.selectionModel().selectedRows()
       and tab._footprint_layer.selectedFeatureCount() == 0
       and not tab._detail_label.text())
-fp_node = project.layerTreeRoot().findLayer(tab._footprint_layer.id())
-aoi_node = project.layerTreeRoot().findLayer(tab._aoi_layer.id())
+fp_id, aoi_id = tab._footprint_layer.id(), tab._aoi_layer.id()
 tab._table.selectRow(row31)
 n0 = n_requests()
-tab.show_outlines_check.setChecked(False)
-check("unticking hides the footprints and the search circle, and clears the selection",
-      not fp_node.itemVisibilityChecked() and not aoi_node.itemVisibilityChecked()
-      and tab._footprint_layer.selectedFeatureCount() == 0
-      and not tab._table.selectionModel().selectedRows())
-tab._rerank_now()                       # rebuilds the footprint layer
-fp_node = project.layerTreeRoot().findLayer(tab._footprint_layer.id())
-check("a rebuilt footprint layer stays hidden while the box is unticked",
-      not fp_node.itemVisibilityChecked())
-tab.show_outlines_check.setChecked(True)
-aoi_node = project.layerTreeRoot().findLayer(tab._aoi_layer.id())
-check("ticking shows both again", fp_node.itemVisibilityChecked()
-      and aoi_node.itemVisibilityChecked())
-check("hiding and showing outlines costs no requests", n_requests() == n0)
+n_live = len(tab._stream_layers)
+tab.footprint_check.setChecked(False)
+check("unticking removes the footprints and the search circle from the map (and their "
+      "folder), like the Sentinel-2 / PlanetScope boxes",
+      project.mapLayer(fp_id) is None and project.mapLayer(aoi_id) is None
+      and tab._footprint_layer is None and tab._aoi_layer is None
+      and not kinds_on_map("footprints", "aoi")
+      and not any(n.endswith("search area") for n in root_groups()))
+check("… and leaves every stream alone",
+      len(tab._stream_layers) == n_live
+      and all(project.mapLayer(l.id()) is not None for l in tab._stream_layers))
+tab._rerank_now()
+check("a re-rank while unticked draws none", tab._footprint_layer is None
+      and not kinds_on_map("footprints", "aoi"))
+tab._table.selectRow(row31)
+tab.footprint_check.setChecked(True)
+fid31 = tab._row_strips[row31].strip.feature_id
+check("ticking draws both again, above the strips, with the selected row highlighted",
+      tab._footprint_layer is not None and tab._aoi_layer is not None and outlines_on_top()
+      and [f["feature_id"] for f in tab._footprint_layer.selectedFeatures()] == [fid31])
+tab._rerank_now()
+check("while ticked they stay on through a re-rank", tab._footprint_layer is not None
+      and len(kinds_on_map("footprints")) == 1 and len(kinds_on_map("aoi")) == 1)
+check("toggling footprints costs no requests", n_requests() == n0)
 
 print("\n=== a failed search keeps the table ===")
 before_rows = [r.strip.feature_id for r in tab._row_strips]
@@ -750,6 +782,30 @@ check(f"the compare pair is the one on screen before the reopen ({pair_names})",
       None not in tab._compare and tuple(l.name() for l in tab._compare) == pair_names)
 check("the table came back from search.json",
       [r.strip.feature_id for r in tab._row_strips] == before_rows)
+check("saved with footprints ticked: the box comes back ticked, and so do they (one of each)",
+      tab.footprint_check.isChecked() and tab._footprint_layer is not None
+      and len(kinds_on_map("footprints")) == 1 and len(kinds_on_map("aoi")) == 1)
+# A project saved before 1.0.1: footprint layers in it (they were always on), no
+# footprint_check entry, and the retired auto_stream_check entry still there.
+from landslide_groundtruth import project_state as PS                 # noqa: E402
+_ps = dock.project_state
+_all_widgets = _ps._widgets
+_ps._widgets = [(k, w) for k, w in _all_widgets if k != "gegd/footprint_check"]
+project.removeEntry(PS.SCOPE, "gegd/footprint_check")   # save() would write it back
+project.writeEntry(PS.SCOPE, "gegd/auto_stream_check", "1")
+project.write(os.path.join(PROJ, "Iliamna.qgz"))
+_ps._widgets = _all_widgets
+check("(the simulated old project really has footprints and no footprint_check entry)",
+      len(kinds_on_map("footprints")) == 1
+      and not project.readEntry(PS.SCOPE, "gegd/footprint_check", "")[1])
+project.clear(); pump()
+project.read(os.path.join(PROJ, "Iliamna.qgz"))
+ok = wait_until(lambda: tab._ranked is not None and len(tab._stream_layers) == n_streams, 10)
+check("a pre-1.0.1 project opens with the box unticked and its footprint layers removed; "
+      "the streams stay",
+      ok and not tab.footprint_check.isChecked() and tab._footprint_layer is None
+      and not kinds_on_map("footprints", "aoi") and len(kinds_on_map("stream")) == n_streams)
+n_streams = len(kinds_on_map("stream"))
 import zipfile
 with zipfile.ZipFile(os.path.join(PROJ, "Iliamna.qgz")) as z:
     blob = b"".join(z.read(n) for n in z.namelist())
@@ -781,6 +837,8 @@ labels = [r.strip.label for r in tab._row_strips]
 check(f"Knik: the 09-02 post is listed and ★ ({labels})",
       "2026-09-02 WV03" in labels and tab._ranked.star_post is not None
       and tab._ranked.star_post.strip.label == "2026-09-02 WV03")
+check("… and not streamed: a saved auto_stream_check entry streams nothing",
+      len(kinds_on_map("stream")) == n_streams and not kinds_on_map("footprints", "aoi"))
 check("… and the pre side says where the nearest earlier strip is (one extra request)",
       "nearest earlier strip 2026-05-02" in txt and n_requests() - n0 == 2)
 MODE["fail_nearest"] = True
@@ -811,7 +869,8 @@ ing = api.Strip(feature_id="00000000-0000-4000-8000-0000000000ee", acq_utc=ref.a
 r_ing = R.rank([ing], R._utc("2026-08-08T13:00:00Z"), 61.15, -148.25, 5.0).post[0]
 items = tab._row_items(r_ing)
 check("a strip ingested on request carries 'ingested' in the Sensor column and its tooltip",
-      "ingested" in items[2].text() and "Ingested on request" in items[2].toolTip())
+      "ingested" in items[GCOLS.index("Sensor")].text()
+      and "Ingested on request" in items[GCOLS.index("Sensor")].toolTip())
 
 print("\n=== teardown cancels a search in flight ===")
 tab.lat_edit.setText("60.0265"); tab.lon_edit.setText("-153.0559")
