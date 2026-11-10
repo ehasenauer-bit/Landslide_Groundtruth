@@ -61,6 +61,8 @@ and are skipped for a scene whose geometry could not be read. Every NISAR
 layer is named "NISAR …" and its detector settings are the C-band ones: one
 event (Iliamna) says they transfer, which is not a validation.
 """
+import hashlib
+import json
 import math
 import os
 import re
@@ -276,17 +278,20 @@ class SarTab(QWidget):
         self._preview_fallback = None    # baked thumb to retry if a render fails
         self._tif_replies = []           # in-flight AOI-GeoTIFF downloads
         self._tif_pending = 0
-        self._preview_added = []         # raster layers added by the current preview
+        self._preview_added = []         # raster layers added by the current preview/Run
+        self._quick_layers = []          # quick-preview layers (replaced by the next render;
+                                         # full-detail layers stay until re-run)
         self._amp_group = None           # layer-tree folder the amplitude preview loads into
         self._preview_failed = []
         self._preview_mode = "preview"   # 'preview' (quick) | 'run' (full detail + save)
         self._preview_res = None         # effective render resolution of the last render
         self._preview_smooth = 0         # median window applied to the last render (0=off)
         self._preview_saved = []         # GeoTIFF paths saved by the current Run
+        self._raw_saved = []             # γ⁰ GeoTIFFs the current Run saved/reused
+        self._raw_failed = []            # scenes whose γ⁰ the current Run could not save
+        self._nisar_raw_jobs = {}        # job key -> (label, final γ⁰ path) of a Run
         self._gallery_replies = []       # in-flight quicklook-thumbnail requests
         self._footprint_layers = []      # scene-footprint vector layers on the map
-        self._cd_replies = []            # in-flight change-detection downloads
-        self._cd_pending = 0
         self._cd_paths = {}              # role ('pre0'…/'post') -> tif path
         self._cd_meta = None             # products/pol/window of the running compute
         self._cd_last_layers = []        # newest change maps (kept above amplitude previews)
@@ -299,10 +304,8 @@ class SarTab(QWidget):
         # numbered so the answers of an abandoned one are recognised and dropped
         self._nisar_batch = 0            # last batch number handed out
         self._nisar_amp_batch = -1       # the amplitude batch still listened to
-        self._nisar_cd_batch = -1        # the change-detection batch still listened to
         self._nisar_amp_task = None      # amplitude preview/Run reads in flight
         self._nisar_amp_jobs = {}        # job key -> (label, candidate)
-        self._nisar_cd_task = None       # change-detection reads in flight
         self._nisar_alive = []           # every NISAR task QGIS has not finished yet
         self._build_ui()
 
@@ -422,12 +425,14 @@ class SarTab(QWidget):
         self.run_btn = QPushButton("Run (full detail)")
         self.run_btn.setToolTip(
             "Full-resolution render of the same scene(s) at the Pixel size and "
-            "speckle filter set in 'Display && pairing options', and SAVES each "
-            "as a GeoTIFF under the tab's output folder "
-            "(out/interactive/sar/amplitude) so it persists after the session. "
-            "Lands in the same 'SAR …/… amplitude' layer folder, replacing the "
-            "quick preview. Slower than Preview — a full-size AOI render can take "
-            "a few seconds when the endpoint is cold.")
+            "speckle filter set in 'Display && pairing options'. SAVES each in "
+            "the project folder — the amplitude image (sar/amplitude) and the raw "
+            "gamma-naught that Compute change map reads (sar/full) — so it "
+            "persists and is never downloaded twice. Lands in a 'SAR …/… "
+            "amplitude full' layer folder, kept across quick previews. Compute "
+            "change map uses ONLY scenes run here, at the current Pixel size. "
+            "Slower than Preview — a full-size AOI render can take a few seconds "
+            "when the endpoint is cold.")
         self.run_btn.setEnabled(False)
         self.run_btn.clicked.connect(self._run_full)
         f = self.run_btn.font()
@@ -789,14 +794,16 @@ class SarTab(QWidget):
         self.cd_btn = QPushButton("Compute change map")
         self.cd_btn.setEnabled(False)
         self.cd_btn.setToolTip(
-            "Download raw (float) gamma-naught for the same-track scene pair — "
-            "or stack — over the AOI and compute the ticked change products. "
-            "Ticked table rows are honored when they fit the same-track rule "
-            "(too few ticked before-scenes are topped up from the same track, "
-            "logged); otherwise the ★ defaults are used. Speckle / blob / "
-            "normalization "
-            "filtering is taken from the Noise reduction panel. Each run adds "
-            "new layers, so you can compare products, windows and filters.")
+            "Compute the ticked change products from the same-track scene pair "
+            "— or stack — using ONLY scenes already rendered with 'Run (full "
+            "detail)' at the current Pixel size (their raw gamma-naught is saved "
+            "in the project folder, so nothing is downloaded here). Ticked table "
+            "rows are honored when they fit the same-track rule (too few ticked "
+            "before-scenes are topped up from the other full-detail scenes on "
+            "that track, logged); otherwise the ★ defaults are used. Speckle / "
+            "blob / normalization filtering is taken from the Noise reduction "
+            "panel. Each run adds new layers, so you can compare products, "
+            "windows and filters.")
         self.cd_btn.clicked.connect(self._run_change_detection)
         form.addRow(self.cd_btn)
 
@@ -1153,17 +1160,17 @@ class SarTab(QWidget):
         (with 'cancelled'), so the pending counters reach zero and the buttons
         come back. `forget` (a new search) also stops listening to those
         batches, so whatever they still say about the OLD scenes is dropped."""
-        for attr in ("_nisar_amp_task", "_nisar_cd_task"):
-            t = getattr(self, attr, None)
-            if t is not None:
-                try:
-                    t.cancel()
-                except RuntimeError:
-                    pass                  # task already deleted by the manager
+        t = getattr(self, "_nisar_amp_task", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except RuntimeError:
+                pass                      # task already deleted by the manager
         if forget:
-            self._nisar_amp_batch = self._nisar_cd_batch = -1
-            self._nisar_amp_task = self._nisar_cd_task = None
+            self._nisar_amp_batch = -1
+            self._nisar_amp_task = None
             self._nisar_amp_jobs = {}
+            self._nisar_raw_jobs = {}
 
     def _on_search_done(self):
         self._busy(False)
@@ -1756,11 +1763,12 @@ class SarTab(QWidget):
         mode='preview' is the FAST coarse look: a small fixed image (PREVIEW_PX),
         no client-side smoothing, dropped in from a throwaway temp file.
         mode='run' is the full-detail render at the chosen Pixel size + median
-        filter, and SAVES each GeoTIFF under out/interactive/sar/amplitude so it
-        survives the session. Both land in the same
-        "SAR <pre>/<post> amplitude <radius>km" folder — the radius comes from the
-        same search AOI either way — so a Run replaces the quick preview (and
-        vice versa).
+        filter, and SAVES each GeoTIFF in the project folder (sar/amplitude) so
+        it survives the session — plus the scene's raw γ⁰ on the same grid
+        (sar/full, _full_path), which is all Compute change map reads. The
+        folders say which is which: "SAR <pre>/<post> amplitude preview …" and
+        "… amplitude full …". A quick preview replaces the previous quick
+        preview only; full-detail layers stay until that scene is Run again.
 
         NISAR picks take the other road: no render service exists, so their
         pixels are read from the HDF5 on a background task (_start_nisar_amp)
@@ -1794,15 +1802,18 @@ class SarTab(QWidget):
         only_nisar = all(_sensor(c) == NISAR for _label, c in picks)
         self._amp_group = lg.name("NISAR" if only_nisar else "SAR",
                                   lg.date_pair(pre, post), "amplitude",
+                                  "full" if mode == "run" else "preview",
                                   lg.radius_tag(radius),
                                   lg.orbit_tag(*(c.get("orbit_state")
                                                  for _label, c in picks)))
         self._clear_preview_layers()
         if mode == "run":
-            res = self.detail_combo.currentData() or 10
+            res, px = self._full_px(radius)
             k = self.smooth_combo.currentData()
-            px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
             res_txt = f"{res} m px"
+            # a re-run overwrites these scenes' files: take their old layers
+            # off the map first, so nothing is reading a file being rewritten
+            self._drop_layers_on([self._amp_save_path(c, res) for _l, c in picks])
         else:                                    # quick preview: fixed small image
             px = PREVIEW_PX
             res = max(1, round(radius * 2 * 1000 / px))   # effective, for the log
@@ -1812,6 +1823,8 @@ class SarTab(QWidget):
         self._preview_res = res
         self._preview_smooth = k
         self._preview_saved = []
+        self._raw_saved = []
+        self._raw_failed = []
         smooth = f", median {k}×{k}" if k else ""
         head = "Run (full detail)" if mode == "run" else "Preview (quick)"
         self._append_log(
@@ -1838,6 +1851,8 @@ class SarTab(QWidget):
             self._tif_replies.append(reply)
             reply.finished.connect(
                 lambda r=reply, l=label, cand=c: self._tif_loaded(r, l, cand))
+            if mode == "run":
+                self._fetch_raw(label, c, (minx, miny, maxx, maxy), px)
         if nisar_picks:
             self._start_nisar_amp(nisar_picks, (minx, miny, maxx, maxy), px)
 
@@ -1906,7 +1921,7 @@ class SarTab(QWidget):
             return
         self._nisar_batch += 1
         batch = self._nisar_amp_batch = self._nisar_batch
-        jobs, self._nisar_amp_jobs = [], {}
+        jobs, self._nisar_amp_jobs, self._nisar_raw_jobs = [], {}, {}
         for i, (label, c) in enumerate(picks):
             key = f"amp{i}"
             if self._preview_mode == "run":
@@ -1921,6 +1936,25 @@ class SarTab(QWidget):
                 cache_dir=self._nisar_cache_dir(),
                 scale=self.scale_combo.currentData(), lo=self.db_min.value(),
                 hi=self.db_max.value(), stretch=self.stretch_spin.value()))
+            if self._preview_mode != "run":
+                continue
+            # the Run also keeps the raw γ⁰ for Compute change map (the
+            # native window is cached, so this second read costs no download)
+            final = self._full_path(c)
+            if final and os.path.isfile(final):
+                self._raw_saved.append(final)
+                self._append_log(f"  γ⁰ for {label} already saved — reused")
+                continue
+            if not final:
+                continue
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            rkey = f"raw{i}"
+            self._nisar_raw_jobs[rkey] = (label, final)
+            self._tif_pending += 1
+            jobs.append(dict(
+                key=rkey, url=c["h5_url"], pol=self._pol_for(c.get("polarizations")),
+                bbox=bbox, px=px, out_path=final[:-4] + ".part.tif", kind="float",
+                cache_dir=self._nisar_cache_dir()))
         self._append_log(
             f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
             f"the background — ~10–25 s each the first time over this AOI, "
@@ -1935,12 +1969,18 @@ class SarTab(QWidget):
     def _nisar_amp_done(self, batch, key, path, err, geom=None):
         if batch != self._nisar_amp_batch:
             return                        # an abandoned Preview/Run still reporting
+        if key in self._nisar_raw_jobs:
+            label, final = self._nisar_raw_jobs.pop(key)
+            if not self._nisar_amp_jobs and not self._nisar_raw_jobs:
+                self._nisar_amp_task = None
+            self._raw_done(label, final, path, err, geom)
+            return
         label, cand = self._nisar_amp_jobs.pop(key, (key, {}))
         if geom:
             # a copy, so the layover fade sees this read's measured geometry
             # without the search result itself changing underneath the table
             cand = dict(cand, **{k: geom.get(k) for k in NISAR_GEOM_KEYS})
-        if not self._nisar_amp_jobs:
+        if not self._nisar_amp_jobs and not self._nisar_raw_jobs:
             self._nisar_amp_task = None
         if path and self._amp_file_ready(path, label, cand):
             self._amp_one_done()
@@ -1956,6 +1996,138 @@ class SarTab(QWidget):
         self._tif_pending -= 1
         if self._tif_pending <= 0:
             self._finish_map_preview()
+
+    # ---------- full-detail γ⁰ (what Compute change map reads) ----------
+    def _full_px(self, radius):
+        """(requested m/px, grid size in px) for a full-detail render of a
+        `radius` km AOI — shared by Run and Compute change map so the γ⁰ a Run
+        saves is exactly the grid the change map wants. Capped at 2048 px (the
+        data API's ceiling), which coarsens wide AOIs."""
+        res = self.detail_combo.currentData() or 10
+        return res, int(min(2048, max(128, round(radius * 2 * 1000 / res))))
+
+    def _full_dir(self):
+        """<results>/sar/full: raw γ⁰ GeoTIFFs saved by Run (full detail)."""
+        return os.path.join(self.dock.results_dir(), "sar", "full")
+
+    def _full_path(self, c, pol=None):
+        """Where Run (full detail) keeps scene `c`'s raw γ⁰ for THIS AOI and
+        Pixel size, or None without a search AOI. The name is readable
+        (sensor/date/orbit/track/pol/res) plus a hash of scene id, pol, AOI box
+        and grid size, so a different AOI or Pixel size is a different file and
+        a stale one is never read as current."""
+        bbox = self._aoi_bbox()
+        if bbox is None:
+            return None
+        minx, miny, maxx, maxy, radius = bbox
+        res, px = self._full_px(radius)
+        pol = (pol or self._pol_for(c.get("polarizations")) or "").lower()
+        key = (f"{c.get('id')}|{pol}|{minx:.5f},{miny:.5f},{maxx:.5f},{maxy:.5f}"
+               f"|{px}")
+        h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+        date = (c.get("date") or "")[:10] or "undated"
+        orbit = (c.get("orbit_state") or "")[:4] or "orb"
+        return os.path.join(
+            self._full_dir(),
+            f"{_tag(c)}_{date}_{orbit}_t{c.get('relative_orbit')}_{pol.upper()}"
+            f"_{res}m_{h}_g0.tif")
+
+    def _has_full(self, c, pol=None):
+        """True if scene `c` was Run in full detail at the current AOI/Pixel size."""
+        p = self._full_path(c, pol)
+        return bool(p) and os.path.isfile(p)
+
+    def _drop_layers_on(self, paths):
+        """Remove every map layer reading one of `paths` (before rewriting them)."""
+        want = {os.path.normcase(os.path.abspath(p)) for p in paths if p}
+        for lyr in list(QgsProject.instance().mapLayers().values()):
+            try:
+                src = lyr.source().split("|")[0]
+            except (RuntimeError, AttributeError):
+                continue
+            if src and os.path.normcase(os.path.abspath(src)) in want:
+                if lyr in self._quick_layers:
+                    self._quick_layers.remove(lyr)
+                lg.remove_layer(lyr)
+
+    def _fetch_raw(self, label, c, box, px):
+        """Run (full detail), Sentinel-1: save the scene's raw float γ⁰ on the
+        Run's grid into the project folder — the same request Compute change map
+        used to make — unless it is already there."""
+        final = self._full_path(c)
+        if not final:
+            return
+        if os.path.isfile(final):
+            self._raw_saved.append(final)
+            self._append_log(f"  γ⁰ for {label} already saved — reused")
+            return
+        minx, miny, maxx, maxy = box
+        pol = self._pol_for(c.get("polarizations"))
+        url = self._with_key(
+            f"{PC_DATA_URL}/item/bbox/{minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}.tif"
+            f"?collection={COLLECTION}&item={c['id']}"
+            f"&assets={pol}&nodata=-32768&width={px}&height={px}")
+        reply = QgsNetworkAccessManager.instance().get(QNetworkRequest(QUrl(url)))
+        self._tif_replies.append(reply)
+        self._tif_pending += 1
+        reply.finished.connect(
+            lambda r=reply, l=label, f=final: self._raw_loaded(r, l, f))
+
+    def _raw_loaded(self, reply, label, final):
+        if reply in self._tif_replies:
+            self._tif_replies.remove(reply)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
+        data = bytes(reply.readAll())
+        reply.deleteLater()
+        part = None
+        err = f"HTTP {status or '—'}"
+        if ok and data:
+            try:
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                part = final[:-4] + ".part.tif"
+                with open(part, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                part, err = None, str(e)
+        self._raw_done(label, final, part, err, None)
+
+    def _raw_done(self, label, final, part, err, geom):
+        """One γ⁰ save finished (either radar). Written to a .part file and
+        renamed only when complete, so an interrupted Run never leaves a file
+        the change map would take for a finished one. A NISAR read's measured
+        look geometry goes in a sidecar for the change map's layover fade."""
+        try:
+            if not part:
+                raise OSError(err or "no data")
+            os.replace(part, final)
+            if geom:
+                with open(final[:-4] + ".geom.json", "w") as f:
+                    json.dump({k: geom.get(k) for k in NISAR_GEOM_KEYS}, f)
+            self._raw_saved.append(final)
+            self._append_log(f"  saved γ⁰ for {label} → {os.path.basename(final)}")
+        except OSError as e:
+            self._raw_failed.append(label)
+            self._append_log(f"  could not save γ⁰ for {label} ({e}) — Compute "
+                             f"change map will not be able to use it")
+            if part:
+                self._unlink_quiet(part)
+        self._amp_one_done()
+
+    @staticmethod
+    def _unlink_quiet(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _full_geom(self, path):
+        """The look geometry saved beside a NISAR γ⁰ file ({} if none)."""
+        try:
+            with open(path[:-4] + ".geom.json") as f:
+                return {k: v for k, v in json.load(f).items() if k in NISAR_GEOM_KEYS}
+        except (OSError, ValueError, AttributeError):
+            return {}
 
     def _amp_out_dir(self):
         """Output folder for saved Run amplitude GeoTIFFs, mirroring _collect's
@@ -2019,6 +2191,8 @@ class SarTab(QWidget):
                 return False
             lg.add_to_group(lyr, self._amp_group)
             self._preview_added.append(lyr)
+            if self._preview_mode != "run":
+                self._quick_layers.append(lyr)
             if self._preview_mode == "run":
                 self._preview_saved.append(path)
                 self._append_log(f"  loaded {label} → saved {os.path.basename(path)}")
@@ -2103,6 +2277,12 @@ class SarTab(QWidget):
             if self._preview_saved:
                 msg += (f" Saved {len(self._preview_saved)} GeoTIFF(s) to "
                         f"{self._amp_out_dir()}.")
+            if self._raw_saved:
+                msg += (f" {len(self._raw_saved)} scene(s) ready for Compute "
+                        f"change map.")
+            if self._raw_failed:
+                msg += (f" γ⁰ could not be saved for {len(self._raw_failed)} "
+                        f"scene(s) — Run them again before Compute change map.")
             if self._preview_failed:
                 msg += f" {len(self._preview_failed)} scene(s) failed to load."
             self.iface.messageBar().pushInfo("SAR", msg)
@@ -2110,8 +2290,12 @@ class SarTab(QWidget):
             self._warn("Preview on map: no scene could be loaded.")
 
     def _clear_preview_layers(self):
-        for lyr in self._preview_added:
+        """Take the previous QUICK preview off the map. Full-detail layers are
+        saved results and stay (a re-run of the same scene replaces its own
+        layer, see _drop_layers_on)."""
+        for lyr in self._quick_layers:
             lg.remove_layer(lyr)
+        self._quick_layers = []
         self._preview_added = []
 
     def _zoom_to_aoi(self):
@@ -2156,7 +2340,12 @@ class SarTab(QWidget):
         Returns None only if NONE of the ticked products can run.
 
         Only one radar's scenes are considered — every list below, ticks
-        included, is that radar's alone (see _cd_radar for which)."""
+        included, is that radar's alone (see _cd_radar for which).
+
+        And only scenes already rendered with Run (full detail) at the current
+        AOI and Pixel size (_has_full): the change map reads their saved γ⁰,
+        so it compares exactly the scenes you looked at in full, and downloads
+        nothing. A ticked scene that was not Run is left out, logged."""
         result = self._search_result or {}
         radar = self._cd_radar()
         if (self.cd_radar_combo.isEnabled()
@@ -2185,8 +2374,7 @@ class SarTab(QWidget):
             self._append_log(
                 f"note: {other} ticked row(s) of the other radar left out — the "
                 f"change map uses {radar} only (Radar, in this panel)")
-        post_pool = ticked_post or post_all
-        if not post_pool:
+        if not post_all:
             elsewhere = [c for c in result.get("post", []) if _sensor(c) != radar]
             self._warn(
                 f"Change detection needs a {radar} scene AFTER the event — none in "
@@ -2195,6 +2383,24 @@ class SarTab(QWidget):
                  f"after-scene(s): switch Radar in the Change detection panel."
                  if elsewhere else ""))
             return None
+        # full-detail scenes only (see docstring)
+        skipped = [c for c in ticked_pre + ticked_post if not self._has_full(c)]
+        if skipped:
+            self._append_log(
+                f"note: {len(skipped)} ticked scene(s) not Run in full detail at "
+                f"this Pixel size left out: " +
+                ", ".join((c.get("date") or "")[:10] for c in skipped))
+        pre_all = [c for c in pre_all if self._has_full(c)]
+        post_all = [c for c in post_all if self._has_full(c)]
+        ticked_pre = [c for c in ticked_pre if self._has_full(c)]
+        ticked_post = [c for c in ticked_post if self._has_full(c)]
+        if not post_all:
+            self._warn(
+                f"No {radar} after-scene has been Run in full detail at this Pixel "
+                f"size. Tick the after-scene and its same-track before-scene(s), "
+                f"click 'Run (full detail)', then Compute change map.")
+            return None
+        post_pool = ticked_post or post_all
         # frames must image the event point: adjacent frames of one pass share
         # the track number but cover different ground — an off-event frame can
         # share ZERO pixels with the other side's frame (see _covers_event)
@@ -2221,10 +2427,10 @@ class SarTab(QWidget):
         if not pool:
             self._warn(
                 f"No before-scene on the post scene's relative orbit "
-                f"(track t{track}, {direction}) — 'same track' means the same "
-                f"repeat orbit, not just {direction}. Widen the before window "
-                f"and search again, or tick an after-scene on a track that does "
-                f"have before-scenes.")
+                f"(track t{track}, {direction}) has been Run in full detail at "
+                f"this Pixel size — 'same track' means the same repeat orbit, not "
+                f"just {direction}. Tick t{track} before-scene(s), click 'Run "
+                f"(full detail)', then Compute change map.")
             return None
         # ticks steer the preview; honor them here but never let a thin tick set
         # block a product the search actually has scenes for (see docstring)
@@ -2258,25 +2464,25 @@ class SarTab(QWidget):
             else:
                 self._append_log(
                     f"note: {CD_NAMES[m]} needs {CD_NEED[m]} before-date(s) on "
-                    f"track t{track} — only {n} available; skipped (try "
-                    f"{alt[m]}, or widen the before window).")
+                    f"track t{track} — only {n} Run in full detail; skipped (try "
+                    f"{alt[m]}, or Run more before-scenes in full detail).")
         if not products:
             dates = ", ".join((c.get("date") or "")[:10] for c in pre_pool)
             self._append_log(
                 f"Change detection stopped: the after-scene is on relative orbit "
                 f"t{track} ({direction}), and only {n} before-date(s) on that "
-                f"same orbit are available ({dates}). Scenes on the other tracks "
+                f"same orbit have been Run in full detail ({dates}). Scenes on the other tracks "
                 f"in the table — even other {direction} ones — image these slopes "
                 f"from a different angle, so they cannot be differenced pixel by "
                 f"pixel." + (f" {off_frame} t{track} frame(s) were excluded: their "
                              f"footprint does not reach the event point."
                              if off_frame else ""))
             self._warn(
-                f"Not enough before-scenes on the after-scene's own repeat orbit "
-                f"(t{track}, {direction}): {n} date(s), and the ticked products "
-                f"need {need}. Widen the before window and search again, tick a "
-                f"lower-requirement product (Log-ratio needs 1), or tick an "
-                f"after-scene on a better-covered track. See the log for detail.")
+                f"Not enough full-detail before-scenes on the after-scene's own "
+                f"repeat orbit (t{track}, {direction}): {n} date(s) Run in full "
+                f"detail, and the ticked products need {need}. Run more t{track} "
+                f"before-scenes in full detail, tick a lower-requirement product "
+                f"(Log-ratio needs 1), or widen the before window. See the log.")
             return None
         count = (MT_MAX_PRE if any(m in ("mtcorr", "tsint") for m in products)
                  else max(CD_NEED[m] for m in products))
@@ -2435,11 +2641,30 @@ class SarTab(QWidget):
             roles[f"pre{i}"] = c
             pre_roles.append(f"pre{i}")
         pol = self._cd_pol(list(roles.values()))
-        self.dock._ensure_network_timeout()
-        res = self.detail_combo.currentData() or 10
+        # every role's γ⁰ is the file its Run (full detail) saved — nothing is
+        # downloaded here. _cd_pick only offers scenes that have one; this
+        # catches a polarization other than the one they were Run at.
+        paths, missing = {}, []
+        for role, c in roles.items():
+            path = self._full_path(c, pol)
+            if path and os.path.isfile(path):
+                paths[role] = path
+                if _sensor(c) == NISAR:
+                    # the read's measured look, onto this compute's own copy
+                    # (feeds the layover fade and the merge's terrain masks)
+                    geom = self._full_geom(path)
+                    if geom:
+                        roles[role] = dict(c, **geom)
+            else:
+                missing.append((c.get("date") or "")[:10])
+        if missing:
+            self._warn(
+                f"Change detection: {', '.join(missing)} not Run in full detail "
+                f"at {pol.upper()} — Run (full detail) those scenes first.")
+            return
         k = self.cd_window_combo.currentData()
         minx, miny, maxx, maxy, radius = bbox
-        px = int(min(2048, max(128, round(radius * 2 * 1000 / res))))
+        res, px = self._full_px(radius)
         # What the render will ACTUALLY be. The 2048 cap is a hard ceiling on the
         # data API request, so past ~20 km radius at 20 m (or ~10 km at 10 m) the
         # Pixel size control stops having any effect and the grid coarsens
@@ -2458,10 +2683,8 @@ class SarTab(QWidget):
             radionorm=self.radionorm_check.isChecked(),
             radius=radius, px=px, eff_res=eff_res,
             stats_only=self.cd_stats_only_check.isChecked())
-        self._cd_paths = {}
-        self._cd_pending = len(roles)
+        self._cd_paths = paths
         self._cd_last_layers = []
-        self.cd_btn.setEnabled(False)
         radar = _sensor(post)
         self._append_log(
             ("Change detection — NISAR L-band, experimental (" if radar == NISAR
@@ -2502,105 +2725,13 @@ class SarTab(QWidget):
                 "  note: this stack mixes NISAR " + " and ".join(sorted(products_seen))
                 + " products, which are calibrated differently — a radiometric "
                 "offset between them can read as change")
-        if radar == NISAR:
-            self._start_nisar_cd(roles, (minx, miny, maxx, maxy), px, pol)
-            return
-        # raw float32 gamma-naught: same bbox endpoint as the visual preview but
-        # WITHOUT rescale/colormap, so pixel values are data, not display bytes
-        for role, c in roles.items():
-            url = self._with_key(
-                f"{PC_DATA_URL}/item/bbox/"
-                f"{minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}.tif"
-                f"?collection={COLLECTION}&item={c['id']}"
-                f"&assets={pol}&nodata=-32768&width={px}&height={px}")
-            reply = QgsNetworkAccessManager.instance().get(
-                QNetworkRequest(QUrl(url)))
-            self._cd_replies.append(reply)
-            reply.finished.connect(
-                lambda r=reply, ro=role: self._cd_tif_loaded(r, ro))
-
-    def _start_nisar_cd(self, roles, bbox, px, pol):
-        """The NISAR road to _cd_compute: read every role's raw gamma-naught onto
-        the AOI grid on a background task and record it in _cd_paths, exactly
-        where a Planetary Computer download would have put it."""
-        how, why = self._nisar_auth(list(roles.values()))
-        if how is None:
-            self._warn("NISAR change detection: " + why)
-            self.cd_btn.setEnabled(True)
-            return
-        self._nisar_batch += 1
-        batch = self._nisar_cd_batch = self._nisar_batch
-        jobs = []
-        for role, c in roles.items():
-            if not c.get("h5_url"):
-                self._cd_role_done(role, "", "the search listed no HTTPS file for it")
-                continue
-            fd, path = tempfile.mkstemp(suffix=".tif", prefix=f"landslide_cd_{role}_")
-            os.close(fd)
-            jobs.append(dict(key=role, url=c["h5_url"], pol=pol, bbox=bbox, px=px,
-                             out_path=path, kind="float",
-                             cache_dir=self._nisar_cache_dir()))
-        if not jobs:
-            return
-        self._append_log(
-            f"  NISAR: reading {len(jobs)} scene(s) from NASA Earthdata ({how}) in "
-            f"the background — ~10–25 s each the first time over this AOI")
-        task = NisarReadTask(batch, jobs, "NISAR L-band change detection")
-        task.logLine.connect(self._append_log)
-        task.jobDone.connect(self._nisar_cd_done)
-        self._nisar_cd_task = task
-        self._keep_task(task)
-        QgsApplication.taskManager().addTask(task)
-
-    def _nisar_cd_done(self, batch, role, path, err, geom=None):
-        if batch != self._nisar_cd_batch:
-            return                        # a search replaced this stack meanwhile
-        roles = (self._cd_meta or {}).get("roles") or {}
-        if path and geom and role in roles:
-            # onto this compute's own copy of the role, which is where
-            # _cd_compute reads the post scene's geometry for the fade and the
-            # _cd_results entry the merge's terrain masks use
-            roles[role] = dict(roles[role],
-                               **{k: geom.get(k) for k in NISAR_GEOM_KEYS})
-        self._cd_role_done(role, path, err)
-
-    def _cd_role_done(self, role, path, err):
-        """One NISAR role read (or failed); the last one starts the compute."""
-        if path:
-            self._cd_paths[role] = path
-        else:
-            self._append_log(f"  could not read the {role} scene: {err}")
-        self._cd_pending -= 1
-        if self._cd_pending <= 0:
-            self._nisar_cd_task = None
-            self._cd_compute()
-
-    def _cd_tif_loaded(self, reply, role):
-        if reply in self._cd_replies:
-            self._cd_replies.remove(reply)
-        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        ok = reply.error() == QNetworkReply.NetworkError.NoError and status == 200
-        data = bytes(reply.readAll())
-        reply.deleteLater()
-        if ok and data:
-            try:
-                fd, path = tempfile.mkstemp(suffix=".tif",
-                                            prefix=f"landslide_cd_{role}_")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                self._cd_paths[role] = path
-            except OSError:
-                pass
-        if role not in self._cd_paths:
-            hint = " (HTTP 401/403 — check the key)" if status in (401, 403) else ""
-            self._append_log(
-                f"  could not fetch the {role} scene (HTTP {status or '—'}){hint}")
-        self._cd_pending -= 1
-        if self._cd_pending <= 0:
-            self._cd_compute()
+        for role in pre_roles + ["post"]:
+            self._append_log(f"  {role} γ⁰: {os.path.basename(paths[role])}")
+        self._cd_compute()
 
     def _cd_compute(self):
-        """All downloads landed: run the detector and add the styled result."""
+        """Every role's saved γ⁰ is in _cd_paths: run the detectors and add the
+        styled result."""
         import numpy as np
         meta = self._cd_meta or {}
         roles = meta.get("roles", {})
@@ -2639,7 +2770,7 @@ class SarTab(QWidget):
                            else sar_change.median_filter(arr, valid, sk))
                 arrs[role], valids[role] = arr, valid
             self._append_log(
-                "  scenes downloaded" +
+                "  scenes read" +
                 (f", speckle-filtered ({speckle[0]} {speckle[1]}×{speckle[1]})"
                  if speckle else "") + " — computing…")
             pres = [arrs[r] for r in pre_roles]
@@ -3704,7 +3835,7 @@ class SarTab(QWidget):
         self.map_preview_btn.setEnabled((not on) and have)
         self.run_btn.setEnabled((not on) and have)
         self.cd_btn.setEnabled(
-            (not on) and self._nisar_cd_task is None
+            (not on)
             and bool(self._search_result and
                      self._search_result.get("pre") and
                      self._search_result.get("post")))
@@ -3726,14 +3857,13 @@ class SarTab(QWidget):
                 except RuntimeError:
                     pass
                 setattr(self, attr, None)
-        for reply in self._tif_replies + self._gallery_replies + self._cd_replies:
+        for reply in self._tif_replies + self._gallery_replies:
             try:
                 reply.abort()
             except RuntimeError:
                 pass
         self._tif_replies = []
         self._gallery_replies = []
-        self._cd_replies = []
         if self.task is not None:
             self.task.cancel()
         self._cancel_nisar(forget=True)

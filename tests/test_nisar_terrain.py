@@ -25,6 +25,7 @@ wrong slopes, which is why the tab used to skip both for NISAR. What is pinned:
   * Sentinel-1 scenes go through exactly the calls they always did.
 """
 import ast
+import json
 import math
 import os
 import shutil
@@ -44,7 +45,8 @@ from landslide_groundtruth import nisar_read as nr  # noqa: E402
 from landslide_groundtruth import sar_change as sc  # noqa: E402
 
 TOP = {"S1", "NISAR", "CD_RAMP", "NISAR_GEOM_KEYS", "_sensor", "_nisar_look"}
-METHODS = {"_nisar_amp_done", "_nisar_cd_done", "_terrain_masks",
+METHODS = {"_nisar_amp_done", "_raw_done", "_full_geom", "_unlink_quiet",
+           "_terrain_masks",
            "_write_change_with_fade", "_apply_layover_amplitude"}
 
 
@@ -81,7 +83,7 @@ def _lift():
                        decorator_list=[])
     mod = ast.Module(body=body + [cls], type_ignores=[])
     ast.fix_missing_locations(mod)
-    ns = {"layover_dim": ld, "sar_change": sc, "Qt": _Qt,
+    ns = {"os": os, "json": json, "layover_dim": ld, "sar_change": sc, "Qt": _Qt,
           "QApplication": _QApplication}
     exec(compile(mod, SRC, "exec"), ns)
     return ns
@@ -150,13 +152,14 @@ def make_tab(fade=True, dem=DEM):
     t._append_log = t.log.append
     t._aoi_dem = lambda _gt, _shape: dem
     t._cd_meta = None
-    t._nisar_cd_batch = t._nisar_amp_batch = 7
+    t._nisar_amp_batch = 7
+    t._nisar_raw_jobs = {}
+    t._raw_saved, t._raw_failed = [], []
     t._nisar_amp_jobs = {}
     t._nisar_amp_task = object()
-    t.role_done, t.ready = [], []
-    t._cd_role_done = lambda role, path, err: t.role_done.append((role, path, err))
+    t.done, t.ready = [], []
     t._amp_file_ready = lambda path, label, cand: t.ready.append(cand) or True
-    t._amp_one_done = lambda: None
+    t._amp_one_done = lambda: t.done.append(1)
     t._amp_failed = lambda label, why: t.ready.append(("failed", label, why))
     return t
 
@@ -172,22 +175,34 @@ def result(radar, direction, **geom):
 
 
 print("=== the read task's geometry reaches the scene it describes ===")
+# Run (full detail) saves each NISAR scene's raw γ⁰ for Compute change map;
+# the read's measured look is kept in a sidecar so the change map's layover
+# fade and the merge's terrain masks still get the granule's own geometry
 t = make_tab()
-post, pre = nisar_scene(), nisar_scene()
-t._cd_meta = {"roles": {"post": post, "pre0": pre}}
-t._nisar_cd_done(7, "post", "/tmp/post.tif", "", dict(GEOM_ASC))
-roles = t._cd_meta["roles"]
-check("change detection: the post role carries the measured look",
-      roles["post"]["look_azimuth_deg"] == 241.4
-      and roles["post"]["incidence_deg"] == 33.0)
-check("  on this compute's own copy — the search result is not mutated",
-      "look_azimuth_deg" not in post and roles["post"] is not post)
-check("  and the role still completes", t.role_done == [("post", "/tmp/post.tif", "")])
-t._nisar_cd_done(7, "pre0", "", "HTTPError: 500", {})
-check("a failed read copies nothing", "look_azimuth_deg" not in roles["pre0"])
-t._nisar_cd_done(6, "pre0", "/tmp/old.tif", "", dict(GEOM_DESC))
-check("an abandoned batch is ignored entirely",
-      "look_azimuth_deg" not in roles["pre0"] and len(t.role_done) == 2)
+final = os.path.join(TMP, "NISAR_2026-08-11_asce_t150_HH_10m_abcd1234_g0.tif")
+part = final[:-4] + ".part.tif"
+open(part, "wb").write(b"x")
+t._nisar_raw_jobs = {"raw0": ("NISAR after", final)}
+t._nisar_amp_done(7, "raw0", part, "", dict(GEOM_ASC))
+check("full-detail γ⁰: the .part file is renamed into place",
+      os.path.isfile(final) and not os.path.exists(part))
+check("  and counts as done for the Run", t.done == [1] and t._raw_saved == [final])
+geom = t._full_geom(final)
+check("  the change map reads back the measured look",
+      geom.get("look_azimuth_deg") == 241.4 and geom.get("incidence_deg") == 33.0)
+t = make_tab()
+missing = os.path.join(TMP, "NISAR_missing_g0.tif")
+t._nisar_raw_jobs = {"raw0": ("NISAR before", missing)}
+t._nisar_amp_done(7, "raw0", "", "HTTPError: 500", {})
+check("a failed read saves nothing, is logged, and still completes",
+      not os.path.exists(missing) and t._raw_failed == ["NISAR before"]
+      and t.done == [1])
+check("  no sidecar means no geometry", t._full_geom(missing) == {})
+t = make_tab()
+t._nisar_amp_batch = 8
+t._nisar_raw_jobs = {"raw0": ("NISAR old", missing)}
+t._nisar_amp_done(7, "raw0", part, "", dict(GEOM_DESC))
+check("an abandoned batch is ignored entirely", t.done == [] and not t._raw_failed)
 
 t = make_tab()
 scene = nisar_scene()

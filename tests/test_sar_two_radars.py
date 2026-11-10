@@ -123,8 +123,11 @@ class Table:
 LOG, WARN = [], []
 
 
-def make_tab(result, orbit="track", radar=S1, nisar_enabled=True, ticked=()):
+def make_tab(result, orbit="track", radar=S1, nisar_enabled=True, ticked=(),
+             full=None):
+    """`full`: ids Run in full detail (None = every scene, the old behaviour)."""
     t = Tab()
+    t._has_full = lambda c, pol=None: full is None or c["id"] in full
     t._search_result = result
     t.orbit_combo = Combo(orbit)
     t.pol_combo = Combo("vv")
@@ -233,6 +236,33 @@ LOG.clear(), WARN.clear()
 got = make_tab(dict(pre=PRE, post=[POST[0]]), radar=S1)._cd_pick(["logratio"])
 check("no S1 after-scene -> stops, and points at the Radar switch",
       got is None and WARN and "switch Radar" in WARN[-1])
+
+print("\n=== change detection uses only scenes Run in full detail ===")
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, full={"s1_post_t150", "s1_pre2_t150"})._cd_pick(
+    ["logratio"])
+check("the nearest before-scene was only previewed -> the full-detail one is used",
+      got and [c["id"] for c in got[2]] == ["s1_pre2_t150"])
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, full={"s1_pre_t150"})._cd_pick(["logratio"])
+check("no after-scene Run in full detail -> stops and says to Run it",
+      got is None and WARN and "Run (full detail)" in WARN[-1])
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, full={"s1_post_t150"})._cd_pick(["logratio"])
+check("no full-detail before-scene on the track -> stops and says to Run it",
+      got is None and WARN and "Run (full detail)" in WARN[-1])
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, ticked=("s1_post_t150", "s1_pre_t150"),
+               full={"s1_post_t150", "s1_pre3_t150"})._cd_pick(["logratio"])
+check("a ticked scene not Run in full detail is left out, logged",
+      got and [c["id"] for c in got[2]] == ["s1_pre3_t150"]
+      and any("not Run in full detail" in m for m in LOG))
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, full={"s1_post_t150", "s1_pre_t150"})._cd_pick(
+    ["logratio", "tsint"])
+check("a product needing more full-detail dates is skipped, the rest runs",
+      got and got[0] == ["logratio"]
+      and any("Run in full detail" in m for m in LOG))
 t = make_tab(BOTH, radar=NISAR, nisar_enabled=False)
 check("a disabled Radar combo means Sentinel-1", t._cd_radar() == S1)
 check("NISAR stack compares HH", make_tab(BOTH)._cd_pol(
