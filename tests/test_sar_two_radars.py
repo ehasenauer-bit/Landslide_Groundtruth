@@ -131,6 +131,7 @@ def make_tab(result, orbit="track", radar=S1, nisar_enabled=True, ticked=(),
     t._search_result = result
     t.orbit_combo = Combo(orbit)
     t.pol_combo = Combo("vv")
+    t.detail_combo = Combo(20)
     t.cd_radar_combo = Combo(radar, nisar_enabled)
     t._covers_event = lambda c: True
     t._gap = lambda c: 1e9 if c.get("gap_days") is None else c["gap_days"]
@@ -220,7 +221,7 @@ got = make_tab(BOTH, radar=NISAR, ticked=("s1_post_t150", "s1_pre_t150"))._cd_pi
 check("only Sentinel-1 ticked + Radar box on NISAR -> a Sentinel-1 run",
       got and got[1]["source"] == S1 and all(c["source"] == S1 for c in got[2]))
 check("  and the log says the ticks overrode the box",
-      any("every ticked after-scene is Sentinel-1" in m for m in LOG))
+      any("after-scene is Sentinel-1" in m for m in LOG))
 LOG.clear(), WARN.clear()
 got = make_tab(BOTH, radar=S1, ticked=("n_post_t150",))._cd_pick(["logratio"])
 check("only a NISAR after-scene ticked + box on Sentinel-1 -> a NISAR run",
@@ -234,7 +235,13 @@ check("  and the other radar's ticked rows are left out, logged",
       any("other radar left out" in m for m in LOG))
 LOG.clear(), WARN.clear()
 got = make_tab(dict(pre=PRE, post=[POST[0]]), radar=S1)._cd_pick(["logratio"])
-check("no S1 after-scene -> stops, and points at the Radar switch",
+check("no S1 after-scene, NISAR's Run in full -> runs NISAR, and says so",
+      got and got[1]["id"] == "n_post_t150"
+      and any("using NISAR" in m for m in LOG))
+LOG.clear(), WARN.clear()
+got = make_tab(dict(pre=PRE, post=[POST[0]]), radar=S1, full=set())._cd_pick(
+    ["logratio"])
+check("no S1 after-scene and nothing Run in full -> stops, points at the Radar switch",
       got is None and WARN and "switch Radar" in WARN[-1])
 
 print("\n=== change detection uses only scenes Run in full detail ===")
@@ -263,6 +270,20 @@ got = make_tab(BOTH, radar=S1, full={"s1_post_t150", "s1_pre_t150"})._cd_pick(
 check("a product needing more full-detail dates is skipped, the rest runs",
       got and got[0] == ["logratio"]
       and any("Run in full detail" in m for m in LOG))
+LOG.clear(), WARN.clear()
+# Mt. Vancouver (2026-11-10): the S1 pair was Run in full detail, a NISAR
+# after-scene was still ticked and the Radar box said NISAR -> must run S1
+got = make_tab(BOTH, radar=NISAR, ticked=("n_post_t150", "n_pre_t150"),
+               full={"s1_post_t150", "s1_pre_t150"})._cd_pick(["logratio"])
+check("ticked NISAR not Run in full, S1 pair Run in full -> a Sentinel-1 run",
+      got and got[1]["id"] == "s1_post_t150"
+      and [c["id"] for c in got[2]] == ["s1_pre_t150"])
+LOG.clear(), WARN.clear()
+got = make_tab(BOTH, radar=S1, full={"s1_post_t150", "s1_pre_t150",
+                                     "n_post_t150", "n_pre_t150"})._cd_pick(
+    ["logratio"])
+check("both radars Run in full, nothing ticked -> the Radar box decides",
+      got and got[1]["source"] == S1)
 t = make_tab(BOTH, radar=NISAR, nisar_enabled=False)
 check("a disabled Radar combo means Sentinel-1", t._cd_radar() == S1)
 check("NISAR stack compares HH", make_tab(BOTH)._cd_pol(

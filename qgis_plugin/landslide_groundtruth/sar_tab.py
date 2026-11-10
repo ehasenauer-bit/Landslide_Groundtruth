@@ -2352,7 +2352,8 @@ class SarTab(QWidget):
                 and radar != self.cd_radar_combo.currentData()):
             # the ticks chose the other radar: say so, and let the box show it
             self._append_log(
-                f"note: using {radar} — every ticked after-scene is {radar} "
+                f"note: using {radar} — every ticked or full-detail after-scene "
+                f"is {radar} "
                 f"(the Radar box said {self.cd_radar_combo.currentData()}; "
                 f"switched to match)")
             i = self.cd_radar_combo.findData(radar)
@@ -2397,7 +2398,7 @@ class SarTab(QWidget):
         if not post_all:
             self._warn(
                 f"No {radar} after-scene has been Run in full detail at this Pixel "
-                f"size. Tick the after-scene and its same-track before-scene(s), "
+                f"size ({self.detail_combo.currentData() or 10} m). Tick the after-scene and its same-track before-scene(s), "
                 f"click 'Run (full detail)', then Compute change map.")
             return None
         post_pool = ticked_post or post_all
@@ -2585,7 +2586,15 @@ class SarTab(QWidget):
         still ran NISAR, and its reads failing read as 'change detection is
         broken' when Sentinel-1 was right there and ticked. The Radar box only
         breaks the tie — both radars' after-scenes ticked (the default ★ pairs)
-        or none — and is Sentinel-1 until a search has offered NISAR."""
+        or none — and is Sentinel-1 until a search has offered NISAR.
+
+        Only scenes Run in full detail count (_has_full), since those are all
+        the change map can use. Measured trap (Mt. Vancouver, 2026-11-10): the
+        Sentinel-1 t123 pair was Run in full detail, a NISAR after-scene was
+        still ticked, the ticks picked NISAR and the run stopped with "no NISAR
+        after-scene has been Run in full detail". So: ticked full-detail
+        after-scenes first; else the one radar that has any full-detail
+        after-scene; else the Radar box."""
         if not self.cd_radar_combo.isEnabled():
             return S1
         posts = set()
@@ -2594,10 +2603,15 @@ class SarTab(QWidget):
             if head is None or head.checkState() != Qt.CheckState.Checked:
                 continue
             side, c = self._candidate_by_id(head.data(Qt.ItemDataRole.UserRole + 1))
-            if c and side == "post":
+            if c and side == "post" and self._has_full(c):
                 posts.add(_sensor(c))
         if len(posts) == 1:
             return posts.pop()
+        if not posts:
+            full = {_sensor(c) for c in (self._search_result or {}).get("post", [])
+                    if self._has_full(c)}
+            if len(full) == 1:
+                return full.pop()
         return self.cd_radar_combo.currentData() or S1
 
     def _cd_pol(self, cands):
