@@ -46,6 +46,7 @@ from . import layer_group as lg
 from . import layover_dim
 from . import sar_change
 from .flow_layout import FlowRow
+from .step_box import tinted
 
 # combo entries: (label, fusion_core kind key, default absolute floor)
 # First entry is the default measure and supplies the default floor. dBright
@@ -261,7 +262,16 @@ class FusionTab(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(8)
-        root.addWidget(self._intro())
+        # Boxes are tinted for their workflow step (theme.STEP_TINTS), as on
+        # every tab: inputs violet, outputs teal, candidates sand, and the
+        # Advanced page's four boxes and the log grey. The tuning already lives
+        # on the Advanced page, so there is no separate Advanced box here.
+        help_toggle = self.dock.help_toggle
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(help_toggle.adopt(self._intro()))
         root.addWidget(self._steps_panel())
         root.addWidget(self._preset_row())
 
@@ -276,8 +286,8 @@ class FusionTab(QWidget):
         root.addWidget(self.pages)
 
         root.addWidget(self._action_row())
-        root.addWidget(self._candidates_box())
-        root.addWidget(self._log_pane(), 1)
+        root.addWidget(tinted("results", self._candidates_box()))
+        root.addWidget(tinted("advanced", self._log_pane()), 1)
 
     # ---------- header ----------
     def _intro(self):
@@ -481,8 +491,8 @@ class FusionTab(QWidget):
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 6, 0, 0)
         v.setSpacing(8)
-        v.addWidget(self._inputs_box())
-        v.addWidget(self._outputs_box())
+        v.addWidget(tinted("inputs", self._inputs_box()))
+        v.addWidget(tinted("options", self._outputs_box()))
         v.addStretch(1)
         return w
 
@@ -496,7 +506,7 @@ class FusionTab(QWidget):
             "Changing them switches the preset to Custom.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: palette(mid); }")
-        v.addWidget(note)
+        v.addWidget(self.dock.help_toggle.adopt(note))     # behind "? Help"
         # Collapsed on open. Four expanded panels of spinboxes is the choice
         # paralysis this split exists to remove; the titles say what is inside,
         # and a normal run never needs any of it.
@@ -504,7 +514,7 @@ class FusionTab(QWidget):
                       self._glacier_box, self._cloud_box):
             gb = build()
             gb.setCollapsed(True)
-            v.addWidget(gb)
+            v.addWidget(tinted("advanced", gb))
         v.addStretch(1)
         return w
 
