@@ -1248,6 +1248,7 @@ class LandslideDock(QgsDockWidget):
             "Hand-picking works for Sentinel-2 / Landsat; PlanetScope has its own "
             "tab.")
         scenes_box.addWidget(scenes_lbl)
+        scenes_box.addWidget(self.footprint_check)     # right under the heading
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Source", "Scene ID"])
@@ -1261,7 +1262,6 @@ class LandslideDock(QgsDockWidget):
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         scenes_box.addWidget(self.table)
-        scenes_box.addWidget(self.footprint_check)
         out_split.addWidget(scenes, 1)
 
         # quicklook gallery: every candidate's browse thumbnail at once (before +

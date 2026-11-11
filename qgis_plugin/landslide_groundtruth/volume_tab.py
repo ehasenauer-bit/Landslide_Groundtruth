@@ -385,6 +385,14 @@ class VolumeTab(QWidget):
             act.addWidget(b)
         root.addWidget(act)
 
+        # The 3D viewer's figure details, shown here because this tab produces
+        # the numbers (Ethan, 2026-11-11). The widgets belong to viewer3d_tab —
+        # its export reads them — and only sit in this layout.
+        viewer = getattr(self.dock, "viewer3d_tab", None)
+        details = getattr(viewer, "figure_details_frame", None)
+        if details is not None:
+            root.addWidget(details)
+
         root.addWidget(tinted("results", self._build_results_box()))
         root.addWidget(tinted("advanced", self._build_log_box()))
         root.addStretch(1)

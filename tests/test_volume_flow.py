@@ -102,9 +102,14 @@ boxes = [w for w in vol.findChildren(QgsCollapsibleGroupBox)
 frames = [b.parent() for b in boxes]
 titles = [b.title() for b in boxes]
 print("  ", " → ".join(titles))
-check("Outlines, Settings, Volumes, Centerline, Results, Log — no Verdict box",
+check("Outlines, Settings, Volumes, Centerline, Figure details, Results, Log — no Verdict box",
       titles == ["Outlines", "Settings", "Volumes", "Centerline && elevation drop",
-                 "Results table", "Log"])
+                 "Figure details (3D web viewer / PNG)", "Results table", "Log"])
+check("Figure details is the 3D viewer's own box, shown here, and its fields stay viewer3d/det_*",
+      boxes[4].isAncestorOf(dock.viewer3d_tab.det_volume)
+      and boxes[4].isAncestorOf(dock.viewer3d_tab.pull_vol_btn)
+      and not dock.viewer3d_tab.isAncestorOf(dock.viewer3d_tab.det_volume)
+      and any(k == "viewer3d/det_volume" for k, _w in dock.project_state._widgets))
 check("no Verdict widgets are left on the tab",
       not any(hasattr(vol, a) for a in ("verdict_combo", "analyst_edit",
                                         "verdict_note", "verdict_summary")))
@@ -117,7 +122,7 @@ mi = vol.layout().indexOf(vol.measure_btn.parentWidget())
 check("Measure sits between Settings and Volumes",
       order[1] < mi < order[2])
 check("results table and log start collapsed; the working sections open",
-      boxes[4].isCollapsed() and boxes[5].isCollapsed()
+      all(b.isCollapsed() for b in boxes[4:])      # figure details too
       and not any(b.isCollapsed() for b in boxes[:4]))
 check("the material setting is ABOVE Measure (it used to sit below the answer)",
       vol.layout().indexOf(frames[1]) < mi

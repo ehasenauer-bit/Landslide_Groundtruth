@@ -232,6 +232,22 @@ def _nearest_from_json(v):
         return None
 
 
+class _AutoHideLabel(QLabel):
+    """A label that takes no space while it has nothing to say."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.setVisible(False)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setVisible(bool(text))
+
+    def clear(self):
+        super().clear()
+        self.setVisible(False)
+
+
 class GegdTab(QWidget):
     def __init__(self, dock):
         super().__init__()
@@ -366,7 +382,9 @@ class GegdTab(QWidget):
         self._progress.hide()
         root.addWidget(self._progress)
         root.addWidget(filter_frame)
-        self._summary_label = QLabel()
+        # Hides itself while empty: an empty word-wrapped label still takes a
+        # line, which showed as dead space between Scene filters and Results.
+        self._summary_label = _AutoHideLabel()
         self._summary_label.setWordWrap(True)
         self._summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self._summary_label)
@@ -377,9 +395,9 @@ class GegdTab(QWidget):
             "row's tooltip. Re-ranks what is already in hand: no request.")
         self._show_hidden_btn.toggled.connect(self._toggle_hidden)
         self._show_hidden_btn.hide()
-        hid = FlowRow()
-        hid.addWidget(self._show_hidden_btn)
-        root.addWidget(hid)
+        # added bare, not in a FlowRow: a hidden widget takes no layout space,
+        # but a row holding one still does
+        root.addWidget(self._show_hidden_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         root.addWidget(tinted("results", self._build_results_box()))
         root.addWidget(adv_frame)

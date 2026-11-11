@@ -325,10 +325,10 @@ class SarTab(QWidget):
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         # Work order, each box tinted for its step (theme.STEP_TINTS):
-        #   key (setup) / event (inputs) / the button row / display options /
-        #   candidate scenes, gallery, preview (results) / change detection
-        #   (options — it runs on the scenes above) / noise reduction and
-        #   Advanced / Log. Prose sits behind "? Help".
+        #   key (setup) / event (inputs) / the button row / change detection
+        #   (options) / candidate scenes, gallery, preview (results) / display
+        #   and pairing options / noise reduction and Advanced / Log.
+        #   Prose sits behind "? Help".
         help_toggle = self.dock.help_toggle
         head = QHBoxLayout()
         head.addStretch(1)
@@ -480,7 +480,9 @@ class SarTab(QWidget):
         self.progress.setRange(0, 0)
         self.progress.hide()
         root.addWidget(self.progress)
-        root.addWidget(display_frame)
+        # Change detection above the scenes, display options below them
+        # (Ethan, 2026-11-11 — swapped from the first layout).
+        root.addWidget(change_frame)
 
         # --- results: candidate table / gallery / preview ---
         # A plain stack in one results-tinted frame, not a splitter: a splitter
@@ -495,6 +497,7 @@ class SarTab(QWidget):
             "Candidate scenes  (★ = default same-track pair; tick the scenes to "
             "preview on the map)"))
         # seismic-time bracket summary for the starred pair (see sar_pairing)
+        tl.addWidget(self.footprint_check)      # right under the heading
         self.pair_summary = QLabel("")
         self.pair_summary.setWordWrap(True)
         self.pair_summary.setTextFormat(Qt.TextFormat.PlainText)
@@ -514,7 +517,6 @@ class SarTab(QWidget):
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         tl.addWidget(self.table)
         self.table.setMinimumHeight(160)
-        tl.addWidget(self.footprint_check)
         split.addWidget(tablebox, 1)
 
         # Gallery and preview: closed by default (Ethan, 2026-11-11).
@@ -551,7 +553,7 @@ class SarTab(QWidget):
         root.addWidget(results_frame, 1)
 
         # --- after the scenes: change detection, then the rarely-changed ---
-        root.addWidget(change_frame)
+        root.addWidget(display_frame)
         root.addWidget(filter_frame)
         root.addWidget(adv_frame)
 

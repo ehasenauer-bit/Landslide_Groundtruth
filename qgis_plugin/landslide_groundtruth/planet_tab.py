@@ -80,58 +80,9 @@ STATUS_COLORS = {
     "warn": "#e65100", "info": "palette(mid)",
 }
 
-# Planet's brand palette, pulled from the official qgis-planet-plugin (its logo
-# SVGs + .ui stylesheets): teal accent, navy header, near-black ink. Used to give
-# this tab the Planet Explorer look instead of the plain QGIS widget theme.
-TEAL = "#009da5"        # primary accent / call-to-action buttons (rgb 0,157,165)
-TEAL_DARK = "#0b7c82"   # button hover / pressed
-NAVY = "#1e3967"        # table header background
-INK = "#27282a"         # near-black (rgb 39,40,42)
-
-# One stylesheet applied to the whole PlanetTab (and only it — the Sentinel-2 /
-# Landsat tab keeps the native QGIS look). Accent colours are explicit so they
-# read on both light and dark QGIS themes; structural colours use the palette().
-THEME_QSS = f"""
-QLabel#section {{ color: {TEAL}; font-weight: 600; padding-top: 2px; }}
-QPushButton#primary {{
-    background-color: {TEAL}; color: white; border: none;
-    border-radius: 4px; padding: 6px 14px; font-weight: 600;
-}}
-QPushButton#primary:hover {{ background-color: {TEAL_DARK}; }}
-QPushButton#primary:disabled {{ background-color: #9cc7ca; color: #eef4f4; }}
-QPushButton {{ border-radius: 4px; padding: 5px 10px; }}
-QLineEdit, QComboBox, QDoubleSpinBox, QDateTimeEdit {{
-    border: 1px solid palette(mid); border-radius: 4px; padding: 3px 6px;
-}}
-/* Styling a QComboBox makes Qt drop the native popup for one that grows to fit
-   EVERY item — with a ledger of orders that runs off the bottom of the screen and
-   can't be scrolled. combobox-popup: 0 restores the list-view popup, which honours
-   setMaxVisibleItems() and gives it a scrollbar. */
-QComboBox {{ combobox-popup: 0; }}
-QComboBox QAbstractItemView {{
-    border: 1px solid palette(mid); selection-background-color: {TEAL};
-    selection-color: white;
-}}
-QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus {{
-    border: 1px solid {TEAL};
-}}
-QToolButton {{
-    border: 1px solid palette(mid); border-radius: 6px;
-    padding: 4px; background: palette(base);
-}}
-QToolButton:hover {{ border: 1px solid {TEAL}; }}
-QHeaderView::section {{
-    background: {NAVY}; color: white; padding: 4px 6px;
-    border: none; font-weight: 600;
-}}
-QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; }}
-QProgressBar::chunk {{ background-color: {TEAL}; border-radius: 3px; }}
-QSlider::groove:horizontal {{ height: 4px; background: palette(mid); border-radius: 2px; }}
-QSlider::sub-page:horizontal {{ background: {TEAL}; border-radius: 2px; }}
-QSlider::handle:horizontal {{
-    background: {TEAL}; width: 14px; margin: -6px 0; border-radius: 7px;
-}}
-"""
+# The tab used to carry its own Planet-Explorer stylesheet (teal buttons, navy
+# table header). Removed 2026-11-11 at Ethan's request: every tab now has the
+# same native look, and the step tints (theme.STEP_TINTS) do the dividing.
 
 # table row tints, matching the Sentinel tab (pre = blue, post = green), plus the
 # cloud/coverage thresholds and colours so the "Cloud" and "Coverage" numbers read
@@ -191,7 +142,6 @@ class PlanetTab(QWidget):
     # ---------- UI ----------
     def _build_ui(self):
         self.setObjectName("planetTab")
-        self.setStyleSheet(THEME_QSS)
         root = QVBoxLayout(self)
         root.setSpacing(8)
 
@@ -255,7 +205,8 @@ class PlanetTab(QWidget):
         form.addRow(copy_btn)
 
         # --- Search window (drop-down) — what dates to look at, per event ---
-        form = self._options_group("Search window", collapsed=False, step="inputs")
+        form = self._options_group("Search window", collapsed=True, step="inputs")
+        window_form = form
 
         # Window: how far before / after the event to search, as day sliders.
         self.pre_slider = QSlider(Qt.Orientation.Horizontal)
@@ -334,6 +285,9 @@ class PlanetTab(QWidget):
         # --- SR detail rendering (drop-down) — how the ordered reflectance is drawn ---
         # Everything in here is free to change after a render: the clips stay on disk,
         # so Re-tone re-draws them without another order (see _retone_detail).
+        # Defaults since 2026-11-11 (Ethan): HDR (highlights only), no S-curve, no
+        # auto-stretch, raw TOA + haze, no dBrightness layer. They are per-user
+        # QgsSettings, so a machine that already chose otherwise keeps its choice.
         form = self._options_group("SR detail rendering")
 
         # Tone curve for the SR detail render. Both presets are detail-preserving; they
@@ -351,7 +305,7 @@ class PlanetTab(QWidget):
                                 "snow compressed", "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
-            "• Highlight rolloff (knee) — THE DEFAULT. A plain linear stretch below "
+            "• Highlight rolloff (knee). A plain linear stretch below "
             "0.165 reflectance, so midtones and shadows (vegetation, wet rock, shadowed "
             "slope, moraine) are arithmetically IDENTICAL to an unstretched render, and "
             "only brighter pixels get compressed — nothing clips to flat white. The cost "
@@ -367,7 +321,7 @@ class PlanetTab(QWidget):
             "Bright ice clips to flat white, exactly as a naive stretch would — the point "
             "is to see the un-toned pixels. Honours the Manual stretch below, but not "
             "Auto-stretch or Contrast (neither applies).\n"
-            "• HDR (highlights only) — below 0.165 reflectance the same plain linear "
+            "• HDR (highlights only) — THE DEFAULT. Below 0.165 reflectance the same plain linear "
             "stretch as the rolloff and as 'None', so shadows and terrain read as they do "
             "in Planet's own preview. Above it the highlights are compressed with a "
             "rolloff fitted to reach white at the scene's own bright tail, so snow keeps "
@@ -381,21 +335,21 @@ class PlanetTab(QWidget):
             "and Natural Color get a gentle S-curve contrast nudge (see 'Contrast' below) "
             "that cannot clip either end.\n"
             "Switching this after a render is FREE — see 'Re-tone'.")
-        tone_mode = self.settings.value("landslide/planet_tone", "knee", type=str)
+        tone_mode = self.settings.value("landslide/planet_tone", "hdr", type=str)
         idx = self.tone_combo.findData(tone_mode)
         self.tone_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.tone_combo.currentIndexChanged.connect(self._on_tone_changed)
         form.addRow("SR tone curve", self.tone_combo)
 
         # The gentle S-curve nudge both shaped curves get (run_single --planet-contrast,
-        # review_package.CONTRAST = 1.15). ON by default keeps every existing render
+        # review_package.CONTRAST = 1.15). ON keeps every pre-2026-11-11 render
         # byte-identical; OFF passes contrast 1.0 (identity). Greyed out for the None
         # curve, which never adds contrast.
         self.contrast_check = QCheckBox("Add S-curve contrast")
         self.contrast_check.setChecked(self.settings.value(
-            "landslide/planet_contrast_scurve", True, type=bool))
+            "landslide/planet_contrast_scurve", False, type=bool))
         self.contrast_check.setToolTip(
-            "ON (default): apply a gentle S-curve contrast nudge (strength 1.15, roughly a "
+            "ON: apply a gentle S-curve contrast nudge (strength 1.15, roughly a "
             "'+10' in photo-editor terms) to the Highlight rolloff and Natural Color "
             "renders. It pivots at mid-grey and pins BOTH ends, so it can never clip "
             "shadows to black or highlights to white.\n"
@@ -414,9 +368,9 @@ class PlanetTab(QWidget):
         # render it has today, byte for byte).
         self.autostretch_check = QCheckBox("Fit black/white points to an all-ice scene")
         self.autostretch_check.setChecked(self.settings.value(
-            "landslide/planet_autostretch", True, type=bool))
+            "landslide/planet_autostretch", False, type=bool))
         self.autostretch_check.setToolTip(
-            "ON (default): before rendering, measure the scene and derive the rolloff "
+            "ON: before rendering, measure the scene and derive the rolloff "
             "curve's black and white points from it — but ONLY when the scene has no dark "
             "end to protect.\n"
             "• Under 0.5% of the AOI below 0.165 reflectance (an all-ice frame): the "
@@ -443,9 +397,9 @@ class PlanetTab(QWidget):
         # detail (a Re-tone/Recall of an existing order can't apply it) and it USES QUOTA.
         self.toa_check = QCheckBox("Raw TOA + haze (skip Planet's SR correction)")
         self.toa_check.setChecked(self.settings.value(
-            "landslide/planet_toa", False, type=bool))
+            "landslide/planet_toa", True, type=bool))
         self.toa_check.setToolTip(
-            "OFF (default): order Surface Reflectance (analytic_sr_udm2) — Planet's own "
+            "OFF: order Surface Reflectance (analytic_sr_udm2) — Planet's own "
             "atmospheric correction.\n"
             "ON: order the DN 'analytic' product (analytic_udm2) and convert it to "
             "top-of-atmosphere reflectance with a dark-object haze removal here, skipping "
@@ -466,9 +420,9 @@ class PlanetTab(QWidget):
         # difference), so a one-sided render produces none.
         self.dbright_check = QCheckBox("Load brightness-change layer (dBrightness)")
         self.dbright_check.setChecked(self.settings.value(
-            "landslide/planet_dbright", True, type=bool))
+            "landslide/planet_dbright", False, type=bool))
         self.dbright_check.setToolTip(
-            "ON (default): alongside the before/after SR detail, load a dBrightness "
+            "ON: alongside the before/after SR detail, load a dBrightness "
             "change layer — the pre→post change in broadband albedo (the mean of the "
             "four SR bands), the same product the Sentinel-2/Landsat tab exports.\n"
             "It's styled to show ONLY where brightness DECREASED (blue = strong "
@@ -547,13 +501,11 @@ class PlanetTab(QWidget):
         # button its natural width and spills onto further lines instead.
         btn_row = FlowRow()
         self.search_btn = QPushButton("Search (free)")
-        self.search_btn.setObjectName("primary")
         self.search_btn.setToolTip(
             "Free Data API search for candidate before/after PlanetScope scenes. No "
             "orders placed, no quota used.")
         self.search_btn.clicked.connect(self._search)
         self.map_preview_btn = QPushButton("Preview on map")
-        self.map_preview_btn.setObjectName("primary")
         self.map_preview_btn.setToolTip(
             "Stream the TICKED scene(s) onto the canvas at full resolution via "
             "Planet's tile service — no order, no download. Tick the scenes you "
@@ -578,7 +530,6 @@ class PlanetTab(QWidget):
         self.detail_btn.setEnabled(False)
         self.detail_btn.clicked.connect(self._render_detail)
         self.recall_btn = QPushButton("Recall order (free)")
-        self.recall_btn.setObjectName("primary")
         self.recall_btn.setToolTip(
             "Load PlanetScope imagery you have ALREADY ORDERED for this event back onto "
             "the map — no new order, no quota. Every 'Render detail' order is kept in a "
@@ -616,10 +567,14 @@ class PlanetTab(QWidget):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
+        # The main row is the same four as the other tabs. The order-recovery
+        # and view buttons live in the Search window drop-down (Ethan, 2026-11-11).
         for b in (self.search_btn, self.map_preview_btn, self.detail_btn,
-                  self.recall_btn, self.retone_btn, self.resume_btn, self.zoom_btn,
                   self.cancel_btn):
             btn_row.addWidget(b)
+        more_row = FlowRow()
+        for b in (self.recall_btn, self.retone_btn, self.resume_btn, self.zoom_btn):
+            more_row.addWidget(b)
 
         # --- cached orders (already paid for) ---
         # A picker rather than only "newest": an event often has several orders (a
@@ -642,9 +597,12 @@ class PlanetTab(QWidget):
         # growing past the bottom of the screen. Needs 'combobox-popup: 0' in the
         # theme, or Qt ignores this and renders one unscrollable list.
         self.recall_combo.setMaxVisibleItems(12)
+        self.recall_combo.setStyleSheet("QComboBox { combobox-popup: 0; }")
         self.recall_combo.setEnabled(False)
         self.recall_btn.setEnabled(False)
         recall_row.addWidget(self.recall_combo, 1)
+        window_form.addRow(more_row)
+        window_form.addRow(self._wrap(recall_row))
 
         self.footprint_check = QCheckBox("Show scene footprints on map")
         self.footprint_check.setToolTip(
@@ -673,6 +631,7 @@ class PlanetTab(QWidget):
         tl.setContentsMargins(0, 0, 0, 0)
         tl.addWidget(self._section(
             "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)"))
+        tl.addWidget(self.footprint_check)      # right under the heading
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Date (UTC)", "Gap (d)", "Cloud", "Coverage", "Scene ID"])
@@ -687,7 +646,6 @@ class PlanetTab(QWidget):
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         self.table.setMinimumHeight(160)
         tl.addWidget(self.table)
-        tl.addWidget(self.footprint_check)
         split.addWidget(tablebox, 1)
 
         # Gallery and browse image: closed by default (Ethan, 2026-11-11) — the
@@ -737,7 +695,6 @@ class PlanetTab(QWidget):
         root.addWidget(g["Event location and time"])
         root.addWidget(g["Search window"])
         root.addWidget(btn_row)
-        root.addWidget(self._wrap(recall_row))
         root.addWidget(self.progress)
         root.addWidget(g["Scene filters"])
         root.addWidget(g["SR detail rendering"])
@@ -787,10 +744,8 @@ class PlanetTab(QWidget):
         self.post_lbl.setText(f"{self.post_slider.value()} d")
 
     def _section(self, text):
-        """A section heading styled in Planet teal (see THEME_QSS QLabel#section)."""
-        lbl = QLabel(text)
-        lbl.setObjectName("section")
-        return lbl
+        """A section heading (plain, like the other tabs' since 2026-11-11)."""
+        return QLabel(text)
 
     # ---------- Planet account login (drop-down) ----------
     def _build_login_box(self):
@@ -836,7 +791,6 @@ class PlanetTab(QWidget):
 
         btns = QHBoxLayout()
         self.login_btn = QPushButton("Log in")
-        self.login_btn.setObjectName("primary")
         self.login_btn.clicked.connect(self._planet_login)
         self.logout_btn = QPushButton("Log out")
         self.logout_btn.clicked.connect(self._planet_logout)

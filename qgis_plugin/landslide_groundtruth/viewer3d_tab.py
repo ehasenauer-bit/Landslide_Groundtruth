@@ -473,7 +473,10 @@ class Viewer3DTab(QWidget):
         root.addWidget(tinted("results", flip_box))
 
         # --- figure Details (captions for the exported PNG) ---------------
-        det_box = QgsCollapsibleGroupBox("Figure details (exported PNG)")
+        # Built and owned here — the export reads these fields, and their project
+        # keys stay viewer3d/det_* — but SHOWN on the Volume tab, where the numbers
+        # come from (Ethan, 2026-11-11). VolumeTab places figure_details_frame.
+        det_box = QgsCollapsibleGroupBox("Figure details (3D web viewer / PNG)")
         det_box.setSaveCollapsedState(False)
         det_box.setCollapsed(True)
         dform = QFormLayout(det_box)
@@ -494,10 +497,10 @@ class Viewer3DTab(QWidget):
         self.det_seis_offset = QLineEdit()
         for lbl, w, tip in (
             ("Terrain satellite", self.det_terrain_sat, "auto-filled from the DEM source; editable"),
-            ("Area", self.det_area, "landslide area (Pull from the Volume tab, or type)"),
+            ("Area", self.det_area, "landslide area (Fill button below, or type)"),
             ("Centerline length", self.det_cl_length, "runout horizontal length"),
             ("Vertical drop", self.det_cl_drop, "centerline elevation drop"),
-            ("Volume", self.det_volume, "paste the estimate from the Volume tab"),
+            ("Volume", self.det_volume, "volume estimate (Fill button below, or type)"),
             ("Seismic offset", self.det_seis_offset,
              "seismic location → landslide centre (Pull, or filled on export)"),
         ):
@@ -511,16 +514,20 @@ class Viewer3DTab(QWidget):
             "centroid of the Volume tab's TOTAL outline (the source outline's, "
             "marked '(source area)', when no total is drawn). Filled by the Pull "
             "button, and on export when empty; editable.")
-        self.pull_vol_btn = QPushButton("↻ Pull area / centerline / volume from Volume tab")
+        self.pull_vol_btn = QPushButton("↻ Fill from this slide's measurement")
         self.pull_vol_btn.setToolTip(
             "Copy the latest area, centerline length + vertical drop, and volume "
-            "estimate from the 'Volume from area' tab into the fields above, and "
+            "estimate from this tab's measurement into the fields above, and "
             "measure the seismic offset from the Detection box's lat/lon to the "
-            "landslide outline's centre. Run a measurement (and the centerline) "
-            "there first.")
+            "landslide outline's centre. Run Measure (and the centerline) first. "
+            "The 3D viewer tab's export writes these onto the web viewer and the "
+            "PNG figure.")
         self.pull_vol_btn.clicked.connect(self._pull_volume_details)
         dform.addRow(self.pull_vol_btn)
-        root.addWidget(tinted("options", det_box))
+        self.figure_details_frame = tinted("options", det_box)
+        root.addWidget(help_toggle.label(
+            "The figure details (area, volume, satellites) that the export "
+            "writes onto the web viewer are on the Volume from area tab."))
 
         # --- actions -------------------------------------------------------
         # FlowRow (not a fixed QHBoxLayout) so the three buttons wrap onto a
