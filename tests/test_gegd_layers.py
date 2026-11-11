@@ -155,14 +155,15 @@ def take():
     return got
 
 
-def render(layer, rect4326):
+def render(layer, rect4326, size=256):
     ms = QgsMapSettings()
     ms.setLayers([layer])
     dst = QgsCoordinateReferenceSystem("EPSG:3857")
     ms.setDestinationCrs(dst)
     ms.setExtent(QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), dst,
                                         QgsProject.instance()).transformBoundingBox(rect4326))
-    ms.setOutputSize(QSize(256, 256))
+    ms.setBackgroundColor(QColor(0, 0, 0, 0))   # transparent: alpha 0 = nothing drawn
+    ms.setOutputSize(QSize(size, size))
     job = QgsMapRendererParallelJob(ms)
     lp = QEventLoop(); job.finished.connect(lp.quit)
     job.start()
@@ -254,6 +255,55 @@ check(f"GetMap requested on our URL ({len(maps)} request(s))",
       maps and all(g[0] == api.ENDPOINTS["wms"] for g in maps))
 check("… each with cql_filter=featureId='<fid>' (IgnoreGetMapUrl keeps our URL)",
       all(g[1].get("cql_filter") == [f"featureId='{FID}'"] for g in maps))
+
+print("\n=== clipped to the search box: no tiles outside it ===")
+# Two strips never rendered above, one per layer: QGIS caches tiles by URL, and a
+# shared cache would hide the requests being counted.
+other = next(r for r in ranked.pre + ranked.post
+             if r.strip.feature_id not in (FID, sp.strip.feature_id))
+world_l = gl.make_stream_layer(other, other.side, host=HOST)
+clip_l = gl.make_stream_layer(sp, "pre", host=HOST)
+check("an unclipped stream spans the whole world (the XYZ default)",
+      world_l.extent().width() > 4e7 and gl.stored_clip(world_l) is None)
+rect = gl.clip_stream(clip_l, LAT, LON, 5.0)
+check(f"clip_stream: extent = the search box ({rect.width() / 1000:.0f} km wide in "
+      "EPSG:3857), stored on the layer",
+      clip_l.extent() == rect and gl.stored_clip(clip_l) == rect and 1e4 < rect.width() < 5e4)
+AWAY = QgsRectangle(LON + 0.5, LAT - 0.1, LON + 0.7, LAT + 0.1)   # ~28 km east
+WIDE = QgsRectangle(LON - 0.5, LAT - 0.25, LON + 0.5, LAT + 0.25)  # ~5x the box
+take()
+render(world_l, AWAY, 1024)
+n_world_away = len(take())
+img = render(clip_l, AWAY, 1024)
+n_clip_away = len(take())
+check(f"a view beside the box: {n_clip_away} tiles clipped vs {n_world_away} unclipped",
+      n_clip_away == 0 and n_world_away > 0 and img.pixelColor(512, 512).alpha() == 0)
+render(world_l, WIDE, 1024)
+n_world_wide = len(take())
+img = render(clip_l, WIDE, 1024)
+n_clip_wide = len(take())
+check(f"a view 5x the box: {n_clip_wide} tiles clipped vs {n_world_wide} unclipped, "
+      "drawn in the middle only",
+      0 < n_clip_wide < n_world_wide / 2 and img.pixelColor(512, 512).alpha() == 255
+      and img.pixelColor(20, 20).alpha() == 0)
+img = render(clip_l, BOX)
+check("a view inside the box is drawn edge to edge",
+      img.pixelColor(2, 2).alpha() == 255 and img.pixelColor(253, 253).alpha() == 255)
+# QGIS keeps a layer extent in memory only: a reopened project, and QGIS 4's
+# reload(), are back at the whole world. reapply_clip puts the stored box back.
+_p = QgsProject.instance()
+_p.addMapLayer(clip_l)
+_p.write(os.path.join(TMP, "clip.qgz"))
+_p.clear()
+_p.read(os.path.join(TMP, "clip.qgz"))
+back = next(iter(_p.mapLayers().values()))
+check("the box is saved on the layer (custom property)", gl.stored_clip(back) == rect)
+check("reapply_clip restores it on a reopened project, then has nothing to do",
+      gl.reapply_clip(back) and back.extent() == rect and not gl.reapply_clip(back))
+back.reload()
+gl.reapply_clip(back)
+check("… and after reload() (QGIS 4 resets the extent there)", back.extent() == rect)
+_p.clear()
 
 print("\n=== names, properties, rights ===")
 pre_l = gl.make_stream_layer(sp, "pre", host=HOST)

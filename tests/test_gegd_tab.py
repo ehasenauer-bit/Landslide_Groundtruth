@@ -444,6 +444,10 @@ names = [l.name() for l in streams]
 check(f"Stream picks streams the ticked ★ pair ({names})",
       names == ["Maxar before · 2026-08-01 WV01 · ONA 30° (stream)",
                 "Maxar after · 2026-08-26 WV02 · ONA 20° (stream)"])
+_box = gegd_layers.clip_rect(tab._search["lat"], tab._search["lon"], tab._search["r_km"],
+                             streams[0].crs())
+check("each stream is clipped to the search box (no tiles fetched outside it)",
+      all(l.extent() == _box and gegd_layers.stored_clip(l) == _box for l in streams))
 tab.footprint_check.setChecked(True)
 fp, aoi = tab._footprint_layer, tab._aoi_layer
 check("ticking the box draws the footprints and search circle (memory layers, tagged), "
@@ -778,6 +782,15 @@ project.clear(); pump()
 project.read(os.path.join(PROJ, "Iliamna.qgz"))
 ok = wait_until(lambda: tab._ranked is not None and len(tab._stream_layers) == n_streams, 10)
 check(f"stream layers handed back by custom property ({len(tab._stream_layers)}/{n_streams})", ok)
+check("… and clipped to their search box again (QGIS reopens them at world extent)",
+      tab._stream_layers and all(
+          gegd_layers.stored_clip(l) is not None and l.extent() == gegd_layers.stored_clip(l)
+          for l in tab._stream_layers))
+_s = tab._stream_layers[0]
+_s.reload()                                  # QGIS 4: back to the whole world, no signal
+tab._on_render_starting()
+check("a render puts the clip back after reload() (F5 in QGIS 4)",
+      _s.extent() == gegd_layers.stored_clip(_s))
 check(f"the compare pair is the one on screen before the reopen ({pair_names})",
       None not in tab._compare and tuple(l.name() for l in tab._compare) == pair_names)
 check("the table came back from search.json",

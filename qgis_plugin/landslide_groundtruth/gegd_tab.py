@@ -676,6 +676,9 @@ class GegdTab(QWidget):
         self._connect(project.readProject, self._on_project_read)
         self._connect(project.cleared, self._on_project_cleared)
         self._connect(project.layersWillBeRemoved, self._on_layers_removed)
+        render_starting = getattr(self.canvas, "renderStarting", None)   # tests: a stub
+        if render_starting is not None:
+            self._connect(render_starting, self._on_render_starting)
 
     def _connect(self, signal, slot):
         signal.connect(slot)
@@ -1749,7 +1752,11 @@ class GegdTab(QWidget):
             self._log_line(f"QGIS rejected the stream layer for {x.strip.label}.")
             return None
         if self._search:
-            gl.set_props(lyr, event_id=self._search.get("event_id", ""))
+            s = self._search
+            gl.set_props(lyr, event_id=s.get("event_id", ""))
+            # Tiles only inside the search box: panning or zooming out beyond it
+            # costs no GEGD requests.
+            gl.clip_stream(lyr, s["lat"], s["lon"], s["r_km"])
         return lyr
 
     def _flip(self):
@@ -1932,8 +1939,36 @@ class GegdTab(QWidget):
             self._adopt()
             if self._search is None:
                 self._restore_search()
+            self._clip_streams()
         except RuntimeError:
             pass
+
+    def _clip_streams(self):
+        """Clip every adopted stream to its search box: the one stored on the layer,
+        or, for a stream made before streams were clipped, the restored search's
+        box when it is the same event. A reopened project loses the clip."""
+        s = self._search
+        for lyr in list(self._stream_layers):
+            try:
+                if gl.stored_clip(lyr) is not None:
+                    changed = gl.reapply_clip(lyr)
+                elif s and gl.get_prop(lyr, "event_id") in ("", s.get("event_id")):
+                    gl.clip_stream(lyr, s["lat"], s["lon"], s["r_km"])
+                    changed = True
+                else:
+                    changed = False
+                if changed:
+                    lyr.triggerRepaint()
+            except RuntimeError:
+                continue
+
+    def _on_render_starting(self):
+        """QGIS 4's reload (F5) puts a stream back at whole-world extent with no
+        signal; re-clip it here and redraw. The render that just started is
+        replaced, so its tile requests are cancelled."""
+        for lyr in list(self._stream_layers):
+            if gl.reapply_clip(lyr):
+                lyr.triggerRepaint()
 
     def _adopt(self):
         found = gl.adopt_layers(QgsProject.instance())

@@ -26,6 +26,18 @@ fails a request before any preprocessor can add the header.
 tokens, and a stream is not a file it can drape:
 ``Maxar before · 2026-08-01 WV01 · ONA 30° (stream)``.
 
+**Clipped to the search box.** An XYZ layer's extent is the whole world, so QGIS
+asked GEGD for every tile in view: zoomed out or panned away from the event, a
+redraw still fetched a full screen of tiles. ``clip_stream`` sets the layer's
+extent to the search box (``gegd_rank.event_bbox``: the circle plus 10 %, the box
+Zoom to AOI frames), and QGIS then requests and draws tiles only inside it.
+Measured headless on QGIS 3.44 and 4.2: a view 10× the box went from 15 tiles to 2,
+a view beside it from 35 to 0; a view inside the box is unchanged. No XYZ URI
+parameter carries an extent and QGIS keeps it only in memory: a reopened project
+starts at the whole world again, and QGIS 4's ``reload()`` (F5, View > Refresh)
+resets it too, with no signal. So the box is stored on the layer (property
+``clip``) and the tab puts it back with ``reapply_clip``.
+
 **Recognising our layers again.** Every layer gets ``landslide/gegd_*`` custom
 properties (kind, side, featureId, dates, rights), which travel in the .qgz, so
 ``adopt_layers`` can rebuild the tab's state when a project is reopened without
@@ -36,10 +48,11 @@ carry different licences, so the credit line is built per strip and written into
 the layer metadata (Layer Properties > Metadata > Rights) and a custom property.
 GEGD Pro access is for AEC internal use; the line says so.
 """
-from qgis.core import (QgsCentroidFillSymbolLayer, QgsDataSourceUri, QgsFeature,
+from qgis.core import (QgsCentroidFillSymbolLayer, QgsCoordinateReferenceSystem,
+                       QgsCoordinateTransform, QgsDataSourceUri, QgsFeature,
                        QgsField, QgsFillSymbol, QgsGeometry, QgsMarkerSymbol,
-                       QgsPointXY, QgsRasterLayer, QgsRuleBasedRenderer,
-                       QgsVectorLayer)
+                       QgsPointXY, QgsProject, QgsRasterLayer, QgsRectangle,
+                       QgsRuleBasedRenderer, QgsVectorLayer)
 from qgis.PyQt.QtCore import QMetaType
 
 try:                                    # Qgis.SelectionRenderingMode: QGIS >= 3.34
@@ -53,8 +66,9 @@ from . import gegd_rank as R
 
 __all__ = [
     "PROP", "strip_xyz_uri", "strip_wms_uri", "stream_name", "make_stream_layer",
-    "footprint_layer", "aoi_layer", "style_selection", "set_props", "get_prop",
-    "set_rights", "credit_line", "adopt_layers",
+    "clip_rect", "clip_stream", "stored_clip", "reapply_clip", "footprint_layer",
+    "aoi_layer", "style_selection", "set_props", "get_prop", "set_rights",
+    "credit_line", "adopt_layers",
 ]
 
 # Custom-property prefix on every layer this module makes ("landslide/gegd_kind" …).
@@ -210,6 +224,57 @@ def make_stream_layer(rstrip, side, host=api.HOST_DEFAULT, path_key="wmts"):
         path_key=path_key)
     set_rights(lyr, s)
     return lyr
+
+
+# ---------------------------------------------------------------- clip
+
+def clip_rect(lat, lon, r_km, crs):
+    """The search box (``gegd_rank.event_bbox``) in ``crs``, a stream's own CRS."""
+    lonmin, latmin, lonmax, latmax = R.event_bbox(lat, lon, r_km)
+    ct = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), crs,
+                                QgsProject.instance())
+    return ct.transformBoundingBox(QgsRectangle(lonmin, latmin, lonmax, latmax))
+
+
+def clip_stream(lyr, lat, lon, r_km):
+    """Clip a stream layer to the search box and store the box on the layer.
+
+    QGIS then fetches and draws tiles only inside the box (see the module notes)."""
+    rect = clip_rect(lat, lon, r_km, lyr.crs())
+    set_props(lyr, clip=",".join(repr(v) for v in (
+        rect.xMinimum(), rect.yMinimum(), rect.xMaximum(), rect.yMaximum())))
+    lyr.setExtent(rect)
+    return rect
+
+
+def stored_clip(lyr):
+    """The box ``clip_stream`` stored on ``lyr`` (layer CRS), or None."""
+    try:
+        x0, y0, x1, y1 = (float(v) for v in str(get_prop(lyr, "clip")).split(","))
+    except ValueError:
+        return None
+    rect = QgsRectangle(x0, y0, x1, y1)
+    return None if rect.isEmpty() else rect
+
+
+def reapply_clip(lyr):
+    """Put the stored clip back on a layer that lost it. True when it had to.
+
+    A reopened project and QGIS 4's ``reload()`` both reset the extent to the
+    whole world."""
+    rect = stored_clip(lyr)
+    if rect is None:
+        return False
+    try:
+        cur = lyr.extent()
+        if all(abs(a - b) < 0.01 for a, b in (
+                (cur.xMinimum(), rect.xMinimum()), (cur.yMinimum(), rect.yMinimum()),
+                (cur.xMaximum(), rect.xMaximum()), (cur.yMaximum(), rect.yMaximum()))):
+            return False
+        lyr.setExtent(rect)
+    except (RuntimeError, AttributeError):          # a deleted layer
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- vectors
