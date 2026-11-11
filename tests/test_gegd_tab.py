@@ -528,13 +528,19 @@ gegd_net.fetch = _real_fetch
 check("back to ★ 08-01 → 08-26", tab._ranked.star_pre.strip.label == "2026-08-01 WV01"
       and tab._ranked.star_post.strip.label == "2026-08-26 WV02")
 
-print("\n=== Flip ===")
+print("\n=== comparing: the after strip is on top, so switching it off shows the before ===")
+def toggle_after():
+    """What the user does in the Layers panel now the Flip button is gone."""
+    n = root.findLayer(tab._compare[1].id())
+    n.setItemVisibilityChecked(not n.itemVisibilityChecked())
 b, a = tab._compare
 node_a = root.findLayer(a.id())
-tab._flip()
-check("Flip hides the after strip", not node_a.itemVisibilityChecked())
-tab._flip()
-check("Flip again shows it", node_a.itemVisibilityChecked())
+check("no Flip button or method is left on the tab",
+      not hasattr(tab, "flip_btn") and not hasattr(tab, "_flip"))
+toggle_after()
+check("switching the after strip off hides it", not node_a.itemVisibilityChecked())
+toggle_after()
+check("… and on again shows it", node_a.itemVisibilityChecked())
 
 print("\n=== Stream picks replaces only the previous streams ===")
 other = QgsVectorLayer("Point?crs=EPSG:4326", "another tab's layer", "memory")
@@ -574,11 +580,11 @@ check(f"double-click on a BEFORE row ({label_b}): it is the shown before-strip, 
       "below the after-strip (after stays on top)",
       label_b in b.name() and ids.index(a.id()) + 1 == ids.index(b.id())
       and top_visible_stream() == a.id() and len(tab._stream_layers) == 5)
-tab._flip()
-check("Flip still works: hiding the after-strip reveals the new before-strip",
+toggle_after()
+check("stacking still works: hiding the after-strip reveals the new before-strip",
       top_visible_stream() == b.id())
-tab._flip()
-check("… and Flip again puts the after-strip back on top", top_visible_stream() == a.id())
+toggle_after()
+check("… and showing it again puts the after-strip back on top", top_visible_stream() == a.id())
 row31 = next(i for i, r in enumerate(tab._row_strips) if r.strip.label == "2026-08-31 WV02")
 tab._on_double_click(tab._table.item(row31, 1))      # streamed already, switched off
 b2, a2 = tab._compare
@@ -586,9 +592,9 @@ ids = [n.layerId() for n in root.findLayers()]
 check("double-click on a strip already streamed: no duplicate, it moves to the top and shows",
       len(tab._stream_layers) == 5 and "2026-08-31" in a2.name() and b2 is b
       and top_visible_stream() == a2.id() and ids.index(a2.id()) < ids.index(b2.id()))
-tab._flip()
-check("… and Flip reveals the before-strip under it", top_visible_stream() == b2.id())
-tab._flip()
+toggle_after()
+check("… and hiding it reveals the before-strip under it", top_visible_stream() == b2.id())
+toggle_after()
 tab._on_double_click(tab._table.item(rowb, 1))
 check("double-clicking the shown before-strip again changes nothing",
       len(tab._stream_layers) == 5 and tab._compare == (b2, a2))

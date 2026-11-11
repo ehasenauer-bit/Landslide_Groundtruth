@@ -13,8 +13,10 @@ Workflow (M1): **Use it in every tab** fills the Event box from the seismic
 detection → **Search** lists the strips that actually see the search circle,
 split before/after on the full UTC origin time, graded and ranked, with the ★
 before/after pair ticked → **Stream picks** puts the ticked strips on the map
-(nothing streams before that: no tile is fetched until you ask) → **Flip**
-toggles the after strip.
+(nothing streams before that: no tile is fetched until you ask), the after
+strip on top → switch the after strip off and on in the Layers panel to compare.
+(The Flip before/after button was removed 2026-11-11 at Ethan's request; the
+after-on-top stacking it relied on is kept.)
 
 **Origin time.** The split is ``acquired < origin`` = before, on aware UTC
 datetimes. The origin is ``dock.detection.origin_utc`` when the detection matches
@@ -101,7 +103,7 @@ COLUMNS = ("Pick", "Date UTC (Δd)", "AOI cover", "Sensor", "Off-nadir°", "Sun�
 COLUMN_TIPS = (
     "Tick the strips to stream with 'Stream picks'. ★ marks the recommended "
     "before/after pair: mapping-grade, close in time, a low view angle, and a sun "
-    "and relief shift similar enough between the two that Flip compares like with "
+    "and relief shift similar enough between the two that switching between them compares like with "
     "like.",
     "Acquisition time (UTC) and days from the event, negative = before. Before/after "
     "is decided on the full UTC time, so an Alaska-evening strip can carry the next "
@@ -272,7 +274,7 @@ class GegdTab(QWidget):
         self._filling = False            # the table is being rebuilt (ignore its signals)
         self._syncing = False            # table <-> footprint selection in progress
         self._stream_layers = []         # the current stream set (Stream picks replaces it)
-        self._compare = (None, None)     # (before, after) layers Flip works on
+        self._compare = (None, None)     # the SHOWN (before, after) stream layers
         self._stream_group = ""          # layer-tree folder of the current stream set
         self._footprint_layer = None
         self._aoi_layer = None
@@ -346,16 +348,9 @@ class GegdTab(QWidget):
             "on top; any extra picks are added switched off, and a switched-off stream "
             "fetches nothing. Double-click a row to make that one strip the shown "
             "before- or after-strip without removing anything: the strip it takes over "
-            "from is switched off, and the after-strip stays on top so Flip still works.")
+            "from is switched off, and the after-strip stays on top, so switching it off in "
+            "the Layers panel shows the before-strip under it.")
         self.stream_btn.clicked.connect(self._stream_picks)
-        self.flip_btn = QPushButton("Flip before/after")
-        self.flip_btn.setToolTip(
-            "Toggle the after-strip on and off over the before-strip. QGIS keeps both "
-            "rendered, so the flip is instant and costs no requests: the fastest way to "
-            "see what moved. Both strips are orthorectified on a pre-event DEM, so "
-            "terrain that dropped shifts sideways by roughly 50·tan(incidence) per 50 m "
-            "(see Off-nadir°); the ★ pair is chosen so that shift is similar in both.")
-        self.flip_btn.clicked.connect(self._flip)
         self.zoom_btn = QPushButton("Zoom to search area")
         self.zoom_btn.setToolTip(
             "Frame the search circle on the canvas. Use this rather than QGIS's own "
@@ -366,7 +361,7 @@ class GegdTab(QWidget):
         self.cancel_btn.setToolTip("Stop the search or key test in flight. The table "
                                    "keeps the previous results.")
         self.cancel_btn.clicked.connect(self._cancel)
-        for b in (self.search_btn, self.stream_btn, self.flip_btn, self.zoom_btn,
+        for b in (self.search_btn, self.stream_btn, self.zoom_btn,
                   self.cancel_btn):
             row.addWidget(b)
         root.addWidget(row)
@@ -1663,7 +1658,7 @@ class GegdTab(QWidget):
         if made:
             names = ", ".join(("★ " if x.star else "") + x.strip.label
                               for x in order if id(x) in made)
-            self._log_line(f"Streaming {names} (after on top; Flip toggles it).")
+            self._log_line(f"Streaming {names} (after on top; switch it off in the Layers panel to compare).")
         self._update_buttons()
         return [made[id(x)] for x in order if id(x) in made]
 
@@ -1695,9 +1690,9 @@ class GegdTab(QWidget):
     def _add_streams(self, rows):
         """Double-click: add strips beside the current stream set, removing nothing.
 
-        Each one becomes the SHOWN strip of its side of the Flip pair and lands
-        where Flip needs it: a new after-strip directly above the current after, a
-        new before-strip directly below it, so the after stays on top and Flip
+        Each one becomes the SHOWN strip of its side of the compare pair and lands
+        where comparing needs it: a new after-strip directly above the current after, a
+        new before-strip directly below it, so the after stays on top and hiding it
         still reveals the before. The strip it takes over from is switched off
         (kept, fetching nothing). A strip already streamed is moved and switched
         on, never added twice."""
@@ -1726,8 +1721,7 @@ class GegdTab(QWidget):
         for x, _l in made:
             self._log_line(f"Streaming {x.strip.label} as the shown "
                            f"{'before' if x.side == 'pre' else 'after'}-strip; the one it "
-                           "replaces stays in the list, switched off (Flip toggles the "
-                           "after-strip).")
+                           "replaces stays in the list, switched off.")
         self._update_buttons()
         return [lyr for _x, lyr in made]
 
@@ -1740,7 +1734,7 @@ class GegdTab(QWidget):
         return 0
 
     def _place_stream(self, lyr, side, fresh):
-        """Put `lyr` where Flip needs it (see _add_streams): an after-strip directly
+        """Put `lyr` where comparing needs it (see _add_streams): an after-strip directly
         above the pair's after-strip, a before-strip directly below it. With no
         after-strip on the map, beside the before-strip; with neither, at the top of
         the stream folder. An existing layer is moved (clone, then remove: the layer
@@ -1790,19 +1784,6 @@ class GegdTab(QWidget):
             # costs no GEGD requests.
             gl.clip_stream(lyr, s["lat"], s["lon"], s["r_km"])
         return lyr
-
-    def _flip(self):
-        """Toggle the after-strip of the compare pair (no request: both are rendered)."""
-        before, after = self._compare
-        node_a = self._node(after)
-        if node_a is None:
-            self._warn("Stream a before/after pair first (Search, then Stream picks).")
-            self._update_buttons()
-            return
-        node_b = self._node(before)
-        if node_b is not None and not node_b.itemVisibilityChecked():
-            node_b.setItemVisibilityChecked(True)
-        node_a.setItemVisibilityChecked(not node_a.itemVisibilityChecked())
 
     # ================================================================ map
     def _zoom(self):
@@ -2154,7 +2135,6 @@ class GegdTab(QWidget):
         self.cancel_btn.setEnabled(busy or self._key_task is not None)
         self.test_key_btn.setEnabled(self._key_task is None)
         self.stream_btn.setEnabled(have)
-        self.flip_btn.setEnabled(self._node(self._compare[1]) is not None)
         self.zoom_btn.setEnabled(self._search is not None or self._latlon() is not None)
 
     def _log_line(self, line):
