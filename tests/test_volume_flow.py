@@ -96,8 +96,10 @@ project.clear()
 dock.project_state._restore_now()
 
 print("=== the sections run in working order ===")
+# each box sits in its step-tinted frame, and the FRAME is what the tab lays out
 boxes = [w for w in vol.findChildren(QgsCollapsibleGroupBox)
-         if w.parent() is vol]
+         if w.parent().parent() is vol]
+frames = [b.parent() for b in boxes]
 titles = [b.title() for b in boxes]
 print("  ", " → ".join(titles))
 check("Outlines, Settings, Volumes, Centerline, Results, Log — no Verdict box",
@@ -109,8 +111,8 @@ check("no Verdict widgets are left on the tab",
 wi = vol.layout().indexOf(vol.write_btn.parentWidget())
 check("Write to layer / Copy results sit between Centerline and the results table",
       vol.copy_btn.parentWidget() is vol.write_btn.parentWidget()
-      and vol.layout().indexOf(boxes[3]) < wi < vol.layout().indexOf(boxes[4]))
-order = [vol.layout().indexOf(w) for w in boxes]
+      and vol.layout().indexOf(frames[3]) < wi < vol.layout().indexOf(frames[4]))
+order = [vol.layout().indexOf(w) for w in frames]
 mi = vol.layout().indexOf(vol.measure_btn.parentWidget())
 check("Measure sits between Settings and Volumes",
       order[1] < mi < order[2])
@@ -118,7 +120,7 @@ check("results table and log start collapsed; the working sections open",
       boxes[4].isCollapsed() and boxes[5].isCollapsed()
       and not any(b.isCollapsed() for b in boxes[:4]))
 check("the material setting is ABOVE Measure (it used to sit below the answer)",
-      vol.layout().indexOf(boxes[1]) < mi
+      vol.layout().indexOf(frames[1]) < mi
       and boxes[1].isAncestorOf(vol.material_combo))
 check("no area × thickness widgets are left on the tab",
       not any(hasattr(vol, a) for a in ("thick_best_edit", "thick_low_edit",
@@ -131,6 +133,34 @@ check("source low and high sit in the Outlines box itself, not a collapsed box",
 check("no Fit combo, no ∫Δh or DEM-differencing widgets, no Add-to-results",
       not any(hasattr(vol, a) for a in ("fit_combo", "_ddem_combo", "_pre_dem_combo",
                                         "diff_btn", "add_btn", "_layer_combo")))
+
+print("\n=== every box on every tab is tinted for its workflow step ===")
+from qgis.gui import QgsCollapsibleGroupBox as _Box
+from qgis.PyQt.QtWidgets import QToolButton
+from landslide_groundtruth import step_box as _SB, theme as _TH
+def _step_of(w):
+    p = w.parentWidget()
+    while p is not None:
+        if isinstance(p, _SB.StepFrame):
+            return p.step
+        p = p.parentWidget()
+    return None
+_inner = dock.widget().widget() if hasattr(dock.widget(), "widget") else dock.widget()
+_boxes = _inner.findChildren(_Box)
+_bare = [b.title() for b in _boxes if _step_of(b) is None]
+check(f"all {len(_boxes)} collapsible boxes sit in a step frame (untinted: {_bare})",
+      len(_boxes) >= 30 and not _bare)
+check("every step colour is in use",
+      {_step_of(b) for b in _boxes} == set(_TH.STEPS))
+for _attr in ("planet_tab", "gegd_tab", "sar_tab", "fusion_tab", "viewer3d_tab", "volume_tab"):
+    _tab = getattr(dock, _attr)
+    check(f"{_attr}: has a ? Help button",
+          any(b.text() == "? Help" for b in _tab.findChildren(QToolButton)))
+_gal = [b for b in _boxes if b.title().startswith(("Quicklook gallery", "Scene preview"))]
+check(f"galleries and scene previews are collapsible ({len(_gal)} boxes: S2, Planet, SAR)",
+      len(_gal) == 6)
+check("the SAR change detector defaults to Log-ratio alone",
+      [k for k, c in dock.sar_tab.cd_product_checks.items() if c.isChecked()] == ["logratio"])
 
 print("\n=== explanatory text behind one toggle ===")
 check(f"the tab registers its prose ({len(vol._help_labels)} labels)",

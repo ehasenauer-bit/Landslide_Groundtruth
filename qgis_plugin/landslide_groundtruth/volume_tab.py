@@ -85,7 +85,7 @@ from . import volume_calc
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .theme import status_css
-from .step_box import HelpToggle, HELP_SETTING as _SHARED_HELP_SETTING
+from .step_box import HelpToggle, tinted, HELP_SETTING as _SHARED_HELP_SETTING
 
 
 def _utm_epsg(lat, lon):
@@ -313,6 +313,8 @@ class VolumeTab(QWidget):
         the Volumes box already shows the row."""
         root = QVBoxLayout(self)
         root.setSpacing(8)
+        # Each box is tinted for its step (theme.STEP_TINTS), as on every tab:
+        # outlines violet, settings teal, volumes / centerline / table sand, log grey.
 
         # Header: the help toggle and the one layer re-sync. Everything the tab
         # explains sits behind the toggle; tooltips carry the detail regardless,
@@ -341,8 +343,8 @@ class VolumeTab(QWidget):
             "source low and high give the low and high estimates. Measure also "
             "records the slide's row."))
 
-        root.addWidget(self._build_outline_box())
-        root.addWidget(self._build_settings_box())
+        root.addWidget(tinted("inputs", self._build_outline_box()))
+        root.addWidget(tinted("options", self._build_settings_box()))
 
         btns = FlowRow()
         self.measure_btn = QPushButton("Measure")
@@ -360,8 +362,8 @@ class VolumeTab(QWidget):
         btns.addWidget(self.measure_btn)
         root.addWidget(btns)
 
-        root.addWidget(self._build_volumes_box())
-        root.addWidget(self._build_centerline_box())
+        root.addWidget(tinted("results", self._build_volumes_box()))
+        root.addWidget(tinted("results", self._build_centerline_box()))
 
         act = FlowRow()
         self.write_btn = QPushButton("Write to layer")
@@ -383,8 +385,8 @@ class VolumeTab(QWidget):
             act.addWidget(b)
         root.addWidget(act)
 
-        root.addWidget(self._build_results_box())
-        root.addWidget(self._build_log_box())
+        root.addWidget(tinted("results", self._build_results_box()))
+        root.addWidget(tinted("advanced", self._build_log_box()))
         root.addStretch(1)
 
     def _help(self, text=""):
