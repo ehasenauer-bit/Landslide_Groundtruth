@@ -57,6 +57,7 @@ from . import dem_diff
 from . import layer_group as lg
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from .step_box import advanced_box, step_box, tinted
 
 # The terrain settings class we build ourselves (the canvas owns its
 # Qgs3DMapSettings; we mutate that live and only construct the terrain settings).
@@ -186,7 +187,15 @@ class Viewer3DTab(QWidget):
             "Opens as a QGIS 3D dock (drag it onto this tab to dock them together).")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(intro)
+        # Work order, each box tinted for its step (theme.STEP_TINTS): event and
+        # terrain (inputs) / draped layers (options) / Open / before-after flip
+        # (results) / figure details (options) / Advanced / Log.
+        help_toggle = self.dock.help_toggle
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(help_toggle.adopt(intro))
 
         if not HAS_3D:
             warn = QLabel(
@@ -197,7 +206,10 @@ class Viewer3DTab(QWidget):
             root.addWidget(warn)
 
         # --- event AOI (own copy; button pulls from the Sentinel tab) ---
-        form = QFormLayout()
+        event_frame, event_box = step_box("inputs", "Event location and time")
+        form = QFormLayout(event_box)
+        adv_frame, adv_box = advanced_box()
+        adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
@@ -220,14 +232,17 @@ class Viewer3DTab(QWidget):
             pass
         form.addRow("Latitude", self.lat_edit)
         form.addRow("Longitude", self.lon_edit)
-        form.addRow("Search radius", self.radius_spin)
+        self.radius_spin.setToolTip(
+            "Half-width of the terrain to fetch around the epicentre. 'Use it in "
+            "every tab' in the Detection box sets this to 15 km.")
+        adv_form.addRow("Search radius", self.radius_spin)
         form.addRow("Event time (UTC)", self.dt_edit)
-        root.addLayout(form)
 
         # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
         copy_btn = QPushButton("Copy location && date from Sentinel-2 / Landsat tab")
         copy_btn.clicked.connect(self._copy_from_main)
-        root.addWidget(copy_btn)
+        form.addRow(copy_btn)
+        root.addWidget(event_frame)
 
         # --- terrain group -------------------------------------------------
         terr_box = QgsCollapsibleGroupBox("Terrain (DEM)")
@@ -338,7 +353,7 @@ class Viewer3DTab(QWidget):
         self.terrain_label.setWordWrap(True)
         self.terrain_label.setStyleSheet("QLabel { color: palette(mid); }")
         tform.addRow(self.terrain_label)
-        root.addWidget(terr_box)
+        root.addWidget(tinted("inputs", terr_box))
 
         # --- draped layers group ------------------------------------------
         drape_box = QgsCollapsibleGroupBox("Draped layers")
@@ -349,7 +364,7 @@ class Viewer3DTab(QWidget):
             "over hillshade).")
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: palette(mid); }")
-        dlay.addWidget(hint)
+        dlay.addWidget(help_toggle.adopt(hint))
         self.drape_list = QListWidget()
         self.drape_list.setMinimumHeight(120)
         # (un)ticking a drape layer changes what the Before/After pickers may offer
@@ -358,7 +373,10 @@ class Viewer3DTab(QWidget):
         refresh_btn = QPushButton("Refresh layer list")
         refresh_btn.clicked.connect(self._refresh_drape_list)
         dlay.addWidget(refresh_btn)
-        root.addWidget(drape_box)
+        root.addWidget(tinted("options", drape_box))
+        # the action row goes here, after the layers it opens (built below)
+        action_slot = QVBoxLayout()
+        root.addLayout(action_slot)
 
         # --- before / after flip (live 3D) --------------------------------
         flip_box = QgsCollapsibleGroupBox("Before / after (3D flip)")
@@ -368,7 +386,7 @@ class Viewer3DTab(QWidget):
             "open 3D scene — no rebuild, no camera move. Open the 3D view first.")
         fhint.setWordWrap(True)
         fhint.setStyleSheet("QLabel { color: palette(mid); }")
-        fbl.addWidget(fhint)
+        fbl.addWidget(help_toggle.adopt(fhint))
 
         sel = QFormLayout()
         self.before_combo = QgsCheckableComboBox()
@@ -452,7 +470,7 @@ class Viewer3DTab(QWidget):
         web_row.addWidget(self.web_btn)
         web_row.addWidget(self.index_btn)
         fbl.addWidget(web_row)
-        root.addWidget(flip_box)
+        root.addWidget(tinted("results", flip_box))
 
         # --- figure Details (captions for the exported PNG) ---------------
         det_box = QgsCollapsibleGroupBox("Figure details (exported PNG)")
@@ -502,7 +520,7 @@ class Viewer3DTab(QWidget):
             "there first.")
         self.pull_vol_btn.clicked.connect(self._pull_volume_details)
         dform.addRow(self.pull_vol_btn)
-        root.addWidget(det_box)
+        root.addWidget(tinted("options", det_box))
 
         # --- actions -------------------------------------------------------
         # FlowRow (not a fixed QHBoxLayout) so the three buttons wrap onto a
@@ -525,18 +543,21 @@ class Viewer3DTab(QWidget):
         btn_row.addWidget(self.open_btn)
         btn_row.addWidget(self.reset_btn)
         btn_row.addWidget(self.close_btn)
-        root.addWidget(btn_row)
+        action_slot.addWidget(btn_row)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
-        root.addWidget(self.progress)
+        action_slot.addWidget(self.progress)
 
+        root.addWidget(adv_frame)
+        log_frame, logbox = step_box("advanced", "Log")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
         self.log.setMinimumHeight(90)
-        root.addWidget(self.log, 1)
+        QVBoxLayout(logbox).addWidget(self.log)
+        root.addWidget(log_frame, 1)
 
         if not HAS_3D:
             for w in (self.fetch_btn, self.open_btn, self.reset_btn, self.close_btn,
