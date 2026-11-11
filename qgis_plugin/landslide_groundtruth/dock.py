@@ -980,7 +980,7 @@ class LandslideDock(QgsDockWidget):
           Layers to export  which products the Run writes
           Mark a spot       a red X or blue circle at typed coordinates, closed
           Candidate scenes  the table to tick, footprints, gallery, browse image
-          Advanced          rarely-changed: search radius, the point/area layers
+          Advanced          rarely-changed: the point/area layers
           Log
 
         NASA Earthdata (optional account, closed) sits first, above Find scenes.
@@ -1005,7 +1005,7 @@ class LandslideDock(QgsDockWidget):
         # --- event inputs ---
         find_frame, find_box = step_box("inputs", "Find scenes")
         form = QFormLayout(find_box)
-        # Rarely changed once the Detection box has filled the tab in: closed.
+        # Rarely changed: the point / area layers. Closed.
         adv_frame, adv_box = advanced_box()
         adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
@@ -1054,7 +1054,8 @@ class LandslideDock(QgsDockWidget):
         self.radius_spin.setToolTip(
             "How far around the epicentre to search. 'Use it in every tab' in "
             "the Detection box sets this to 15 km.")
-        adv_form.addRow("Search radius", self.radius_spin)
+        # Search radius stays in the event box (Ethan, 2026-11-11): it is the AOI.
+        form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit(QDateTime.currentDateTimeUtc())
         self.dt_edit.setCalendarPopup(True)

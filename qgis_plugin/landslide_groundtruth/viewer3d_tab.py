@@ -57,7 +57,7 @@ from . import dem_diff
 from . import layer_group as lg
 from .task import PipelineTask
 from .flow_layout import FlowRow
-from .step_box import advanced_box, step_box, tinted
+from .step_box import step_box, tinted
 
 # The terrain settings class we build ourselves (the canvas owns its
 # Qgs3DMapSettings; we mutate that live and only construct the terrain settings).
@@ -189,7 +189,7 @@ class Viewer3DTab(QWidget):
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         # Work order, each box tinted for its step (theme.STEP_TINTS): event and
         # terrain (inputs) / draped layers (options) / Open / before-after flip
-        # (results) / figure details (options) / Advanced / Log.
+        # (results) / Log. Figure details are shown on the Volume tab.
         help_toggle = self.dock.help_toggle
         head = QHBoxLayout()
         head.addStretch(1)
@@ -208,8 +208,6 @@ class Viewer3DTab(QWidget):
         # --- event AOI (own copy; button pulls from the Sentinel tab) ---
         event_frame, event_box = step_box("inputs", "Event location and time")
         form = QFormLayout(event_box)
-        adv_frame, adv_box = advanced_box()
-        adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
@@ -235,7 +233,8 @@ class Viewer3DTab(QWidget):
         self.radius_spin.setToolTip(
             "Half-width of the terrain to fetch around the epicentre. 'Use it in "
             "every tab' in the Detection box sets this to 15 km.")
-        adv_form.addRow("Search radius", self.radius_spin)
+        # Search radius stays in the event box (Ethan, 2026-11-11): it is the AOI.
+        form.addRow("Search radius", self.radius_spin)
         form.addRow("Event time (UTC)", self.dt_edit)
 
         # "&&": a single & is a Qt mnemonic marker and renders as "location _date"
@@ -557,7 +556,6 @@ class Viewer3DTab(QWidget):
         self.progress.hide()
         action_slot.addWidget(self.progress)
 
-        root.addWidget(adv_frame)
         log_frame, logbox = step_box("advanced", "Log")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)

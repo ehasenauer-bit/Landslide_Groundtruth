@@ -93,7 +93,7 @@ from . import layover_dim
 from . import nisar_read
 from . import layer_group as lg
 from .flow_layout import FlowRow
-from .step_box import advanced_box, step_box, tinted
+from .step_box import step_box, tinted
 from .task import PipelineTask
 from .nisar_task import NisarReadTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
@@ -327,7 +327,7 @@ class SarTab(QWidget):
         # Work order, each box tinted for its step (theme.STEP_TINTS):
         #   key (setup) / event (inputs) / the button row / change detection
         #   (options) / candidate scenes, gallery, preview (results) / display
-        #   and pairing options / noise reduction and Advanced / Log.
+        #   and pairing options / noise reduction / Log.
         #   Prose sits behind "? Help".
         help_toggle = self.dock.help_toggle
         head = QHBoxLayout()
@@ -341,8 +341,6 @@ class SarTab(QWidget):
         # --- event inputs (own copy; button pulls from the Sentinel tab) ---
         event_frame, event_box = step_box("inputs", "Event location and time")
         form = QFormLayout(event_box)
-        adv_frame, adv_box = advanced_box()
-        adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
@@ -359,7 +357,8 @@ class SarTab(QWidget):
         self.radius_spin.setToolTip(
             "How far around the epicentre to search. 'Use it in every tab' in "
             "the Detection box sets this to 15 km.")
-        adv_form.addRow("Search radius", self.radius_spin)
+        # Search radius stays in the event box (Ethan, 2026-11-11): it is the AOI.
+        form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
@@ -555,7 +554,6 @@ class SarTab(QWidget):
         # --- after the scenes: change detection, then the rarely-changed ---
         root.addWidget(display_frame)
         root.addWidget(filter_frame)
-        root.addWidget(adv_frame)
 
         log_frame, logbox = step_box("advanced", "Log")
         lo = QVBoxLayout(logbox)

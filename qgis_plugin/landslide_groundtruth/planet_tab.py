@@ -164,8 +164,7 @@ class PlanetTab(QWidget):
 
         # --- Planet account login (drop-down) ---
         login_frame = tinted("setup", self._build_login_box())
-        # Rarely changed: the search radius (set by the Detection box) and the
-        # timed-out-order policy. Built first so both can be put in it.
+        # Rarely changed: the timed-out-order policy.
         adv_form = self._options_group("Advanced", step="advanced")
 
         # --- Event (drop-down) — own copy; the button pulls from the other tab ---
@@ -188,7 +187,8 @@ class PlanetTab(QWidget):
         self.radius_spin.setToolTip(
             "How far around the epicentre to search. 'Use it in every tab' in "
             "the Detection box sets this to 10 km.")
-        adv_form.addRow("Search radius", self.radius_spin)
+        # Search radius stays in the event box (Ethan, 2026-11-11): it is the AOI.
+        form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)

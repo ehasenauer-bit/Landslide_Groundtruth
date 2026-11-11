@@ -77,7 +77,7 @@ from . import gegd_layers as gl
 from . import gegd_rank as R
 from . import layer_group as lg
 from .flow_layout import FlowRow
-from .step_box import advanced_box, step_box, tinted
+from .step_box import step_box, tinted
 from .gegd_tasks import KeyTestTask, SearchTask
 from .theme import (GRADE_VISUAL_FG, MISSES_EPICENTRE_FG, MUTED_FG, POST_BG, PRE_BG,
                     ROW_FG, status_css, status_html, status_text)
@@ -310,19 +310,13 @@ class GegdTab(QWidget):
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         # Work order, each box tinted for its step (theme.STEP_TINTS): connection
         # (setup) / event (inputs) / the button row / scene filters (options) /
-        # results / Advanced / Log. The intro sits behind "? Help".
+        # results / Log. The intro sits behind "? Help".
         help_toggle = self.dock.help_toggle
         head = QHBoxLayout()
         head.addStretch(1)
         head.addWidget(help_toggle.button())
         root.addLayout(head)
         root.addWidget(help_toggle.adopt(intro))
-
-        # Rarely changed: the search radius, which the Detection box sets. Built
-        # before the event box, which fills it.
-        adv_frame, adv_box = advanced_box()
-        self._adv_form = QFormLayout(adv_box)
-        self._adv_form.setContentsMargins(6, 4, 6, 4)
 
         # each _group() box sits in its own tinted frame: add the frame
         root.addWidget(self._build_key_box().parentWidget())
@@ -400,7 +394,6 @@ class GegdTab(QWidget):
         root.addWidget(self._show_hidden_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         root.addWidget(tinted("results", self._build_results_box()))
-        root.addWidget(adv_frame)
 
         logbox = QgsCollapsibleGroupBox("Log")
         logbox.setSaveCollapsedState(False)
@@ -513,7 +506,8 @@ class GegdTab(QWidget):
             "Radius of the search circle around the epicentre. A strip is listed only if "
             "its footprint touches this circle (checked here, not just by the server's "
             "box). 'Use it in every tab' sets it to 15 km.")
-        self._adv_form.addRow("Search radius", self.radius_spin)
+        # Search radius stays in the event box (Ethan, 2026-11-11): it is the AOI.
+        form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
