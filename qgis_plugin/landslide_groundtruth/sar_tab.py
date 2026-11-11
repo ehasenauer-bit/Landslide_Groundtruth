@@ -76,7 +76,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QDoubleSpinBox, QDateTimeEdit, QCheckBox,
     QProgressBar, QPlainTextEdit, QTableWidget, QTableWidgetItem, QSplitter,
-    QScrollArea, QGridLayout, QToolButton, QSlider, QApplication,
+    QScrollArea, QGridLayout, QToolButton, QSlider, QApplication, QSizePolicy,
 )
 from qgis.core import (Qgis, 
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
@@ -93,6 +93,7 @@ from . import layover_dim
 from . import nisar_read
 from . import layer_group as lg
 from .flow_layout import FlowRow
+from .step_box import advanced_box, step_box, tinted
 from .task import PipelineTask
 from .nisar_task import NisarReadTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
@@ -136,15 +137,17 @@ ORBIT_MODES = [
 # incoherent change-detection products (Jung & Yun 2020, doi:10.3390/rs12020265).
 # The paper's coherent (phase) methods need SLC/InSAR data RTC doesn't carry —
 # and its own finding is they fail over low-coherence natural terrain anyway.
-# Each is a checkbox: tick which change maps to compute. The two recommended
-# defaults (texture + brightness) fail in opposite ways and are meant to be read
-# together — see the tooltip in _build_change_box. Tuple is
+# Each is a checkbox: tick which change maps to compute. Texture and brightness
+# fail in opposite ways and are meant to be read together when both are ticked —
+# see the tooltip in _build_change_box. Tuple is
 # (key, checkbox label, before-scenes needed, checked by default).
 CD_PRODUCTS = [
-    ("mtcorr", "Texture — multi-temporal intensity correlation", 3, True),
-    ("tsint", "Brightness — intensity z-score", 2, True),
+    # Log-ratio alone is ticked by default (Ethan, 2026-11-11); the other three
+    # are opt-in. A project saved before then keeps the ticks it was saved with.
+    ("mtcorr", "Texture — multi-temporal intensity correlation", 3, False),
+    ("tsint", "Brightness — intensity z-score", 2, False),
     ("intcorr", "Norm. diff — intensity correlation", 2, False),
-    ("logratio", "Log-ratio of intensity", 1, False),
+    ("logratio", "Log-ratio of intensity", 1, True),
 ]
 # before-scenes each product needs, and human names, keyed for reuse in _cd_pick
 CD_NEED = {k: n for k, _l, n, _d in CD_PRODUCTS}
@@ -321,12 +324,25 @@ class SarTab(QWidget):
             "when optical scenes are clouded out.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(intro)
+        # Work order, each box tinted for its step (theme.STEP_TINTS):
+        #   key (setup) / event (inputs) / the button row / display options /
+        #   candidate scenes, gallery, preview (results) / change detection
+        #   (options — it runs on the scenes above) / noise reduction and
+        #   Advanced / Log. Prose sits behind "? Help".
+        help_toggle = self.dock.help_toggle
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(help_toggle.adopt(intro))
 
-        root.addWidget(self._build_key_box())
+        root.addWidget(tinted("setup", self._build_key_box()))
 
         # --- event inputs (own copy; button pulls from the Sentinel tab) ---
-        form = QFormLayout()
+        event_frame, event_box = step_box("inputs", "Event location and time")
+        form = QFormLayout(event_box)
+        adv_frame, adv_box = advanced_box()
+        adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
@@ -340,7 +356,10 @@ class SarTab(QWidget):
         self.radius_spin.setSingleStep(0.5)
         self.radius_spin.setValue(5.0)
         self.radius_spin.setSuffix(" km")
-        form.addRow("Search radius", self.radius_spin)
+        self.radius_spin.setToolTip(
+            "How far around the epicentre to search. 'Use it in every tab' in "
+            "the Detection box sets this to 15 km.")
+        adv_form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
@@ -394,12 +413,12 @@ class SarTab(QWidget):
             "at the top of the Sentinel-2 / Landsat tab). Expect 10–25 s per NISAR scene, in the "
             "background.")
         form.addRow("", self.nisar_check)
-        root.addLayout(form)
+        root.addWidget(event_frame)
 
-        # --- collapsible option drop-downs (keep the tab compact) ---
-        root.addWidget(self._build_display_box())
-        root.addWidget(self._build_change_box())
-        root.addWidget(self._build_filter_box())
+        # --- collapsible option drop-downs (placed below, in work order) ---
+        display_frame = tinted("options", self._build_display_box())
+        change_frame = tinted("options", self._build_change_box())
+        filter_frame = tinted("advanced", self._build_filter_box())
 
         # --- buttons ---
         # FlowRow (not a fixed QHBoxLayout) so the four buttons wrap onto a
@@ -456,15 +475,18 @@ class SarTab(QWidget):
             "Sentinel-1 IW scenes are ~250 km wide, so your whole search area "
             "almost always sits inside one scene.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
-        root.addWidget(self.footprint_check)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
         root.addWidget(self.progress)
+        root.addWidget(display_frame)
 
-        # --- outputs: candidate table / gallery / preview / log ---
-        split = QSplitter(Qt.Orientation.Vertical)
+        # --- results: candidate table / gallery / preview ---
+        # A plain stack in one results-tinted frame, not a splitter: a splitter
+        # keeps a pane's height when the box in it is closed (see dock.py).
+        results_frame = tinted("results")
+        split = results_frame.layout()
 
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
@@ -491,14 +513,19 @@ class SarTab(QWidget):
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         tl.addWidget(self.table)
-        split.addWidget(tablebox)
+        self.table.setMinimumHeight(160)
+        tl.addWidget(self.footprint_check)
+        split.addWidget(tablebox, 1)
 
-        gallerybox = QWidget()
+        # Gallery and preview: closed by default (Ethan, 2026-11-11).
+        gallerybox = QgsCollapsibleGroupBox(
+            "Quicklook gallery (click a thumbnail to select its scene)")
+        gallerybox.setSaveCollapsedState(False)
+        gallerybox.setCollapsed(True)
         gl = QVBoxLayout(gallerybox)
-        gl.setContentsMargins(0, 0, 0, 0)
-        gl.addWidget(QLabel("Quicklook gallery (click a thumbnail to select its scene)"))
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
+        self.gallery_scroll.setMinimumHeight(280)    # when open; closed = title bar
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
         self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -506,32 +533,36 @@ class SarTab(QWidget):
         gl.addWidget(self.gallery_scroll, 1)
         split.addWidget(gallerybox)
 
-        previewbox = QWidget()
+        previewbox = QgsCollapsibleGroupBox("Scene preview (amplitude render)")
+        previewbox.setSaveCollapsedState(False)
+        previewbox.setCollapsed(True)
         pl = QVBoxLayout(previewbox)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(QLabel("Scene preview (amplitude render)"))
         self.preview = QLabel("Search, then select a scene to preview it.")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
+        # A fixed viewing height when open; Ignored because the pixmap is scaled
+        # TO the label, so its size must not feed back into the layout.
+        self.preview.setMinimumHeight(260)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Ignored)
         pl.addWidget(self.preview, 1)
         split.addWidget(previewbox)
+        root.addWidget(results_frame, 1)
 
-        logbox = QWidget()
+        # --- after the scenes: change detection, then the rarely-changed ---
+        root.addWidget(change_frame)
+        root.addWidget(filter_frame)
+        root.addWidget(adv_frame)
+
+        log_frame, logbox = step_box("advanced", "Log")
         lo = QVBoxLayout(logbox)
-        lo.setContentsMargins(0, 0, 0, 0)
-        lo.addWidget(QLabel("Log"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1000)
+        self.log.setMinimumHeight(80)
         lo.addWidget(self.log)
-        split.addWidget(logbox)
-
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 3)
-        split.setStretchFactor(2, 2)
-        split.setStretchFactor(3, 2)
-        root.addWidget(split, 1)
+        root.addWidget(log_frame)
 
     def _wrap(self, layout):
         w = QWidget()
@@ -683,11 +714,13 @@ class SarTab(QWidget):
             "track' means the same relative orbit number (t123), not merely "
             "ascending or descending — two ascending tracks see a slope from "
             "different angles, so only one track's scenes can feed a run. Run "
-            "Search first, then tick which products to compute. The two "
-            "recommended defaults are complementary: texture (multi-temporal "
-            "intensity correlation — the paper's most reliable detector) and "
-            "brightness (z-score — catches debris that uniformly brightens "
-            "smooth snow/ice, which texture methods cannot see). Speckle and "
+            "Search first, then tick which products to compute. Log-ratio is "
+            "ticked by default and needs only one before-scene. Texture and "
+            "brightness are complementary when there are enough before-scenes: "
+            "texture (multi-temporal intensity correlation — the paper's most "
+            "reliable detector) and brightness (z-score — catches debris that "
+            "uniformly brightens smooth snow/ice, which texture methods cannot "
+            "see). Speckle and "
             "false-positive filtering live in the Noise reduction panel below. "
             "Caution: wet snow, melt onset and freeze–thaw between the "
             "compared scenes also change radar brightness — compare scenes in "
@@ -695,7 +728,7 @@ class SarTab(QWidget):
             "not confirmed slides.")
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(info)
+        form.addRow(self.dock.help_toggle.adopt(info))     # behind "? Help"
 
         # One radar per run: the detectors difference ONE sensor's same-track
         # stack. Enabled once a search has returned NISAR scenes at all.
@@ -725,8 +758,8 @@ class SarTab(QWidget):
         form.addRow("Radar", self.cd_radar_combo)
 
         # one checkbox per detector — tick which change maps to compute. Each
-        # ticked product adds its own layer; the two defaults fail in opposite
-        # ways and are meant to be read together.
+        # ticked product adds its own layer; texture and brightness fail in
+        # opposite ways and are meant to be read together.
         cd_tips = {
             "mtcorr":
                 "Texture: compares each before×after correlation against the "
@@ -908,7 +941,7 @@ class SarTab(QWidget):
             "and coarser Pixel size (Display panel), which also cut speckle.")
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(info)
+        form.addRow(self.dock.help_toggle.adopt(info))     # behind "? Help"
 
         # fade radar-layover slopes: the layover-facing side (east on descending,
         # west on ascending) reads as false high amplitude / false change
@@ -993,7 +1026,7 @@ class SarTab(QWidget):
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(info)
+        form.addRow(self.dock.help_toggle.adopt(info))     # behind "? Help"
 
         self.key_edit = QLineEdit(
             self.settings.value("landslide/pc_subscription_key", "", type=str))
