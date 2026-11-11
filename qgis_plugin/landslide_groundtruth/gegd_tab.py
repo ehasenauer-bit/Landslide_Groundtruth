@@ -77,6 +77,7 @@ from . import gegd_layers as gl
 from . import gegd_rank as R
 from . import layer_group as lg
 from .flow_layout import FlowRow
+from .step_box import advanced_box, step_box, tinted
 from .gegd_tasks import KeyTestTask, SearchTask
 from .theme import (GRADE_VISUAL_FG, MISSES_EPICENTRE_FG, MUTED_FG, POST_BG, PRE_BG,
                     ROW_FG, status_css, status_html, status_text)
@@ -291,11 +292,26 @@ class GegdTab(QWidget):
             "never for Fusion's change indices.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(intro)
+        # Work order, each box tinted for its step (theme.STEP_TINTS): connection
+        # (setup) / event (inputs) / the button row / scene filters (options) /
+        # results / Advanced / Log. The intro sits behind "? Help".
+        help_toggle = self.dock.help_toggle
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(help_toggle.adopt(intro))
 
-        root.addWidget(self._build_key_box())
-        root.addWidget(self._build_event_box())
-        root.addWidget(self._build_filter_box())
+        # Rarely changed: the search radius, which the Detection box sets. Built
+        # before the event box, which fills it.
+        adv_frame, adv_box = advanced_box()
+        self._adv_form = QFormLayout(adv_box)
+        self._adv_form.setContentsMargins(6, 4, 6, 4)
+
+        # each _group() box sits in its own tinted frame: add the frame
+        root.addWidget(self._build_key_box().parentWidget())
+        root.addWidget(self._build_event_box().parentWidget())
+        filter_frame = self._build_filter_box().parentWidget()
 
         row = FlowRow()
         self.search_btn = QPushButton("Search")
@@ -349,6 +365,7 @@ class GegdTab(QWidget):
         self._progress.setRange(0, 0)
         self._progress.hide()
         root.addWidget(self._progress)
+        root.addWidget(filter_frame)
         self._summary_label = QLabel()
         self._summary_label.setWordWrap(True)
         self._summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -364,7 +381,8 @@ class GegdTab(QWidget):
         hid.addWidget(self._show_hidden_btn)
         root.addWidget(hid)
 
-        root.addWidget(self._build_results_box())
+        root.addWidget(tinted("results", self._build_results_box()))
+        root.addWidget(adv_frame)
 
         logbox = QgsCollapsibleGroupBox("Log")
         logbox.setSaveCollapsedState(False)
@@ -375,21 +393,22 @@ class GegdTab(QWidget):
         self._log.setMaximumBlockCount(1000)
         self._log.setMinimumHeight(90)
         lv.addWidget(self._log)
-        root.addWidget(logbox)
+        root.addWidget(tinted("advanced", logbox))
         root.addStretch(1)
 
-    def _group(self, title, collapsed):
+    def _group(self, title, collapsed, step):
         """A collapsible group ("drop-down") and its form, opened the same way every
-        session (setSaveCollapsedState(False), as dock.py's and Planet's boxes)."""
-        box = QgsCollapsibleGroupBox(title)
-        box.setSaveCollapsedState(False)
-        box.setCollapsed(collapsed)
+        session (setSaveCollapsedState(False), as dock.py's and Planet's boxes).
+        The box sits in a frame tinted for `step` — box.parentWidget() — and that
+        frame is what goes into the layout."""
+        _frame, box = step_box(step, title, collapsed=collapsed)
         form = QFormLayout(box)
         form.setContentsMargins(6, 4, 6, 4)
         return box, form
 
     def _build_key_box(self):
-        box, form = self._group("Maxar/Vantor GEGD Pro connection", collapsed=False)
+        box, form = self._group("Maxar/Vantor GEGD Pro connection", collapsed=False,
+                                step="setup")
         self._key_box = box
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
@@ -451,7 +470,8 @@ class GegdTab(QWidget):
         return box
 
     def _build_event_box(self):
-        box, form = self._group("Event location and time", collapsed=False)
+        box, form = self._group("Event location and time", collapsed=False,
+                                step="inputs")
         self._event_label = QLabel()
         self._event_label.setWordWrap(True)
         self._event_label.setTextFormat(Qt.TextFormat.RichText)
@@ -475,7 +495,7 @@ class GegdTab(QWidget):
             "Radius of the search circle around the epicentre. A strip is listed only if "
             "its footprint touches this circle (checked here, not just by the server's "
             "box). 'Use it in every tab' sets it to 15 km.")
-        form.addRow("Search radius", self.radius_spin)
+        self._adv_form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
@@ -541,7 +561,7 @@ class GegdTab(QWidget):
         return box
 
     def _build_filter_box(self):
-        box, form = self._group("Scene filters", collapsed=True)
+        box, form = self._group("Scene filters", collapsed=True, step="options")
         self.ona_max_spin = QDoubleSpinBox()
         self.ona_max_spin.setRange(0.0, 45.0)
         self.ona_max_spin.setDecimals(1)

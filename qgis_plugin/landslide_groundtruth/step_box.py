@@ -55,6 +55,10 @@ def tinted(step, *widgets):
     frame = StepFrame(step)
     for w in widgets:
         frame.add(w)
+        # The frame owns the widget, and until the frame is in a layout only
+        # Python owns the frame: a caller that keeps just the box (a builder that
+        # returns it) would have both deleted under it. This keeps them together.
+        w._step_frame = frame
     return frame
 
 
