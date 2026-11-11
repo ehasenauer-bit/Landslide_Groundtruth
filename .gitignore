@@ -13,3 +13,6 @@ __pycache__/
 .DS_Store
 *.swp
 dist/
+
+# Account recovery codes: never commit (the repo is public).
+github-recovery-codes.txt
