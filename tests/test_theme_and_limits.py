@@ -26,8 +26,25 @@ assert (PRE_BG.red(),PRE_BG.green(),PRE_BG.blue())==(220,235,252)
 assert (POST_BG.red(),POST_BG.green(),POST_BG.blue())==(224,244,226)
 assert (ROW_FG.red(),ROW_FG.green(),ROW_FG.blue())==(20,20,20)
 assert (MUTED_FG.red(),MUTED_FG.green(),MUTED_FG.blue())==(120,120,120)
-assert (CLOUD_GREEN_MAX,CLOUD_AMBER_MAX)==(10.0,40.0)
+assert (CLOUD_GREEN_MAX,CLOUD_AMBER_MAX)==(10.0,50.0)
+assert (theme.COVER_GREEN_MIN,theme.COVER_AMBER_MIN)==(75.0,45.0)
 print("   row tints and thresholds identical")
+
+print("2b. Cloud / Coverage bands (Ethan, 2026-11-11), judged on the PRINTED number")
+G,A,R=theme.CLOUD_CLEAR,theme.CLOUD_SOME,theme.CLOUD_HEAVY
+for pct,want in ((0,G),(10,G),(10.4,G),(10.6,A),(11,A),(50,A),(50.4,A),(50.6,R),
+                 (51,R),(100,R),(None,theme.CLOUD_UNKNOWN)):
+    got=theme.cloud_color(pct)
+    assert got==want, f"cloud {pct}% -> {got.name()}, want {want.name()}"
+    # the colour must agree with the text the cell shows
+    if pct is not None:
+        assert theme.cloud_color(float(f"{pct:.0f}"))==got
+for pct,want in ((100,G),(75,G),(74.6,G),(74.4,A),(74,A),(45,A),(44.6,A),(44.4,R),
+                 (44,R),(0,R)):
+    got=theme.coverage_color(pct)
+    assert got==want, f"coverage {pct}% -> {got.name()}, want {want.name()}"
+    assert theme.coverage_color(float(f"{pct:.0f}"))==got
+print("   cloud 0-10 green / 11-50 amber / >50 red; coverage >=75 / 45-74 / <45")
 
 print("3. EVERY token clears 4.5:1 where it is actually drawn")
 def lum(hexs):

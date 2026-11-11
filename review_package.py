@@ -59,7 +59,8 @@ TONE_MODES = {
     "knee": "Highlight rolloff — untouched midtones, tamed highlights",
     "natural": "Highlight Optimized Natural Color — even detail, softer contrast",
     "linear": "None — plain linear stretch, no tone shaping",
-    "hdr": "HDR (one global curve) — shadow AND snow detail, no clipping at either end",
+    "hdr": "HDR (highlights only) — plain stretch on terrain, snow compressed instead "
+           "of blown",
 }
 
 # Gentle S-curve strength applied to BOTH tone modes by the PlanetScope render path
@@ -316,6 +317,44 @@ def _shoulder(d, knee=KNEE):
     return d.where(d <= knee, knee + (1.0 - knee) * (1.0 - np.exp(-t)))
 
 
+def _fitted_shoulder(d, knee, top):
+    """Highlight rolloff that ARRIVES at 1.0 where d == `top`, instead of _shoulder's fixed
+    exponential: identity for d <= knee, then
+
+        y = knee + (1 - knee) * log1p(a*t) / log1p(a*T)      t = (d - knee) / (1 - knee)
+
+    with T the same quantity at `top` and `a` solved so the slope at the knee is exactly 1
+    (a == log1p(a*T)) — the curve leaves the straight line tangentially, like _shoulder.
+
+    Why not _shoulder: its e-folding length is welded to the linear white point
+    ((1 - knee) * white = 0.135 reflectance at the defaults), so it is 96% of the way to
+    white by 0.6 reflectance whatever the scene holds, and snow at 0.6-1.3 shares ~5 DN.
+    Here the whole span from the knee up to the scene's own bright tail is spread over the
+    DN the knee left free. Measured on the 2026-09-02 St. Elias TOA clip (54% of the frame
+    above 0.6): snow at DN >= 250 falls from 50.8% to 1.5%, and everything below the knee
+    is within 0.5 DN of the plain linear stretch.
+
+    Past `top` the log keeps rising above 1.0, so the brightest tail (0.5% of the frame
+    when `top` is hdr_white's p99.5) is clamped by the caller rather than kept distinct —
+    the price of spending no DN on pixels that are not there. top <= 1 (nothing above the
+    linear white) leaves no shoulder to fit and returns `d` untouched."""
+    T = (float(top) - knee) / (1.0 - knee)
+    if not T > 1.0 + 1e-6:
+        return d
+    # a - log1p(a*T) = 0 has exactly one positive root for T > 1, and the function is
+    # negative at (T-1)/T**2 (log1p(x) >= x - x*x/2), so that brackets it from below.
+    lo, hi = (T - 1.0) / (T * T), 1e6
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if mid - np.log1p(mid * T) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    a = 0.5 * (lo + hi)
+    t = ((d - knee) / (1.0 - knee)).clip(0.0, None)
+    return d.where(d <= knee, knee + (1.0 - knee) * np.log1p(a * t) / float(np.log1p(a * T)))
+
+
 def _desat_weight(refl, onset=DESAT_ONSET, strength=DESAT):
     """How far a pixel should be faded toward neutral: 0-1, keyed to REFLECTANCE.
 
@@ -515,7 +554,7 @@ HDR_SATURATION = 0.7
 def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
                  desat=DESAT, black=0.0, onset=DESAT_ONSET,
                  blue_desat=BLUE_DESAT, cyan_strip=CYAN_STRIP,
-                 pink_strip=PINK_STRIP, lift=0.0, lift_taper=HDR_LIFT_TAPER):
+                 pink_strip=PINK_STRIP, lift=0.0, lift_taper=HDR_LIFT_TAPER, reach=None):
     """The "highlight rolloff" render as a 0-255 float rgb DataArray (NaN = nodata);
     _highlight_rolloff writes it and _highlight_hdr fuses several exposures of it.
 
@@ -541,6 +580,12 @@ def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
     see HDR_LIFT / HDR_LIFT_TAPER. It is what lets a single curve hold a shadowed valley
     and sunlit snow at once. Without the taper the lift buys the shadows by flattening the
     snow, which is measured and asserted in tests/test_hdr_curve.py.
+
+    `reach` (the PlanetScope HDR mode only; None is an exact no-op) is the REFLECTANCE at
+    which the highlight rolloff should arrive at white. Given, the fixed exponential
+    shoulder is swapped for one fitted to end there (_fitted_shoulder), so `white` keeps
+    meaning "the plain linear stretch below the knee" while the highlights above it are
+    spread right up to the scene's bright tail instead of saturating at ~2x `white`.
 
     The rolloff is driven by the per-pixel channel MAXIMUM and applied as a single
     gain to R/G/B, so a pixel's hue and saturation survive the compression instead of
@@ -570,7 +615,10 @@ def _rolloff_rgb(comp, white=WHITE, knee=KNEE, contrast=1.0,
     # m.where(m != 0, 1.0) only guards the divide; _shoulder(0)==0 keeps those pixels 0.
     # Below a nonzero black point m goes negative, where _shoulder is the identity, so
     # sh/m is exactly 1 and those pixels pass through to be clipped to black below.
-    sh = _shoulder(m, knee)
+    if reach is None:
+        sh = _shoulder(m, knee)
+    else:
+        sh = _fitted_shoulder(m, knee, (reach - black) / max(white - black, 1e-6))
     if lift > 0:
         # HDR mode's shadow lift (see HDR_LIFT). Applied to the SHOULDER's output, so it
         # rides on top of the rolloff instead of replacing it, and to the channel maximum
@@ -683,21 +731,42 @@ def hdr_white(comps):
 
 def _highlight_hdr(comp, path, src_crs, knee=KNEE, contrast=1.0, desat=DESAT,
                    black=0.0, onset=DESAT_ONSET, blue_desat=BLUE_DESAT,
-                   cyan_strip=CYAN_STRIP, pink_strip=PINK_STRIP, white=None):
+                   cyan_strip=CYAN_STRIP, pink_strip=PINK_STRIP, white=None,
+                   highlights_only=False, linear_white=WHITE):
     """HDR render: ONE global tone curve — the rolloff shoulder with a log shadow lift on
     top (see HDR_LIFT) — so a frame holding both deep shadow and sunlit snow keeps detail at
     BOTH ends without a clip anywhere in the chain. `white` is the scene's anchor from
     hdr_white; passing None fits it from this composite alone, which is right for a
-    one-sided render and wrong for a pre/post pair (see hdr_white)."""
+    one-sided render and wrong for a pre/post pair (see hdr_white).
+
+    highlights_only=True is the PlanetScope tab's HDR (run_single opts in; the Sentinel-2/
+    Landsat export and the dock's S2 preview keep the curve above, which hdr_render.py
+    ports). It drops the shadow lift and leaves everything below the knee as the plain
+    0..`linear_white` stretch — the look of Planet's own preview on terrain — and spends
+    the DN above the knee on a shoulder fitted to reach `white`, the scene anchor
+    (_fitted_shoulder). The lift is what cost the terrain: with the anchor at 1.30 it put
+    shadow and rock into one grey band, and on the 2026-09-02 St. Elias clip terrain
+    texture (5x5 local luminance std) measured 6.3 DN against 18.0 for the plain stretch.
+    This form keeps 14.3 there, at 5.7 DN of snow texture against the lifted curve's 7.7.
+    The shadows are NOT opened, and the brightest ~0.5% of the frame sits at DN 254."""
     # Keep a bit of colour: ease the chroma neutralizers by HDR_SATURATION. They touch only
     # chroma (fade toward the pixel's own luminance/neutral), never brightness, so this cannot
     # darken the image or reduce the snow's contrast — it only lets some colour survive.
     s = HDR_SATURATION
     if white is None:
         white = hdr_white([comp])[0]
-    rgb = _rolloff_rgb(comp, white=white, knee=knee, contrast=contrast, desat=desat * s,
-                       black=black, onset=onset, blue_desat=blue_desat * s,
-                       cyan_strip=cyan_strip * s, pink_strip=pink_strip * s, lift=HDR_LIFT)
+    if highlights_only:
+        # An anchor below the linear white (a dark frame, or a low manual white) becomes
+        # the linear white itself: there is then nothing above it to roll off.
+        rgb = _rolloff_rgb(comp, white=min(linear_white, white), knee=knee,
+                           contrast=contrast, desat=desat * s, black=black, onset=onset,
+                           blue_desat=blue_desat * s, cyan_strip=cyan_strip * s,
+                           pink_strip=pink_strip * s, reach=white)
+    else:
+        rgb = _rolloff_rgb(comp, white=white, knee=knee, contrast=contrast,
+                           desat=desat * s, black=black, onset=onset,
+                           blue_desat=blue_desat * s, cyan_strip=cyan_strip * s,
+                           pink_strip=pink_strip * s, lift=HDR_LIFT)
     # The curve is asymptotic, so across the physical range it lands at DN 254.99 at worst
     # and the uint8 truncation alone would hold — but only across the physical range: past
     # about 10x the white point the shoulder's exp() underflows and it pins at exactly 1.0.

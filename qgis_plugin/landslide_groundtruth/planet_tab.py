@@ -133,12 +133,13 @@ QSlider::handle:horizontal {{
 """
 
 # table row tints, matching the Sentinel tab (pre = blue, post = green), plus the
-# AOI-cloud thresholds/colours so the "Cloud" number reads identically to the
-# Sentinel/Landsat tab's (dock.py is the single source of truth for both).
+# cloud/coverage thresholds and colours so the "Cloud" and "Coverage" numbers read
+# identically to the Sentinel/Landsat tab's (theme.py, re-exported by dock.py, is
+# the single source of truth for both).
 from .dock import (  # noqa: E402
     PRE_BG, POST_BG, ROW_FG, MUTED_FG,
-    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX,
-    CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
+    CLOUD_GREEN_MAX, CLOUD_AMBER_MAX, COVER_GREEN_MIN, COVER_AMBER_MIN,
+    cloud_color, coverage_color,
 )
 
 # auto-resume wait after a Render-detail order times out, and a cap on how many
@@ -328,8 +329,8 @@ class PlanetTab(QWidget):
         self.tone_combo.addItem("Highlight Optimized Natural Color — even detail, "
                                 "softer contrast", "natural")
         self.tone_combo.addItem("None — plain linear stretch, no tone shaping", "linear")
-        self.tone_combo.addItem("HDR (one global curve) — shadow AND snow detail at once",
-                                "hdr")
+        self.tone_combo.addItem("HDR (highlights only) — plain stretch on terrain, "
+                                "snow compressed", "hdr")
         self.tone_combo.setToolTip(
             "Tone curve applied to the raw surface reflectance by 'Render detail'.\n"
             "• Highlight rolloff (knee) — THE DEFAULT. A plain linear stretch below "
@@ -348,13 +349,14 @@ class PlanetTab(QWidget):
             "Bright ice clips to flat white, exactly as a naive stretch would — the point "
             "is to see the un-toned pixels. Honours the Manual stretch below, but not "
             "Auto-stretch or Contrast (neither applies).\n"
-            "• HDR (one global curve) — the rolloff curve with a log shadow lift on top, "
-            "fitted to the scene's own bright tail, so a frame with deep shadow AND sunlit "
-            "snow keeps detail at BOTH ends in one image. Nothing in the chain clips: no "
-            "pixel comes out pure black or pure white, on any scene. The white point is "
-            "fitted from the scene unless you set it in Manual stretch; Auto-stretch and "
-            "the black point don't apply. The cost is global contrast — holding both ends "
-            "reads flatter than the rolloff does.\n"
+            "• HDR (highlights only) — below 0.165 reflectance the same plain linear "
+            "stretch as the rolloff and as 'None', so shadows and terrain read as they do "
+            "in Planet's own preview. Above it the highlights are compressed with a "
+            "rolloff fitted to reach white at the scene's own bright tail, so snow keeps "
+            "texture instead of blowing out (measured on a St. Elias frame: snow within 5 "
+            "DN of white fell from 51% under the rolloff to 1.5%). Shadows are NOT "
+            "lifted. The bright-tail anchor is fitted from the scene unless you set "
+            "'white' in Manual stretch; Auto-stretch and the black point don't apply.\n"
             "Stay on rolloff to read a scar on terrain with ice as context; switch to "
             "Natural Color when the feature is ON the ice, or to read the whole scene at "
             "once; pick None to check what the raw reflectance looks like unshaped. rolloff "
@@ -1213,24 +1215,6 @@ class PlanetTab(QWidget):
             return sorted(cands, key=lambda c: (round(gap(c)), cloud(c)))
         return sorted(cands, key=lambda c: gap(c) + cw * cloud(c))
 
-    def _cloud_color(self, pct):
-        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
-
-        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when pct
-        is None. Matches the Sentinel/Landsat tab exactly (same thresholds and
-        colours, imported from dock.py) — replicated here rather than shared because
-        dock's version is a method bound to its own widget. For PlanetScope the number
-        is grey on every preview row: the AOI cloud number needs a UDM2 order and so
-        isn't measured in the free dry-run (see planet_imagery.search_event), so the
-        cell shows the whole-scene value with a ~ and must not read as clear/cloudy."""
-        if pct is None:
-            return CLOUD_UNKNOWN
-        if pct <= CLOUD_GREEN_MAX:
-            return CLOUD_CLEAR
-        if pct <= CLOUD_AMBER_MAX:
-            return CLOUD_SOME
-        return CLOUD_HEAVY
-
     # ---------- AOI coverage for the "Coverage" column ----------
     # Mirrors dock.py's Sentinel/Landsat coverage helpers, but measured against
     # THIS tab's own search AOI: the Planet tab has its own lat/lon/radius inputs
@@ -1342,10 +1326,13 @@ class PlanetTab(QWidget):
                     item.setFont(f)
                 self.table.setItem(r, col, item)
             # colour the Cloud number itself + tooltip (col 3): green/amber/red by
-            # AOI cloud, grey when only the whole-scene value is known — which, for
-            # the free PlanetScope preview, is always (UDM2 is order-gated).
+            # the value the cell prints — AOI cloud when known, else the whole-scene
+            # cloud_cover behind the "~" (always, in the free PlanetScope preview:
+            # UDM2 is order-gated). Planet's cloud_cover is the UDM2 cloud percent
+            # and doesn't count snow as cloud, so it is worth colouring.
             cloud_item = self.table.item(r, 3)
-            cloud_item.setForeground(QBrush(self._cloud_color(aoi_cloud)))
+            shown_cloud = aoi_cloud if aoi_cloud is not None else scene_cloud
+            cloud_item.setForeground(QBrush(cloud_color(shown_cloud)))
             if aoi_cloud is not None:
                 tip = (f"Cloud, shadow & haze over your AOI: {aoi_cloud:.0f}%.\n"
                        f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
@@ -1353,20 +1340,30 @@ class PlanetTab(QWidget):
                 if scene_cloud is not None:
                     tip += f"\nWhole scene (cloud_cover): {scene_cloud:.0f}%."
             else:
-                tip = ("Whole-scene cloud cover (Planet cloud_cover), shown with a ~ "
-                       "and a grey number. Cloud over just your AOI comes from the UDM2 "
-                       "mask, which Planet delivers only with a paid order — so it "
-                       "isn't measured in this free preview.\n")
+                tip = ("Whole-scene cloud cover (Planet cloud_cover), shown with a ~. "
+                       "Cloud over just your AOI comes from the UDM2 mask, which Planet "
+                       "delivers only with a paid order — so it isn't measured in this "
+                       "free preview.\n"
+                       f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       "· red above.\n")
                 tip += (f"Whole scene (cloud_cover): {scene_cloud:.0f}%."
                         if scene_cloud is not None else "No cloud metric reported.")
             cloud_item.setToolTip(tip)
-            # "Coverage" tooltip (col 4): AOI-box fill %, with a flag when the strip
-            # clips the box but leaves the epicentre itself in a nodata gap.
+            # "Coverage" (col 4): AOI-box fill %, green/amber/red, with a flag when
+            # the strip clips the box but leaves the epicentre itself in a nodata
+            # gap. That case stays grey, as the Sentinel tab greys the whole row:
+            # a high fill % is no use when the point itself has no pixels.
             covers_pt = self._covers_event(c)
-            self.table.item(r, 4).setToolTip(
+            cover_item = self.table.item(r, 4)
+            cover_item.setForeground(QBrush(
+                coverage_color(cover_frac * 100) if covers_pt else MUTED_FG))
+            cover_item.setToolTip(
                 f"Footprint covers {cover}% of your AOI box — how much of the search "
-                f"area has pixels, NOT how cloudy it is (that's the Cloud column)."
-                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
+                f"area has pixels, NOT how cloudy it is (that's the Cloud column).\n"
+                f"Green ≥{COVER_GREEN_MIN:.0f}% · amber ≥{COVER_AMBER_MIN:.0f}% "
+                f"· red below."
+                + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself, "
+                   "so the number is greyed."))
             head = self.table.item(r, 0)
             head.setData(Qt.ItemDataRole.UserRole, c.get("thumb_url"))
             head.setData(Qt.ItemDataRole.UserRole + 1, cid)
@@ -1951,7 +1948,8 @@ class PlanetTab(QWidget):
             self._zoom_to_aoi()
             shown = {"knee": "Highlight rolloff",
                      "natural": "Highlight Optimized Natural Color",
-                     "linear": "None (plain linear stretch)"}.get(
+                     "linear": "None (plain linear stretch)",
+                     "hdr": "HDR (highlights only)"}.get(
                          tone, "Highlight Optimized Natural Color")
             other = "Natural Color" if tone == "knee" else "Highlight rolloff"
             self.iface.messageBar().pushInfo(

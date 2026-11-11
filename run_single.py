@@ -109,13 +109,16 @@ def _write_render_json(a, event_id, r):
         out["stretch"] = dict(tone)
         render = rp._linear
     elif a.planet_tone == "hdr":
-        # HDR: ONE global curve — the rolloff shoulder plus a log shadow lift (rp.HDR_LIFT)
-        # — fitted to the scene's own bright tail. Honours knee + contrast; --planet-white
-        # is honoured as the anchor when given, otherwise it is fitted ONCE from both sides
-        # (rp.hdr_white) so the before/after pair stays comparable under the swipe tool.
-        # --planet-black doesn't apply: the curve's whole point is not to clip the dark end.
+        # HDR, highlights only: the plain 0..rp.WHITE linear stretch below the knee (so
+        # terrain and shadow read as they do in Planet's own preview), and above it a
+        # shoulder fitted to arrive at white at the scene's own bright tail — see
+        # rp._highlight_hdr(highlights_only=True). Honours knee + contrast; --planet-white
+        # is honoured as that bright-tail anchor when given, otherwise it is fitted ONCE
+        # from both sides (rp.hdr_white) so the before/after pair stays comparable under
+        # the swipe tool. --planet-black doesn't apply.
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None else rp.CONTRAST,
-                    knee=a.planet_knee if a.planet_knee is not None else rp.KNEE)
+                    knee=a.planet_knee if a.planet_knee is not None else rp.KNEE,
+                    highlights_only=True)
         if a.planet_white is not None:
             tone["white"] = a.planet_white
             out["notes"].append(f"hdr: white {a.planet_white:.3f} from --planet-white")
@@ -124,7 +127,8 @@ def _write_render_json(a, event_id, r):
             white_used, note = rp.hdr_white(comps)
             tone["white"] = white_used
             out["notes"].append(note)
-        out["stretch"] = {k: v for k, v in tone.items() if k != "contrast"}
+        out["stretch"] = {"knee": tone["knee"], "white": tone["white"],
+                          "linear_white": min(rp.WHITE, tone["white"])}
         render = rp._highlight_hdr
     else:
         tone = dict(contrast=a.planet_contrast if a.planet_contrast is not None
@@ -529,12 +533,13 @@ def main():
                          "never does. See review_package.TONE_MODES. 'knee' additionally "
                          "fits its black/white points to a frame that is all snow/ice — see "
                          "--planet-no-auto-stretch; 'linear' honours --planet-white/"
-                         "--planet-black but never auto-fits. 'hdr' = one global curve: "
-                         "the knee curve plus a log shadow lift, so deep shadow AND sunlit "
-                         "snow both keep detail in one image and nothing clips at either "
-                         "end. Its white point is fitted from the scene unless "
-                         "--planet-white says otherwise; --planet-black doesn't apply "
-                         "(see review_package._highlight_hdr).")
+                         "--planet-black but never auto-fits. 'hdr' = highlights only: "
+                         "the same plain linear stretch below the knee, but the rolloff "
+                         "above it is fitted to reach white at the scene's own bright "
+                         "tail, so snow is compressed instead of blown and terrain is "
+                         "left alone. That bright-tail anchor is fitted from the scene "
+                         "unless --planet-white says otherwise; --planet-black doesn't "
+                         "apply (see review_package._highlight_hdr).")
     ap.add_argument("--planet-knee", type=float, default=None,
                     help="knee position for --planet-tone knee, on the 0-1 ramp that "
                          "--planet-white maps to white (default 0.55 -> 0.165 reflectance). "

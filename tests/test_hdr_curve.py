@@ -215,6 +215,68 @@ for snow_frac, hi, lo in ((0.05, 0.30, 0.010), (0.45, 1.05, 0.010),
         check(dark.std() > 8, f"terrain came out flat ({dark.std():.1f} DN std)")
         check(bright.std() > 4, f"snow came out flat ({bright.std():.1f} DN std)")
 
+print("\n=== 6. highlights-only (the PlanetScope tab's HDR): terrain is the plain stretch ===")
+# What the Planet path renders (run_single passes highlights_only=True). Three promises:
+# below the knee it IS the linear 0..WHITE stretch; the shoulder is tangent at the knee,
+# monotonic, and arrives at 1.0 at the anchor; and snow is not parked against white the
+# way the fixed exponential shoulder parks it.
+d = xr.DataArray(np.linspace(0.0, 6.0, 60001))
+for top in (1.0, 1.5, 2.0, 1.30 / rp.WHITE, 6.0):
+    y = rp._fitted_shoulder(d, rp.KNEE, top).values
+    x = d.values
+    below = x <= rp.KNEE
+    check(np.array_equal(y[below], x[below]), f"top={top}: not the identity below the knee")
+    check(np.all(np.diff(y) > 0), f"top={top}: fitted shoulder is not strictly increasing")
+    if top > 1.0:
+        check(abs(np.interp(top, x, y) - 1.0) < 1e-6,
+              f"top={top}: shoulder reaches {np.interp(top, x, y):.6f} at the anchor, not 1")
+        i = np.searchsorted(x, rp.KNEE) + 1
+        slope = (y[i + 1] - y[i]) / (x[i + 1] - x[i])
+        check(abs(slope - 1.0) < 2e-3, f"top={top}: slope {slope:.4f} at the knee, not 1 "
+                                       f"(a tone break along every snowline)")
+    else:
+        check(np.array_equal(y, x), "top<=1 must leave the ramp untouched")
+
+snow, comp = scene(0.5, hi=1.25, lo=0.010)
+white, _ = rp.hdr_white([comp])
+lin = (comp.sel(band=["red", "green", "blue"]).clip(0, None) / rp.WHITE).clip(0, 1) * 255
+kw = dict(contrast=1.0, desat=0.0, blue_desat=0.0, cyan_strip=0.0, pink_strip=0.0)
+new = rp._rolloff_rgb(comp, white=rp.WHITE, reach=white, **kw)
+old = rp._rolloff_rgb(comp, white=rp.WHITE, **kw)
+rmax = comp.sel(band=["red", "green", "blue"]).max("band").values
+dark = rmax <= rp.KNEE * rp.WHITE
+check(dark.mean() > 0.2, "test scene lost its terrain")
+dmax = float(np.abs(new.values - lin.values)[:, dark].max())
+print(f"   below the knee: max |highlights-only - linear| = {dmax:.2e} DN over "
+      f"{dark.mean() * 100:.0f}% of the frame")
+check(dmax < 1e-3, f"terrain differs from the plain linear stretch by {dmax:.3f} DN")
+bright = rmax >= 0.6
+near_new = float((new.max("band").values[bright] >= 250).mean())
+near_old = float((old.max("band").values[bright] >= 250).mean())
+sd_new = float(new.max("band").values[bright].std())
+sd_old = float(old.max("band").values[bright].std())
+print(f"   snow (>= 0.6 refl) at DN >= 250: fixed shoulder {near_old * 100:.1f}%, "
+      f"fitted {near_new * 100:.1f}%; spread {sd_old:.1f} -> {sd_new:.1f} DN")
+check(near_new < 0.25 * near_old, "the fitted shoulder still parks the snow against white")
+check(sd_new > 2 * sd_old, "the fitted shoulder did not widen the snow's tonal range")
+
+path = os.path.join(TMP, "_hdr_curve.tif")
+rp._highlight_hdr(comp.rio.write_crs("EPSG:32607"), path, "EPSG:32607", white=white,
+                  highlights_only=True)
+with rasterio.open(path) as ds:
+    arr = ds.read()
+os.remove(path)
+check(int((arr == 0).all(0).sum()) == 0, "highlights-only wrote valid pixels at DN 0")
+check(int((arr == 255).any(0).sum()) == 0, "highlights-only wrote DN 255")
+# a low anchor (dark frame / low manual white) must fall back to a plain ramp, not blow up
+rp._highlight_hdr(comp.rio.write_crs("EPSG:32607"), path, "EPSG:32607", white=0.20,
+                  highlights_only=True)
+with rasterio.open(path) as ds:
+    low = ds.read()
+os.remove(path)
+check(np.isfinite(low).all() and low.max() <= 254 and (low > 0).all(),
+      "an anchor below the linear white broke the render")
+
 if fails:
     print("\nFAILURES:")
     for f in fails:

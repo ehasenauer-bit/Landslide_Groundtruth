@@ -59,9 +59,53 @@ MUTED_FG = QColor(120, 120, 120)
 CLOUD_CLEAR = QColor(0x1a, 0x79, 0x30)   # <= CLOUD_GREEN_MAX % of the AOI cloudy
 CLOUD_SOME = QColor(0x8a, 0x5f, 0x00)    # <= CLOUD_AMBER_MAX %
 CLOUD_HEAVY = QColor(0xc7, 0x1e, 0x2a)   # above that
-CLOUD_UNKNOWN = QColor(0x69, 0x69, 0x69)  # no AOI-cloud measurement / snow-swamped
+CLOUD_UNKNOWN = QColor(0x69, 0x69, 0x69)  # no cloud number at all / snow-swamped
+# Ethan's bands (2026-11-11): 0–10 % green, 11–50 % amber, over 50 % red. Applied
+# to whatever number the cell prints — the AOI measurement, or the whole-scene
+# value behind a "~" (the ~ is what says which one it is).
 CLOUD_GREEN_MAX = 10.0
-CLOUD_AMBER_MAX = 40.0
+CLOUD_AMBER_MAX = 50.0
+
+# --------------------------------------------------------------------------
+# AOI coverage — severity in the "Coverage" column
+# --------------------------------------------------------------------------
+# How much of the AOI box the footprint fills. Same three colours as cloud (drawn
+# on the same row tints, so the same measured contrast), under their own names so
+# "amber" in the Coverage column means partial coverage, not cloud.
+# Ethan's bands (2026-11-11): 75 % and up green, 45–74 % amber, below 45 % red.
+COVER_FULL = CLOUD_CLEAR
+COVER_PARTIAL = CLOUD_SOME
+COVER_POOR = CLOUD_HEAVY
+COVER_GREEN_MIN = 75.0
+COVER_AMBER_MIN = 45.0
+
+
+def cloud_color(pct):
+    """Text colour for a Cloud cell showing `pct` %.
+
+    Judged on the WHOLE number the cell prints (f"{pct:.0f}"), so a cell reading
+    "10%" is green even when the measurement was 10.4 — the colour never
+    disagrees with the text beside it. None (no cloud metric) -> grey."""
+    if pct is None:
+        return CLOUD_UNKNOWN
+    shown = round(pct)
+    if shown <= CLOUD_GREEN_MAX:
+        return CLOUD_CLEAR
+    if shown <= CLOUD_AMBER_MAX:
+        return CLOUD_SOME
+    return CLOUD_HEAVY
+
+
+def coverage_color(pct):
+    """Text colour for a Coverage cell showing `pct` % of the AOI box filled.
+
+    Judged on the printed whole number, like cloud_color."""
+    shown = round(pct)
+    if shown >= COVER_GREEN_MIN:
+        return COVER_FULL
+    if shown >= COVER_AMBER_MIN:
+        return COVER_PARTIAL
+    return COVER_POOR
 
 # --------------------------------------------------------------------------
 # Maxar VHR table — warnings that are NOT about cloud

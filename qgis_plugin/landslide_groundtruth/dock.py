@@ -149,6 +149,7 @@ from .theme import (            # noqa: F401  (re-exported for the other tabs)
     PRE_BG, POST_BG, ROW_FG, MUTED_FG,
     CLOUD_CLEAR, CLOUD_SOME, CLOUD_HEAVY, CLOUD_UNKNOWN,
     CLOUD_GREEN_MAX, CLOUD_AMBER_MAX, CLOUD_SNOW_MARK,
+    COVER_GREEN_MIN, COVER_AMBER_MIN, cloud_color, coverage_color,
     STATUS_COLORS,
     status_css, status_text, status_html, invalid_field_css,
 )
@@ -1908,10 +1909,12 @@ class LandslideDock(QgsDockWidget):
             side_item.setCheckState(Qt.CheckState.Unchecked)
             if c.get("thumb_url"):
                 self.table.item(r, 6).setToolTip(c["thumb_url"])
-            # colour the Cloud number itself: green/amber/red by AOI cloud, grey
-            # when we only have the whole-scene value. Set here (before the
-            # off-point muting below), so a scene that misses the point still
-            # greys out wholesale — its cloud colour is moot there anyway.
+            # colour the Cloud and Coverage numbers themselves, green/amber/red by
+            # the value the cell prints (theme.cloud_color / coverage_color). A
+            # "~" whole-scene cloud value is coloured too — the ~ already says it
+            # is not the AOI number. Set here (before the off-point muting below),
+            # so a scene that misses the point still greys out wholesale — its
+            # colours are moot there anyway.
             cloud_item = self.table.item(r, 3)
             # Grey the number only when it is genuinely untrustworthy: a snow-swamped
             # AOI with a reassuring green/amber reading that came from the SCL/QA
@@ -1920,8 +1923,10 @@ class LandslideDock(QgsDockWidget):
             # number keeps its true green/amber/red colour even when snow-swamped.
             mask_color = (snow_swamped and aoi_cloud <= CLOUD_AMBER_MAX
                           and aoi_method != "ocm")
+            shown_cloud = aoi_cloud if aoi_cloud is not None else scene_cloud
             cloud_item.setForeground(QBrush(
-                CLOUD_UNKNOWN if mask_color else self._cloud_color(aoi_cloud)))
+                CLOUD_UNKNOWN if mask_color else cloud_color(shown_cloud)))
+            self.table.item(r, 4).setForeground(QBrush(coverage_color(cover_frac * 100)))
             if aoi_cloud is not None:
                 tip = (f"Cloud, cirrus & shadow over your AOI: {aoi_cloud:.0f}%.\n"
                        f"Green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
@@ -1954,13 +1959,17 @@ class LandslideDock(QgsDockWidget):
             else:
                 tip = ("AOI cloud unavailable — the footprint may miss your AOI box, "
                        "or the classification read failed, so this is the WHOLE-scene "
-                       "value (shown with a ~).\n")
+                       "value (shown with a ~), coloured on the same scale: "
+                       f"green ≤{CLOUD_GREEN_MAX:.0f}% · amber ≤{CLOUD_AMBER_MAX:.0f}% "
+                       "· red above.\n")
                 tip += (f"Whole scene (eo:cloud_cover): {scene_cloud:.0f}%."
                         if scene_cloud is not None else "No cloud metric reported.")
             cloud_item.setToolTip(tip)
             self.table.item(r, 4).setToolTip(
                 f"Footprint covers {cover}% of the AOI box — how much of the area "
-                f"has pixels, NOT how cloudy it is (that's the Cloud column)."
+                f"has pixels, NOT how cloudy it is (that's the Cloud column).\n"
+                f"Green ≥{COVER_GREEN_MIN:.0f}% · amber ≥{COVER_AMBER_MIN:.0f}% "
+                f"· red below."
                 + ("" if covers_pt else "\n⚠ Does NOT cover the event point itself."))
             if is_top:
                 side_item.setToolTip(
@@ -2025,20 +2034,6 @@ class LandslideDock(QgsDockWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- replicate fetch_event's scene selection (for the ★/preview) ----------
-    def _cloud_color(self, pct):
-        """Text colour for the 'Cloud' cell, by cloud over the AOI %.
-
-        green ≤ CLOUD_GREEN_MAX, amber ≤ CLOUD_AMBER_MAX, red above; grey when
-        pct is None (no AOI measurement — the cell shows the whole-scene value
-        with a ~, so it must not read as a confident clear/cloudy signal)."""
-        if pct is None:
-            return CLOUD_UNKNOWN
-        if pct <= CLOUD_GREEN_MAX:
-            return CLOUD_CLEAR
-        if pct <= CLOUD_AMBER_MAX:
-            return CLOUD_SOME
-        return CLOUD_HEAVY
-
     def _rank_like_run(self, cands, cloud_weight, auto_window):
         """Order candidates for the ★ / Preview-on-map: the scene that best covers
         the point AND the AOI, with the least cloud.
