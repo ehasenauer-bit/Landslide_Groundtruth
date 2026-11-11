@@ -40,7 +40,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QDoubleSpinBox, QDateTimeEdit, QCheckBox,
     QProgressBar, QPlainTextEdit, QTableWidget, QTableWidgetItem, QSplitter,
-    QScrollArea, QGridLayout, QToolButton, QSlider,
+    QScrollArea, QGridLayout, QToolButton, QSlider, QSizePolicy,
 )
 from qgis.core import (
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsRectangle,
@@ -52,6 +52,7 @@ from qgis.PyQt.QtCore import QMetaType
 
 from .task import PipelineTask
 from .flow_layout import FlowRow
+from .step_box import step_box, tinted
 from . import coord_paste
 from . import layer_group as lg
 from . import planet_keystore
@@ -194,19 +195,33 @@ class PlanetTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(8)
 
-        intro = QLabel(
-            "Preview scenes at full resolution straight on the map — no order "
-            "placed, no quota used. (Ordering into the review package comes later.)")
-        intro.setWordWrap(True)
-        intro.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(intro)
+        # Top to bottom in the order the work is done, each box tinted for its
+        # step (theme.STEP_TINTS), as on the Sentinel-2 tab:
+        #   Planet Labs account (setup) / Event + Search window (inputs) /
+        #   the button row / Scene filters + SR detail rendering (options) /
+        #   Candidate scenes, gallery, preview (results) / Advanced / Log.
+        # The groups are built in code order but ADDED in that order, at the end.
+        self._group_frames = {}
+        help_toggle = self.dock.help_toggle
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(help_toggle.label(
+            "Search is free, and Preview on map streams the ticked scenes at "
+            "full resolution with no order placed. Only Render detail places a "
+            "Planet order and uses quota."))
 
         # --- Planet account login (drop-down) ---
-        root.addWidget(self._build_login_box())
+        login_frame = tinted("setup", self._build_login_box())
+        # Rarely changed: the search radius (set by the Detection box) and the
+        # timed-out-order policy. Built first so both can be put in it.
+        adv_form = self._options_group("Advanced", step="advanced")
 
         # --- Event (drop-down) — own copy; the button pulls from the other tab ---
         # "and", not "&": a group-box title takes & as a mnemonic marker too
-        form = self._options_group(root, "Event location and time", collapsed=False)
+        form = self._options_group("Event location and time", collapsed=False,
+                                   step="inputs")
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self.lon_edit = QLineEdit()
@@ -220,7 +235,10 @@ class PlanetTab(QWidget):
         self.radius_spin.setSingleStep(0.5)
         self.radius_spin.setValue(5.0)
         self.radius_spin.setSuffix(" km")
-        form.addRow("Search radius", self.radius_spin)
+        self.radius_spin.setToolTip(
+            "How far around the epicentre to search. 'Use it in every tab' in "
+            "the Detection box sets this to 10 km.")
+        adv_form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit()
         self.dt_edit.setCalendarPopup(True)
@@ -237,7 +255,7 @@ class PlanetTab(QWidget):
         form.addRow(copy_btn)
 
         # --- Search window (drop-down) — what dates to look at, per event ---
-        form = self._options_group(root, "Search window", collapsed=False)
+        form = self._options_group("Search window", collapsed=False, step="inputs")
 
         # Window: how far before / after the event to search, as day sliders.
         self.pre_slider = QSlider(Qt.Orientation.Horizontal)
@@ -262,7 +280,7 @@ class PlanetTab(QWidget):
 
         # --- Scene filters (drop-down) — which acquisitions the search will consider ---
         # Planet-specific; these were the old Advanced options.
-        form = self._options_group(root, "Scene filters")
+        form = self._options_group("Scene filters")
 
         # Cloud cover as a teal slider, echoing Planet Explorer's slider filters.
         self.cloud_slider = QSlider(Qt.Orientation.Horizontal)
@@ -316,7 +334,7 @@ class PlanetTab(QWidget):
         # --- SR detail rendering (drop-down) — how the ordered reflectance is drawn ---
         # Everything in here is free to change after a render: the clips stay on disk,
         # so Re-tone re-draws them without another order (see _retone_detail).
-        form = self._options_group(root, "SR detail rendering")
+        form = self._options_group("SR detail rendering")
 
         # Tone curve for the SR detail render. Both presets are detail-preserving; they
         # differ in WHAT they preserve, so this is a per-scene judgement call rather
@@ -496,8 +514,8 @@ class PlanetTab(QWidget):
         srow.addWidget(self.white_spin, 1)
         form.addRow("Manual stretch", self._wrap(srow))
 
-        # --- Order handling (drop-down) — a set-once policy, hence collapsed ---
-        form = self._options_group(root, "Order handling")
+        # --- Order handling — a set-once policy, hence in Advanced ---
+        form = adv_form
 
         # What to do when a Render-detail order is still processing at the wait budget.
         # The order is already placed and paid for, so "resuming" only downloads it —
@@ -602,7 +620,6 @@ class PlanetTab(QWidget):
                   self.recall_btn, self.retone_btn, self.resume_btn, self.zoom_btn,
                   self.cancel_btn):
             btn_row.addWidget(b)
-        root.addWidget(btn_row)
 
         # --- cached orders (already paid for) ---
         # A picker rather than only "newest": an event often has several orders (a
@@ -628,7 +645,6 @@ class PlanetTab(QWidget):
         self.recall_combo.setEnabled(False)
         self.recall_btn.setEnabled(False)
         recall_row.addWidget(self.recall_combo, 1)
-        root.addLayout(recall_row)
 
         self.footprint_check = QCheckBox("Show scene footprints on map")
         self.footprint_check.setToolTip(
@@ -641,15 +657,16 @@ class PlanetTab(QWidget):
             "the frames follow the satellite's track and sit on no tiling grid, so a "
             "scene can overlap the box and still miss the epicentre.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
-        root.addWidget(self.footprint_check)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
-        root.addWidget(self.progress)
 
-        # --- outputs: candidate table / gallery / thumbnail / log ---
-        split = QSplitter(Qt.Orientation.Vertical)
+        # --- results: candidate table / gallery / browse image ---
+        # A plain stack in one results-tinted frame, not a splitter: a splitter
+        # keeps a pane's height when the box in it is closed (see dock.py).
+        results_frame = tinted("results")
+        split = results_frame.layout()
 
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
@@ -668,15 +685,21 @@ class PlanetTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
+        self.table.setMinimumHeight(160)
         tl.addWidget(self.table)
-        split.addWidget(tablebox)
+        tl.addWidget(self.footprint_check)
+        split.addWidget(tablebox, 1)
 
-        gallerybox = QWidget()
+        # Gallery and browse image: closed by default (Ethan, 2026-11-11) — the
+        # Cloud and Coverage columns are the primary signal.
+        gallerybox = QgsCollapsibleGroupBox(
+            "Quicklook gallery (click a thumbnail to select its scene)")
+        gallerybox.setSaveCollapsedState(False)
+        gallerybox.setCollapsed(True)
         gl = QVBoxLayout(gallerybox)
-        gl.setContentsMargins(0, 0, 0, 0)
-        gl.addWidget(self._section("Quicklook gallery  (click a thumbnail to select its scene)"))
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
+        self.gallery_scroll.setMinimumHeight(280)    # when open; closed = title bar
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
         self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -684,32 +707,43 @@ class PlanetTab(QWidget):
         gl.addWidget(self.gallery_scroll, 1)
         split.addWidget(gallerybox)
 
-        previewbox = QWidget()
+        previewbox = QgsCollapsibleGroupBox("Scene preview (browse image)")
+        previewbox.setSaveCollapsedState(False)
+        previewbox.setCollapsed(True)
         pl = QVBoxLayout(previewbox)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(self._section("Scene preview  (browse image)"))
         self.preview = QLabel("Search, then select a scene to preview its browse image.")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
+        # A fixed viewing height when open; Ignored because the pixmap is scaled
+        # TO the label, so its size must not feed back into the layout.
+        self.preview.setMinimumHeight(260)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Ignored)
         pl.addWidget(self.preview, 1)
         split.addWidget(previewbox)
 
-        logbox = QWidget()
+        log_frame, logbox = step_box("advanced", "Log")
         lo = QVBoxLayout(logbox)
-        lo.setContentsMargins(0, 0, 0, 0)
-        lo.addWidget(self._section("Log"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1000)
+        self.log.setMinimumHeight(80)
         lo.addWidget(self.log)
-        split.addWidget(logbox)
 
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 3)
-        split.setStretchFactor(2, 2)
-        split.setStretchFactor(3, 2)
-        root.addWidget(split, 1)
+        # --- assemble, in work order ---
+        g = self._group_frames
+        root.addWidget(login_frame)
+        root.addWidget(g["Event location and time"])
+        root.addWidget(g["Search window"])
+        root.addWidget(btn_row)
+        root.addWidget(self._wrap(recall_row))
+        root.addWidget(self.progress)
+        root.addWidget(g["Scene filters"])
+        root.addWidget(g["SR detail rendering"])
+        root.addWidget(results_frame, 1)
+        root.addWidget(g["Advanced"])
+        root.addWidget(log_frame)
 
         # Wire the auto-resume combo now that the Resume button it toggles exists.
         self.autoresume_combo.currentIndexChanged.connect(self._on_autoresume_changed)
@@ -727,8 +761,9 @@ class PlanetTab(QWidget):
         w.setLayout(layout)
         return w
 
-    def _options_group(self, root, title, collapsed=True):
-        """Add a collapsible options group ("drop-down") to `root`; return its form.
+    def _options_group(self, title, collapsed=True, step="options"):
+        """Make a collapsible, step-tinted options group; return its form. Its
+        frame is kept in self._group_frames[title] for _build_ui to place.
 
         The options on this tab split into four kinds that are set on completely
         different schedules — the search window changes per event, the scene filters
@@ -741,10 +776,8 @@ class PlanetTab(QWidget):
         setSaveCollapsedState(False) plus an explicit default matches
         _build_login_box and dock.py's boxes: the panel opens the same shape every
         time rather than inheriting a state set weeks ago on a different event."""
-        box = QgsCollapsibleGroupBox(title)
-        box.setSaveCollapsedState(False)
-        box.setCollapsed(collapsed)
-        root.addWidget(box)
+        frame, box = step_box(step, title, collapsed=collapsed)
+        self._group_frames[title] = frame
         form = QFormLayout(box)
         form.setContentsMargins(6, 4, 6, 4)
         return form
@@ -783,7 +816,7 @@ class PlanetTab(QWidget):
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(info)
+        form.addRow(self.dock.help_toggle.adopt(info))     # behind "? Help"
 
         self.user_edit = QLineEdit(
             self.settings.value("landslide/planet_user", "", type=str))
