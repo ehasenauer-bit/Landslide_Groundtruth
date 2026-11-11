@@ -85,6 +85,7 @@ from . import volume_calc
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .theme import status_css
+from .step_box import HelpToggle, HELP_SETTING as _SHARED_HELP_SETTING
 
 
 def _utm_epsg(lat, lon):
@@ -104,7 +105,9 @@ CENTERLINE_LAYER = "Landslide centerlines"
 
 # Whether the explanatory text is showing. Per user, not per project: it is about
 # how well you know the tab, not about the slide — so QgsSettings, not the .qgz.
-HELP_SETTING = "landslide_groundtruth/volume_show_help"
+# Shared by every tab since 2026-11-11 (step_box.HelpToggle); this name stays for
+# the tests that read it.
+HELP_SETTING = _SHARED_HELP_SETTING
 
 # ---------------------------------------------------------------------------
 # Recognising role layers by name, so a project that already carries the
@@ -291,6 +294,9 @@ class VolumeTab(QWidget):
         self._planar_noted = False  # measurement-mode note already logged
         self._watched = []          # layer ids whose edit signals we follow
         self._help_labels = []      # explanatory text the "? Help" toggle shows
+        # shared with every other tab; a bare test dock may not carry one
+        self._help_toggle = (getattr(dock, "help_toggle", None)
+                             or HelpToggle(self.settings))
         # role -> set by hand (stop name-matching it) / last name-matched layer
         self._role_pinned = {"total": False, "best": False,
                              "low": False, "high": False}
@@ -313,12 +319,9 @@ class VolumeTab(QWidget):
         # and live warnings (swapped outlines, a skipped fit) always show.
         head = QHBoxLayout()
         head.addStretch(1)
-        self._help_btn = QToolButton()
-        self._help_btn.setText("? Help")
-        self._help_btn.setCheckable(True)
-        self._help_btn.setToolTip(
-            "Show or hide the explanations on this tab. Remembered for next "
-            "time. Warnings about the measurement always show.")
+        # The dock's one Help switch (step_box.HelpToggle): every tab's button
+        # moves together.
+        self._help_btn = self._help_toggle.button()
         head.addWidget(self._help_btn)
         refresh = QToolButton()
         refresh.setText("⟳")
@@ -384,26 +387,11 @@ class VolumeTab(QWidget):
         root.addWidget(self._build_log_box())
         root.addStretch(1)
 
-        on = _truthy(self.settings.value(HELP_SETTING, False))
-        self._help_btn.setChecked(on)
-        self._help_btn.toggled.connect(self._set_help_visible)
-        self._set_help_visible(on)
-
     def _help(self, text=""):
         """A grey explanatory label the "? Help" toggle shows and hides."""
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("QLabel { color: palette(mid); }")
+        lbl = self._help_toggle.label(text)
         self._help_labels.append(lbl)
         return lbl
-
-    def _set_help_visible(self, on):
-        for lbl in self._help_labels:
-            lbl.setVisible(bool(on))
-        try:
-            self.settings.setValue(HELP_SETTING, bool(on))
-        except Exception:
-            pass
 
     def _build_outline_box(self):
         """Which outlines are measured — and the buttons that make them.

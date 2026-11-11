@@ -129,15 +129,20 @@ MISSES_EPICENTRE_FG = CLOUD_HEAVY
 # status_color() picks by the running palette. The old single set failed badly in
 # the dark theme (success 2.46:1, error 2.25:1) and warn failed in BOTH (3.33:1).
 STATUS_COLORS_LIGHT = {
-    "success": "#2d7a31",   # 4.68:1 on #F0F0F0 (was #2e7d32 — 4.4992:1, just under)
-    "error": "#c62828",     # 4.93:1
-    "warn": "#bd4200",      # 4.67:1  (was #e65100, only 3.33:1)
+    # Deepened 2026-11-11 so each still clears 4.5:1 on the step tints below
+    # (STEP_TINTS), which are darker than the bare #F0F0F0 window. Ratios are the
+    # WORST case over the window and every light tint.
+    "success": "#29702d",   # 4.56:1  (was #2d7a31: 3.99:1 on the Advanced tint)
+    "error": "#bc2626",     # 4.56:1  (was #c62828)
+    "warn": "#ac3c00",      # 4.62:1  (was #bd4200)
     "info": "palette(mid)",
 }
 STATUS_COLORS_DARK = {
-    "success": "#42b348",   # 4.68:1 on #333333
-    "error": "#e58080",     # 4.65:1
-    "warn": "#ff6e1f",      # 4.51:1
+    # Lightened 2026-11-11 for the same reason: the dark step tints are brighter
+    # than #333333. Worst case over the window and every dark tint.
+    "success": "#6cc470",   # 4.58:1  (was #42b348: 3.65:1 on the Options tint)
+    "error": "#eb9c9c",     # 4.58:1  (was #e58080)
+    "warn": "#ff955b",      # 4.55:1  (was #ff6e1f)
     "info": "palette(mid)",
 }
 # Back-compat: sar_tab and planet_tab import this name directly. It stays the
@@ -199,6 +204,57 @@ def status_html(kind, msg):
 def invalid_field_css():
     """Mark the one input that is stopping the user."""
     return "QLineEdit { border: 1px solid %s; }" % status_color("error")
+
+
+# --------------------------------------------------------------------------
+# Workflow-step tints — what KIND of box this is, the same on every tab
+# --------------------------------------------------------------------------
+# Ethan, 2026-11-11: the whole box is tinted, and the colour says which step of
+# the work the box belongs to, so every tab reads the same way once one is
+# learned. The hues deliberately avoid the ones that already mean something:
+# red / amber / green are status and the Cloud / Coverage columns, blue and
+# green are the pre / post table rows.
+#
+#   setup     accounts, keys, the imagery tools        grey
+#   inputs    what the work starts from                 violet
+#   options   choices about what is produced            teal
+#   results   what came back: tables, numbers, previews warm sand
+#   advanced  rarely-changed controls, and the log      darker grey
+#
+# Each is (background, border) per theme. The theme's own text colour is drawn
+# on them (>= 13.8:1 light, >= 8.0:1 dark), and so are the status colours above,
+# which is why those were re-measured against these. A tint goes on a QFrame
+# AROUND the box (step_box.tinted), never on the QgsCollapsibleGroupBox itself:
+# a stylesheet on the box replaces the one QGIS uses to place its title.
+STEP_TINTS_LIGHT = {
+    "setup": ("#E9E9E6", "#B4B2A9"),
+    "inputs": ("#E9E8FB", "#AFA9EC"),
+    "options": ("#DCF1E9", "#5DCAA5"),
+    "results": ("#F6EBD6", "#D9B87A"),
+    "advanced": ("#DFDFDB", "#A3A199"),
+}
+STEP_TINTS_DARK = {
+    "setup": ("#3D3D3B", "#888780"),
+    "inputs": ("#3A3760", "#7F77DD"),
+    "options": ("#254A40", "#1D9E75"),
+    "results": ("#4D4028", "#BA7517"),
+    "advanced": ("#2B2B2A", "#6E6D68"),
+}
+STEPS = tuple(STEP_TINTS_LIGHT)
+# What each step is called, for a tooltip — colour is never the only signal.
+STEP_NAMES = {
+    "setup": "Setup and accounts",
+    "inputs": "Inputs",
+    "options": "Options",
+    "results": "Results",
+    "advanced": "Advanced and log",
+}
+
+
+def step_tint(step):
+    """(background, border) for a workflow step, in the running theme."""
+    table = STEP_TINTS_DARK if is_dark_theme() else STEP_TINTS_LIGHT
+    return table[step]
 
 
 # --------------------------------------------------------------------------

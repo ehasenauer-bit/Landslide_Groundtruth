@@ -24,7 +24,11 @@ class FakeIface:
     def __init__(s): s.bar=FakeBar()
     def messageBar(s): return s.bar
 class Stub:
-    def __init__(s): s.detection=None; s.iface=FakeIface()
+    def __init__(s):
+        s.detection=None; s.iface=FakeIface()
+        from qgis.core import QgsSettings
+        from landslide_groundtruth.step_box import HelpToggle
+        s.help_toggle=HelpToggle(QgsSettings())   # the box's hint sits behind ? Help
     def _warn(s,t): s.iface.messageBar().pushWarning("L",t)
     def _append_log(s,t): pass
 for m in ("_build_detection_box","_num_or_none","_read_detection","_clear_detection",

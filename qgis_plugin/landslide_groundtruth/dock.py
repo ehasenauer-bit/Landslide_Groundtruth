@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QDateTimeEdit, QProgressBar,
     QPlainTextEdit, QFileDialog, QCheckBox, QTableWidget,
     QTableWidgetItem, QSplitter, QToolButton, QScrollArea, QGridLayout,
-    QTabWidget,
+    QTabWidget, QSizePolicy,
 )
 from qgis.core import (Qgis, 
     QgsProject, QgsApplication, QgsRasterLayer, QgsVectorLayer, QgsSettings,
@@ -36,6 +36,7 @@ from . import coord_paste
 from . import hdr_render
 from . import layer_group as lg
 from .flow_layout import FlowRow
+from .step_box import HelpToggle, advanced_box, step_box, tinted
 
 # label -> --prefer value. PlanetScope lives in its own tab now (separate
 # Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
@@ -255,6 +256,8 @@ class LandslideDock(QgsDockWidget):
         self.canvas = iface.mapCanvas()
         self.task = None
         self.settings = QgsSettings()
+        # One switch for every tab's "? Help" button (step_box.HelpToggle).
+        self.help_toggle = HelpToggle(self.settings)
         self.detection = None        # the seismic record; see detection.py
         from collections import deque
         self._log_tail = deque(maxlen=80)   # for report_failure
@@ -336,8 +339,9 @@ class LandslideDock(QgsDockWidget):
         container = QWidget()
         outer = QVBoxLayout(container)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self._build_env_box())
-        outer.addWidget(self._build_detection_box())
+        # Tinted by workflow step (theme.STEP_TINTS): setup grey, inputs violet.
+        outer.addWidget(tinted("setup", self._build_env_box()))
+        outer.addWidget(tinted("inputs", self._build_detection_box()))
 
         tabs = QTabWidget()
         tabs.addTab(self._build_ui(), "Sentinel-2 / Landsat")
@@ -768,7 +772,7 @@ class LandslideDock(QgsDockWidget):
             "search radius.")
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: palette(mid); }")
-        v.addWidget(hint)
+        v.addWidget(self.help_toggle.adopt(hint))     # behind "? Help"
 
         form = QFormLayout()
         self.det_id_edit = QLineEdit()
@@ -968,14 +972,42 @@ class LandslideDock(QgsDockWidget):
 
     # ---------- Sentinel-2 / Landsat tab ----------
     def _build_ui(self):
+        """Top to bottom in the order the work is done, each box tinted for its
+        step (theme.STEP_TINTS):
+
+          Find scenes       where, when, which satellite, then the one button
+                            row: Search / Preview, Preview on map, Run, Cancel
+          Layers to export  which products the Run writes
+          Mark a spot       a red X or blue circle at typed coordinates, closed
+          Candidate scenes  the table to tick, footprints, gallery, browse image
+          Advanced          rarely-changed: search radius, the point/area layers
+          Log
+
+        NASA Earthdata (optional account, closed) sits first, above Find scenes.
+
+        Prose sits behind "? Help"; tooltips carry the detail either way."""
         w = QWidget()
         root = QVBoxLayout(w)
+        root.setSpacing(8)
 
-        # --- NASA Earthdata login (drop-down) ---
-        root.addWidget(self._build_earthdata_box())
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(self.help_toggle.button())
+        root.addLayout(head)
+        root.addWidget(self.help_toggle.label(
+            "Search / Preview lists the scenes around the event — free, nothing "
+            "is downloaded. Tick the before and after scenes you want, choose "
+            "the layers to export, then Run."))
+
+        # Optional account: first, as setup is on every tab, and closed.
+        root.addWidget(tinted("setup", self._build_earthdata_box()))
 
         # --- event inputs ---
-        form = QFormLayout()
+        find_frame, find_box = step_box("inputs", "Find scenes")
+        form = QFormLayout(find_box)
+        # Rarely changed once the Detection box has filled the tab in: closed.
+        adv_frame, adv_box = advanced_box()
+        adv_form = QFormLayout(adv_box)
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         # No QDoubleValidator here on purpose. It rejected any string containing a
@@ -1019,7 +1051,10 @@ class LandslideDock(QgsDockWidget):
         self.radius_spin.setSingleStep(0.5)
         self.radius_spin.setValue(5.0)
         self.radius_spin.setSuffix(" km")
-        form.addRow("Search radius", self.radius_spin)
+        self.radius_spin.setToolTip(
+            "How far around the epicentre to search. 'Use it in every tab' in "
+            "the Detection box sets this to 15 km.")
+        adv_form.addRow("Search radius", self.radius_spin)
 
         self.dt_edit = QDateTimeEdit(QDateTime.currentDateTimeUtc())
         self.dt_edit.setCalendarPopup(True)
@@ -1044,7 +1079,7 @@ class LandslideDock(QgsDockWidget):
         pa_row = QHBoxLayout()
         pa_row.addWidget(self.point_area_combo, 1)
         pa_row.addWidget(add_pa_btn)
-        form.addRow("Point and area", pa_row)
+        adv_form.addRow("Point and area", pa_row)
 
         self.pre_slider, self.pre_lbl = self._day_slider(60)
         self.post_slider, self.post_lbl = self._day_slider(90)
@@ -1102,7 +1137,6 @@ class LandslideDock(QgsDockWidget):
         cloud_row.addWidget(self.cloud_spin)
         cloud_row.addStretch(1)
         form.addRow("Cloud filter", cloud_row)
-        root.addLayout(form)
 
         # --- which review layers to export ---
         # These are OUTPUT products (renderings), not satellite acquisitions — the
@@ -1112,9 +1146,10 @@ class LandslideDock(QgsDockWidget):
         # The predicted-epicentre point layer
         # is always included. Expanded by default so the choice is visible (a primary
         # control).
-        scenes_box = QgsCollapsibleGroupBox("Layers to export")
-        scenes_box.setSaveCollapsedState(False)
-        scenes_box.setCollapsed(False)
+        # Closed by default (Ethan, 2026-11-11): HDR and dBright are already
+        # ticked, so the box only needs opening to ask for something extra.
+        layers_frame, scenes_box = step_box("options", "Layers to export",
+                                            collapsed=True)
         sbox = QVBoxLayout(scenes_box)
         self.scene_checks = {}
         for key, label, tip in SCENES:
@@ -1123,12 +1158,12 @@ class LandslideDock(QgsDockWidget):
             cb.setToolTip(tip)
             self.scene_checks[key] = cb
             sbox.addWidget(cb)
-        root.addWidget(scenes_box)
 
         # (PlanetScope coverage/quality toggles moved to the PlanetScope tab.)
 
         # --- search (free dry-run) / run / cancel ---
-        btn_row = FlowRow()
+        # One row under the inputs (Ethan, 2026-11-11: Run belongs beside Search,
+        # not below the table).
         self.search_btn = QPushButton("Search / Preview")
         self.search_btn.setToolTip(
             "Free dry-run: list the candidate before/after scenes per source, "
@@ -1161,11 +1196,15 @@ class LandslideDock(QgsDockWidget):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        btn_row.addWidget(self.search_btn)
-        btn_row.addWidget(self.map_preview_btn)
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.cancel_btn)
-        root.addWidget(btn_row)
+        search_row = FlowRow()
+        search_row.addWidget(self.search_btn)
+        search_row.addWidget(self.map_preview_btn)
+        search_row.addWidget(self.run_btn)
+        search_row.addWidget(self.cancel_btn)
+        form.addRow(search_row)
+        root.addWidget(find_frame)
+        # What the Run writes, directly under the row that starts it.
+        root.addWidget(layers_frame)
 
         # draw each candidate scene's footprint on the map (off by default)
         self.footprint_check = QCheckBox("Show scene footprints on map")
@@ -1178,17 +1217,17 @@ class LandslideDock(QgsDockWidget):
             "several, click in empty table space to show all candidates again. Off "
             "by default; refreshes after each Search / Preview.")
         self.footprint_check.toggled.connect(self._on_footprint_toggle)
-        root.addWidget(self.footprint_check)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)         # indeterminate
         self.progress.hide()
-        root.addWidget(self.progress)
 
-        # --- outputs: candidate scenes (top) + run log (bottom) ---
-        # A draggable splitter so the user can grow whichever pane matters now,
-        # instead of the old fixed 50/50 split that left both cramped.
-        out_split = QSplitter(Qt.Orientation.Vertical)
+        # --- results: candidate scenes, gallery, browse image ---
+        # A plain stack, not a splitter: a splitter keeps a pane's height when the
+        # box inside it collapses, which left the closed gallery and preview as
+        # blank tinted space. Stacked, a closed box is only its title bar.
+        results_frame = tinted("results")
+        out_split = results_frame.layout()
 
         scenes = QWidget()
         scenes_box = QVBoxLayout(scenes)
@@ -1222,7 +1261,8 @@ class LandslideDock(QgsDockWidget):
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         scenes_box.addWidget(self.table)
-        out_split.addWidget(scenes)
+        scenes_box.addWidget(self.footprint_check)
+        out_split.addWidget(scenes, 1)
 
         # quicklook gallery: every candidate's browse thumbnail at once (before +
         # after) so you can scan for the cloud-free scene over the AOI in one
@@ -1237,6 +1277,7 @@ class LandslideDock(QgsDockWidget):
         g_layout = QVBoxLayout(gallerybox)
         self.gallery_scroll = QScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
+        self.gallery_scroll.setMinimumHeight(280)    # when open; closed = title bar
         self.gallery_inner = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery_inner)
         self.gallery_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -1255,32 +1296,97 @@ class LandslideDock(QgsDockWidget):
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setStyleSheet("QLabel { background: palette(base); }")
+        # A fixed viewing height when open. Ignored policy: the pixmap is scaled
+        # TO the label, so its size must not feed back into the layout.
+        self.preview.setMinimumHeight(260)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Ignored)
         pv_layout.addWidget(self.preview, 1)
         out_split.addWidget(previewbox)
 
-        logbox = QWidget()
+        # The table is the primary signal, so it takes the spare height.
+        scenes.setMinimumHeight(160)
+        root.addWidget(self.progress)
+        root.addWidget(self._build_marks_box())
+        root.addWidget(results_frame, 1)
+
+        # --- out of the way: rarely-changed controls, the optional account, log ---
+        root.addWidget(adv_frame)
+        log_frame, logbox = step_box("advanced", "Log")
         log_layout = QVBoxLayout(logbox)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(QLabel("Run log"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1000)
+        self.log.setMinimumHeight(80)
         log_layout.addWidget(self.log)
-        out_split.addWidget(logbox)
-
-        # gallery + preview are collapsible and collapsed by default, so give them
-        # no stretch: they sit as thin title bars until expanded (then drag the
-        # handle to size them). The table is the primary signal, so it dominates.
-        out_split.setStretchFactor(0, 5)   # table
-        out_split.setStretchFactor(1, 0)   # gallery (collapsible, sizes on demand)
-        out_split.setStretchFactor(2, 0)   # preview (collapsible, sizes on demand)
-        out_split.setStretchFactor(3, 2)   # log
-        scenes.setMinimumHeight(120)
-        gallerybox.setMinimumHeight(0)     # collapsed to its title bar by default
-        previewbox.setMinimumHeight(0)     # collapsed to its title bar by default
-        logbox.setMinimumHeight(80)
-        root.addWidget(out_split, 1)
+        root.addWidget(log_frame)
         return w
+
+    # ---------- Mark a spot (drop-down) ----------
+    def _build_marks_box(self):
+        """Typed coordinates -> a mark kept with the project (map_marks.py): a
+        red X for "do not look here", a blue circle for "possible landslide,
+        come back". Closed by default. The entry fields are private attributes
+        on purpose: they are scratch input, not project state — the marks
+        themselves are what is saved."""
+        frame, box = step_box("inputs", "Mark a spot", collapsed=True)
+        form = QFormLayout(box)
+        form.addRow(self.help_toggle.label(
+            "Type or paste a coordinate, then mark it. Marks are saved as "
+            "map_marks.gpkg in this project's folder and stay on the map."))
+        self._mark_lat_edit = QLineEdit()
+        self._mark_lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
+        self._mark_lon_edit = QLineEdit()
+        self._mark_lon_edit.setPlaceholderText("e.g. -149.823317")
+        coord_paste.link_pair(self._mark_lat_edit, self._mark_lon_edit)
+        form.addRow("Latitude", self._mark_lat_edit)
+        form.addRow("Longitude", self._mark_lon_edit)
+        self._mark_note_edit = QLineEdit()
+        self._mark_note_edit.setPlaceholderText("optional — why")
+        self._mark_note_edit.setToolTip(
+            "Stored with the mark (the layer's 'note' field), e.g. 'cloud "
+            "shadow, not debris' or 'dark streak on the 8 Aug scene'.")
+        form.addRow("Note", self._mark_note_edit)
+        from . import map_marks
+        not_btn = QPushButton("✗  Don't look here")
+        not_btn.setToolTip(
+            "Add a red X at these coordinates: checked, nothing there.")
+        not_btn.clicked.connect(lambda: self._add_mark(map_marks.NOT_HERE))
+        back_btn = QPushButton("○  Come back here")
+        back_btn.setToolTip(
+            "Add a blue circle at these coordinates: a possible landslide area "
+            "to return to.")
+        back_btn.clicked.connect(lambda: self._add_mark(map_marks.COME_BACK))
+        row = FlowRow()
+        row.addWidget(not_btn)
+        row.addWidget(back_btn)
+        form.addRow(row)
+        self._mark_status = QLabel()
+        self._mark_status.setWordWrap(True)
+        self._mark_status.setVisible(False)
+        form.addRow(self._mark_status)
+        return frame
+
+    def _add_mark(self, kind):
+        from . import map_marks
+        try:
+            lat, lon = map_marks.parse_coords(self._mark_lat_edit.text(),
+                                              self._mark_lon_edit.text())
+            layer = map_marks.add_mark(self.results_dir(), kind, lat, lon,
+                                       self._mark_note_edit.text().strip())
+        except map_marks.MarkError as e:
+            self._mark_status.setStyleSheet(status_css("error"))
+            self._mark_status.setText(_theme.status_text("error", str(e)))
+            self._mark_status.setVisible(True)
+            return
+        label = map_marks.KINDS[kind][0]
+        where = layer.source().split("|")[0]
+        self._mark_status.setStyleSheet(status_css("success"))
+        self._mark_status.setText(_theme.status_text(
+            "success", f"{label}: {lat:.6f}, {lon:.6f} — saved in {where}"))
+        self._mark_status.setVisible(True)
+        self._mark_note_edit.clear()
+        self._append_log(f"Mark added ({label}) at {lat:.6f}, {lon:.6f} -> {where}")
 
     # ---------- NASA Earthdata login (drop-down) ----------
     def _build_earthdata_box(self):
@@ -1305,7 +1411,7 @@ class LandslideDock(QgsDockWidget):
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: palette(mid); }")
-        form.addRow(info)
+        form.addRow(self.help_toggle.adopt(info))     # behind "? Help"
 
         self.ed_user_edit = QLineEdit(
             self.settings.value("landslide/earthdata_user", "", type=str))

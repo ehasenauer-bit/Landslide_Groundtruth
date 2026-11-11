@@ -72,7 +72,41 @@ for nm,c in (("clear",CLOUD_CLEAR),("some",CLOUD_SOME),
 for nm,c in (("ROW_FG/PRE",(qc(ROW_FG),qc(PRE_BG))),("ROW_FG/POST",(qc(ROW_FG),qc(POST_BG)))):
     r=ratio(*c); ok=r>=4.5
     print(f"     {nm:11s} {r:.2f}:1  {'ok' if ok else 'FAIL'}"); bad+=(not ok)
+print("   step tints (theme.STEP_TINTS): status colours AND body text on every tint")
+assert set(theme.STEP_TINTS_LIGHT)==set(theme.STEP_TINTS_DARK)==set(theme.STEPS)==set(theme.STEP_NAMES)
+for nm,tints,status,text in (("light",theme.STEP_TINTS_LIGHT,theme.STATUS_COLORS_LIGHT,"#141414"),
+                             ("dark",theme.STEP_TINTS_DARK,theme.STATUS_COLORS_DARK,"#e8e8e8")):
+    for step,(bg,_border) in tints.items():
+        worst=min(ratio(status[k],bg) for k in ("success","error","warn"))
+        rt=ratio(text,bg); ok=worst>=4.5 and rt>=7.0
+        print(f"     {nm:5s} {step:8s} {bg}  status >= {worst:.2f}:1  text {rt:.1f}:1  {'ok' if ok else 'FAIL'}"); bad+=(not ok)
+# a step colour must not be mistaken for the pre / post row tints
+for step,(bg,_b) in theme.STEP_TINTS_LIGHT.items():
+    assert bg.lower() not in (qc(PRE_BG),qc(POST_BG)), step
 assert bad==0, f"{bad} contrast failures"
+
+print("3a. step_box: the tint goes on a frame AROUND the box, and Help is one switch")
+from landslide_groundtruth import step_box as SB
+from qgis.core import QgsSettings
+frame,box=SB.step_box("inputs","x")
+assert isinstance(frame,SB.StepFrame) and box.parentWidget() is frame
+assert theme.STEP_TINTS_LIGHT["inputs"][0] in frame.styleSheet()
+assert "background" not in box.styleSheet(), "a stylesheet on the box breaks its title"
+aframe,abox=SB.advanced_box()          # keep the frame alive: it owns the box
+assert aframe.step=="advanced" and abox.title()=="Advanced"
+_before=QgsSettings().value(SB.HELP_SETTING,None)
+try:
+    QgsSettings().setValue(SB.HELP_SETTING,False)
+    ht=SB.HelpToggle(QgsSettings()); b1,b2=ht.button(),ht.button(); lab=ht.label("x")
+    assert lab.isHidden() and not b1.isChecked()
+    b1.setChecked(True)
+    assert b2.isChecked() and not lab.isHidden(), "every tab's button is the same switch"
+    assert SB._truthy(QgsSettings().value(SB.HELP_SETTING))
+    b2.setChecked(False)
+    assert not b1.isChecked() and lab.isHidden()
+finally:
+    QgsSettings().remove(SB.HELP_SETTING) if _before is None else QgsSettings().setValue(SB.HELP_SETTING,_before)
+print("   frame carries the tint; two buttons and a label move together; remembered")
 
 print("3b. one colour genuinely cannot serve both themes")
 need_light=(lum(LIGHT)+0.05)/4.5-0.05
