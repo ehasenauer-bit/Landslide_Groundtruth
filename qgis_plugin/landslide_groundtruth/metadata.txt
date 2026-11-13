@@ -20,16 +20,28 @@ email=ehasenauer@alaska.edu
 homepage=https://github.com/ehasenauer-bit/Landslide_Groundtruth#readme
 repository=https://github.com/ehasenauer-bit/Landslide_Groundtruth
 tracker=https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues
-changelog=1.0.1 - Faster scene search; SAR change map from full-detail scenes; seismic offset in the 3D viewer; Maxar strips stream only when asked.
+changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change map from full-detail scenes; Maxar streams only when asked and only inside the search box; Mark a spot.
+    * Every tab: boxes are tinted by workflow step (setup, inputs, options, results, advanced) and sit in the order you work. One ? Help switch shows or hides the explanations on every tab. Galleries and scene previews are collapsible and start closed.
+    * The search radius sits in each imagery tab's event box, with the location and time.
+    * Mark a spot (Sentinel-2 tab): type coordinates or use Pick on map to drop a red X (don't look here) or a blue circle (come back here) into map_marks.gpkg in the project folder. Show notes opens their table.
+    * Sentinel-2 and PlanetScope tables: Cloud is coloured green 0-10 %, amber 11-50 %, red above; Coverage green from 75 %, amber 45-74 %, red below.
     * SAR: Compute change map uses only scenes rendered with Run (full detail), reading the data that Run saved in the project folder, so it downloads nothing and a scene is never fetched twice.
     * SAR: full-detail layers go in an "amplitude full" folder and stay on the map; quick previews go in "amplitude preview" and replace only the previous preview.
+    * SAR: change detection ticks Log-ratio alone by default (was texture + brightness). Projects saved earlier keep their ticks.
+    * Fixed: SAR Compute change map could pick NISAR, and stop, when only the Sentinel-1 pair had been Run in full detail.
+    * PlanetScope: HDR is now "highlights only": Planet's own linear look below the knee and a shoulder fitted to the scene's bright tail, with no shadow lift. Full-detail renders default to HDR with no S-curve, auto-stretch or dBrightness, from raw TOA (settings you already saved are kept).
+    * PlanetScope: the tab looks like the others. Recall, Re-tone, Resume, Zoom and the cached-orders picker sit in the Search window box.
+    * Maxar VHR: Search no longer streams the recommended before/after pair by itself. It is ticked in the Pick column, and no tile is fetched until you press Stream picks.
+    * Maxar VHR: streams are clipped to the search box, so QGIS no longer fetches tiles for the whole screen when you zoom out or pan away.
+    * Maxar VHR: strip footprints and the search circle are off by default; tick "Show strip footprints and search circle on map" to draw them and untick it to remove them, as on the Sentinel-2 and PlanetScope tabs.
+    * Maxar VHR: the AOI cover column sits right after the date.
+    * Maxar VHR: the Flip before/after button is gone. To compare, switch the after strip off in the Layers panel.
+    * The figure details for the 3D viewer's exports are edited on the Volume tab, where the numbers come from.
+    1.0.1 - Faster scene search; seismic offset in the 3D viewer.
     * The Sentinel-2 / Landsat scene search is several times faster (about 20 s where it took 1 to 8 minutes on a slow link): the cloud check now reads each scene through Planetary Computer's data API instead of downloading image tiles.
     * Fixed: the cloud % of a scene that only clips the edge of the search box could read far too low.
     * The 3D viewer's figure details, and the exported figures, show how far and which way the landslide's centre lies from the detection's epicentre, e.g. "2.31 km SW of seismic location".
     * A warning when that offset is over 50 km, usually a dropped minus sign in the longitude.
-    * Maxar VHR: Search no longer streams the recommended before/after pair by itself. It is ticked in the Pick column, and no tile is fetched until you press Stream picks.
-    * Maxar VHR: the AOI cover column sits right after the date.
-    * Maxar VHR: strip footprints and the search circle are off by default; tick "Show strip footprints and search circle on map" to draw them and untick it to remove them, as on the Sentinel-2 and PlanetScope tabs.
     1.0.0 - First public release.
     * One-click "Install imagery tools": the plugin builds its own Python environment; no venv to make by hand.
     * The imagery pipeline ships inside the plugin.
