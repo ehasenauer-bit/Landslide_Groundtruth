@@ -978,7 +978,8 @@ class LandslideDock(QgsDockWidget):
           Find scenes       where, when, which satellite, then the one button
                             row: Search / Preview, Preview on map, Run, Cancel
           Layers to export  which products the Run writes
-          Mark a spot       a red X or blue circle at typed coordinates, closed
+          Mark a spot       a red X or blue circle at typed or clicked
+                            coordinates; Show notes opens the table. Closed
           Candidate scenes  the table to tick, footprints, gallery, browse image
           Advanced          rarely-changed: the point/area layers
           Log
@@ -1333,8 +1334,10 @@ class LandslideDock(QgsDockWidget):
         frame, box = step_box("inputs", "Mark a spot", collapsed=True)
         form = QFormLayout(box)
         form.addRow(self.help_toggle.label(
-            "Type or paste a coordinate, then mark it. Marks are saved as "
-            "map_marks.gpkg in this project's folder and stay on the map."))
+            "Type or paste a coordinate, or use Pick on map and click the "
+            "spot, then mark it. Marks are saved as map_marks.gpkg in this "
+            "project's folder and stay on the map. Show notes opens the table "
+            "of every mark with its note."))
         self._mark_lat_edit = QLineEdit()
         self._mark_lat_edit.setPlaceholderText("e.g. 59.906992  (or paste '59.9070, -149.8233')")
         self._mark_lon_edit = QLineEdit()
@@ -1342,6 +1345,24 @@ class LandslideDock(QgsDockWidget):
         coord_paste.link_pair(self._mark_lat_edit, self._mark_lon_edit)
         form.addRow("Latitude", self._mark_lat_edit)
         form.addRow("Longitude", self._mark_lon_edit)
+        self._mark_pick_btn = QPushButton("Pick on map")
+        self._mark_pick_btn.setCheckable(True)
+        self._mark_pick_btn.setToolTip(
+            "Click a point on the QGIS map to fill in the latitude and "
+            "longitude above, then add a note and choose ✗ or ○. Click this "
+            "button again (or press Esc) to stop.")
+        self._mark_pick_btn.toggled.connect(self._toggle_mark_pick)
+        notes_btn = QPushButton("Show notes")
+        notes_btn.setToolTip(
+            "Open the Map marks attribute table: every mark with its kind, "
+            "note, coordinates and time added. Select a row and use 'Zoom map "
+            "to selected' to go back to it. You can also click a mark with "
+            "QGIS's Identify tool.")
+        notes_btn.clicked.connect(self._show_mark_notes)
+        pick_row = FlowRow()
+        pick_row.addWidget(self._mark_pick_btn)
+        pick_row.addWidget(notes_btn)
+        form.addRow("", pick_row)
         self._mark_note_edit = QLineEdit()
         self._mark_note_edit.setPlaceholderText("optional — why")
         self._mark_note_edit.setToolTip(
@@ -1388,6 +1409,92 @@ class LandslideDock(QgsDockWidget):
         self._mark_status.setVisible(True)
         self._mark_note_edit.clear()
         self._append_log(f"Mark added ({label}) at {lat:.6f}, {lon:.6f} -> {where}")
+
+    def _toggle_mark_pick(self, on):
+        """Arm/disarm the click-to-pick tool for the Mark a spot fields. Its
+        own tool, separate from the epicentre picker, so a click here never
+        moves the event location."""
+        if not on:
+            self._end_mark_pick()
+            return
+        if getattr(self, "pick_btn", None) is not None and self.pick_btn.isChecked():
+            self.pick_btn.setChecked(False)      # one picker armed at a time
+        try:
+            tool = QgsMapToolEmitPoint(self.canvas)
+            tool.canvasClicked.connect(self._on_mark_pick)
+            # another map tool chosen in QGIS (pan, identify…) un-arms us
+            tool.deactivated.connect(self._on_mark_pick_deactivated)
+            self._mark_pick_tool = tool
+            self._mark_prev_tool = self.canvas.mapTool()
+            self.canvas.setMapTool(tool)
+            self.iface.messageBar().pushInfo(
+                "Landslide", "Click the spot to mark on the map.")
+        except Exception as e:
+            self._append_log(f"Could not start the map picker: {e}")
+            self._mark_pick_btn.setChecked(False)
+
+    def _on_mark_pick_deactivated(self):
+        if getattr(self, "_mark_pick_tool", None) is None:
+            return                   # we are the ones switching it off
+        self._mark_pick_tool = None
+        self._mark_prev_tool = None
+        try:
+            self._mark_pick_btn.setChecked(False)
+        except RuntimeError:
+            pass
+
+    def _end_mark_pick(self):
+        """Put the previous map tool back, so the canvas is not left armed."""
+        tool = getattr(self, "_mark_pick_tool", None)
+        if tool is None:
+            return
+        self._mark_pick_tool = None
+        prev, self._mark_prev_tool = getattr(self, "_mark_prev_tool", None), None
+        for sig, slot in ((tool.canvasClicked, self._on_mark_pick),
+                          (tool.deactivated, self._on_mark_pick_deactivated)):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        try:
+            if prev is not None:
+                self.canvas.setMapTool(prev)
+            else:
+                self.canvas.unsetMapTool(tool)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _on_mark_pick(self, point, button):
+        """Write a clicked canvas point into the Mark a spot fields."""
+        p = self._wgs84(point, self.canvas.mapSettings().destinationCrs())
+        if p is None:
+            self._warn("Could not convert that map position to latitude/longitude. "
+                       "Check the project's coordinate system.")
+            return
+        self._mark_lat_edit.setText(f"{p.y():.6f}")
+        self._mark_lon_edit.setText(f"{p.x():.6f}")
+        self._mark_pick_btn.setChecked(False)    # one click, one point
+        self._mark_note_edit.setFocus()          # next: type why, then ✗ / ○
+
+    def _show_mark_notes(self):
+        """The Map marks attribute table, where the notes live."""
+        from . import map_marks
+        layer = map_marks.find_layer()
+        if layer is None:
+            path = os.path.join(self.results_dir() or "", map_marks.FILE_NAME)
+            if self.results_dir() and os.path.exists(path):
+                try:     # saved marks not loaded in this project yet
+                    layer = map_marks.ensure_layer(self.results_dir())
+                except map_marks.MarkError as e:
+                    self._warn(str(e))
+                    return
+        if layer is None:
+            self._mark_status.setStyleSheet(status_css("info"))
+            self._mark_status.setText(_theme.status_text(
+                "info", "No marks yet — add one first."))
+            self._mark_status.setVisible(True)
+            return
+        self.iface.showAttributeTable(layer)
 
     # ---------- NASA Earthdata login (drop-down) ----------
     def _build_earthdata_box(self):
@@ -1647,6 +1754,9 @@ class LandslideDock(QgsDockWidget):
         if not on:
             self._end_pick()
             return
+        mark_btn = getattr(self, "_mark_pick_btn", None)
+        if mark_btn is not None and mark_btn.isChecked():
+            mark_btn.setChecked(False)           # one picker armed at a time
         try:
             self._pick_tool = QgsMapToolEmitPoint(self.canvas)
             self._pick_tool.canvasClicked.connect(self._on_map_pick)
@@ -3415,10 +3525,11 @@ class LandslideDock(QgsDockWidget):
     def teardown(self):
         # hand the canvas back its previous tool: leaving the picker armed after
         # the plugin is unloaded would swallow the user's next click
-        try:
-            self._end_pick()
-        except (AttributeError, RuntimeError):
-            pass
+        for end in ("_end_pick", "_end_mark_pick"):
+            try:
+                getattr(self, end)()
+            except (AttributeError, RuntimeError):
+                pass
         # drop the project-signal connections first: they'd otherwise fire into
         # deleted widgets when the plugin is unloaded/reloaded with QGIS open
         state = getattr(self, "project_state", None)
