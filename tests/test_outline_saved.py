@@ -5,9 +5,9 @@ Run with tests/run_all.sh, or directly with QGIS's bundled python:
 
 A memory layer loses the afternoon's digitizing to any QGIS restart, and the
 project that reopens has nothing to measure. Each outline role's New button —
-total, source best, source low, source high — writes a GeoPackage beside the
-.qgz instead (dock.results_dir), names it for its role and assigns it to that
-role in one press.
+total, source best, source low, source high — writes a shapefile into shp_files/
+beside the .qgz instead (dock.results_dir), names it for its role and assigns it
+to that role in one press.
 
 Checks: the file is really on disk and the layer reads from it; the role is set
 and pinned; the name carries the role so a reopened project re-matches it; a
@@ -98,23 +98,26 @@ tab.name_edit.setText("test slide")
 tab._new_role_layer("total")
 unsaved = tab._role_layer("total")
 src0 = unsaved.source().split("|", 1)[0] if unsaved is not None else ""
-check(f"an unsaved project's outline is saved in the default folder ({src0})",
-      os.path.isfile(src0) and os.path.dirname(src0) == DEFAULT)
+check(f"an unsaved project's outline is saved in the default folder's shp_files ({src0})",
+      os.path.isfile(src0) and os.path.dirname(src0) == os.path.join(DEFAULT, "shp_files"))
 project.clear()
 
-print("\n=== New total area: a GeoPackage in the project's folder ===")
+print("\n=== New total area: a shapefile in the project's shp_files folder ===")
 A = tempfile.mkdtemp(prefix="proj outline ")     # a space, like the real folders
 project.write(os.path.join(A, "event A.qgz"))
+SHP = os.path.join(A, "shp_files")
 tab._new_role_layer("total")
 total = tab._role_layer("total")
 check("the Total area role is filled in", isinstance(total, QgsVectorLayer))
 src = total.source().split("|", 1)[0] if total is not None else ""
 check(f"it reads from a file, not memory ({total.providerType() if total else None})",
       total is not None and total.providerType() == "ogr")
-check(f"the file is in the project's folder ({src})",
-      os.path.isfile(src) and os.path.dirname(src) == A)
+check(f"the file is in the project's shp_files folder ({src})",
+      os.path.isfile(src) and os.path.dirname(src) == SHP)
 check(f"named for the slide and the role ({os.path.basename(src)})",
-      os.path.basename(src) == "test_slide_total_area.gpkg")
+      os.path.basename(src) == "test_slide_total_area.shp")
+check("a real ESRI Shapefile",
+      total is not None and total.dataProvider().storageType() == "ESRI Shapefile")
 check("the layer is a polygon layer, with a slide field",
       total is not None
       and total.geometryType() == Qgis.GeometryType.Polygon
@@ -136,9 +139,9 @@ tab._new_role_layer("best")
 best = tab._role_layer("best")
 bsrc = best.source().split("|", 1)[0] if best is not None else ""
 check("the Source area (best) role is filled in", isinstance(best, QgsVectorLayer))
-check(f"a second, separate GeoPackage ({os.path.basename(bsrc)})",
+check(f"a second, separate shapefile ({os.path.basename(bsrc)})",
       os.path.isfile(bsrc) and bsrc != src
-      and os.path.basename(bsrc) == "test_slide_source_area_best.gpkg")
+      and os.path.basename(bsrc) == "test_slide_source_area_best.shp")
 check("it did not disturb the total role", tab._role_layer("total") is total)
 check("name matching alone would assign it to best",
       tab._match_role_layers([best]).get("best") is best)
@@ -154,10 +157,14 @@ def outline(layer):
 
 check(f"total: red outline, no fill {outline(total)}", outline(total) == ("#dc1e1e", True))
 check(f"best: blue outline, no fill {outline(best)}", outline(best) == ("#1e5ae6", True))
-probe = QgsVectorLayer(f"{src}|layername={os.path.splitext(os.path.basename(src))[0]}",
-                       "probe", "ogr")
-check(f"the colour is stored IN the GeoPackage, so it opens red anywhere {outline(probe)}",
-      outline(probe) == ("#dc1e1e", True))
+probe = QgsVectorLayer(src, "probe", "ogr")
+check(f"the colour is stored in a .qml beside the shapefile, so it opens red anywhere "
+      f"{outline(probe)}",
+      os.path.isfile(os.path.splitext(src)[0] + ".qml")
+      and outline(probe) == ("#dc1e1e", True))
+pidx = probe.fields().indexOf(AREA_FIELD)
+check("and so does the area expression",
+      pidx >= 0 and probe.defaultValueDefinition(pidx).expression() == AREA_EXPRESSION)
 del probe
 
 print("\n=== the outline carries its own area, kept current by QGIS ===")
@@ -208,7 +215,7 @@ check("the first file is untouched", os.path.isfile(src)
       and os.path.getmtime(src) == stamp)
 check("both files are still there",
       {os.path.basename(p) for p in (src, asrc, bsrc)}
-      <= set(os.listdir(A)))
+      <= set(os.listdir(SHP)))
 
 print("\n=== the files survive the project: reopening finds them ===")
 ids = {l.source().split("|", 1)[0] for l in project.mapLayers().values()}
@@ -232,13 +239,13 @@ tab._new_role_layer("low")
 low = tab._role_layer("low")
 lsrc = low.source().split("|", 1)[0] if low is not None else ""
 check(f"New beside Source (low) fills that role ({os.path.basename(lsrc)})",
-      low is not None and os.path.basename(lsrc) == "test_slide_source_area_low.gpkg"
-      and os.path.dirname(lsrc) == A)
+      low is not None and os.path.basename(lsrc) == "test_slide_source_area_low.shp"
+      and os.path.dirname(lsrc) == SHP)
 tab._new_role_layer("high")
 high = tab._role_layer("high")
 hsrc = high.source().split("|", 1)[0] if high is not None else ""
 check(f"New beside Source (high) fills that role ({os.path.basename(hsrc)})",
-      high is not None and os.path.basename(hsrc) == "test_slide_source_area_high.gpkg")
+      high is not None and os.path.basename(hsrc) == "test_slide_source_area_high.shp")
 check("neither disturbed the total or best roles",
       tab._role_layer("best") is not None and tab._role_layer("total") is not None
       and tab._role_layer("low") is not tab._role_layer("best"))

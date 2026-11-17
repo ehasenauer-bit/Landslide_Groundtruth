@@ -90,6 +90,11 @@ QgsSettings().setValue(VT.HELP_SETTING, False)
 
 from landslide_groundtruth.dock import LandslideDock
 dock = LandslideDock(FakeIface())
+# Draw centerline writes shp_files/landslide_centerlines.shp into the results
+# folder — a throwaway one here, never a real project or the Documents folder.
+import tempfile
+RESULTS = tempfile.mkdtemp(prefix="volume flow ")
+dock.results_dir = lambda: RESULTS
 vol = dock.volume_tab
 project = QgsProject.instance()
 project.clear()
@@ -233,6 +238,8 @@ vol._draw_centerline()
 check(f"length {c.get('length')} m, in the table too",
       c.get("length") and c.get("cl_fid") is not None
       and vol.table.item(0, VT.TABLE_COLS.index("Length (m)")).text() != "—")
+check("and saved as shp_files/landslide_centerlines.shp in the results folder",
+      os.path.isfile(os.path.join(RESULTS, "shp_files", "landslide_centerlines.shp")))
 
 print("\n=== re-measuring the same slide replaces its row and keeps the centerline ===")
 vol.material_combo.setCurrentIndex(vol.material_combo.findText("Soil"))

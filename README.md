@@ -230,9 +230,10 @@ work is done:
 
 1. **Outlines.** Press **New** beside *Total area*, draw the whole affected area
    (click each vertex, right-click to finish, toggle editing off to save), then
-   **New** beside *Source (best)* for the scar. Each New writes a GeoPackage beside
-   the project's `.qgz`, named for its role (`<slide>_total_area.gpkg`, …), assigns
-   it and arms QGIS's Add Polygon tool; **Draw** adds another polygon to the
+   **New** beside *Source (best)* for the scar. Each New writes a shapefile into
+   `shp_files/` beside the project's `.qgz`, named for its role
+   (`shp_files/<slide>_total_area.shp`, …), assigns it and arms QGIS's Add Polygon
+   tool; **Draw** adds another polygon to the
    assigned layer. Then the same for *Source (low)* and *Source (high)*, a
    conservative and a generous reading of the scar. Total is a red outline, source
    blue (low dashed, high dotted). The line under the pickers shows
@@ -268,8 +269,9 @@ work is done:
    is probably too high on ice, and tens of metres means the outline or the
    material is wrong. Warnings about this measurement show here.
 5. **Centerline & elevation drop.** **Draw centerline** derives the medial-axis
-   spine of the total outline into `Landslide centerlines`, left in edit mode to
-   trim and **Re-measure**; with a DEM assigned it also reads the crown-to-toe fall
+   spine of the total outline into `Landslide centerlines`, saved straight away as
+   `shp_files/landslide_centerlines.shp` (one file for every slide's line) and
+   left in edit mode to trim and **Re-measure** (save the layer to keep a trim); with a DEM assigned it also reads the crown-to-toe fall
    height and travel angle. Reference only.
 6. **Write to layer** stamps everything — `vsrc_m3` / `vsrc_lo_m3` / `vsrc_hi_m3`
    (best, with its range), `vlowsrc_m3` / `vhisrc_m3` (source low / high),

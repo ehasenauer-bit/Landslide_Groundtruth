@@ -37,6 +37,7 @@ changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change m
     * Maxar VHR: the AOI cover column sits right after the date.
     * Maxar VHR: the Flip before/after button is gone. To compare, switch the after strip off in the Layers panel.
     * The figure details for the 3D viewer's exports are edited on the Volume tab, where the numbers come from.
+    * Volume tab: the outlines New makes are now shapefiles, and Draw centerline saves its line as landslide_centerlines.shp (it was a temporary layer, lost when QGIS closed). Both go in a shp_files folder in the project folder. Outlines made before stay where they are.
     * Sentinel-2 / Landsat: "Hide scenes cloudier than" now judges the cloud over your search area (the Cloud column), not the whole scene's cloud cover, which at low winter sun counts clear snow as cloud and hid every November scene at Iliamna. The search reads further back until each side's list is full, so a cloudy season makes it slower; the log says how many scenes were hidden.
     * Candidate scene tables on the Sentinel-2, PlanetScope, SAR and Maxar tabs are only as tall as the scenes found, with no blank space under the last row.
     1.0.1 - Faster scene search; seismic offset in the 3D viewer.

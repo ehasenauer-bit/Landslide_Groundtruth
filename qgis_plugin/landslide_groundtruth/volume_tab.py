@@ -36,9 +36,10 @@ Roles are assigned by layer rather than by map selection, so the input is
 explicit and re-measurable, and layers named for their role — "Total Area",
 "Source Area (low)" — are recognised automatically, so a project that already
 holds the outlines comes up ready to measure. The New buttons create each
-outline already named and assigned, as a GeoPackage in the project's folder
-rather than a scratch layer — they are the measurement, so they are kept like
-one (see ROLE_LAYERS). A role layer holding several polygons contributes its
+outline already named and assigned, as a shapefile in the project folder's
+shp_files/ rather than a scratch layer — they are the measurement, so they are
+kept like one (see ROLE_LAYERS); the centerlines go there too. A role layer
+holding several polygons contributes its
 largest; the rest are reported, not combined.
 
 Area is ellipsoidal plan-view area (QgsDistanceArea + the project ellipsoid) —
@@ -98,10 +99,21 @@ def _utm_epsg(lat, lon):
     zone = int((lon + 180.0) / 6.0) + 1
     return (32700 if lat < 0 else 32600) + zone
 
-# Scratch layer the derived centerlines are collected in. Reused across slides
-# (looked up by name if its id goes stale) so a session leaves one tidy layer
-# rather than one per measurement.
+# Every vector file the tab writes — the outlines and the centerlines — goes in
+# this subfolder of the project's own folder (dock.results_dir), as an ESRI
+# Shapefile, so the digitizing sits together and apart from the imagery.
+SHP_DIR = "shp_files"
+
+# Layer the derived centerlines are collected in, saved as
+# shp_files/landslide_centerlines.shp. Reused across slides (looked up by name if
+# its id goes stale) so a project keeps one tidy layer rather than one per
+# measurement — and a file, not a scratch layer, so the lines survive closing
+# QGIS like the outlines they were spined from.
 CENTERLINE_LAYER = "Landslide centerlines"
+CENTERLINE_FILE = "landslide_centerlines"
+# Width of the text fields in those shapefiles: a .dbf text field's maximum. Left
+# unset, GDAL writes 255 and warns every time that it truncated it to this.
+TEXT_WIDTH = 254
 
 # Whether the explanatory text is showing. Per user, not per project: it is about
 # how well you know the tab, not about the slide — so QgsSettings, not the .qgz.
@@ -139,8 +151,8 @@ ROLE_NAME_ANY = frozenset().union(*ROLE_NAME_TOKENS.values())
 SOURCE_ROLES = (("best", "best"), ("low", "low"), ("high", "high"))
 
 # Every outline role, and what its New button produces: (role label as the
-# drop-down spells it, layer-name suffix, file stem, fill style). GeoPackages in
-# the project's own folder rather than memory layers — they ARE the measurement,
+# drop-down spells it, layer-name suffix, file stem, fill style). Shapefiles in
+# the project's shp_files/ folder rather than memory layers — they ARE the measurement,
 # so leaving them in memory puts the afternoon's digitizing one forgotten "Save
 # Features As…" away from being lost. The suffix carries the role word (see
 # ROLE_NAME_TOKENS above), so the project reopens with the drop-down already
@@ -182,10 +194,10 @@ AREA_EXPRESSION = ("round(area(transform($geometry, @layer_crs, 'EPSG:6933'))"
                    " / 1e6, 4)")
 
 # What each role's New button says it does.
-_SAVED = ("Saved as a GeoPackage in this project's folder, not a scratch layer — "
-          "the outline survives closing QGIS, and the project reopens measuring "
-          "it. Press it again for another attempt: an existing file is never "
-          "written over.")
+_SAVED = (f"Saved as a shapefile in this project's {SHP_DIR} folder, not a "
+          "scratch layer — the outline survives closing QGIS, and the project "
+          "reopens measuring it. Press it again for another attempt: an "
+          "existing file is never written over.")
 NEW_TIPS = {
     "total": ("Create the TOTAL landslide outline, assign it to “Total area” and "
               "start digitizing. Drawn as a red outline, with an "
@@ -289,7 +301,7 @@ class VolumeTab(QWidget):
         self.settings = dock.settings
         self._current = None        # the slide on screen — the same dict as its row
         self._rows = []             # result rows (raw values), one per slide name
-        self._cl_layer_id = None    # scratch centerline layer
+        self._cl_layer_id = None    # the centerline layer (shp_files/)
         self._cl_fid = None         # centerline feature for the current slide
         self._planar_noted = False  # measurement-mode note already logged
         self._watched = []          # layer ids whose edit signals we follow
@@ -407,7 +419,7 @@ class VolumeTab(QWidget):
         """Which outlines are measured — and the buttons that make them.
 
         Each role is one row: its layer picker, New (create the outline as a
-        GeoPackage beside the project, named and assigned, and start drawing)
+        shapefile in the project's shp_files/, named and assigned, and start drawing)
         and Draw (digitize another polygon into the assigned layer). Creating,
         naming, saving and assigning an outline is one intention, and splitting
         it across panels is how an afternoon's digitizing ends up in a memory
@@ -425,9 +437,9 @@ class VolumeTab(QWidget):
             "deposit inflates it. TOTAL (red) — the whole affected area: source "
             "scar, runout track and deposit; it gives the implied mean depth, "
             "the centerline, and the feature Write to layer stamps. New makes "
-            "the outline as a GeoPackage beside the project, assigned and ready "
-            "to draw; Draw adds another polygon to the assigned layer (a layer "
-            "is measured by its largest polygon)."))
+            f"the outline as a shapefile in the project's {SHP_DIR} folder, "
+            "assigned and ready to draw; Draw adds another polygon to the "
+            "assigned layer (a layer is measured by its largest polygon)."))
 
         form = QFormLayout()
         self.name_edit = QLineEdit("slide 1")
@@ -876,68 +888,27 @@ class VolumeTab(QWidget):
         return False
 
     def _outline_dir(self):
-        """Folder the saved outlines are written to: the open project's own (see
-        dock.results_dir), created if it isn't there yet. "" when there is
-        nowhere to write — a project that has never been saved AND no Results
-        folder set in Environment. This does NOT fall back to a temp dir: an outline dropped in /tmp is the scratch layer the
+        """Folder the outlines and centerlines are written to: shp_files/ in the
+        open project's own folder (see dock.results_dir), created if it isn't
+        there yet. "" when there is nowhere to write — a project that has never
+        been saved AND no Results folder set in Environment. This does NOT fall
+        back to a temp dir: an outline dropped in /tmp is the scratch layer the
         button exists to avoid, so it says so instead."""
-        out_dir = self.dock.results_dir()
-        if not out_dir:
+        base = self.dock.results_dir()
+        if not base:
             return ""
+        out_dir = os.path.join(base, SHP_DIR)
         try:
             os.makedirs(out_dir, exist_ok=True)   # <tools>/out/interactive may not exist yet
         except OSError:
             return ""
         return out_dir if os.path.isdir(out_dir) else ""
 
-    def _new_role_layer(self, role):
-        """Create one role's outline on disk, assign it to that role and start
-        digitizing — in one press.
-
-        A GeoPackage beside the project rather than a memory layer, because
-        these two ARE the measurement: a scratch layer loses the digitizing to
-        any QGIS restart, and the project that reopens has nothing to measure.
-        Digitizing into a GeoPackage writes to the file every time editing is
-        toggled off, so the outline is kept by the same gesture that finishes
-        it. Assigning the role here is the point of the button — the layer is
-        also NAMED for its role, so the drop-down refills itself when the
-        project is opened again months later."""
-        label, suffix, stem, style = ROLE_LAYERS[role]
-        out_dir = self._outline_dir()
-        if not out_dir:
-            self._notify(
-                "Nowhere to save the outline. Save this QGIS project first — "
-                "outlines are written beside its .qgz — or set “Results "
-                "(unsaved projects)” in Environment.", level=Qgis.MessageLevel.Warning)
-            return
-
-        slide = self.name_edit.text().strip() or "slide"
-        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", slide).strip("_") or "slide"
-        name = f"{slide} {suffix}"
-        path = os.path.join(out_dir, f"{safe}_{stem}.gpkg")
-        # Never write over an outline that is already there — it may be the
-        # last session's work, and digitizing is slow to redo. File and layer
-        # name step up together so the folder still reads like the layer panel.
-        n = 1
-        while os.path.exists(path) or QgsProject.instance().mapLayersByName(name):
-            n += 1
-            path = os.path.join(out_dir, f"{safe}_{stem}_{n}.gpkg")
-            name = f"{slide} {suffix} {n}"
-
-        crs = self._target_crs()
-        scratch = QgsVectorLayer(f"Polygon?crs={crs.authid()}", name, "memory")
-        if not scratch.isValid():
-            self._append_log(f"Could not create the {label} outline.")
-            return
-        scratch.dataProvider().addAttributes(self._outline_fields())
-        scratch.updateFields()
-
-        # One layer per GeoPackage, named after the file, so "which layer is in
-        # there" is never a question a reader of the folder has to ask.
-        table = os.path.splitext(os.path.basename(path))[0]
+    def _write_shapefile(self, scratch, path):
+        """Write the (empty) memory layer `scratch` out as the shapefile `path`.
+        True on success; on failure the reason is shown and False returned."""
         opts = QgsVectorFileWriter.SaveVectorOptions()
-        opts.driverName = "GPKG"
-        opts.layerName = table
+        opts.driverName = "ESRI Shapefile"
         opts.fileEncoding = "UTF-8"
         try:
             ctx = QgsProject.instance().transformContext()
@@ -950,24 +921,76 @@ class VolumeTab(QWidget):
         except Exception as e:
             err, msg = -1, str(e)
         if err != QgsVectorFileWriter.WriterError.NoError:
-            self._notify(f"Could not write {path}: {msg}", level=Qgis.MessageLevel.Warning)
+            self._notify(f"Could not write {path}: {msg}",
+                         level=Qgis.MessageLevel.Warning)
+            return False
+        return True
+
+    def _save_style_beside(self, layer, path):
+        """Store the layer's style as a .qml beside its shapefile — QGIS loads
+        it with the file, so it opens in the same colours, with its area kept
+        current, in any project it is dropped into."""
+        qml = os.path.splitext(path)[0] + ".qml"
+        try:
+            _msg, ok = layer.saveNamedStyle(qml)
+        except Exception as e:                       # noqa: BLE001 — a nicety
+            ok, _msg = False, str(e)
+        if not ok:
+            self._append_log(f"Could not store the style as {qml}: {_msg}")
+
+    def _new_role_layer(self, role):
+        """Create one role's outline on disk, assign it to that role and start
+        digitizing — in one press.
+
+        A shapefile in the project's shp_files/ rather than a memory layer,
+        because these ARE the measurement: a scratch layer loses the digitizing
+        to any QGIS restart, and the project that reopens has nothing to
+        measure. Digitizing into a shapefile writes to the file every time editing is
+        toggled off, so the outline is kept by the same gesture that finishes
+        it. Assigning the role here is the point of the button — the layer is
+        also NAMED for its role, so the drop-down refills itself when the
+        project is opened again months later."""
+        label, suffix, stem, style = ROLE_LAYERS[role]
+        out_dir = self._outline_dir()
+        if not out_dir:
+            self._notify(
+                "Nowhere to save the outline. Save this QGIS project first — "
+                f"outlines are written to {SHP_DIR} beside its .qgz — or set "
+                "“Results (unsaved projects)” in Environment.",
+                level=Qgis.MessageLevel.Warning)
             return
 
-        layer = QgsVectorLayer(f"{path}|layername={table}", name, "ogr")
+        slide = self.name_edit.text().strip() or "slide"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", slide).strip("_") or "slide"
+        name = f"{slide} {suffix}"
+        path = os.path.join(out_dir, f"{safe}_{stem}.shp")
+        # Never write over an outline that is already there — it may be the
+        # last session's work, and digitizing is slow to redo. File and layer
+        # name step up together so the folder still reads like the layer panel.
+        n = 1
+        while os.path.exists(path) or QgsProject.instance().mapLayersByName(name):
+            n += 1
+            path = os.path.join(out_dir, f"{safe}_{stem}_{n}.shp")
+            name = f"{slide} {suffix} {n}"
+
+        crs = self._target_crs()
+        scratch = QgsVectorLayer(f"Polygon?crs={crs.authid()}", name, "memory")
+        if not scratch.isValid():
+            self._append_log(f"Could not create the {label} outline.")
+            return
+        scratch.dataProvider().addAttributes(self._outline_fields())
+        scratch.updateFields()
+        if not self._write_shapefile(scratch, path):
+            return
+
+        layer = QgsVectorLayer(path, name, "ogr")
         if not layer.isValid():
             self._notify(
                 f"Wrote {path} but QGIS could not load it back — add it by "
                 f"hand and assign it to {label}.", level=Qgis.MessageLevel.Warning)
             return
         self._prepare_outline(layer, style)
-        # Also into the GeoPackage as its default style, so the file opens red
-        # or blue, with its area kept current, in any project it is dropped into.
-        try:
-            save = (getattr(layer, "saveStyleToDatabaseV2", None)
-                    or layer.saveStyleToDatabase)
-            save(table, f"{label} outline", True, "")
-        except Exception as e:                       # noqa: BLE001 — a nicety
-            self._append_log(f"Could not store the style in {path}: {e}")
+        self._save_style_beside(layer, path)
         # read before the layer is added: adding it runs the name match, which
         # may hand the role over on its own, and then nothing would be left to
         # say which layer this one displaced.
@@ -995,7 +1018,7 @@ class VolumeTab(QWidget):
     @staticmethod
     def _outline_fields():
         """The attribute fields every outline the tab creates starts with."""
-        return [QgsField("slide", QMetaType.Type.QString),
+        return [QgsField("slide", QMetaType.Type.QString, len=TEXT_WIDTH),
                 QgsField(AREA_FIELD, QMetaType.Type.Double)]
 
     def _prepare_outline(self, layer, style):
@@ -1196,9 +1219,11 @@ class VolumeTab(QWidget):
         v.addWidget(self._help(
             "Derives the medial-axis spine of the chosen outline (the total "
             "landslide outline by default) — it follows the slide's bends "
-            f"instead of cutting across them — into “{CENTERLINE_LAYER}”, left "
-            "in edit mode so you can trim the ends with the Vertex Tool. "
-            "Re-measure afterwards to pick up your edits. With an elevation "
+            f"instead of cutting across them — into “{CENTERLINE_LAYER}”, saved "
+            f"as {SHP_DIR}/{CENTERLINE_FILE}.shp in the project's folder and "
+            "left in edit mode so you can trim the ends with the Vertex Tool. "
+            "Re-measure afterwards to pick up your edits, and save them to keep "
+            "them in the file. With an elevation "
             "raster assigned it also reads the crown-to-toe fall height along "
             "that spine. Reported for reference; the volumes come from area "
             "alone."))
@@ -1236,7 +1261,10 @@ class VolumeTab(QWidget):
         self.centerline_btn.setEnabled(False)
         self.centerline_btn.setToolTip(
             "Derive the runout centerline for the measured slide, spined from the "
-            "outline above. Enabled after a successful Measure.")
+            "outline above, and save it to "
+            f"{SHP_DIR}/{CENTERLINE_FILE}.shp in this project's folder — one "
+            "file holds every slide's centerline. Enabled after a successful "
+            "Measure.")
         self.centerline_btn.clicked.connect(self._draw_centerline)
         self.remeasure_btn = QPushButton("Re-measure (after editing)")
         self.remeasure_btn.setEnabled(False)
@@ -1699,20 +1727,25 @@ class VolumeTab(QWidget):
         if cl_layer is None:
             return
         length = self._measure_length(line, target_crs)
+        if cl_layer.crs() != target_crs:
+            # a centerline file reused from before the project's CRS changed
+            to_layer = QgsCoordinateTransform(
+                target_crs, cl_layer.crs(), QgsProject.instance())
+            if line.transform(to_layer) != 0:
+                self._append_log(
+                    f"Could not project the centerline into “{cl_layer.name()}”"
+                    f"'s CRS ({cl_layer.crs().authid()}).")
+                return
 
-        was_editing = cl_layer.isEditable()
-        if not was_editing and not cl_layer.startEditing():
-            self._append_log(f"Could not open “{CENTERLINE_LAYER}” for editing.")
-            return
         f = QgsFeature(cl_layer.fields())
         f.setGeometry(line)
         f.setAttribute("slide", c["name"])
         f.setAttribute("length_m", float(length))
         f.setAttribute("method", method)
-        if not cl_layer.addFeature(f):
-            self._append_log("Could not add the centerline feature.")
+        fid = self._save_centerline(cl_layer, f)
+        if fid is None:
             return
-        self._cl_fid = f.id()
+        self._cl_fid = fid
         c["cl_fid"] = self._cl_fid          # survives a re-measure (_record)
 
         c["length"] = length
@@ -1721,23 +1754,79 @@ class VolumeTab(QWidget):
         self.remeasure_btn.setEnabled(True)
         self.sample_btn.setEnabled(True)
 
-        self.iface.setActiveLayer(cl_layer)
-        cl_layer.removeSelection()
-        cl_layer.select(self._cl_fid)
-        cl_layer.triggerRepaint()
+        path = cl_layer.source().split("|", 1)[0]
         self._append_log(
-            f"Centerline ({method}) = {_fmt(length)} m, added to "
-            f"“{CENTERLINE_LAYER}” as feature {self._cl_fid}. The layer is in "
-            "edit mode — trim it with the Vertex Tool, then Re-measure.")
+            f"Centerline ({method}) = {_fmt(length)} m, saved to {path} "
+            f"(“{CENTERLINE_LAYER}”, feature {self._cl_fid}).")
         if method == "straight major axis":
             self._append_log(
                 "The medial-axis skeleton degenerated (very narrow or very "
                 "simple outline), so this is the longest straight chord — it "
                 "cuts corners on a curving slide.")
         # read the fall height straight away when a DEM is assigned, so the drop
-        # appears with the length rather than needing a second click
+        # appears with the length rather than needing a second click (and is
+        # written into the file with it — see _stamp_centerline)
         if self._dem_layer() is not None:
             self._sample_elevation_current(auto=True)
+
+        # left in edit mode for trimming, as before — the line itself is
+        # already in the file, so only the trims wait for a Save
+        if not cl_layer.isEditable():
+            cl_layer.startEditing()
+        self.iface.setActiveLayer(cl_layer)
+        cl_layer.removeSelection()
+        cl_layer.select(self._cl_fid)
+        cl_layer.triggerRepaint()
+        self._append_log(
+            "The layer is in edit mode — trim the line with the Vertex Tool, "
+            "Re-measure, then save the layer's edits to keep the trim.")
+
+    def _save_centerline(self, cl_layer, feat):
+        """Write one centerline straight into its file; its feature id, or None.
+
+        Through the provider rather than the edit buffer, so the line is on disk
+        the moment it is drawn — not one forgotten Save away from being lost —
+        and its id is the file's own, the one Re-measure finds it by afterwards
+        (an edit-buffer id is a temporary one until saved). An edit session
+        already open on the layer — the unsaved trim of the last slide's line,
+        say — is left exactly as it is: saving it would commit the user's work
+        behind their back (as _write_one also refuses to)."""
+        ok, added = cl_layer.dataProvider().addFeatures([feat])
+        if not ok or not added:
+            err = cl_layer.dataProvider().lastError() or "unknown error"
+            self._append_log(
+                f"Could not write the centerline to "
+                f"{cl_layer.source().split('|', 1)[0]}: {err}")
+            return None
+        cl_layer.updateExtents()
+        cl_layer.triggerRepaint()
+        return added[0].id()
+
+    def _centerline_feature(self, cl_layer):
+        """The current slide's centerline feature in `cl_layer`, or None.
+
+        Found by the id recorded when it was drawn, checked against the slide
+        name: a shapefile renumbers its features when one is deleted and saved,
+        so that id can come to name another slide's line. Then the slide's
+        newest line is looked up by name instead, and its id remembered."""
+        c = self._current
+        name = c.get("name") if c else None
+        has_slide = cl_layer.fields().indexOf("slide") >= 0
+        if self._cl_fid is not None:
+            feat = cl_layer.getFeature(self._cl_fid)
+            if feat.isValid() and (not has_slide or name is None
+                                   or feat["slide"] == name):
+                return feat
+        if not has_slide or name is None:
+            return None
+        found = None
+        for feat in cl_layer.getFeatures():
+            if feat["slide"] == name and (found is None or feat.id() > found.id()):
+                found = feat
+        if found is not None:
+            self._cl_fid = found.id()
+            c["cl_fid"] = self._cl_fid
+        return found
 
     def _centerline_source(self, c):
         """(layer, geometry) of the outline to spine, or (None, None) with a log.
@@ -1778,7 +1867,7 @@ class VolumeTab(QWidget):
         if c is None or cl_layer is None or self._cl_fid is None:
             self._append_log("Nothing to re-measure — draw a centerline first.")
             return
-        feat = cl_layer.getFeature(self._cl_fid)
+        feat = self._centerline_feature(cl_layer)
         geom = feat.geometry() if feat is not None else None
         if geom is None or geom.isEmpty():
             self._append_log(
@@ -1788,11 +1877,7 @@ class VolumeTab(QWidget):
         length = self._measure_length(geom, cl_layer.crs())
         c["length"] = length
         c["length_method"] = (c["length_method"] or "medial axis") + ", edited"
-        if cl_layer.isEditable():
-            idx = cl_layer.fields().indexOf("length_m")
-            if idx >= 0:
-                cl_layer.changeAttributeValue(
-                    self._cl_fid, idx, float(length))
+        self._stamp_centerline(cl_layer, {"length_m": length})
         self._show_current()
         self._append_log(f"Centerline re-measured: {_fmt(length)} m.")
         # the edit moved the ends and changed L, so the drop and travel angle
@@ -1856,7 +1941,7 @@ class VolumeTab(QWidget):
                     "Draw a centerline first — the fall height is read along "
                     "it.")
             return
-        feat = cl_layer.getFeature(self._cl_fid)
+        feat = self._centerline_feature(cl_layer)
         geom = feat.geometry() if feat is not None else None
         if geom is None or geom.isEmpty():
             self._append_log("The centerline feature is gone — draw it again.")
@@ -1891,7 +1976,8 @@ class VolumeTab(QWidget):
         c.update(z_top=z_top, z_bottom=z_bottom, drop=drop,
                  hl_ratio=hl, reach_angle=reach, dem_name=dem.name())
         self._show_current()
-        self._write_centerline_relief(cl_layer, z_top, z_bottom, drop, reach)
+        self._stamp_centerline(cl_layer, {"z_top_m": z_top, "z_bot_m": z_bottom,
+                                          "drop_m": drop, "reach_deg": reach})
 
         msg = (f"Elevation from “{dem.name()}”: crown {_fmt(z_top)} m → toe "
                f"{_fmt(z_bottom)} m = {_fmt(drop)} m fall ({n} samples).")
@@ -1943,20 +2029,33 @@ class VolumeTab(QWidget):
             return None
         return z_top, z_bottom, n
 
-    def _write_centerline_relief(self, cl_layer, z_top, z_bottom, drop, reach):
-        """Stamp the fall height onto the centerline feature, so the derived
-        layer carries the relief alongside its length. Silently skips fields a
+    def _stamp_centerline(self, cl_layer, values):
+        """Write {field: number} onto the current slide's centerline feature —
+        its length after a re-measure, the fall height after sampling — so the
+        file carries them alongside the line.
+
+        Saved with the geometry they were measured from: when the line has
+        unsaved edits (a trim), into the edit session, so they reach the file
+        with that trim when it is saved; otherwise straight into the file, with
+        any edit session on other lines left alone. Silently skips fields a
         pre-existing centerline layer (older schema) doesn't have."""
-        started = not cl_layer.isEditable()
-        if started and not cl_layer.startEditing():
+        fields = cl_layer.fields()
+        changes = {fields.indexOf(n): float(v) for n, v in values.items()
+                   if v is not None and fields.indexOf(n) >= 0}
+        if not changes or self._cl_fid is None:
             return
-        for name, value in (("z_top_m", z_top), ("z_bot_m", z_bottom),
-                            ("drop_m", drop), ("reach_deg", reach)):
-            idx = cl_layer.fields().indexOf(name)
-            if idx >= 0 and value is not None:
-                cl_layer.changeAttributeValue(self._cl_fid, idx, float(value))
-        if started:
-            cl_layer.commitChanges()
+        buf = cl_layer.editBuffer() if cl_layer.isEditable() else None
+        if buf is not None and (self._cl_fid in buf.changedGeometries()
+                                or self._cl_fid in buf.changedAttributeValues()
+                                or self._cl_fid in buf.addedFeatures()):
+            for idx, value in changes.items():
+                cl_layer.changeAttributeValue(self._cl_fid, idx, value)
+            return
+        if not cl_layer.dataProvider().changeAttributeValues(
+                {self._cl_fid: changes}):
+            self._append_log(
+                f"Could not write {', '.join(values)} to “{cl_layer.name()}”.")
+        cl_layer.triggerRepaint()
 
     def _to_utm(self, geom, layer_crs):
         """(geometry in local UTM metres, that UTM CRS) — or (None, None).
@@ -2014,42 +2113,101 @@ class VolumeTab(QWidget):
         return QgsCoordinateReferenceSystem("EPSG:4326")
 
     def _existing_centerline_layer(self):
+        """The project's centerline layer, or None. A memory layer of that name
+        — the scratch layer older versions made, which an old project reopens
+        empty — doesn't count: the lines go to the file now."""
         project = QgsProject.instance()
         layer = project.mapLayer(self._cl_layer_id) if self._cl_layer_id else None
         if layer is not None:
             return layer
         for lyr in project.mapLayersByName(CENTERLINE_LAYER):
-            if isinstance(lyr, QgsVectorLayer):
+            if isinstance(lyr, QgsVectorLayer) and lyr.providerType() != "memory":
                 self._cl_layer_id = lyr.id()
                 return lyr
         return None
 
+    @staticmethod
+    def _is_centerline_file(layer):
+        """True when `layer` is a centerline file this tab wrote: lines, with
+        the slide and length fields new centerlines are stamped with."""
+        return (layer.isValid()
+                and layer.geometryType() == Qgis.GeometryType.Line
+                and layer.fields().indexOf("slide") >= 0
+                and layer.fields().indexOf("length_m") >= 0)
+
     def _centerline_layer(self, crs):
-        """The scratch centerline layer, created on first use."""
+        """The project's centerline layer — shp_files/landslide_centerlines.shp
+        — created on first use.
+
+        When the file is already there but not in the project (removed from
+        the Layers panel, or written by another project in this folder) it is
+        loaded and added to, not written over: it holds earlier slides' lines.
+        A file of that name that isn't one of ours is left alone and the name
+        steps up instead."""
         layer = self._existing_centerline_layer()
         if layer is not None:
             return layer
-        layer = QgsVectorLayer(
-            f"LineString?crs={crs.authid()}", CENTERLINE_LAYER, "memory")
-        if not layer.isValid():
-            self._append_log("Could not create the centerline layer.")
+        out_dir = self._outline_dir()
+        if not out_dir:
+            self._notify(
+                "Nowhere to save the centerline. Save this QGIS project first — "
+                f"centerlines are written to {SHP_DIR} beside its .qgz — or set "
+                "“Results (unsaved projects)” in Environment.",
+                level=Qgis.MessageLevel.Warning)
             return None
-        layer.dataProvider().addAttributes([
-            QgsField("slide", QMetaType.Type.QString),
-            QgsField("length_m", QMetaType.Type.Double),
-            QgsField("method", QMetaType.Type.QString),
-            QgsField("z_top_m", QMetaType.Type.Double),
-            QgsField("z_bot_m", QMetaType.Type.Double),
-            QgsField("drop_m", QMetaType.Type.Double),
-            QgsField("reach_deg", QMetaType.Type.Double),
-        ])
-        layer.updateFields()
-        symbol = QgsLineSymbol.createSimple({"color": "255,32,32", "width": "0.7"})
-        if symbol is not None and layer.renderer() is not None:
-            layer.renderer().setSymbol(symbol)
+
+        path = os.path.join(out_dir, f"{CENTERLINE_FILE}.shp")
+        n = 1
+        layer = None
+        while os.path.exists(path):
+            found = QgsVectorLayer(path, CENTERLINE_LAYER, "ogr")
+            if self._is_centerline_file(found):
+                layer = found
+                break
+            n += 1
+            path = os.path.join(out_dir, f"{CENTERLINE_FILE}_{n}.shp")
+
+        if layer is not None:
+            self._append_log(
+                f"Adding to the existing centerline file {path} "
+                f"({layer.featureCount()} line(s) already in it).")
+        else:
+            scratch = QgsVectorLayer(
+                f"LineString?crs={crs.authid()}", CENTERLINE_LAYER, "memory")
+            if not scratch.isValid():
+                self._append_log("Could not create the centerline layer.")
+                return None
+            scratch.dataProvider().addAttributes([
+                QgsField("slide", QMetaType.Type.QString, len=TEXT_WIDTH),
+                QgsField("length_m", QMetaType.Type.Double),
+                QgsField("method", QMetaType.Type.QString, len=TEXT_WIDTH),
+                QgsField("z_top_m", QMetaType.Type.Double),
+                QgsField("z_bot_m", QMetaType.Type.Double),
+                QgsField("drop_m", QMetaType.Type.Double),
+                QgsField("reach_deg", QMetaType.Type.Double),
+            ])
+            scratch.updateFields()
+            if not self._write_shapefile(scratch, path):
+                return None
+            layer = QgsVectorLayer(path, CENTERLINE_LAYER, "ogr")
+            if not layer.isValid():
+                self._notify(
+                    f"Wrote {path} but QGIS could not load it back.",
+                    level=Qgis.MessageLevel.Warning)
+                return None
+            symbol = QgsLineSymbol.createSimple(
+                {"color": "255,32,32", "width": "0.7"})
+            if symbol is not None:
+                layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+            self._save_style_beside(layer, path)
+            self._append_log(f"Created the centerline file {path}.")
+        if any(l.providerType() == "memory"
+               for l in QgsProject.instance().mapLayersByName(CENTERLINE_LAYER)):
+            self._append_log(
+                f"The older scratch layer “{CENTERLINE_LAYER}” is left as it "
+                "was; new centerlines go to the file.")
         lg.add_to_group(layer, "Volume")
         self._cl_layer_id = layer.id()
-        self._append_log(f"Created scratch layer “{CENTERLINE_LAYER}”.")
         return layer
 
     # ---------- results table ----------
