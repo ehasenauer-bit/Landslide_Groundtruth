@@ -636,10 +636,9 @@ _VIEWER_JS = r'''
       color: color, alpha: (alpha == null ? 1 : alpha), noDepth: !!noDepth,
       layer: layer });
   }
-  // planar area of a flat tri list ([p0,p1,p2, ...]) -- used only to order fills
-  function trisArea(t){ var s=0; for (var i=0;i+2<t.length;i+=3){
-    var p=t[i],q=t[i+1],r=t[i+2];
-    s+=Math.abs((q[0]-p[0])*(r[1]-p[1])-(r[0]-p[0])*(q[1]-p[1]))*0.5; } return s; }
+  // planar area of a ring ([[x,y], ...]) -- used only to order fills + outlines
+  function ringArea(r){ var s=0; for (var i=0;i<r.length;i++){
+    var u=r[i], v=r[(i+1)%r.length]; s+=u[0]*v[1]-v[0]*u[1]; } return Math.abs(s)/2; }
   (CFG.polys || []).forEach(function (P) {
     // mirror the QGIS symbol: fill colour + outline colour are independent, and an
     // outline-only symbol (fill===false) draws just the ring — no translucent fill.
@@ -650,12 +649,15 @@ _VIEWER_JS = r'''
     var fa = (P.fill_alpha != null) ? P.fill_alpha : 0.55;
     regLayer(P.name, hasFill ? fc : lc);               // legend swatch = what's drawn
     (P.rings || []).forEach(function (R) {
-      var tris = R.tris || [], out = R.outline || [];
+      var tris = R.tris || [], out = R.outline || [], area = ringArea(out);
       if (hasFill && tris.length >= 3) {
         op(drape(tris, 1.0), tris.length, gl.TRIANGLES, fc, fa, true, P.name);
-        overlays[overlays.length-1].fillArea = trisArea(tris);   // for draw ordering
+        overlays[overlays.length-1].area = area;   // for draw ordering
       }
-      if (hasLine && out.length >= 2) op(drape(out, 1.4), out.length, gl.LINE_LOOP, lc, 1.0, false, P.name);
+      if (hasLine && out.length >= 2) {
+        op(drape(out, 1.4), out.length, gl.LINE_LOOP, lc, 1.0, false, P.name);
+        overlays[overlays.length-1].area = area;
+      }
     });
   });
   (CFG.lines || []).forEach(function (L) {
@@ -692,15 +694,25 @@ _VIEWER_JS = r'''
     op(marks, coords.length, gl.POINTS, c, 1.0, false, PT.name);
   });
 
-  // Draw translucent fills largest-first, so a small polygon nested inside a bigger
-  // one (e.g. the source zone within the total area) lands ON TOP and stays visible
-  // instead of being buried under the larger fill. Outlines / lines / points follow.
-  overlays.sort(function (a, b) {
-    var ka = (a.mode === gl.TRIANGLES && a.noDepth) ? 0 : 1;
-    var kb = (b.mode === gl.TRIANGLES && b.noDepth) ? 0 : 1;
+  // Paint order, bottom to top (drawMapOverlays uses the same):
+  //   polygon fills, largest first -- a source zone nested in the total area
+  //     stays visible instead of being buried under the bigger fill;
+  //   lines -- the centerline, so it runs UNDER the outlines;
+  //   polygon outlines, largest first -- total area, then source area on top;
+  //   point markers.
+  // Overlays write no depth (see draw), so this order -- not a near-tie in depth
+  // between two draped lines -- decides which overlay crosses over which, while
+  // the terrain still hides anything behind a ridge.
+  function paintRank(o) {
+    if (o.mode === gl.TRIANGLES && o.noDepth) return 0;
+    if (o.mode === gl.LINE_STRIP) return 1;
+    if (o.mode === gl.LINE_LOOP) return 2;
+    return 3;
+  }
+  overlays.sort(function (a, b) {          // stable: ties keep insertion order
+    var ka = paintRank(a), kb = paintRank(b);
     if (ka !== kb) return ka - kb;
-    if (ka === 0) return (b.fillArea || 0) - (a.fillArea || 0);
-    return 0;
+    return (b.area || 0) - (a.area || 0);
   });
 
   (function buildLayersPanel() {
@@ -921,37 +933,38 @@ _VIEWER_JS = r'''
       gl.uniformMatrix4fv(oMVP, false, new Float32Array(mvp));
       gl.uniform1f(oPtSize, Math.max(9, Math.min(20, canvas.height/50)));
       gl.uniform2f(oOffset, 0, 0);
+      // depth-tested against the terrain but never written: overlays stack in the
+      // paint order set where `overlays` is sorted (centerline under the outlines)
+      gl.depthMask(false);
       for (var oi=0; oi<overlays.length; oi++) {
         var o = overlays[oi], c = o.color;
         if (o.layer && !vis[o.layer]) continue;
         if (o.noDepth) {
           gl.enable(gl.BLEND);
           gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-          gl.depthMask(false);
         }
         gl.uniform1f(oPoint, o.mode === gl.POINTS ? 1.0 : 0.0);
         gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
         gl.enableVertexAttribArray(oPos);
         gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
         if (o.casing) {
-          // white halo: redraw the line at 8 screen-space offsets (~1.2px) without
-          // writing depth, so the dark core keeps its colour but stays legible over
-          // bright OR shadowed terrain (a thin cased-line edge, not a fat white line).
+          // white halo: redraw the line at 8 screen-space offsets (~1.2px), so the
+          // dark core keeps its colour but stays legible over bright OR shadowed
+          // terrain (a thin cased-line edge, not a fat white line).
           var ox = 2.4/Math.max(1,canvas.width), oy = 2.4/Math.max(1,canvas.height);
           var DIRS = [[1,0],[-1,0],[0,1],[0,-1],[0.7,0.7],[-0.7,0.7],[0.7,-0.7],[-0.7,-0.7]];
-          gl.depthMask(false);
           gl.uniform4f(oColor, 1, 1, 1, 1);
           for (var di=0; di<DIRS.length; di++) {
             gl.uniform2f(oOffset, DIRS[di][0]*ox, DIRS[di][1]*oy);
             gl.drawArrays(o.mode, 0, o.n);
           }
           gl.uniform2f(oOffset, 0, 0);
-          if (!o.noDepth) gl.depthMask(true);
         }
         gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
         gl.drawArrays(o.mode, 0, o.n);
-        if (o.noDepth) { gl.depthMask(true); gl.disable(gl.BLEND); }
+        if (o.noDepth) gl.disable(gl.BLEND);
       }
+      gl.depthMask(true);
       gl.useProgram(prog);
     }
     return mvp;
@@ -1846,8 +1859,10 @@ _VIEWER_JS = r'''
       for (var i=0;i<pts.length;i++) { var q = mapPx(L, pts[i][0], pts[i][1]);
         if (i) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); }
     }
-    // fills largest-first, matching the 3D draw order, so a nested source zone
-    // stays visible on top of the total-area polygon instead of under it
+    // Paint order, bottom to top -- the same as the 3D view (see paintRank):
+    // fills largest-first, so a nested source zone stays visible on top of the
+    // total-area polygon; then lines, so the centerline runs UNDER the outlines;
+    // then outlines largest-first (total area, source area on top); then points.
     var rings = [];
     (CFG.polys || []).forEach(function (P) {
       if (P.name && !vis[P.name]) return;
@@ -1864,15 +1879,9 @@ _VIEWER_JS = r'''
     });
     rings.sort(function (a, b) { return b.area - a.area; });
     rings.forEach(function (F) {
+      if (!F.hasFill) return;
       trace(F.out); ctx.closePath();
-      if (F.hasFill) {
-        ctx.fillStyle = "rgba("+F.fc[0]+","+F.fc[1]+","+F.fc[2]+","+F.fa+")"; ctx.fill();
-      }
-      if (F.hasLine) {
-        ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = lwB*2.4; ctx.stroke();
-        ctx.strokeStyle = "rgb("+F.lc[0]+","+F.lc[1]+","+F.lc[2]+")";
-        ctx.lineWidth = lwB*1.3; ctx.stroke();
-      }
+      ctx.fillStyle = "rgba("+F.fc[0]+","+F.fc[1]+","+F.fc[2]+","+F.fa+")"; ctx.fill();
     });
     (CFG.lines || []).forEach(function (LN) {          // centerline etc: white casing
       if (LN.name && !vis[LN.name]) return;
@@ -1884,6 +1893,14 @@ _VIEWER_JS = r'''
         ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = lwB*3.0; ctx.stroke();
         ctx.strokeStyle = "rgb("+c[0]+","+c[1]+","+c[2]+")"; ctx.lineWidth = lwB*1.6; ctx.stroke();
       });
+    });
+    rings.forEach(function (F) {
+      if (!F.hasLine) return;
+      trace(F.out); ctx.closePath();
+      ctx.lineCap = "butt"; ctx.lineJoin = "miter";
+      ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = lwB*2.4; ctx.stroke();
+      ctx.strokeStyle = "rgb("+F.lc[0]+","+F.lc[1]+","+F.lc[2]+")";
+      ctx.lineWidth = lwB*1.3; ctx.stroke();
     });
     var fsP = Math.max(11, Math.round(L.iw/58));
     (CFG.points || []).forEach(function (PT) {          // crown/tip/epicentre markers
