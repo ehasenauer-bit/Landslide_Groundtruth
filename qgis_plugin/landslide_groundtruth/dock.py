@@ -37,6 +37,7 @@ from . import hdr_render
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .step_box import HelpToggle, advanced_box, step_box, tinted
+from .table_fit import bound_height, fit_rows
 
 # label -> --prefer value. PlanetScope lives in its own tab now (separate
 # Data/Orders/Tiles system); this tab covers only the Planetary Computer STAC
@@ -1108,20 +1109,21 @@ class LandslideDock(QgsDockWidget):
             self.source_combo.addItem(label, value)
         form.addRow("Imagery source", self.source_combo)
 
-        # Cloud filtering is ON by default at 50%: eo:cloud_cover is a whole-scene
-        # metric over a 110 km granule, so it says nothing about your few-km AOI,
-        # but a 50% cap trims the mostly-clouded acquisitions that swamp a long
-        # list while still keeping most of the scenes worth eyeballing. Untick the
-        # box to see every scene, clouds and all, and pick purely by thumbnail.
+        # Cloud filtering is ON by default at 50%, judged on the Cloud column —
+        # the cloud over the AOI (imagery.search_event) — not the tile's
+        # eo:cloud_cover: at low winter sun that calls clear snow cloud and hid
+        # every November 2026 Iliamna scene (2026-11-16). Untick the box to list
+        # the nearest scenes, clouds and all, and pick purely by thumbnail.
         self.cloud_filter_check = QCheckBox("Hide scenes cloudier than")
         self.cloud_filter_check.setChecked(True)
         self.cloud_filter_check.setToolTip(
-            "On (default): drop scenes whose WHOLE-SCENE cloud cover exceeds the "
-            "value on the right. That is a scene-wide metric, not your AOI — a "
-            "scene can be 60% cloudy overall and still clear over your point, so "
-            "raise the cap or untick this if the list looks too thin.\n"
-            "Off: NO cloud filtering — every scene in the window is listed, clouds "
-            "and all, so you can see the clouds and pick by eye.\n"
+            "On (default): hide scenes whose cloud OVER YOUR AOI — the Cloud "
+            "column — exceeds the value on the right. The search then reads "
+            "further back in the window until each side's list is full, so a "
+            "cloudy season makes it slower. The whole-scene cloud cover is not "
+            "used: at low winter sun it counts clear snow as cloud.\n"
+            "Off: NO cloud filtering — the scenes nearest the event are listed, "
+            "clouds and all, so you can see the clouds and pick by eye.\n"
             "Either way this only chooses WHICH scenes are listed: a Run downloads "
             "the scenes as acquired, with the cloud left in. No pixels are masked "
             "out for cloud, so you never get holes in the imagery.")
@@ -1249,7 +1251,7 @@ class LandslideDock(QgsDockWidget):
             "footprint on the map. Double-click a row to preview just that scene.\n\n"
             "Hand-picking works for Sentinel-2 / Landsat; PlanetScope has its own "
             "tab.")
-        scenes_box.addWidget(scenes_lbl)
+        scenes_box.addWidget(bound_height(scenes_lbl))
         scenes_box.addWidget(self.footprint_check)     # right under the heading
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -1265,6 +1267,8 @@ class LandslideDock(QgsDockWidget):
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         scenes_box.addWidget(self.table)
         out_split.addWidget(scenes, 1)
+        # As tall as the rows the search found (table_fit), not the whole tab.
+        fit_rows(self.table, 160, containers=(scenes, results_frame))
 
         # quicklook gallery: every candidate's browse thumbnail at once (before +
         # after) so you can scan for the cloud-free scene over the AOI in one
@@ -1306,8 +1310,6 @@ class LandslideDock(QgsDockWidget):
         pv_layout.addWidget(self.preview, 1)
         out_split.addWidget(previewbox)
 
-        # The table is the primary signal, so it takes the spare height.
-        scenes.setMinimumHeight(160)
         root.addWidget(self.progress)
         root.addWidget(self._build_marks_box())
         root.addWidget(results_frame, 1)
@@ -1322,6 +1324,9 @@ class LandslideDock(QgsDockWidget):
         self.log.setMinimumHeight(80)
         log_layout.addWidget(self.log)
         root.addWidget(log_frame)
+        # Stretch 0: gets the height only once the results box is at its cap,
+        # i.e. when the table already shows every row (table_fit).
+        root.addStretch()
         return w
 
     # ---------- Mark a spot (drop-down) ----------

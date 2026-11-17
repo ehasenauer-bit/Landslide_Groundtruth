@@ -94,6 +94,7 @@ from . import nisar_read
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .step_box import step_box, tinted
+from .table_fit import bound_height, fit_rows
 from .task import PipelineTask
 from .nisar_task import NisarReadTask
 from .dock import PRE_BG, POST_BG, ROW_FG, MUTED_FG, STATUS_COLORS
@@ -492,9 +493,9 @@ class SarTab(QWidget):
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(QLabel(
+        tl.addWidget(bound_height(QLabel(
             "Candidate scenes  (★ = default same-track pair; tick the scenes to "
-            "preview on the map)"))
+            "preview on the map)")))
         # seismic-time bracket summary for the starred pair (see sar_pairing)
         tl.addWidget(self.footprint_check)      # right under the heading
         self.pair_summary = QLabel("")
@@ -502,7 +503,7 @@ class SarTab(QWidget):
         self.pair_summary.setTextFormat(Qt.TextFormat.PlainText)
         self.pair_summary.setVisible(False)
         self.pair_summary.setStyleSheet("QLabel { font-style: italic; padding: 2px 0; }")
-        tl.addWidget(self.pair_summary)
+        tl.addWidget(bound_height(self.pair_summary))
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["Side", "Radar", "Date (UTC)", "Gap (d)", "Orbit", "Track", "AOI %",
@@ -515,8 +516,9 @@ class SarTab(QWidget):
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
         tl.addWidget(self.table)
-        self.table.setMinimumHeight(160)
         split.addWidget(tablebox, 1)
+        # As tall as the rows the search found (table_fit), not the whole tab.
+        fit_rows(self.table, 160, containers=(tablebox, results_frame))
 
         # Gallery and preview: closed by default (Ethan, 2026-11-11).
         gallerybox = QgsCollapsibleGroupBox(
@@ -563,6 +565,7 @@ class SarTab(QWidget):
         self.log.setMinimumHeight(80)
         lo.addWidget(self.log)
         root.addWidget(log_frame)
+        root.addStretch()     # the height a short table gives up (table_fit)
 
     def _wrap(self, layout):
         w = QWidget()

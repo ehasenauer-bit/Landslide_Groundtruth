@@ -409,14 +409,17 @@ def main():
                          "stay closer to the event date; higher = prefer clearer scenes. "
                          "Ignored with --auto-window. (default 0.5)")
     ap.add_argument("--max-cloud", type=float, default=None,
-                    help="max whole-scene cloud cover %% to consider. 100 (or omitted, for "
+                    help="max cloud cover %% to consider. 100 (or omitted, for "
                          "--search-only) = NO CAP: every acquisition in the window is listed, "
                          "clouds and all, so scenes can be judged by eye rather than by "
-                         "metadata. Scene-wide metric, and it only picks WHICH scenes are used "
-                         "— a Run composites them as acquired, with no per-pixel cloud masking "
-                         "(Sentinel-2/Landsat; see imagery._composite), so a high cap surfaces "
-                         "scenes clear over the AOI but cloudy elsewhere (what Planet Explorer "
-                         "shows). A Run without --max-cloud "
+                         "metadata. With --search-only on Sentinel-2/Landsat it is the cloud "
+                         "OVER THE AOI (OmniCloudMask, the plugin's Cloud column; the tile's "
+                         "eo:cloud_cover calls snow cloud at low sun), and the search reads "
+                         "further back until each side's list is full. A Run's automatic pick "
+                         "and PlanetScope still cap the whole-scene number. Either way it only "
+                         "picks WHICH scenes are used — a Run composites them as acquired, "
+                         "with no per-pixel cloud masking (Sentinel-2/Landsat; see "
+                         "imagery._composite). A Run without --max-cloud "
                          "still caps (PlanetScope 80, Sentinel-2/Landsat 60, either one 20 "
                          "with --auto-window), since it picks scenes for you rather than "
                          "showing them to you.")

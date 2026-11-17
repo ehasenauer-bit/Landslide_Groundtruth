@@ -53,6 +53,7 @@ from qgis.PyQt.QtCore import QMetaType
 from .task import PipelineTask
 from .flow_layout import FlowRow
 from .step_box import step_box, tinted
+from .table_fit import bound_height, fit_rows
 from . import coord_paste
 from . import layer_group as lg
 from . import planet_keystore
@@ -629,8 +630,8 @@ class PlanetTab(QWidget):
         tablebox = QWidget()
         tl = QVBoxLayout(tablebox)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(self._section(
-            "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)"))
+        tl.addWidget(bound_height(self._section(
+            "Candidate scenes  (★ = nearest each side; tick the scenes to preview on the map)")))
         tl.addWidget(self.footprint_check)      # right under the heading
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -644,9 +645,10 @@ class PlanetTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(self._preview_row_on_map)
-        self.table.setMinimumHeight(160)
         tl.addWidget(self.table)
         split.addWidget(tablebox, 1)
+        # As tall as the rows the search found (table_fit), not the whole tab.
+        fit_rows(self.table, 160, containers=(tablebox, results_frame))
 
         # Gallery and browse image: closed by default (Ethan, 2026-11-11) — the
         # Cloud and Coverage columns are the primary signal.
@@ -701,6 +703,7 @@ class PlanetTab(QWidget):
         root.addWidget(results_frame, 1)
         root.addWidget(g["Advanced"])
         root.addWidget(log_frame)
+        root.addStretch()     # the height a short table gives up (table_fit)
 
         # Wire the auto-resume combo now that the Resume button it toggles exists.
         self.autoresume_combo.currentIndexChanged.connect(self._on_autoresume_changed)

@@ -37,6 +37,8 @@ changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change m
     * Maxar VHR: the AOI cover column sits right after the date.
     * Maxar VHR: the Flip before/after button is gone. To compare, switch the after strip off in the Layers panel.
     * The figure details for the 3D viewer's exports are edited on the Volume tab, where the numbers come from.
+    * Sentinel-2 / Landsat: "Hide scenes cloudier than" now judges the cloud over your search area (the Cloud column), not the whole scene's cloud cover, which at low winter sun counts clear snow as cloud and hid every November scene at Iliamna. The search reads further back until each side's list is full, so a cloudy season makes it slower; the log says how many scenes were hidden.
+    * Candidate scene tables on the Sentinel-2, PlanetScope, SAR and Maxar tabs are only as tall as the scenes found, with no blank space under the last row.
     1.0.1 - Faster scene search; seismic offset in the 3D viewer.
     * The Sentinel-2 / Landsat scene search is several times faster (about 20 s where it took 1 to 8 minutes on a slow link): the cloud check now reads each scene through Planetary Computer's data API instead of downloading image tiles.
     * Fixed: the cloud % of a scene that only clips the edge of the search box could read far too low.

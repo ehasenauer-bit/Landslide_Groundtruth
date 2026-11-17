@@ -742,6 +742,71 @@ def _stac_candidate(item, event_time, source, aoi_cloud_pct=None, aoi_snow_pct=N
                 geometry=item.geometry, bbox=list(item.bbox) if item.bbox else None)
 
 
+# The search's cloud filter judges each scene by its cloud OVER THE AOI (the
+# plugin's Cloud column), not the tile's eo:cloud_cover. Measured 2026-11-16 at
+# Iliamna: at low winter sun Sen2Cor files clear snow as cloud. Every tile there
+# from 2026-10-28 to 11-15 read 88-99% cloud with ~0% snow, so a 50% tile cap hid
+# them all, including a clear 2026-11-15 scene OmniCloudMask put at 24-37% over
+# the AOI. A hidden scene still costs its cloud read, so the search measures
+# nearest-first, a batch per side at a time, until each side's list is full,
+# and gives up after AOI_FILL_ROUNDS batches (a cloudy season then reads up to
+# about that many lists' worth per side, and the older rest goes unchecked).
+AOI_FILL_ROUNDS = 4
+
+
+def _filter_cloud(item, fractions):
+    """The cloud % the search filter judges `item` by: its AOI cloud, or the tile's
+    eo:cloud_cover where the AOI has no measurement (footprint misses the box or
+    every read failed). None when neither exists."""
+    aoi = (fractions.get(item.id) or (None,))[0]
+    return aoi if aoi is not None else item.properties.get("eo:cloud_cover")
+
+
+def _keep_by_aoi_cloud(sides, cap, lat, lon, radius_km, sensor):
+    """The nearest scenes per side whose cloud over the AOI is at most `cap`.
+
+    sides: {name: (items nearest-first, limit)}. Reads nearest-first in batches
+    (see AOI_FILL_ROUNDS) and stops a side once it holds `limit`. cap None or
+    >= 100 is no filter: the nearest `limit` per side, one batch, as before.
+    A scene with no measurement at all (no AOI cloud, no eo:cloud_cover) is kept:
+    it can't be judged, so it is shown.
+
+    Returns (kept, fractions, note, hidden, unread): kept {name: [items]}
+    nearest-first; fractions {id: (cloud, snow, source, bad_data)} for every scene
+    read; note the first OmniCloudMask fallback note (or None); hidden {name: n}
+    scenes read and dropped as too cloudy; unread {name: n} scenes left in the
+    window when the rounds ran out with the side still short."""
+    nocap = _no_cloud_cap(cap)
+    kept = {s: [] for s in sides}
+    queue = {s: list(items) for s, (items, _lim) in sides.items()}
+    hidden = {s: 0 for s in sides}
+    fractions, note = {}, None
+    for _ in range(1 if nocap else AOI_FILL_ROUNDS):
+        batch = {}
+        for s, (_items, lim) in sides.items():
+            need = lim - len(kept[s])
+            if need > 0 and queue[s]:
+                # a full list's worth on the first pass, then twice the shortfall
+                take = lim if nocap else max(4, min(lim, 2 * need))
+                batch[s], queue[s] = queue[s][:take], queue[s][take:]
+        if not batch:
+            break
+        f, n = _aoi_cloud_fractions([i for b in batch.values() for i in b],
+                                    lat, lon, radius_km, sensor)
+        fractions.update(f)
+        note = note or n
+        for s, items in batch.items():
+            lim = sides[s][1]
+            for i in items:
+                c = None if nocap else _filter_cloud(i, fractions)
+                if c is not None and c > cap:
+                    hidden[s] += 1
+                elif len(kept[s]) < lim:
+                    kept[s].append(i)
+    unread = {s: len(queue[s]) if len(kept[s]) < sides[s][1] else 0 for s in sides}
+    return kept, fractions, note, hidden, unread
+
+
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
                  post_days=60, auto_window=False, sensor="s2",
                  cloud_weight=0.5, max_cloud_pct=None):
@@ -762,14 +827,15 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     symmetry with fetch_event but not applied here — the plugin re-ranks the
     returned rows with that same blend to mark the run's pick (★) among them.
 
-    max_cloud_pct: whole-tile cloud cap (0-100); None or >= 100 -> no cap, every
-    acquisition in the window is listed. Tile-wide metric (the STAC filter), and
-    the only cloud handling on a Run is: it composites the scenes as acquired,
-    with no per-pixel cloud masking (see _composite), so what you see listed is
-    what you get. Each listed candidate also carries aoi_cloud_pct — the fraction
-    of the AOI box that is cloud/cirrus/shadow, read per-pixel from the
-    classification band (see _aoi_cloud_fractions) — the honest cloud-over-point
-    number the tile-wide cap can't give."""
+    max_cloud_pct: cloud cap (0-100) over the AOI — the candidate's aoi_cloud_pct,
+    the fraction of the AOI box that is cloud/cirrus/shadow (OmniCloudMask, see
+    _aoi_cloud_fractions) — NOT the tile's eo:cloud_cover, which at low sun calls
+    snow cloud (see AOI_FILL_ROUNDS). Scenes over the cap are read and dropped,
+    and the search reads further back until each side's list is full. None or
+    >= 100 -> no cap, the nearest scenes are listed clouds and all. It only picks
+    which scenes are LISTED: a Run composites the scenes as acquired, with no
+    per-pixel cloud masking (see _composite), so what you see listed is what you
+    get. The result's `notes` say how many were hidden."""
     coll = "sentinel-2-l2a" if sensor == "s2" else "landsat-c2-l2"
     src = _STAC_SOURCE[coll]
     pre0, pre1, post0, post1 = windows(event_time, pre_days, post_days)
@@ -783,15 +849,30 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     # _client), and both sides' scenes then go through ONE read batch, so the short
     # side's reads never leave workers idle while the other side waits its turn.
     from concurrent.futures import ThreadPoolExecutor
+    # No cloud predicate on the STAC search: every acquisition in the window,
+    # nearest first; the cap is applied to the AOI cloud below.
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_pre = ex.submit(search_scenes, lat, lon, radius_km, pre0, pre1, coll,
-                          event_time, max_cloud=cloud, limit=pre_lim, cloud_weight=None)
+                          event_time, max_cloud=None, limit=None, cloud_weight=None)
         f_post = ex.submit(search_scenes, lat, lon, radius_km, post0, post1, coll,
-                           event_time, max_cloud=cloud, limit=post_lim, cloud_weight=None)
-        pre_items, post_items = f_pre.result(), f_post.result()
-    aoi, note = _aoi_cloud_fractions(pre_items + post_items, lat, lon, radius_km, sensor)
+                           event_time, max_cloud=None, limit=None, cloud_weight=None)
+        pre_all, post_all = f_pre.result(), f_post.result()
+    kept, aoi, note, hidden, unread = _keep_by_aoi_cloud(
+        {"pre": (pre_all, pre_lim), "post": (post_all, post_lim)},
+        cloud, lat, lon, radius_km, sensor)
+    pre_items, post_items = kept["pre"], kept["post"]
+    notes = []
+    if sum(hidden.values()):
+        notes.append(f"{src}: {hidden['pre']} pre / {hidden['post']} post scene(s) "
+                     f"hidden, cloudier than {cloud:.0f}% over the AOI (untick 'Hide "
+                     f"scenes cloudier than' to list the nearest regardless)")
+    for side in ("pre", "post"):
+        if unread[side]:
+            notes.append(f"{src} {side}: stopped reading after {AOI_FILL_ROUNDS} "
+                         f"batches with the list short; {unread[side]} older scene(s) "
+                         f"in the window were not checked")
     pre_aoi = post_aoi = aoi
-    return dict(source=src,
+    return dict(source=src, notes=notes,
                 pre=[_stac_candidate(i, event_time, src,
                                      *(pre_aoi.get(i.id) or (None, None, None, None)))
                      for i in pre_items],

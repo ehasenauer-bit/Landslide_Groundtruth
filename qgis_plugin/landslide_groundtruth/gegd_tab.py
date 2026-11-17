@@ -80,6 +80,7 @@ from . import gegd_rank as R
 from . import layer_group as lg
 from .flow_layout import FlowRow
 from .step_box import step_box, tinted
+from .table_fit import fit_rows
 from .gegd_tasks import KeyTestTask, SearchTask
 from .theme import (GRADE_VISUAL_FG, MISSES_EPICENTRE_FG, MUTED_FG, POST_BG, PRE_BG,
                     ROW_FG, status_css, status_html, status_text)
@@ -676,7 +677,7 @@ class GegdTab(QWidget):
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         t.horizontalHeader().setStretchLastSection(True)
-        t.setMinimumHeight(200)
+        fit_rows(t, 200)      # no taller than its rows (table_fit), 200 px floor
         t.setWordWrap(False)
         t.itemSelectionChanged.connect(self._on_table_selection)
         t.itemDoubleClicked.connect(self._on_double_click)
