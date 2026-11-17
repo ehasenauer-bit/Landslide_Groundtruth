@@ -500,7 +500,7 @@ class Viewer3DTab(QWidget):
             ("Centerline length", self.det_cl_length, "runout horizontal length"),
             ("Vertical drop", self.det_cl_drop, "centerline elevation drop"),
             ("Volume", self.det_volume, "volume estimate (Fill button below, or type)"),
-            ("Seismic offset", self.det_seis_offset,
+            ("Location error", self.det_seis_offset,
              "seismic location → landslide centre (Pull, or filled on export)"),
         ):
             # the placeholder already shows `tip` in the empty field; an
@@ -517,7 +517,7 @@ class Viewer3DTab(QWidget):
         self.pull_vol_btn.setToolTip(
             "Copy the latest area, centerline length + vertical drop, and volume "
             "estimate from this tab's measurement into the fields above, and "
-            "measure the seismic offset from the Detection box's lat/lon to the "
+            "measure the location error from the Detection box's lat/lon to the "
             "landslide outline's centre. Run Measure (and the centerline) first. "
             "The 3D viewer tab's export writes these onto the web viewer and the "
             "PNG figure.")
@@ -1995,7 +1995,7 @@ class Viewer3DTab(QWidget):
         # Needs only an outline and the Detection box, not a measurement.
         offset, why = self._fill_seismic_offset()
         if not offset:
-            self._log(f"Seismic offset not measured: {why}")
+            self._log(f"Location error not measured: {why}")
         if not cur:
             self._warn("No Volume-tab result yet — run a measurement in the "
                        "'Volume from area' tab (and compute the centerline) first.")
@@ -2033,7 +2033,7 @@ class Viewer3DTab(QWidget):
             self.det_volume.setText(" · ".join(vols))
         got = [k for k, v in (("area", a), ("length", ln), ("drop", dr),
                               ("volume", vols or None),
-                              ("seismic offset", offset or None)) if v is not None]
+                              ("location error", offset or None)) if v is not None]
         if got:
             self._log("Pulled from Volume tab: " + ", ".join(got) + ".")
         else:
@@ -2042,7 +2042,7 @@ class Viewer3DTab(QWidget):
 
     def _fill_seismic_offset(self):
         """Measure the Detection box's lat/lon to the landslide's centre and put
-        it in the Seismic offset field. (text, "") on success, else ("", why)
+        it in the Location error field. (text, "") on success, else ("", why)
         with the field left as it was."""
         from . import verdict as V
         det = getattr(self.dock, "detection", None)
@@ -2061,13 +2061,13 @@ class Viewer3DTab(QWidget):
             txt += " (source area)"
         self.det_seis_offset.setText(txt)
         what = "total outline" if role == "total" else "source outline (no total drawn)"
-        self._log(f"Seismic offset: {txt} — from {det.lat:.5f}, {det.lon:.5f} to the "
+        self._log(f"Location error: {txt} — from {det.lat:.5f}, {det.lon:.5f} to the "
                   f"{what} centroid at {lat:.5f}, {lon:.5f}.")
         # Far past any search radius means a typo, not a mislocation: Surprise 1
         # (2024-09-20) was saved with longitude +148.45 for a slide at -148.44.
         km = V.haversine_km(det.lat, det.lon, lat, lon)
         if km is not None and km > self.SEISMIC_OFFSET_CHECK_KM:
-            self._warn(f"Seismic offset is {km:,.0f} km — far outside the search "
+            self._warn(f"Location error is {km:,.0f} km — far outside the search "
                        f"radius. Check the Detection box's latitude/longitude "
                        f"({det.lat:g}, {det.lon:g}); a dropped minus sign is the "
                        f"usual cause.")
@@ -2255,11 +2255,11 @@ class Viewer3DTab(QWidget):
         polys, lines, points = self._collect_overlays(scene_crs, extent)
         cfg["polys"], cfg["lines"], cfg["points"] = polys, lines, points
         # extra Details rows for the figure (satellites, area, centerline, volume,
-        # seismic offset). The offset needs no Pull: measured here when empty.
+        # location error). The offset needs no Pull: measured here when empty.
         if not self.det_seis_offset.text().strip():
             offset, why = self._fill_seismic_offset()
             if not offset:
-                self._log(f"Figure has no seismic offset: {why}")
+                self._log(f"Figure has no location error: {why}")
         det = []
         img = self.det_imagery_sat.currentText().strip()
         if img:
@@ -2267,7 +2267,7 @@ class Viewer3DTab(QWidget):
         for lbl, w in (("Terrain", self.det_terrain_sat), ("Area", self.det_area),
                        ("Centerline length", self.det_cl_length),
                        ("Vertical drop", self.det_cl_drop), ("Volume", self.det_volume),
-                       ("Seismic offset", self.det_seis_offset)):
+                       ("Location error", self.det_seis_offset)):
             v = w.text().strip()
             if lbl == "Volume" and v:      # normalize any older ×10⁶ m³ text to Mm³
                 v = v.replace(" ×10⁶ m³", " Mm³").replace("×10⁶ m³", "Mm³")

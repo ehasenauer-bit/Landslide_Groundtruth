@@ -84,8 +84,10 @@ hdrs = [h for h, _ in VT.CSV_FIELDS]
 assert len(hdrs) == len(set(hdrs)), "duplicate CSV header"
 for gone in ("verdict", "analyst", "analyst_note", "recorded_utc", "vol_seismic_m3",
              "agreement", "det_loc_error_km", "offset_vs_loc_error",
-             "vol_thickness_m3", "thickness_m", "thickness_setting"):
+             "vol_thickness_m3", "thickness_m", "thickness_setting",
+             "offset_from_det_km"):
     assert gone not in hdrs, gone
+assert "location_error_km" in hdrs, "the offset column is called location_error_km"
 print(f"   {len(hdrs)} columns, three distinct volumes, no verdict, seismic or "
       "thickness columns")
 

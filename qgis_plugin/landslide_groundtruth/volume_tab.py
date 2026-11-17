@@ -2330,7 +2330,7 @@ class VolumeTab(QWidget):
         """(lat, lon, role) of the whole landslide's centre in EPSG:4326: the
         TOTAL outline's centroid, else the source scar's when no total is
         drawn; (None, None, None) without either. For the 3D viewer's
-        seismic-offset row."""
+        location-error row."""
         return self._outline_centroid(("total", "best"))
 
     def _outline_centroid(self, roles):

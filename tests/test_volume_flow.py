@@ -275,7 +275,7 @@ v3._pull_volume_details()
 txt = v3.det_volume.text()
 check(f"figure volume: {txt!r}", "Larsen et al." in txt and "thickness" not in txt)
 
-print("\n=== the seismic offset: Detection lat/lon to the landslide's centre ===")
+print("\n=== the location error: Detection lat/lon to the landslide's centre ===")
 import re                                                               # noqa: E402
 from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY  # noqa: E402
 from landslide_groundtruth import verdict as V                         # noqa: E402
@@ -328,6 +328,10 @@ v3._warn = warned.append
 v3._fill_seismic_offset()
 v3._warn = _orig_warn
 check("a 2 km offset does not", not warned)
+_lay = v3.det_seis_offset.parentWidget().layout()
+_lbl = _lay.labelForField(v3.det_seis_offset) if hasattr(_lay, "labelForField") else None
+check("the field is labelled 'Location error'",
+      _lbl is not None and _lbl.text() == "Location error")
 dock.detection = None
 
 print("\n=== source low and high: their own volumes, and a wider best range ===")

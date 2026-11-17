@@ -87,6 +87,6 @@ EVENT_CSV_FIELDS = [
     # where the digitized scar sits
     ("scar_lat", "scar_lat"),
     ("scar_lon", "scar_lon"),
-    ("offset_from_det_km", "offset_km"),
+    ("location_error_km", "offset_km"),   # detection -> source scar (else total)
     ("implied_depth_m", "implied_depth"),
 ]
