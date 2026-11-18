@@ -636,6 +636,14 @@ _VIEWER_JS = r'''
       color: color, alpha: (alpha == null ? 1 : alpha), noDepth: !!noDepth,
       layer: layer });
   }
+  // Line weights, in px at the figure's panel height (figPanelSize().pxH, the
+  // 2x-supersampled slide cell), scaled to whatever is rendering -- live view,
+  // figure panel, orbit GIF -- so a line reads the same weight in all of them.
+  // WebGL draws lines 1 px wide whatever lineWidth says, so renderScene builds
+  // the weight by redrawing at a disc of screen-space offsets (lineDisc).
+  // outline: every polygon ring; line: centerlines; casing: the white halo a
+  // line gets beyond its core.
+  var LINE_W = { outline: 2.6, line: 1.95, casing: 1.3 };
   // planar area of a ring ([[x,y], ...]) -- used only to order fills + outlines
   function ringArea(r){ var s=0; for (var i=0;i<r.length;i++){
     var u=r[i], v=r[(i+1)%r.length]; s+=u[0]*v[1]-v[0]*u[1]; } return Math.abs(s)/2; }
@@ -657,6 +665,7 @@ _VIEWER_JS = r'''
       if (hasLine && out.length >= 2) {
         op(drape(out, 1.4), out.length, gl.LINE_LOOP, lc, 1.0, false, P.name);
         overlays[overlays.length-1].area = area;
+        overlays[overlays.length-1].weight = LINE_W.outline;
       }
     });
   });
@@ -666,6 +675,7 @@ _VIEWER_JS = r'''
       if (path.length >= 2) {
         op(drape(path, 1.4), path.length, gl.LINE_STRIP, c, 1.0, false, L.name);
         overlays[overlays.length-1].casing = true;   // white halo -> readable on any terrain
+        overlays[overlays.length-1].weight = LINE_W.line;
       }
     });
   });
@@ -904,6 +914,17 @@ _VIEWER_JS = r'''
   gl.clearColor(0.043, 0.055, 0.075, 1);
   var scheduled = false, lastMVP = null;
 
+  // Redraw the bound overlay at a disc of screen-space offsets of radius R px
+  // (rings ~0.65 px apart, 16 directions each): a solid line ~2R px wide.
+  function lineDisc(o, R) {
+    var nr = Math.ceil(R/0.65), W = Math.max(1, canvas.width), H = Math.max(1, canvas.height);
+    for (var k = 1; k <= nr; k++) for (var t = 0; t < 16; t++) {
+      var r = R*k/nr, a = t*Math.PI/8;
+      gl.uniform2f(oOffset, 2*r*Math.cos(a)/W, 2*r*Math.sin(a)/H);
+      gl.drawArrays(o.mode, 0, o.n);
+    }
+    gl.uniform2f(oOffset, 0, 0);
+  }
   // synchronous GL render (also used per-panel by the figure export); returns mvp
   function renderScene(skipResize) {
     if (!skipResize) resize();
@@ -947,18 +968,17 @@ _VIEWER_JS = r'''
         gl.bindBuffer(gl.ARRAY_BUFFER, o.buf);
         gl.enableVertexAttribArray(oPos);
         gl.vertexAttribPointer(oPos, 3, gl.FLOAT, false, 0, 0);
-        if (o.casing) {
-          // white halo: redraw the line at 8 screen-space offsets (~1.2px), so the
-          // dark core keeps its colour but stays legible over bright OR shadowed
-          // terrain (a thin cased-line edge, not a fat white line).
-          var ox = 2.4/Math.max(1,canvas.width), oy = 2.4/Math.max(1,canvas.height);
-          var DIRS = [[1,0],[-1,0],[0,1],[0,-1],[0.7,0.7],[-0.7,0.7],[0.7,-0.7],[-0.7,-0.7]];
-          gl.uniform4f(oColor, 1, 1, 1, 1);
-          for (var di=0; di<DIRS.length; di++) {
-            gl.uniform2f(oOffset, DIRS[di][0]*ox, DIRS[di][1]*oy);
-            gl.drawArrays(o.mode, 0, o.n);
+        if (o.weight) {
+          // LINE_W: o.weight px at the figure's panel height, scaled to this render.
+          // A cased line gets its white halo first, so the dark core keeps its
+          // colour but stays legible over bright OR shadowed terrain.
+          var sc = canvas.height / figPanelSize().pxH, R = Math.max(1.0, o.weight*sc);
+          if (o.casing) {
+            gl.uniform4f(oColor, 1, 1, 1, 1);
+            lineDisc(o, R + Math.max(0.6, LINE_W.casing*sc));
           }
-          gl.uniform2f(oOffset, 0, 0);
+          gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
+          lineDisc(o, R);
         }
         gl.uniform4f(oColor, c[0]/255, c[1]/255, c[2]/255, o.alpha);
         gl.drawArrays(o.mode, 0, o.n);
@@ -1101,8 +1121,8 @@ _VIEWER_JS = r'''
   }
   // Frame the data box for the current az/el as LARGE as possible without clipping
   // ANYTHING: fit the projected box corners into an INNER rect that reserves margin
-  // for the axis labels (left = elevation, bottom = distance) and the N arrow (top-
-  // right), then pan the box onto that rect's centre. m = margin fractions {L,R,T,B};
+  // for the axis labels (left = elevation, bottom = distance), then pan the box
+  // onto that rect's centre. m = margin fractions {L,R,T,B};
   // default ~symmetric (the live view draws no labels). The export passes larger
   // left/bottom margins so nothing runs off the panel.
   function fitView(m) {
@@ -1321,37 +1341,6 @@ _VIEWER_JS = r'''
                  [Zc[0]?bb.x1:bb.x0, Zc[1]?bb.y1:bb.y0, zData], corner(Zc[0],Zc[1],1),
                  zmin, zCapTop(), "Elevation (m)", fs, bc, {scale:1,dec:0,unit:"m"}, 5);
   }
-  // The compass's square footprint, measured in from the corner it sits in.
-  function northFootprint(W) { return 2*(1.6*Math.max(16, W/42)+6); }
-  // box: the rect the compass pins itself to the top-right corner of -- the
-  // figure's crop (see exportFigure), or the whole panel.
-  function drawNorth(ctx, mvp, W, H, box) {
-    var p0 = project(mvp, [0,0,0], W, H), p1 = project(mvp, [0, meshSpan()*0.15, 0], W, H);
-    if (!p0 || !p1) return;
-    box = box || {x0:0, y0:0, x1:W, y1:H};
-    var ang = Math.atan2(p1[1]-p0[1], p1[0]-p0[0]);
-    // inset by the arrow+label reach (~1.6R) so the "N" never clips the panel edge,
-    // whatever compass direction north points.
-    var R = Math.max(16, W/42), pad = 1.6*R+6, cx = box.x1-pad, cy = box.y0+pad, L = R*0.85;
-    ctx.save();
-    ctx.lineWidth = Math.max(2, W/650);
-    ctx.strokeStyle = "rgba(255,255,255,0.35)";
-    ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2*Math.PI); ctx.stroke();
-    var tx=cx+Math.cos(ang)*L, ty=cy+Math.sin(ang)*L;
-    var bx=cx-Math.cos(ang)*L*0.6, by=cy-Math.sin(ang)*L*0.6;
-    ctx.strokeStyle="rgba(240,244,250,0.95)";
-    ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(tx,ty); ctx.stroke();
-    var ah=L*0.4;
-    ctx.fillStyle="rgba(240,244,250,0.95)";
-    ctx.beginPath(); ctx.moveTo(tx,ty);
-    ctx.lineTo(tx-Math.cos(ang-0.42)*ah, ty-Math.sin(ang-0.42)*ah);
-    ctx.lineTo(tx-Math.cos(ang+0.42)*ah, ty-Math.sin(ang+0.42)*ah);
-    ctx.closePath(); ctx.fill();
-    ctx.fillStyle="#fff"; ctx.font="bold "+Math.round(R*0.7)+"px sans-serif";
-    ctx.textAlign="center"; ctx.textBaseline="middle";
-    ctx.fillText("N", cx+Math.cos(ang)*(R+ah*0.5), cy+Math.sin(ang)*(R+ah*0.5));
-    ctx.restore();
-  }
   function meshSpan(){ return Math.max(+CFG.width_m, +CFG.height_m); }
   function drawPeakLabels(ctx, mvp, W, H) {
     ctx.save(); ctx.font = "bold "+Math.max(11, Math.round(W/95))+"px sans-serif";
@@ -1402,13 +1391,13 @@ _VIEWER_JS = r'''
     var tw=0; lines.forEach(function(l){ tw=Math.max(tw, ctx.measureText(l[0]).width); });
     ctx.restore();
     var padX=fs*0.7, padY=fs*0.55, lineH=fs*1.5, bw=tw+padX*2, bh=lines.length*lineH+padY*2;
-    // place opposite the scar, at the top; the right slot sits below the N compass
+    // place opposite the scar, in a top corner
     if (onLeft == null) {
       var midX=((pc?pc[0]:pe[0])+(pe?pe[0]:pc[0]))/2;
       onLeft = midX > (box.x0+box.x1)/2;
     }
     var inset=Math.round(H*0.02);
-    var dy=onLeft ? inset : northFootprint(W)+Math.round(H*0.012);
+    var dy=inset;
     return { pc:pc, pe:pe, lines:lines, fs:fs, padX:padX, padY:padY, lineH:lineH,
              bw:bw, bh:bh, onLeft:onLeft, inset:inset, dy:dy,
              bx:onLeft ? box.x0+inset : box.x1-inset-bw, by:box.y0+dy };
@@ -1977,7 +1966,7 @@ _VIEWER_JS = r'''
              x1: Math.min(E.W, x1+1+pad), y1: Math.min(E.H, y1+1+pad) };
   }
   // Room for furniture pinned to a top corner of the crop instead of to the
-  // terrain (the compass, the metrics callout): w px in from that side, h tall,
+  // terrain (the metrics callout): w px in from that side, h tall,
   // dy below the crop's top. If anything drawn in those rows would sit under
   // it, widen the crop sideways until it clears by gap -- the crop only ever
   // grows, so nothing that was drawn is cut.
@@ -2060,7 +2049,7 @@ _VIEWER_JS = r'''
     // in frame at that angle -- no clipped corners, whatever angle they chose.
     var scam = { az:cam.az, el:cam.el, dist:cam.dist, tgt:cam.tgt.slice() };
     // reserve margin for the labels: left (elevation) + bottom (distance) big,
-    // right small, top for the N arrow. Box fills the rest and is panned into it.
+    // right + top small. Box fills the rest and is panned into it.
     fitView({L:0.13, R:0.075, T:0.07, B:0.085});
     var shots=[];
     panels.forEach(function (pn) {
@@ -2079,18 +2068,15 @@ _VIEWER_JS = r'''
     positionLabels(renderScene(true));
     draw();
     // Crop to what the three panels drew (terrain, block, axes, labels), then make
-    // room for the two things pinned to a CORNER rather than to the terrain: the
-    // compass (top-right) and the metrics callout (top, opposite the scar).
+    // room for the one thing pinned to a CORNER rather than to the terrain: the
+    // metrics callout (top, opposite the scar). No north arrow on the 3D figure.
     var E = inkExtents(shots.map(function (s) { return s.img; }));
     var pad = Math.round(pxH*0.02), gap = Math.round(pxH*0.012), R = inkBox(E, pad);
-    var nb = northFootprint(pxW);
-    reserveCorner(E, R, nb, nb, "right", 0, gap);
     var ovS = shots.filter(function (s) { return s.ov; })[0];
     var co = ovS ? calloutGeom(ovS.img.getContext("2d"), ovS.mvp, pxW, pxH, R) : null;
     if (co) reserveCorner(E, R, co.inset + co.bw, co.bh, co.onLeft ? "left" : "right", co.dy, gap);
     shots.forEach(function (s) {
       var g = s.img.getContext("2d");
-      drawNorth(g, s.mvp, pxW, pxH, R);
       if (s.ov && co) drawLandslideAnnotations(g, s.mvp, pxW, pxH, R, co.onLeft);
       s.img = cropCanvas(s.img, R);
     });

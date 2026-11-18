@@ -151,9 +151,23 @@ for name, src in (("map", mapfig), ("3D", fig3d)):
 compose = body("composeFigure")
 assert "FW: 3*m + 2*colW" in compose, "composeFigure no longer sizes the slide to its panels"
 assert "1920" not in compose, "composeFigure is back to a fixed-width slide"
-# the compass and callout follow the crop, or they float in the trimmed-off margin
-assert "drawNorth(g, s.mvp, pxW, pxH, R)" in fig3d
-assert "reserveCorner(E, R, nb, nb" in fig3d
+# the callout follows the crop, or it floats in the trimmed-off margin
+assert "drawLandslideAnnotations(g, s.mvp, pxW, pxH, R, co.onLeft)" in fig3d
+assert "reserveCorner(E, R, co.inset + co.bw" in fig3d
+# no north arrow on the 3D figure (removed 2026-11-18); the map figure keeps its own
+assert "drawNorth" not in JS and "northFootprint" not in JS, \
+    "the 3D figure's north arrow is back"
+assert "drawMapNorthArrow(" in mapfig or "drawMapNorthArrow(" in body("mapPanel"), \
+    "the map figure lost its north arrow"
+
+# ---- line weights: one set, scaled to the render, used by every overlay ------
+assert re.search(r"var LINE_W = \{ outline: [\d.]+, line: [\d.]+, casing: [\d.]+ \};", JS), \
+    "LINE_W (overlay line weights) is gone or reshaped"
+assert ".weight = LINE_W.outline;" in JS, "polygon outlines stopped taking LINE_W.outline"
+assert ".weight = LINE_W.line;" in JS, "lines stopped taking LINE_W.line"
+rs = body("renderScene")
+assert "figPanelSize().pxH" in rs and "lineDisc(o, R)" in rs, \
+    "renderScene no longer scales line weights to the render"
 
 print("map axes OK — %d panel shapes clear the degree and distance labels (ship "
       "%dx%d: %.1f / %.1f px to spare); pre-fix margin clipped by %.1f px; figures "
