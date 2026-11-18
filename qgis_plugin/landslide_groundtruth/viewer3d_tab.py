@@ -2297,7 +2297,9 @@ class Viewer3DTab(QWidget):
             "imagery": self.det_imagery_sat.currentText().strip(),
             "thumb": self._thumb_uri(after_img),
         }
-        # Every scene this project downloaded, for the page's "Export metadata
+        # For imagery_details.txt in the figure ZIPs (index_meta is lifted out of the payload).
+        cfg["event_id"] = cfg["index_meta"]["event"]
+        # The figure's scenes plus every SAR scene, for the page's "Export metadata
         # CSV" button. Read at export time, so the page keeps it offline.
         csv_cfg = self._scene_csv(before, after)
         if csv_cfg:
@@ -2338,9 +2340,11 @@ class Viewer3DTab(QWidget):
         return self._thumb_uri(img)
 
     def _scene_csv(self, before, after):
-        """{"name", "csv", "n"}: every downloaded scene as CSV text (see
-        scene_manifest), or None on any failure -- the viewer still exports,
-        just with its CSV button greyed out."""
+        """The page's scene tables (see scene_manifest.payload): the figure's
+        scenes plus every downloaded SAR scene, one CSV per mission, written for
+        a reader outside this project; the button saves them as one ZIP. None on
+        any failure -- the viewer still exports, just with its CSV button
+        greyed out."""
         from . import scene_manifest as sm
         try:
             det = getattr(self.dock, "detection", None)
@@ -2349,39 +2353,34 @@ class Viewer3DTab(QWidget):
             def paths(layers):
                 return [l.source().split("|")[0] for l in layers]
 
-            rows = sm.collect(self.dock.results_dir(), event_id,
-                              viewer={"Before": paths(before), "After": paths(after)},
-                              extra=self._maxar_scene_rows(before, after, event_id))
+            sections = sm.collect(self.dock.results_dir(), event_id,
+                                  viewer={"Before": paths(before), "After": paths(after)},
+                                  maxar=self._maxar_streams(before, after))
+            stem = self._viewer_stem()
+            stem = stem[:-3] if stem.endswith("_3d") else stem
+            cfg = sm.payload(sections, stem)
         except Exception as e:
             self._log(f"Metadata CSV skipped ({type(e).__name__}: {e}).")
             return None
-        if rows:
-            tabs = sorted({r["Tab"] for r in rows}, key=sm.TABS.index)
-            self._log(f"Metadata CSV: {len(rows)} downloaded scene(s) "
-                      f"({', '.join(tabs)}).")
+        if cfg["n"]:
+            self._log(f"Metadata CSV: {cfg['n']} scene(s) — {', '.join(cfg['tables'])}.")
         else:
-            self._log("Metadata CSV: no downloaded scenes found in "
-                      f"{self.dock.results_dir()} — the page's CSV button is greyed out.")
-        stem = self._viewer_stem()
-        stem = stem[:-3] if stem.endswith("_3d") else stem
-        return {"name": stem + "_scenes.csv", "csv": sm.to_csv(rows), "n": len(rows)}
+            self._log("Metadata CSV: none of the figure's layers is a downloaded scene and "
+                      f"there is no SAR in {self.dock.results_dir()} — the page's CSV "
+                      "button is greyed out.")
+        return cfg
 
-    def _maxar_scene_rows(self, before, after, event_id):
-        """Maxar strips streamed into this project, as scene_manifest rows.
+    def _maxar_streams(self, before, after):
+        """The Maxar strips streamed into this project, for scene_manifest:
+        [{"fid", "side", "in_figure", "props"}].
 
-        Streams leave no file behind, so each comes from its layer's
-        landslide/gegd_* properties, filled out with the Maxar tab's own table
-        cells (sun, cover, cloud) while its search still lists the strip."""
+        Streams leave no file behind. The manifest finds each strip's full record
+        in the Maxar tab's cached search (gegd/<event>/search.json); `props`, the
+        layer's own landslide/gegd_* values, is the fallback when no cached
+        search lists it."""
         from . import gegd_layers as gl
-        from . import scene_manifest as sm
-        shown = {}
-        for label, layers in (("Before", before), ("After", after)):
-            for lyr in layers:
-                fid = gl.get_prop(lyr, "fid")
-                if fid and label not in shown.setdefault(fid, []):
-                    shown[fid].append(label)
-        tab = getattr(self.dock, "gegd_tab", None)
-        rows, seen = [], set()
+        shown = {gl.get_prop(lyr, "fid") for lyr in list(before) + list(after)} - {""}
+        out, seen = [], set()
         for lyr in QgsProject.instance().mapLayers().values():
             if gl.get_prop(lyr, "kind") != gl.KIND_STREAM:
                 continue
@@ -2389,41 +2388,10 @@ class Viewer3DTab(QWidget):
             if not fid or fid in seen:
                 continue
             seen.add(fid)
-            ona, level = gl.get_prop(lyr, "ona"), gl.get_prop(lyr, "level")
-            try:
-                ona_txt = f"{float(ona):.1f}"
-            except (TypeError, ValueError):
-                ona_txt = "—"
-            if level:
-                ona_txt += f" ({level})"
-            row = {
-                "Event": gl.get_prop(lyr, "event_id") or event_id, "Tab": sm.TAB_MAXAR,
-                "Side": gl.get_prop(lyr, "side"),
-                "Date (UTC)": str(gl.get_prop(lyr, "acq_utc"))[:16].replace("T", " "),
-                "Source": "Maxar", "Sensor": gl.get_prop(lyr, "sensor"),
-                "Off-nadir°": ona_txt, "Scene ID": fid,
-                "In 3D viewer": " + ".join(shown.get(fid, [])),
-                "File": "(streamed: " + lyr.name() + ")",
-            }
-            cells = None
-            if tab is not None and hasattr(tab, "strip_cells"):
-                try:
-                    cells = tab.strip_cells(fid)
-                except Exception:
-                    cells = None
-            if cells:
-                acq = cells.get("acq_utc")
-                if acq is not None:
-                    row["Date (UTC)"] = f"{acq:%Y-%m-%d %H:%M}"
-                row["Side"] = cells.get("side") or row["Side"]
-                row["Gap (d)"] = f"{float(cells.get('gap_days') or 0.0):.1f}"
-                row["Sensor"] = cells.get("Sensor", row["Sensor"])
-                row["Off-nadir°"] = cells.get("Off-nadir°", row["Off-nadir°"])
-                row["Sun°"] = cells.get("Sun°", "")
-                row["Coverage (% AOI)"] = cells.get("AOI cover", "").replace("%", "", 1)
-                row["Strip cloud %"] = cells.get("Strip cloud %", "")
-            rows.append(row)
-        return rows
+            out.append({"fid": fid, "side": gl.get_prop(lyr, "side"), "in_figure": fid in shown,
+                        "props": {k: gl.get_prop(lyr, k) for k in (
+                            "event_id", "acq_utc", "sensor", "ona", "level", "catalog_id")}})
+        return out
 
     def _web_out_dir(self):
         base_out = self.dock.results_dir()     # this project's folder once it's saved

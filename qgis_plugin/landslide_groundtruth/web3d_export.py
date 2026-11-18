@@ -415,25 +415,29 @@ _VIEWER_JS = r'''
   try { CFG = JSON.parse(document.getElementById("cfg").textContent); }
   catch (ex) { return fail("Could not read scene data: " + ex); }
 
-  // ---------- metadata CSV: every scene the project downloaded ----------
-  // CFG.scene_csv is built by the plugin at export time (scene_manifest.py):
-  // one row per downloaded scene under the imagery tabs' table headings. Wired
-  // before WebGL starts, so the table still saves where the 3D view cannot run.
+  // ---------- metadata CSV: the figure's scenes, plus every SAR scene ----------
+  // CFG.scene_csv is built by the plugin at export time (scene_manifest.py): one
+  // CSV per mission table plus a README, saved together as one ZIP. Wired before
+  // WebGL starts, so the tables still save where the 3D view cannot run.
   (function () {
     var b = document.getElementById("csvBtn"), S = CFG.scene_csv;
-    if (!S || !S.n) {
+    if (!S || !S.n || !S.files) {
       b.disabled = true;
-      b.title = S ? "No downloaded scenes were found in the project folder when this viewer was exported."
+      b.title = S ? "None of the figure's layers was a downloaded scene, and the project had no SAR, when this viewer was exported."
                   : "This viewer was exported without a scene list.";
       return;
     }
-    b.title = S.n + " downloaded scene" + (S.n === 1 ? "" : "s") +
-              ": Side, Date, Gap, Cloud, Coverage, Source, Radar, Orbit, Track, Sensor, ... Scene ID";
+    b.title = S.n + " scene" + (S.n === 1 ? "" : "s") + ", one CSV per table — " +
+              S.tables.join(", ") +
+              ": archive, collection, scene ID, tile / orbit / frame, footprint, search settings";
     b.onclick = function () {
-      // The BOM is for Excel, which otherwise reads this UTF-8 (° ❄ —) as Latin-1.
-      var blob = new Blob(["\ufeff" + S.csv], {type: "text/csv;charset=utf-8"});
+      // The BOM is for Excel, which otherwise reads this UTF-8 (° —) as Latin-1.
+      var enc = new TextEncoder();
+      var blob = new Blob([zipStore(S.files.map(function (f) {
+        return {name: f.name, data: enc.encode((/\.csv$/i.test(f.name) ? "\ufeff" : "") + f.csv)};
+      }))], {type: "application/zip"});
       var a = document.createElement("a");
-      a.href = URL.createObjectURL(blob); a.download = S.name || "scenes.csv";
+      a.href = URL.createObjectURL(blob); a.download = S.name || "scenes.zip";
       document.body.appendChild(a); a.click();
       setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
     };
@@ -1551,6 +1555,7 @@ _VIEWER_JS = r'''
         var orb=renderOrbitFrames(24, 480, 270);
         files.push({name:"orbit.gif", data:gifEncode(orb.frames, orb.w, orb.h, 16)});   // 16cs/frame = half speed
       }
+      files.push({name:"imagery_details.txt", data:new TextEncoder().encode(detailsText())});
       var blob=new Blob([zipStore(files)], {type:"application/zip"});
       var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=zipName;
       document.body.appendChild(a); a.click();
@@ -2131,6 +2136,19 @@ _VIEWER_JS = r'''
              ["Before image", CFG.before_date||"—"],
              ["After image", CFG.after_date||"—"]])
       .concat((CFG.extra_details||[]).filter(function (kv) { return !!kv[1]; }));
+  }
+  // The 3D slide's Details block as plain text, for imagery_details.txt in both figure
+  // ZIPs: the full set of rows (the map slide prints fewer, or a locator instead)
+  // and the overlay names its legend shows.
+  function detailsText() {
+    var L = ["Landslide figure details", ""];
+    if (CFG.event_id) L.push("event_id: " + CFG.event_id);
+    figureDetailRows({}).forEach(function (kv) { L.push(kv[0] + ": " + kv[1]); });
+    if (layerMeta.length) {
+      L.push("", "Overlays:");
+      layerMeta.forEach(function (mm) { L.push("  " + mm.name); });
+    }
+    return L.join("\r\n") + "\r\n";
   }
   function detailsWidth(g, rows) {          // the Details cell's text, widest line
     g.font = "bold 22px sans-serif";

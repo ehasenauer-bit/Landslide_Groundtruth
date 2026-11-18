@@ -603,30 +603,31 @@ check(f"the search-area folder is still above the stream folder ({root_groups()}
 
 print("\n=== streamed strips in the 3D viewer's metadata CSV ===")
 from landslide_groundtruth import scene_manifest as SM                 # noqa: E402
-cells = tab.strip_cells(tab._row_strips[row31].strip.feature_id)
-check("strip_cells gives exactly the table's cells for a strip",
-      cells is not None and [cells[h] for h in GCOLS]
-      == [tab._table.item(row31, c).text() for c in range(len(GCOLS))])
-check("… plus its side and gap", cells["side"] == tab._row_strips[row31].side
-      and cells["gap_days"] == tab._row_strips[row31].gap_days)
-check("a strip the search does not list is None", tab.strip_cells("not-a-strip") is None)
 v3d = dock.viewer3d_tab
-mrows = v3d._maxar_scene_rows([b2], [a2], "AK2099-0001")
-mfids = sorted(r["Scene ID"] for r in mrows)
-check(f"one row per streamed strip ({len(mrows)}/{len(tab._stream_layers)})",
-      mfids == sorted({gegd_layers.get_prop(l, "fid") for l in tab._stream_layers}))
-r31 = next((r for r in mrows if r["Scene ID"] == gegd_layers.get_prop(a2, "fid")), {})
-check(f"the draped strips are marked ({r31.get('In 3D viewer')})",
-      r31.get("In 3D viewer") == "After" and sum(bool(r["In 3D viewer"]) for r in mrows) == 2)
-check(f"a row carries the Maxar table's Sun / cover / cloud ({r31.get('Sun°')}, "
-      f"{r31.get('Coverage (% AOI)')}, {r31.get('Strip cloud %')})",
-      r31.get("Tab") == SM.TAB_MAXAR and r31.get("Sun°") == cells["Sun°"]
-      and r31.get("Strip cloud %") == cells["Strip cloud %"]
-      and r31.get("Coverage (% AOI)") == cells["AOI cover"].replace("%", "", 1)
-      and r31.get("Date (UTC)", "").startswith("2026-08-31"))
+streams = v3d._maxar_streams([b2], [a2])
+check(f"one entry per streamed strip ({len(streams)}/{len(tab._stream_layers)})",
+      sorted(s["fid"] for s in streams)
+      == sorted({gegd_layers.get_prop(l, "fid") for l in tab._stream_layers}))
+check("the figure's two strips, and only they, are in_figure",
+      {s["fid"] for s in streams if s["in_figure"]}
+      == {gegd_layers.get_prop(b2, "fid"), gegd_layers.get_prop(a2, "fid")})
+mx = SM.collect(dock.results_dir(), "AK2099-0001", viewer={"Before": [], "After": []},
+                maxar=streams).get("maxar", [])
+s31 = tab._row_strips[row31].strip
+r31 = next((r for r in mx if r["scene_id"] == s31.feature_id), {})
+check(f"the Maxar table holds the figure's strips only ({len(mx)})", len(mx) == 2)
+check("a row carries the cached search's record (catalog id, sensor, off-nadir, sun, "
+      f"footprint): {r31.get('catalog_id')}, {r31.get('sensor')}, {r31.get('off_nadir_deg')}",
+      r31.get("catalog_id") == (s31.catalog_id or SM.NA) and r31.get("sensor") == s31.sensor
+      and r31.get("off_nadir_deg") == SM._num(s31.ona)
+      and r31.get("sun_elevation_deg") == SM._num(s31.sun_el)
+      and r31.get("footprint_west") != SM.NA
+      and r31.get("acquired_utc", "").startswith("2026-08-31"))
+check("every cell of it is filled", all(v not in ("", None) for v in r31.values()))
 csv_cfg = v3d._scene_csv([b2], [a2])
-check("the viewer's CSV payload lists them", csv_cfg is not None and csv_cfg["n"] >= len(mrows)
-      and csv_cfg["csv"].startswith(",".join(SM.COLUMNS[:3])))
+check("the viewer's CSV payload has the Maxar table",
+      csv_cfg is not None and "Maxar / WorldView" in csv_cfg["tables"]
+      and any(f["name"].endswith("_maxar.csv") for f in csv_cfg["files"]))
 
 print("\n=== table and footprints select each other ===")
 tab._table.selectRow(row31)
