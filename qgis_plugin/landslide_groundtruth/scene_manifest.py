@@ -1,22 +1,25 @@
-"""The scenes behind an exported figure, as tables someone else can search with.
+"""The scenes behind an exported figure, as small tables someone else can search with.
 
 The exported 3D viewer carries these tables behind its "Export metadata CSV"
 button. They are written for a reader who has the figure but not this project
-(an analyst, or an agent at another organisation) and wants to find the same
-acquisitions in the same archives. So every row says where the scene lives
-(archive + collection), what identifies it (scene ID, tile / orbit / frame,
-catalog ID), where it lies (footprint bounds) and how it was searched for
-(centre, radius, date window, cloud limit). Nothing that only means something
+(an analyst, or an agent at another organisation) and wants to fetch the same
+acquisitions again. So a row says only that: which event the scene was pulled
+for, before or after, when it was acquired, its id, and the archive + collection
+that serve it. How each source was searched (centre, radius, dates, cloud limit)
+is said once, in the README, not on every row. Nothing that only means something
 on this machine: no dock tab names, file names or viewer state.
+
+Ethan cut the tables to these six columns on 2026-11-18. Before that each table
+had 26-28: footprint bounds, the search repeated on every row, and fields the
+scene ID already spells out (mission, tile, orbit, frame).
 
 Which scenes: the before/after scenes draped in the figure, plus every SAR scene
 the project downloaded (radar is never draped, but it is half the evidence).
 With no figure given (viewer=None) every downloaded scene is listed.
 
-One table per mission family, so every column applies to every row of its table
-and no cell is structurally empty: Sentinel-2, Landsat, PlanetScope,
-Maxar / WorldView, and under SAR, Sentinel-1 and NISAR. A value that applies but
-was not recorded (a scene whose search entry has gone) reads "n/a".
+One CSV per mission (Sentinel-2, Landsat, PlanetScope, Maxar / WorldView, SAR
+Sentinel-1, SAR NISAR) plus the README; the viewer saves them as one ZIP. A
+value the project never recorded reads "n/a".
 
 "Downloaded" is read from what each tab leaves in the project folder, not from
 the tables on screen (empty again after a reopen):
@@ -31,12 +34,8 @@ the tables on screen (empty again after a reopen):
   * Maxar -- streamed, never written to disk: the plugin names the streamed
     strips (viewer3d_tab._maxar_streams); their records come from the Maxar
     tab's cached searches, gegd/<event>/search.json, else from the stream
-    layer's own properties.
-
-Written as one plain CSV per table plus a README that says how to read the
-columns (to_csv_files); the viewer saves them together as one ZIP. One file per
-table, not one file with a block per table, so every file opens as a clean
-table in a spreadsheet or pandas (Ethan's pick, 2026-11-17).
+    layer's own properties. Their scene_id is the Maxar catalog ID, which other
+    archives know, not GEGD's own feature UUID.
 
 No QGIS imports, so it is testable on its own.
 """
@@ -50,54 +49,33 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-__all__ = ["SECTIONS", "NA", "collect", "to_csv_files", "payload", "aoi_box",
-           "coverage_pct"]
+__all__ = ["SECTIONS", "COLUMNS", "NA", "collect", "to_csv_files", "payload",
+           "aoi_box", "coverage_pct"]
 
-NA = "n/a"          # applies to this scene, but the project never recorded it
+NA = "n/a"          # the project never recorded it
 
-_HEAD = ("event_id", "side", "acquired_utc", "days_from_event")
-_WHERE = ("aoi_coverage_pct", "scene_id", "archive", "collection",
-          "footprint_west", "footprint_south", "footprint_east", "footprint_north")
-_SEARCH = ("search_center_lat", "search_center_lon", "search_radius_km",
-           "search_start_utc", "search_end_utc")
-_SEARCH_CLOUD = _SEARCH + ("search_max_cloud_pct",)
-_OPTICAL_CLOUD = ("aoi_cloud_pct", "aoi_snow_pct", "aoi_cloud_method", "scene_cloud_pct")
-_SAR = ("mission", "band", "product", "acquisition_mode", "polarization_used",
-        "polarizations_available", "orbit_direction", "relative_orbit")
+COLUMNS = ("event_id", "side", "acquired_utc", "scene_id", "archive", "collection")
 
-# (key, title, columns), in the order the tables are written.
+# (key, title), in the order the tables are written.
 SECTIONS = (
-    ("sentinel2", "Sentinel-2",
-     _HEAD + ("mission", "product_level", "mgrs_tile", "relative_orbit")
-     + _OPTICAL_CLOUD + _WHERE + _SEARCH_CLOUD),
-    ("landsat", "Landsat",
-     _HEAD + ("mission", "product_level", "wrs_path", "wrs_row", "collection_category")
-     + _OPTICAL_CLOUD + _WHERE + _SEARCH_CLOUD),
-    ("planetscope", "PlanetScope",
-     _HEAD + ("satellite_id", "product_bundle", "scene_cloud_pct") + _WHERE + _SEARCH_CLOUD),
-    ("maxar", "Maxar / WorldView",
-     _HEAD + ("sensor", "catalog_id", "off_nadir_deg", "sun_elevation_deg", "sun_azimuth_deg",
-              "gsd_m", "processing_level", "product_name", "strip_cloud_pct")
-     + _WHERE + _SEARCH),
-    ("sar_sentinel1", "SAR - Sentinel-1",
-     _HEAD + _SAR + ("absolute_orbit", "datatake_id", "esa_granule") + _WHERE + _SEARCH),
-    ("sar_nisar", "SAR - NISAR",
-     _HEAD + _SAR + ("frame", "cycle") + _WHERE + _SEARCH),
+    ("sentinel2", "Sentinel-2"),
+    ("landsat", "Landsat"),
+    ("planetscope", "PlanetScope"),
+    ("maxar", "Maxar / WorldView"),
+    ("sar_sentinel1", "SAR - Sentinel-1"),
+    ("sar_nisar", "SAR - NISAR"),
 )
-_COLUMNS = {key: cols for key, _title, cols in SECTIONS}
-_TITLES = {key: title for key, title, _cols in SECTIONS}
+_TITLES = dict(SECTIONS)
 
-# What a reader needs to read the columns right; the body of the README.
+# The README's column notes.
 ABOUT = (
-    "One table per mission; every column applies to every row of its table.",
-    "side: before / after the event. days_from_event: days between the "
-    "acquisition and the event origin time.",
-    "aoi_*: inside the square search box, search_center_lat/lon +- search_radius_km. "
-    "aoi_cloud_method: ocm = OmniCloudMask, scl = Sentinel-2 Scene Classification.",
-    "scene_cloud_pct / strip_cloud_pct: the archive's own whole-scene figure.",
-    "footprint_*: the scene's bounding box, degrees (WGS84).",
-    "search_*: the search that found the scene (dates UTC).",
-    "n/a: applies to this scene but was not recorded.",
+    "Columns (the same in every file):",
+    "  event_id      the seismic detection the scenes were pulled for",
+    "  side          before / after the event",
+    "  acquired_utc  when the scene was acquired (UTC)",
+    "  scene_id      the archive's own id for the scene",
+    "  archive, collection  where to search for scene_id",
+    "  n/a           not recorded by the project",
 )
 
 ARCHIVE_MPC = "Microsoft Planetary Computer"
@@ -105,35 +83,15 @@ ARCHIVE_PLANET = "Planet Labs"
 ARCHIVE_GEGD = "NGA GEGD Pro"
 ARCHIVE_ASF = "NASA ASF DAAC"
 
-# Mirror of dock.SNOW_UNRELIABLE_PCT (dock imports Qt): an AOI this snowy reads
-# its cloud % as a lower bound. Kept for callers that want to flag it.
-SNOW_UNRELIABLE_PCT = 50.0
-
 # <event>_<side>_<scene tag>_planet_<tone>[_toa].tif  (run_single._write_render_json)
 _PLANET_RE = re.compile(
-    r"^(?P<event>.+?)_(?P<side>pre|post)_(?P<tag>.+)_planet_[a-z]+(?P<toa>_toa)?\.tif$")
+    r"^(?P<event>.+?)_(?P<side>pre|post)_(?P<tag>.+)_planet_[a-z]+(?:_toa)?\.tif$")
 # <S1|NISAR>_<date>_<orbit>_t<track>_<pol>_<res>m.tif  (sar_tab._amp_save_path)
 _SAR_RE = re.compile(
     r"^(?P<tag>S1|NISAR)_(?P<date>\d{4}-\d{2}-\d{2}|undated)_(?P<orbit>[a-z]+)"
     r"_t(?P<track>\w+?)_(?P<pol>[A-Za-z]+)_(?P<res>[\d.]+)m\.tif$")
 _PLANET_ID_RE = re.compile(r"^(\d{8})_(\d{6})(?:_\d{2})?_([0-9a-f]{4})$")
-# S2A_MSIL2A_20990101T213529_R086_T05VPG_20990101T233244 (optional _N0511_ baseline)
-_S2_ID_RE = re.compile(
-    r"^(S2[A-D])_MSI(L[12][AC])_(\d{8}T\d{6})_(?:N\d{4}_)?R(\d{3})_T(\d{2}[A-Z]{3})_")
-# LC09_L2SP_062018_20990120_02_T1 (MPC) or ..._20990120_20990125_02_T1 (USGS)
-_LANDSAT_ID_RE = re.compile(
-    r"^L([COTEM])(\d{2})_(L\d\w{2})_(\d{3})(\d{3})_(\d{8})_(?:\d{8}_)?(\d{2})_(T1|T2|RT)")
-# S1A_IW_GRDH_1SDV_20981228T030020_20981228T030045_012345_00ABCE[_rtc]
-_S1_ID_RE = re.compile(
-    r"^(S1[A-D])_([A-Z0-9]{2})_(\w{4})_(\w{4})_(\d{8}T\d{6})_(\d{8}T\d{6})"
-    r"_(\d{6})_([0-9A-F]{6})")
-# NISAR_L2_PR_GCOV_<cycle>_<track>_<A|D>_<frame>_<mode>_<pols>_A_<start>_<end>_...
-_NISAR_ID_RE = re.compile(
-    r"^NISAR_L(\d)_(\w{2})_(\w{4})_(\d{3})_(\d{3})_([AD])_(\d{3})_(\w{4})_(\w{4})_")
-
-_POL_PAIRS = {"DV": "VV+VH", "DH": "HH+HV", "SV": "VV", "SH": "HH",
-              "DHDH": "HH+HV", "DVDV": "VV+VH", "SHNA": "HH", "SVNA": "VV",
-              "QPQP": "HH+HV+VH+VV"}
+_LANDSAT_ID_RE = re.compile(r"^L[COTEM]\d{2}_")
 
 
 # ---------------------------------------------------------------- reading
@@ -162,6 +120,7 @@ def _search_index(search):
 
 
 # ---------------------------------------------------------------- coverage
+# Only used to pick, of two frames of one SAR pass, the one that covers the AOI.
 
 def aoi_box(search):
     """(minx, miny, maxx, maxy) of a tab's search box in lon/lat, or None.
@@ -174,10 +133,6 @@ def aoi_box(search):
         radius = float((search.get("params") or {})["radius_km"])
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    return _box(lat, lon, radius)
-
-
-def _box(lat, lon, radius):
     dlat = radius / 111.32
     dlon = radius / (111.32 * math.cos(math.radians(lat)))
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
@@ -270,37 +225,7 @@ def coverage_pct(candidate, box):
     return max(0.0, min(100.0, 100.0 * area / box_area))
 
 
-def _bounds(candidate):
-    """(west, south, east, north) of a scene: its stored bbox, else its footprint."""
-    bb = candidate.get("bbox")
-    if isinstance(bb, (list, tuple)) and len(bb) == 4:
-        try:
-            return tuple(float(v) for v in bb)
-        except (TypeError, ValueError):
-            pass
-    xs, ys = [], []
-    for rings in _polygons(candidate.get("geometry")):
-        for p in (rings[0] if rings else []):
-            try:
-                xs.append(float(p[0]))
-                ys.append(float(p[1]))
-            except (TypeError, ValueError, IndexError):
-                continue
-    return (min(xs), min(ys), max(xs), max(ys)) if xs else None
-
-
 # ---------------------------------------------------------------- cells
-
-def _num(v, nd=1):
-    """A number at `nd` decimals, NA when absent or unreadable."""
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return NA
-    if math.isnan(f):
-        return NA
-    return f"{f:.{nd}f}" if nd else str(int(round(f)))
-
 
 def _parse_time(text):
     """An aware UTC datetime from an ISO-ish string (or a date), or None."""
@@ -317,77 +242,60 @@ def _parse_time(text):
     return None
 
 
-def _iso(d):
-    return d.strftime("%Y-%m-%dT%H:%M:%SZ") if d is not None else NA
-
-
 def _acquired(text):
     """'2026-09-13T20:40:41Z' -- or just the date when that is all there is."""
     s = str(text or "").strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         return s
-    return _iso(_parse_time(s))
-
-
-def _days(c, scene_time, event_time):
-    if c is not None and c.get("gap_days") is not None:
-        return _num(c["gap_days"], 0)
-    a, b = _parse_time(scene_time), event_time
-    if a is None or b is None:
-        return NA
-    return str(int(round(abs((a - b).total_seconds()) / 86400.0)))
+    d = _parse_time(s)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ") if d is not None else NA
 
 
 def _side(side):
     return {"pre": "before", "post": "after"}.get(side, NA)
 
 
-def _where(c, box, scene_id, archive, collection):
-    out = {"scene_id": scene_id or NA, "archive": archive, "collection": collection}
-    pct = coverage_pct(c, box) if c is not None else None
-    out["aoi_coverage_pct"] = _num(pct, 0) if pct is not None else NA
-    bb = _bounds(c) if c is not None else None
-    for k, v in zip(("footprint_west", "footprint_south", "footprint_east", "footprint_north"),
-                    bb or (None,) * 4):
-        out[k] = _num(v, 5)
-    return out
+def _search_line(lat, lon, radius, start, end, cloud=False, max_cloud=None):
+    """'within 15 km of 60.30452, -140.32928, 2026-07-28 to 2026-12-25 (UTC),
+    scenes up to 50% cloud' -- the parts that were recorded."""
+    parts = []
+    try:
+        parts.append(f"within {float(radius):g} km of {float(lat):.5f}, {float(lon):.5f}")
+    except (TypeError, ValueError):
+        pass
+    if start is not None and end is not None:
+        parts.append(f"{start:%Y-%m-%d} to {end:%Y-%m-%d} (UTC)")
+    if cloud:
+        try:
+            mc = float(max_cloud)
+            parts.append(f"scenes up to {mc:g}% cloud" if mc < 100 else "no cloud limit")
+        except (TypeError, ValueError):
+            parts.append("no cloud limit")
+    return ", ".join(parts) or NA
 
 
-def _search_cols(search, with_cloud):
-    """The search_* cells of one tab's search.json."""
+def _tab_search(search, cloud):
+    """The search line of one tab's search.json (event time -/+ pre/post days)."""
     s = search or {}
     p = s.get("params") or {}
     t = _parse_time(s.get("datetime_utc"))
-    out = {"search_center_lat": _num(s.get("lat"), 5),
-           "search_center_lon": _num(s.get("lon"), 5),
-           "search_radius_km": _num(p.get("radius_km"), 1)}
-    for key, sign, days in (("search_start_utc", -1, p.get("pre_days")),
-                            ("search_end_utc", 1, p.get("post_days"))):
+    start = end = None
+    if t is not None:
         try:
-            out[key] = _iso(t + sign * timedelta(days=float(days))) if t else NA
-        except (TypeError, ValueError):
-            out[key] = NA
-    if with_cloud:
-        mc = p.get("max_cloud")
-        out["search_max_cloud_pct"] = _num(mc, 0) if mc is not None else "none"
-    return out
+            start = t - timedelta(days=float(p["pre_days"]))
+            end = t + timedelta(days=float(p["post_days"]))
+        except (KeyError, TypeError, ValueError):
+            start = end = None
+    return _search_line(s.get("lat"), s.get("lon"), p.get("radius_km"), start, end,
+                        cloud, p.get("max_cloud"))
 
 
-def _cloud_cols(c):
-    if c is None:
-        return dict.fromkeys(_OPTICAL_CLOUD, NA)
-    aoi = c.get("aoi_cloud_pct")
-    method = {"ocm": "ocm", "scl": "scl"}.get(str(c.get("aoi_cloud_method") or "").lower())
-    return {"aoi_cloud_pct": _num(aoi),
-            "aoi_snow_pct": _num(c.get("aoi_snow_pct")) if aoi is not None else NA,
-            "aoi_cloud_method": (method or NA) if aoi is not None else NA,
-            "scene_cloud_pct": _num(c.get("cloud_pct"))}
-
-
-def _row(section, **kv):
-    r = dict.fromkeys(_COLUMNS[section], NA)
-    r.update({k: (NA if v in (None, "") else v) for k, v in kv.items() if k in r})
+def _row(section, search_line, **kv):
+    """A row of COLUMNS, NA where empty; _section / _search ride along until written."""
+    r = dict.fromkeys(COLUMNS, NA)
+    r.update({k: (NA if v in (None, "") else str(v)) for k, v in kv.items() if k in r})
     r["_section"] = section
+    r["_search"] = search_line
     return r
 
 
@@ -402,29 +310,6 @@ def _matching(docs, event_id):
     return docs
 
 
-def _optical_row(sid, c, side, ev, box, search, meta_date, event_time, sensor_hint):
-    """One Sentinel-2 or Landsat scene; `c` is its search entry or None."""
-    date = (c or {}).get("date") or meta_date
-    head = dict(event_id=ev, side=_side(side), acquired_utc=_acquired(date),
-                days_from_event=_days(c, date, event_time))
-    cloud = _cloud_cols(c)
-    srch = _search_cols(search, True)
-    m = _S2_ID_RE.match(sid)
-    if m or (not _LANDSAT_ID_RE.match(sid) and sensor_hint == "s2"):
-        kv = dict(head, **cloud, **srch,
-                  **_where(c, box, sid, ARCHIVE_MPC, "sentinel-2-l2a"))
-        if m:
-            kv.update(mission="Sentinel-" + m.group(1)[1:], product_level=m.group(2),
-                      mgrs_tile=m.group(5), relative_orbit=str(int(m.group(4))))
-        return _row("sentinel2", **kv)
-    kv = dict(head, **cloud, **srch, **_where(c, box, sid, ARCHIVE_MPC, "landsat-c2-l2"))
-    m = _LANDSAT_ID_RE.match(sid)
-    if m:
-        kv.update(mission=f"Landsat {int(m.group(2))}", product_level=m.group(3),
-                  wrs_path=m.group(4), wrs_row=m.group(5), collection_category=m.group(8))
-    return _row("landsat", **kv)
-
-
 def _optical_rows(results_dir, event_id):
     """Sentinel-2 / Landsat: each Run's composited scenes."""
     docs = []
@@ -436,11 +321,10 @@ def _optical_rows(results_dir, event_id):
         return []
     search = _load_json(os.path.join(results_dir, "search.json")) or {}
     index = _search_index(search)
-    box = aoi_box(search)
+    line = _tab_search(search, cloud=True)
     rows = []
     for _path, meta in _matching(docs, event_id):
         ev = event_id or str(meta.get("event_id") or "")
-        event_time = _parse_time(meta.get("datetime_utc") or search.get("datetime_utc"))
         layers = [str(x) for x in meta.get("layers") or []]
         for side in ("pre", "post"):
             ids = [str(x) for x in meta.get(f"{side}_scenes") or []]
@@ -449,9 +333,18 @@ def _optical_rows(results_dir, event_id):
                      and f.lower().endswith(".tif")]
             for i, sid in enumerate(ids):
                 hit = index.get(sid)
-                row = _optical_row(sid, hit[1] if hit else None, side, ev, box, search,
-                                   dates[i] if i < len(dates) else "", event_time,
-                                   meta.get("sensor"))
+                date = (hit[1].get("date") if hit else None) or (dates[i] if i < len(dates) else "")
+                if _LANDSAT_ID_RE.match(sid):
+                    landsat = True
+                elif sid.startswith("S2"):
+                    landsat = False
+                else:
+                    landsat = meta.get("sensor") == "landsat"
+                row = _row("landsat" if landsat else "sentinel2", line,
+                           event_id=ev, side=_side(side),
+                           acquired_utc=_acquired(date) if date else NA, scene_id=sid,
+                           archive=ARCHIVE_MPC,
+                           collection="landsat-c2-l2" if landsat else "sentinel-2-l2a")
                 row["_files"] = files
                 rows.append(row)
     return rows
@@ -464,20 +357,18 @@ def _planet_rows(results_dir, event_id):
     for p in sorted(glob.glob(os.path.join(pdir, "*.tif"))):
         m = _PLANET_RE.match(os.path.basename(p))
         if m:
-            found.append((p, m.group("event"), m.group("side"), m.group("tag"),
-                          bool(m.group("toa"))))
+            found.append((p, m.group("event"), m.group("side"), m.group("tag")))
     if not found:
         return []
     if event_id and any(f[1] == event_id for f in found):
         found = [f for f in found if f[1] == event_id]
     search = _load_json(os.path.join(pdir, "search.json")) or {}
     index = _search_index(search)
-    box = aoi_box(search)
-    event_time = _parse_time(search.get("datetime_utc"))
+    line = _tab_search(search, cloud=True)
     render = _load_json(os.path.join(pdir, "render.json")) or {}
     rscenes = render.get("scenes") or {}
     by_scene = {}                       # (side, id) -> row; a re-tone is the same scene
-    for path, ev, side, tag, toa in found:
+    for path, ev, side, tag in found:
         if tag in index:
             ids = [tag]
         elif _norm(render.get(side)) == _norm(path) and rscenes.get(side):
@@ -490,32 +381,17 @@ def _planet_rows(results_dir, event_id):
                 by_scene[key]["_files"].append(path)
                 continue
             hit = index.get(sid)
-            c = hit[1] if hit else None
+            date = hit[1].get("date") if hit else None
             m = _PLANET_ID_RE.match(sid)
-            date = (c or {}).get("date")
             if not date and m:
                 d, t = m.group(1), m.group(2)
                 date = f"{d[:4]}-{d[4:6]}-{d[6:]}T{t[:2]}:{t[2:4]}:{t[4:]}"
-            row = _row("planetscope",
-                       event_id=event_id or ev, side=_side(side),
-                       acquired_utc=_acquired(date) if date else NA,
-                       days_from_event=_days(c, date, event_time),
-                       satellite_id=m.group(3) if m else NA,
-                       # what run_single ordered: DN for the TOA path, else SR
-                       product_bundle="analytic_udm2" if toa else "analytic_sr_udm2",
-                       scene_cloud_pct=_num((c or {}).get("cloud_pct")),
-                       **_where(c, box, sid, ARCHIVE_PLANET, "PSScene"),
-                       **_search_cols(search, True))
+            row = _row("planetscope", line, event_id=event_id or ev, side=_side(side),
+                       acquired_utc=_acquired(date) if date else NA, scene_id=sid,
+                       archive=ARCHIVE_PLANET, collection="PSScene")
             row["_files"] = [path]
             by_scene[key] = row
     return list(by_scene.values())
-
-
-def _pols(c, tag_hint=""):
-    p = (c or {}).get("polarizations")
-    if isinstance(p, (list, tuple)) and p:
-        return "+".join(str(x) for x in p)
-    return _POL_PAIRS.get(tag_hint, NA)
 
 
 def _sar_rows(results_dir, event_id):
@@ -534,15 +410,14 @@ def _sar_rows(results_dir, event_id):
     # loaded detection names them; the search's own id is often a datetime one
     # from before the detection was loaded.
     ev = str(event_id or search.get("event_id") or "")
-    event_time = _parse_time(search.get("datetime_utc"))
     event_day = str(search.get("datetime_utc") or "")[:10]
+    line = _tab_search(search, cloud=False)
     cands = [(side, c) for side in ("pre", "post")
              for c in search.get(side) or [] if isinstance(c, dict)]
-    srch = _search_cols(search, False)
     rows = []
     for path, m in files:
-        tag, date, orbit, track, pol = (m.group("tag"), m.group("date"), m.group("orbit"),
-                                        m.group("track"), m.group("pol").upper())
+        tag, date, orbit, track = (m.group("tag"), m.group("date"), m.group("orbit"),
+                                   m.group("track"))
         hits = []
         for side, c in cands:
             is_nisar = c.get("source") == "NISAR"
@@ -551,7 +426,7 @@ def _sar_rows(results_dir, event_id):
                     and (c.get("orbit_state") or "")[:4] == orbit
                     and str(c.get("relative_orbit")) == track):
                 hits.append((side, c))
-        c = None
+        c = {}
         if hits:
             # Two frames of one pass can both match; the file is clipped to the
             # AOI, so it is the one that covers it.
@@ -560,42 +435,15 @@ def _sar_rows(results_dir, event_id):
             side = ""
             if event_day and date != "undated":
                 side = "pre" if date < event_day else ("post" if date > event_day else "")
-        sid = str((c or {}).get("id") or "")
-        when = (c or {}).get("date") or ("" if date == "undated" else date)
-        direction = (c or {}).get("orbit_state") or \
-            {"asce": "ascending", "desc": "descending"}.get(orbit, orbit)
-        common = dict(event_id=ev, side=_side(side), acquired_utc=_acquired(when) if when else NA,
-                      days_from_event=_days(c, when, event_time),
-                      polarization_used=pol, orbit_direction=direction,
-                      relative_orbit=str((c or {}).get("relative_orbit") or track),
-                      **srch)
+        when = c.get("date") or ("" if date == "undated" else date)
+        common = dict(event_id=ev, side=_side(side),
+                      acquired_utc=_acquired(when) if when else NA, scene_id=c.get("id"))
         if tag == "NISAR":
-            n = _NISAR_ID_RE.match(sid)
-            prod = (c or {}).get("product")
-            kind = n.group(3) if n else "GCOV"
-            row = _row("sar_nisar", mission="NISAR", band=(c or {}).get("band") or "L",
-                       product=f"L2 {kind}" + (f" ({prod})" if prod else ""),
-                       acquisition_mode=(c or {}).get("mode") or (n.group(8) if n else NA),
-                       polarizations_available=_pols(c, n.group(9) if n else ""),
-                       frame=str((c or {}).get("frame") or (int(n.group(7)) if n else NA)),
-                       cycle=str((c or {}).get("cycle") or (int(n.group(4)) if n else NA)),
-                       **common,
-                       **_where(c, box, sid, ARCHIVE_ASF,
-                                (c or {}).get("collection") or "NISAR_L2_GCOV"))
+            row = _row("sar_nisar", line, archive=ARCHIVE_ASF,
+                       collection=c.get("collection") or "NISAR_L2_GCOV", **common)
         else:
-            s = _S1_ID_RE.match(sid)
-            row = _row("sar_sentinel1",
-                       mission=("Sentinel-" + s.group(1)[1:]) if s else "Sentinel-1",
-                       band="C", product="GRD RTC (terrain-corrected)",
-                       acquisition_mode=s.group(2) if s else NA,
-                       polarizations_available=_pols(c, s.group(4)[2:] if s else ""),
-                       absolute_orbit=str(int(s.group(7))) if s else NA,
-                       datatake_id=s.group(8) if s else NA,
-                       # MPC's RTC item id is the ESA GRD granule + "_rtc"; ASF and
-                       # the Copernicus browser search by the granule.
-                       esa_granule=re.sub(r"_rtc$", "", sid) if s else NA,
-                       **common,
-                       **_where(c, box, sid, ARCHIVE_MPC, "sentinel-1-rtc"))
+            row = _row("sar_sentinel1", line, archive=ARCHIVE_MPC,
+                       collection="sentinel-1-rtc", **common)
         row["_files"] = [path]
         rows.append(row)
     return rows
@@ -621,11 +469,6 @@ def _gegd_index(results_dir):
     return out
 
 
-def _maxar_sensor(props):
-    raw = str(props.get("source") or props.get("sensorCode") or props.get("sensorName") or "")
-    return re.sub(r"_(VNIR|SWIR|PAN|MS|CAVIS)$", "", raw.upper()) or NA
-
-
 def _maxar_rows(results_dir, event_id, streams):
     """Maxar: one row per streamed strip, its record from the cached search."""
     if not streams:
@@ -640,40 +483,19 @@ def _maxar_rows(results_dir, event_id, streams):
         lp = s.get("props") or {}
         if feat is not None:
             p = feat.get("properties") or {}
-            origin = _parse_time(doc.get("origin_utc"))
-            acq = _parse_time(p.get("acquisitionDate"))
-            box = None
-            try:
-                box = _box(float(doc["lat"]), float(doc["lon"]), float(doc["radius_km"]))
-            except (KeyError, TypeError, ValueError):
-                pass
-            cloud = p.get("cloudCover")
-            row = _row(
-                "maxar", event_id=event_id or doc.get("event_id"), side=_side(s.get("side")),
-                acquired_utc=_iso(acq),
-                days_from_event=(f"{abs((acq - origin).total_seconds()) / 86400.0:.1f}"
-                                 if acq and origin else NA),
-                sensor=_maxar_sensor(p), catalog_id=p.get("legacyIdentifier"),
-                off_nadir_deg=_num(p.get("offNadirAngle")),
-                sun_elevation_deg=_num(p.get("sunElevation")),
-                sun_azimuth_deg=_num(p.get("sunAzimuth")),
-                gsd_m=_num(p.get("groundSampleDistance"), 2),
-                processing_level=p.get("processingLevel"), product_name=p.get("productName"),
-                strip_cloud_pct=_num(100.0 * float(cloud)) if cloud is not None else NA,
-                search_center_lat=_num(doc.get("lat"), 5),
-                search_center_lon=_num(doc.get("lon"), 5),
-                search_radius_km=_num(doc.get("radius_km"), 1),
-                search_start_utc=_iso(_parse_time(doc.get("t0"))),
-                search_end_utc=_iso(_parse_time(doc.get("t1"))),
-                **_where({"geometry": feat.get("geometry")}, box, fid, ARCHIVE_GEGD,
-                         "Maxar:FinishedFeature"))
+            line = _search_line(doc.get("lat"), doc.get("lon"), doc.get("radius_km"),
+                                _parse_time(doc.get("t0")), _parse_time(doc.get("t1")))
+            row = _row("maxar", line, event_id=event_id or doc.get("event_id"),
+                       side=_side(s.get("side")),
+                       acquired_utc=_acquired(p.get("acquisitionDate")),
+                       scene_id=p.get("legacyIdentifier") or lp.get("catalog_id") or fid,
+                       archive=ARCHIVE_GEGD, collection="Maxar:FinishedFeature")
         else:                           # the search is gone: what the layer remembers
-            row = _row("maxar", event_id=event_id or lp.get("event_id"),
+            row = _row("maxar", NA, event_id=event_id or lp.get("event_id"),
                        side=_side(s.get("side")),
                        acquired_utc=_acquired(lp.get("acq_utc")) if lp.get("acq_utc") else NA,
-                       sensor=lp.get("sensor"), catalog_id=lp.get("catalog_id"),
-                       off_nadir_deg=_num(lp.get("ona")), processing_level=lp.get("level"),
-                       scene_id=fid, archive=ARCHIVE_GEGD, collection="Maxar:FinishedFeature")
+                       scene_id=lp.get("catalog_id") or fid,
+                       archive=ARCHIVE_GEGD, collection="Maxar:FinishedFeature")
         row["_in_figure"] = bool(s.get("in_figure"))
         rows.append(row)
     return rows
@@ -684,13 +506,15 @@ def _maxar_rows(results_dir, event_id, streams):
 def collect(results_dir, event_id="", viewer=None, maxar=()):
     """{section key: [rows]} in SECTIONS order; tables with no rows are left out.
 
+    Each row is COLUMNS plus "_search", the line saying how its source was
+    searched (the README's; to_csv_files leaves it out of the CSV).
     viewer: {"Before": [paths], "After": [paths]} -- the files draped in the
     figure. Given, the optical / PlanetScope / Maxar tables keep only the
     figure's scenes; SAR keeps every downloaded scene. None lists everything.
     maxar: the streamed strips, [{"fid", "side", "in_figure", "props"}] (props:
-    the layer's landslide/gegd_* values, the fallback when no cached search
-    knows the strip). event_id: stamped on every row (the loaded Detection's),
-    whatever id a file was written under.
+    the layer's landslide/gegd_* values -- event_id, acq_utc, catalog_id -- the
+    fallback when no cached search knows the strip). event_id: stamped on every
+    row (the loaded Detection's), whatever id a file was written under.
     Rows sort before -> after, then by acquisition time."""
     figure = None
     if viewer is not None:
@@ -706,7 +530,7 @@ def collect(results_dir, event_id="", viewer=None, maxar=()):
         rows += _maxar_rows(results_dir, event_id or "", maxar)
     except Exception:
         pass
-    out = {key: [] for key, _t, _c in SECTIONS}
+    out = {key: [] for key, _t in SECTIONS}
     seen = set()
     for r in rows:
         sec = r.pop("_section")
@@ -733,30 +557,35 @@ def count(sections):
     return sum(len(v) for v in sections.values())
 
 
-def _table(key, rows, w):
-    cols = _COLUMNS[key]
-    w.writerow(cols)
-    for r in rows:
-        w.writerow([r.get(c, NA) for c in cols])
-
-
 def to_csv_files(sections, stem):
-    """{file name: CSV text}, one plain table per mission, plus a README.txt.
+    """{file name: text}: one plain CSV per table (COLUMNS only) and a README
+    naming the files, the columns and how each source was searched.
     No BOM: the viewer adds it to each CSV when it saves the ZIP, for Excel."""
     out = {}
-    for key, _t, _c in SECTIONS:
+    for key, _t in SECTIONS:
         if key not in sections:
             continue
         buf = io.StringIO()
-        _table(key, sections[key], csv.writer(buf, lineterminator="\r\n"))
+        w = csv.writer(buf, lineterminator="\r\n")
+        w.writerow(COLUMNS)
+        for r in sections[key]:
+            w.writerow([r.get(c, NA) for c in COLUMNS])
         out[f"{stem}_{key}.csv"] = buf.getvalue()
-    if out:
-        out[f"{stem}_README.txt"] = "\r\n".join(
-            ["Scene metadata, one CSV per mission:"]
-            + [f"  {stem}_{k}.csv  {_TITLES[k]} ({len(sections[k])} scene"
-               f"{'' if len(sections[k]) == 1 else 's'})"
-               for k, _t, _c in SECTIONS if k in sections]
-            + [""] + list(ABOUT)) + "\r\n"
+    if not out:
+        return out
+    lines = ["Scene metadata, one CSV per mission:"]
+    for key, title in SECTIONS:
+        if key in sections:
+            n = len(sections[key])
+            note = "; scene_id is the Maxar catalog ID" if key == "maxar" else ""
+            lines.append(f"  {stem}_{key}.csv  {title} ({n} scene{'' if n == 1 else 's'}{note})")
+    lines += [""] + list(ABOUT) + ["", "How each source was searched:"]
+    for key, title in SECTIONS:
+        if key not in sections:
+            continue
+        for s in dict.fromkeys(r.get("_search") or NA for r in sections[key]):
+            lines.append(f"  {title}: {s}")
+    out[f"{stem}_README.txt"] = "\r\n".join(lines) + "\r\n"
     return out
 
 
@@ -765,5 +594,5 @@ def payload(sections, stem):
     "files": [{"name", "csv"}], "n" (scenes), "tables" (their titles)}."""
     files = to_csv_files(sections, stem)
     return {"name": stem + "_scenes.zip", "n": count(sections),
-            "tables": [_TITLES[k] for k, _t, _c in SECTIONS if k in sections],
+            "tables": [t for k, t in SECTIONS if k in sections],
             "files": [{"name": k, "csv": v} for k, v in files.items()]}

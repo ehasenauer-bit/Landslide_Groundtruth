@@ -429,7 +429,7 @@ _VIEWER_JS = r'''
     }
     b.title = S.n + " scene" + (S.n === 1 ? "" : "s") + ", one CSV per table — " +
               S.tables.join(", ") +
-              ": archive, collection, scene ID, tile / orbit / frame, footprint, search settings";
+              ": event, before / after, acquisition time, scene ID, archive, collection";
     b.onclick = function () {
       // The BOM is for Excel, which otherwise reads this UTF-8 (° —) as Latin-1.
       var enc = new TextEncoder();

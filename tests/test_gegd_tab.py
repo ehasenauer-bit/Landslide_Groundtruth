@@ -614,20 +614,21 @@ check("the figure's two strips, and only they, are in_figure",
 mx = SM.collect(dock.results_dir(), "AK2099-0001", viewer={"Before": [], "After": []},
                 maxar=streams).get("maxar", [])
 s31 = tab._row_strips[row31].strip
-r31 = next((r for r in mx if r["scene_id"] == s31.feature_id), {})
+r31 = next((r for r in mx if r["scene_id"] == (s31.catalog_id or s31.feature_id)), {})
 check(f"the Maxar table holds the figure's strips only ({len(mx)})", len(mx) == 2)
-check("a row carries the cached search's record (catalog id, sensor, off-nadir, sun, "
-      f"footprint): {r31.get('catalog_id')}, {r31.get('sensor')}, {r31.get('off_nadir_deg')}",
-      r31.get("catalog_id") == (s31.catalog_id or SM.NA) and r31.get("sensor") == s31.sensor
-      and r31.get("off_nadir_deg") == SM._num(s31.ona)
-      and r31.get("sun_elevation_deg") == SM._num(s31.sun_el)
-      and r31.get("footprint_west") != SM.NA
-      and r31.get("acquired_utc", "").startswith("2026-08-31"))
-check("every cell of it is filled", all(v not in ("", None) for v in r31.values()))
+check(f"a row is the strip's catalog ID, time and archive ({r31.get('scene_id')})",
+      r31.get("acquired_utc", "").startswith("2026-08-31")
+      and r31.get("archive") == SM.ARCHIVE_GEGD
+      and r31.get("collection") == "Maxar:FinishedFeature"
+      and r31.get("event_id") == "AK2099-0001")
+check("… and how the strip was searched", r31.get("_search", "").startswith("within "))
 csv_cfg = v3d._scene_csv([b2], [a2])
-check("the viewer's CSV payload has the Maxar table",
+files = {f["name"]: f["csv"] for f in (csv_cfg or {}).get("files", [])}
+check("the viewer's CSV payload has the Maxar table, and the README its search",
       csv_cfg is not None and "Maxar / WorldView" in csv_cfg["tables"]
-      and any(f["name"].endswith("_maxar.csv") for f in csv_cfg["files"]))
+      and any(n.endswith("_maxar.csv") for n in files)
+      and any(n.endswith("_README.txt") and "Maxar / WorldView: within" in t
+              for n, t in files.items()))
 
 print("\n=== table and footprints select each other ===")
 tab._table.selectRow(row31)

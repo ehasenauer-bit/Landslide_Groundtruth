@@ -2390,7 +2390,7 @@ class Viewer3DTab(QWidget):
             seen.add(fid)
             out.append({"fid": fid, "side": gl.get_prop(lyr, "side"), "in_figure": fid in shown,
                         "props": {k: gl.get_prop(lyr, k) for k in (
-                            "event_id", "acq_utc", "sensor", "ona", "level", "catalog_id")}})
+                            "event_id", "acq_utc", "catalog_id")}})
         return out
 
     def _web_out_dir(self):

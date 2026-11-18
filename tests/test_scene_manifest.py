@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """The 3D viewer's metadata CSV: the figure's scenes plus every SAR scene, as
-per-mission tables someone outside the project can search with.
+small per-mission tables someone outside the project can fetch the scenes from.
+
+Six columns in every table (event_id, side, acquired_utc, scene_id, archive,
+collection); how each source was searched is said once, in the README. Ethan
+cut the tables to this on 2026-11-18 from 26-28 columns.
 
 scene_manifest reads what each imagery tab leaves in the project folder, not
 the tables on screen (empty again after a reopen). These checks pin the ways a
@@ -9,13 +13,13 @@ row could go wrong without anyone noticing in the CSV itself:
   * the wrong scenes -- only the figure's optical / Planet / Maxar scenes, but
     every downloaded SAR scene; a search candidate never downloaded must not
     appear, and a downloaded one whose search entry is gone must not vanish;
-  * an empty cell -- every column of a table applies to every row of it, and a
-    value that applies but was not recorded reads "n/a";
-  * the wrong identity -- tile / orbit / frame parsed from the right part of
-    each mission's id, the right archive + collection, the loaded Detection's
-    event id on every row whatever a file was named under;
+  * an empty cell -- a value the project never recorded reads "n/a";
+  * the wrong identity -- the right archive + collection, the Maxar catalog ID
+    (not GEGD's UUID), the loaded Detection's event id on every row whatever a
+    file was named under;
   * the wrong match -- a NISAR and a Sentinel-1 file on the same track number
-    and date must each find their own radar's scene.
+    and date must each find their own radar's scene, and of two frames of one
+    pass, the one that covers the AOI.
 
 Synthetic fixtures only (the repo is public).
 """
@@ -64,6 +68,10 @@ def ids(sections, key):
     return [r["scene_id"] for r in sections.get(key, [])]
 
 
+def cells(r):
+    return tuple(r[c] for c in M.COLUMNS)
+
+
 LAT, LON, R = 60.0, -140.0, 10.0
 BOX = M.aoi_box({"lat": LAT, "lon": LON, "params": {"radius_km": R}})
 MINX, MINY, MAXX, MAXY = BOX
@@ -87,26 +95,11 @@ check("a big tilted footprint around the box covers 100%",
       M.coverage_pct({"geometry": diamond}, BOX))
 
 # ---------------------------------------------------------------- the tables
-hdr = {key: cols for key, _t, cols in M.SECTIONS}
-check("every table starts with event_id, side, acquired_utc, days_from_event",
-      all(cols[:4] == ("event_id", "side", "acquired_utc", "days_from_event")
-          for cols in hdr.values()))
-check("every table says where the scene lives and what it is",
-      all({"scene_id", "archive", "collection", "footprint_west", "footprint_north",
-           "search_center_lat", "search_radius_km", "search_start_utc"} <= set(cols)
-          for cols in hdr.values()))
-only = {"off_nadir_deg": {"maxar"}, "sun_elevation_deg": {"maxar"}, "catalog_id": {"maxar"},
-        "mgrs_tile": {"sentinel2"}, "wrs_path": {"landsat"}, "satellite_id": {"planetscope"},
-        "absolute_orbit": {"sar_sentinel1"}, "frame": {"sar_nisar"},
-        "polarization_used": {"sar_sentinel1", "sar_nisar"},
-        "search_max_cloud_pct": {"sentinel2", "landsat", "planetscope"}}
-for col, where in only.items():
-    check(f"{col} is a column of {sorted(where)} only",
-          {k for k, cols in hdr.items() if col in cols} == where)
-gone = {"Event", "Tab", "In 3D viewer", "File", "Side", "Scene ID"}
-check("no machine-only or old flat-table headings",
-      not any(gone & set(cols) for cols in hdr.values()))
-check("no duplicate column inside a table", all(len(c) == len(set(c)) for c in hdr.values()))
+check("six columns, the same in every table",
+      M.COLUMNS == ("event_id", "side", "acquired_utc", "scene_id", "archive", "collection"))
+check("one table per mission, SAR split by radar",
+      [k for k, _t in M.SECTIONS] == ["sentinel2", "landsat", "planetscope", "maxar",
+                                      "sar_sentinel1", "sar_nisar"])
 
 with tempfile.TemporaryDirectory() as proj:
     ev = "AK2099-0101"                  # the loaded Detection's id
@@ -224,7 +217,8 @@ with tempfile.TemporaryDirectory() as proj:
     check("every downloaded SAR scene, though none is in the figure",
           len(secs.get("sar_sentinel1", [])) == 2 and len(secs.get("sar_nisar", [])) == 1)
     check("Maxar: the figure's strips only (one with a record, one without)",
-          sorted(ids(secs, "maxar")) == sorted([FID_FIG, FID_LOST]), ids(secs, "maxar"))
+          sorted(ids(secs, "maxar")) == ["10300100LOST000", "10400100ABCDEF00"],
+          ids(secs, "maxar"))
     check("no figure given -> every downloaded scene",
           sorted(ids(every, "sentinel2")) == sorted([S2_PRE, S2_GONE])
           and ids(every, "landsat") == [LS_POST] and len(every["planetscope"]) == 4
@@ -236,115 +230,76 @@ with tempfile.TemporaryDirectory() as proj:
     check("a hashed Planet render render.json no longer knows keeps its tag",
           "20990110_3scenes_deadbeef" in ids(every, "planetscope"))
     check("tables come in SECTIONS order, empty ones left out",
-          list(every) == [k for k, _t, _c in M.SECTIONS if k in every]
-          and "landsat" not in secs)
+          list(every) == [k for k, _t in M.SECTIONS if k in every] and "landsat" not in secs)
 
-    # ---- no empty cell, and each row has exactly its table's columns
+    # ---- no empty cell; the six columns plus the search line, nothing else
     for name, ss in (("figure", secs), ("everything", every)):
         bad = [(k, c) for k, rows in ss.items() for r in rows for c, v in r.items()
                if v in ("", None)]
         check(f"no empty cell anywhere ({name})", not bad, bad[:5])
-        check(f"each row carries exactly its table's columns ({name})",
-              all(tuple(r) == hdr[k] for k, rows in ss.items() for r in rows))
+        check(f"each row is the six columns plus its search line ({name})",
+              all(set(r) == set(M.COLUMNS) | {"_search"} for rows in ss.values() for r in rows))
     check("every row has the loaded Detection's event id, not the file's",
           all(r["event_id"] == ev for rows in every.values() for r in rows))
 
-    # ---- the right numbers + identity
-    pre = secs["sentinel2"][0]
-    check("Sentinel-2: mission, level, MGRS tile, relative orbit from the id",
-          (pre["mission"], pre["product_level"], pre["mgrs_tile"], pre["relative_orbit"])
-          == ("Sentinel-2A", "L2A", "05VPG", "86"), pre)
-    check("Sentinel-2: AOI cloud / snow / method and the archive's scene cloud",
-          (pre["aoi_cloud_pct"], pre["aoi_snow_pct"], pre["aoi_cloud_method"],
-           pre["scene_cloud_pct"]) == ("3.4", "80.0", "ocm", "40.0"), pre)
-    check("Sentinel-2: before, ISO time, days, coverage",
-          (pre["side"], pre["acquired_utc"], pre["days_from_event"], pre["aoi_coverage_pct"])
-          == ("before", "2099-01-01T21:35:29Z", "1", "100"), pre)
-    check("Sentinel-2: archive + collection",
-          (pre["archive"], pre["collection"]) == (M.ARCHIVE_MPC, "sentinel-2-l2a"))
-    check("footprint is the stored bbox",
-          (pre["footprint_west"], pre["footprint_south"], pre["footprint_east"],
-           pre["footprint_north"]) == ("-141.50000", "59.50000", "-138.50000", "60.50000"), pre)
-    check("search settings: centre, radius, window from the event time, cloud limit",
-          (pre["search_center_lat"], pre["search_radius_km"], pre["search_start_utc"],
-           pre["search_end_utc"], pre["search_max_cloud_pct"])
-          == ("60.00000", "10.0", "2098-12-03T00:00:00Z", "2099-03-03T00:00:00Z", "50"), pre)
+    # ---- the right values
+    check("Sentinel-2 row",
+          cells(secs["sentinel2"][0]) == (ev, "before", "2099-01-01T21:35:29Z", S2_PRE,
+                                          M.ARCHIVE_MPC, "sentinel-2-l2a"),
+          secs["sentinel2"][0])
     gone_row = next(r for r in every["sentinel2"] if r["scene_id"] == S2_GONE)
-    check("a downloaded scene whose search entry is gone: date from the run, id parsed, "
-          "the rest n/a",
-          (gone_row["acquired_utc"], gone_row["side"], gone_row["mgrs_tile"],
-           gone_row["scene_cloud_pct"], gone_row["footprint_west"], gone_row["days_from_event"])
-          == ("2099-01-20", "after", "05VPG", NA, NA, "18"), gone_row)
-    ls = every["landsat"][0]
-    check("Landsat: mission, WRS path/row, category from the id",
-          (ls["mission"], ls["product_level"], ls["wrs_path"], ls["wrs_row"],
-           ls["collection_category"]) == ("Landsat 9", "L2SP", "062", "018", "T1"), ls)
-    check("Landsat: no AOI cloud -> n/a, not blank; scene cloud and coverage kept",
-          (ls["aoi_cloud_pct"], ls["aoi_snow_pct"], ls["aoi_cloud_method"],
-           ls["scene_cloud_pct"], ls["aoi_coverage_pct"], ls["collection"])
-          == (NA, NA, NA, "44.6", "50", "landsat-c2-l2"), ls)
+    check("a downloaded scene whose search entry is gone keeps the Run's date",
+          cells(gone_row) == (ev, "after", "2099-01-20", S2_GONE, M.ARCHIVE_MPC,
+                              "sentinel-2-l2a"), gone_row)
+    check("Landsat row",
+          cells(every["landsat"][0]) == (ev, "after", "2099-01-20T21:40:00Z", LS_POST,
+                                         M.ARCHIVE_MPC, "landsat-c2-l2"), every["landsat"][0])
     pa = next(r for r in secs["planetscope"] if r["scene_id"] == "20990105_200000_10_aaaa")
     pb = next(r for r in secs["planetscope"] if r["scene_id"] == "20990105_200001_10_bbbb")
-    check("Planet: satellite id from the id, TOA render -> analytic_udm2, PSScene",
-          (pa["satellite_id"], pa["product_bundle"], pa["collection"], pa["archive"],
-           pa["scene_cloud_pct"], pa["search_max_cloud_pct"])
-          == ("aaaa", "analytic_udm2", "PSScene", M.ARCHIVE_PLANET, "1.0", "100"), pa)
-    check("Planet: an id the search no longer lists still gets its time from the id",
-          pb["acquired_utc"] == "2099-01-05T20:00:01Z" and pb["scene_cloud_pct"] == NA, pb)
-    psr = next(r for r in every["planetscope"] if r["scene_id"] == "20981225_211844_55_2534")
-    check("Planet: an SR render -> analytic_sr_udm2", psr["product_bundle"] == "analytic_sr_udm2")
-
+    check("PlanetScope row", cells(pa) == (ev, "after", "2099-01-05T20:00:00Z",
+                                           "20990105_200000_10_aaaa", M.ARCHIVE_PLANET,
+                                           "PSScene"), pa)
+    check("a Planet id the search no longer lists still gets its time from the id",
+          pb["acquired_utc"] == "2099-01-05T20:00:01Z", pb)
     s1rows = {r["acquired_utc"][:10]: r for r in secs["sar_sentinel1"]}
-    s1row = s1rows.get("2098-12-28", {})
     check("an S1 file matches its own radar's scene, the frame that covers the AOI",
-          s1row.get("scene_id") == S1_FULL, s1row)
-    check("Sentinel-1: mission, mode, absolute orbit, datatake, ESA granule from the id",
-          (s1row.get("mission"), s1row.get("acquisition_mode"), s1row.get("absolute_orbit"),
-           s1row.get("datatake_id"), s1row.get("esa_granule"))
-          == ("Sentinel-1A", "IW", "12345", "00ABCE", S1_FULL[:-4]), s1row)
-    check("Sentinel-1: band, polarizations, direction, track, MPC collection",
-          (s1row.get("band"), s1row.get("polarization_used"),
-           s1row.get("polarizations_available"), s1row.get("orbit_direction"),
-           s1row.get("relative_orbit"), s1row.get("collection"))
-          == ("C", "VV", "VV+VH", "descending", "130", "sentinel-1-rtc"), s1row)
-    nirow = secs["sar_nisar"][0]
-    check("a NISAR file on the same track number + date matches NISAR",
-          nirow["scene_id"] == NI, nirow)
-    check("NISAR: band, product, mode, frame, cycle, polarizations, ASF collection",
-          (nirow["band"], nirow["product"], nirow["acquisition_mode"], nirow["frame"],
-           nirow["cycle"], nirow["polarization_used"], nirow["polarizations_available"],
-           nirow["archive"], nirow["collection"])
-          == ("L", "L2 GCOV (provisional)", "4005", "57", "30", "HH", "HH+HV",
-              M.ARCHIVE_ASF, "NISAR_L2_GCOV_PROVISIONAL_V1"), nirow)
-    check("SAR rows carry the search window but no cloud limit",
-          s1row.get("search_start_utc") == "2098-12-03T00:00:00Z"
-          and "search_max_cloud_pct" not in s1row)
+          cells(s1rows.get("2098-12-28", {c: "" for c in M.COLUMNS}))
+          == (ev, "before", "2098-12-28T03:00:20Z", S1_FULL, M.ARCHIVE_MPC, "sentinel-1-rtc"),
+          s1rows.get("2098-12-28"))
+    check("a NISAR file on the same track number + date matches NISAR, ASF collection",
+          cells(secs["sar_nisar"][0]) == (ev, "before", "2098-12-28T05:02:57Z", NI,
+                                          M.ARCHIVE_ASF, "NISAR_L2_GCOV_PROVISIONAL_V1"),
+          secs["sar_nisar"][0])
     sx = s1rows.get("2099-01-09", {})
-    check("an unmatched SAR file keeps what its name says, side from the event date",
-          (sx.get("side"), sx.get("acquired_utc"), sx.get("relative_orbit"),
-           sx.get("orbit_direction"), sx.get("scene_id"), sx.get("mission"))
-          == ("after", "2099-01-09", "64", "ascending", NA, "Sentinel-1"), sx)
-
+    check("an unmatched SAR file: date from its name, side from the event date, id n/a",
+          (sx.get("side"), sx.get("acquired_utc"), sx.get("scene_id"))
+          == ("after", "2099-01-09", NA), sx)
     mx = {r["scene_id"]: r for r in secs["maxar"]}
-    mf = mx[FID_FIG]
-    check("Maxar from the cached search: sensor, catalog id, off-nadir, sun, GSD, level",
-          (mf["sensor"], mf["catalog_id"], mf["off_nadir_deg"], mf["sun_elevation_deg"],
-           mf["sun_azimuth_deg"], mf["gsd_m"], mf["processing_level"], mf["product_name"])
-          == ("WV03", "10400100ABCDEF00", "21.0", "12.3", "171.4", "0.31", "LV3D",
-              "DAILY_TAKE"), mf)
-    check("Maxar: strip cloud as a %, coverage of the search box, days, search window",
-          (mf["strip_cloud_pct"], mf["aoi_coverage_pct"], mf["days_from_event"],
-           mf["search_start_utc"], mf["search_end_utc"], mf["side"])
-          == ("0.7", "50", "2.5", "2098-01-02T00:00:00Z", "2099-04-02T00:00:00Z", "after"), mf)
-    ml = mx[FID_LOST]
-    check("Maxar strip with no cached record: what the layer remembers, the rest n/a",
-          (ml["sensor"], ml["catalog_id"], ml["off_nadir_deg"], ml["processing_level"],
-           ml["acquired_utc"], ml["sun_elevation_deg"], ml["archive"])
-          == ("WV02", "10300100LOST000", "9.9", "LV2A", "2098-12-20T12:00:00Z", NA,
-              M.ARCHIVE_GEGD), ml)
+    check("Maxar from the cached search: the catalog ID, not GEGD's UUID",
+          cells(mx.get("10400100ABCDEF00", {c: "" for c in M.COLUMNS}))
+          == (ev, "after", "2099-01-04T12:00:00Z", "10400100ABCDEF00", M.ARCHIVE_GEGD,
+              "Maxar:FinishedFeature"), mx)
+    check("Maxar strip with no cached record: the layer's catalog ID and time",
+          (mx.get("10300100LOST000") or {}).get("acquired_utc") == "2098-12-20T12:00:00Z")
     check("rows sort before -> after inside a table",
           [r["side"] for r in every["sar_sentinel1"]] == ["before", "after"]
           and [r["side"] for r in every["maxar"]][-1] == "after")
+
+    # ---- how each source was searched
+    line = secs["sentinel2"][0]["_search"]
+    check("optical search line: radius, centre, window from the event time, cloud limit",
+          line == "within 10 km of 60.00000, -140.00000, 2098-12-03 to 2099-03-03 (UTC), "
+                  "scenes up to 50% cloud", line)
+    check("Planet at 100% says no cloud limit",
+          pa["_search"].endswith("no cloud limit"), pa["_search"])
+    check("SAR search line has no cloud limit at all",
+          secs["sar_nisar"][0]["_search"]
+          == "within 10 km of 60.00000, -140.00000, 2098-12-03 to 2099-03-03 (UTC)",
+          secs["sar_nisar"][0]["_search"])
+    check("Maxar search line uses the cached search's own window",
+          mx["10400100ABCDEF00"]["_search"]
+          == "within 10 km of 60.00000, -140.00000, 2098-01-02 to 2099-04-02 (UTC)",
+          mx["10400100ABCDEF00"]["_search"])
 
     # ---- another event's run in the same folder is left out
     write(os.path.join(pkg, "AK2099-9999_metadata.json"), {
@@ -359,24 +314,27 @@ with tempfile.TemporaryDirectory() as proj:
           any("T05VPH" in s for s in ids(M.collect(proj, "AK2099-0000"), "sentinel2")))
 
     # ---- one CSV per table, plus a README
-    titles = [t for k, t, _c in M.SECTIONS if k in secs]
+    titles = [t for k, t in M.SECTIONS if k in secs]
     files = M.to_csv_files(secs, "AK")
     want = {f"AK_{k}.csv" for k in secs} | {"AK_README.txt"}
     check("one CSV per table plus a README", set(files) == want, sorted(files))
     for k in secs:
         back = list(csv.DictReader(io.StringIO(files[f"AK_{k}.csv"])))
-        check(f"AK_{k}.csv is one plain table: its header, one line per scene",
-              tuple(back[0]) == hdr[k] and len(back) == len(secs[k])
-              and not files[f"AK_{k}.csv"].startswith("#"))
-    nb = list(csv.DictReader(io.StringIO(files["AK_sar_nisar.csv"])))
-    check("the NISAR file reads back with its values", nb[0]["frame"] == "57")
+        check(f"AK_{k}.csv: the six columns, one line per scene, the rows' values",
+              tuple(back[0]) == M.COLUMNS and len(back) == len(secs[k])
+              and [tuple(b.values()) for b in back] == [cells(r) for r in secs[k]])
     allcsv = "".join(v for k, v in files.items() if k.endswith(".csv"))
-    check("no blank cell in any written file",
-          ",," not in allcsv and not re.search(r",\r\n", allcsv) and "\r\n," not in allcsv)
+    check("no blank cell and no search line in any CSV",
+          ",," not in allcsv and not re.search(r",\r\n", allcsv) and "within" not in allcsv)
     readme = files["AK_README.txt"]
     check("README names every file and table, and carries the column notes",
           all(t in readme for t in titles) and all(f"AK_{k}.csv" in readme for k in secs)
-          and all(line in readme for line in M.ABOUT))
+          and all(a in readme for a in M.ABOUT))
+    check("README says once how each source was searched",
+          f"  Sentinel-2: {line}" in readme and readme.count("Sentinel-2: within") == 1
+          and "  SAR - NISAR: within" in readme and "  Maxar / WorldView: within" in readme)
+    check("README says the Maxar scene_id is the catalog ID",
+          "scene_id is the Maxar catalog ID" in readme)
 
     # ---- what the viewer embeds
     pl = M.payload(secs, "AK")
@@ -396,7 +354,7 @@ check("an empty / missing folder is no tables, not an error",
       M.collect("") == {} and M.collect("/nonexistent/folder/x") == {})
 
 # ---------------------------------------------------------------- the page
-evil = M._row("sentinel2", scene_id="</script><b>x")
+evil = M._row("sentinel2", NA, scene_id="</script><b>x")
 evil.pop("_section")
 scene_cfg = M.payload({"sentinel2": [evil]}, "AK")
 base = {"title": "t", "ncols": 2, "nrows": 2, "width_m": 1, "height_m": 1,
