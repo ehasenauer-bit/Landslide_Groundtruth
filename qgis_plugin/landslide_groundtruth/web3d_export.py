@@ -428,7 +428,7 @@ _VIEWER_JS = r'''
       return;
     }
     b.title = S.n + " scene" + (S.n === 1 ? "" : "s") + " (" + S.tables.join(", ") +
-              "): event, before / after, acquisition time, scene ID, archive, collection";
+              "): event, before / after, acquisition time, scene ID, archive, dataset";
     b.onclick = function () {
       // The BOM is for Excel, which otherwise reads this UTF-8 as Latin-1.
       var blob = new Blob(["\ufeff" + S.csv], {type: "text/csv;charset=utf-8"});

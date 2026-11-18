@@ -3,7 +3,7 @@
 small per-mission tables someone outside the project can fetch the scenes from.
 
 One CSV, <event_id>_imagery.csv, with six columns (event_id, side,
-acquired_utc, scene_id, archive, collection), rows grouped by mission; how each
+acquired_utc, scene_id, archive, dataset), rows grouped by mission; how each
 source was searched goes once per source into imagery_details.txt. Ethan cut it
 to this on 2026-11-18 from per-mission tables of 26-28 columns.
 
@@ -15,7 +15,7 @@ row could go wrong without anyone noticing in the CSV itself:
     every downloaded SAR scene; a search candidate never downloaded must not
     appear, and a downloaded one whose search entry is gone must not vanish;
   * an empty cell -- a value the project never recorded reads "n/a";
-  * the wrong identity -- the right archive + collection, the Maxar catalog ID
+  * the wrong identity -- the right archive + dataset, the Maxar catalog ID
     (not GEGD's UUID), the loaded Detection's event id on every row whatever a
     file was named under;
   * the wrong match -- a NISAR and a Sentinel-1 file on the same track number
@@ -97,7 +97,7 @@ check("a big tilted footprint around the box covers 100%",
 
 # ---------------------------------------------------------------- the tables
 check("six columns, the same in every table",
-      M.COLUMNS == ("event_id", "side", "acquired_utc", "scene_id", "archive", "collection"))
+      M.COLUMNS == ("event_id", "side", "acquired_utc", "scene_id", "archive", "dataset"))
 check("one table per mission, SAR split by radar",
       [k for k, _t in M.SECTIONS] == ["sentinel2", "landsat", "planetscope", "maxar",
                                       "sar_sentinel1", "sar_nisar"])
@@ -267,7 +267,7 @@ with tempfile.TemporaryDirectory() as proj:
           cells(s1rows.get("2098-12-28", {c: "" for c in M.COLUMNS}))
           == (ev, "before", "2098-12-28T03:00:20Z", S1_FULL, M.ARCHIVE_MPC, "sentinel-1-rtc"),
           s1rows.get("2098-12-28"))
-    check("a NISAR file on the same track number + date matches NISAR, ASF collection",
+    check("a NISAR file on the same track number + date matches NISAR, ASF dataset",
           cells(secs["sar_nisar"][0]) == (ev, "before", "2098-12-28T05:02:57Z", NI,
                                           M.ARCHIVE_ASF, "NISAR_L2_GCOV_PROVISIONAL_V1"),
           secs["sar_nisar"][0])
@@ -322,7 +322,7 @@ with tempfile.TemporaryDirectory() as proj:
     check("one CSV: the six columns, every row of every mission, grouped in SECTIONS order",
           tuple(back[0]) == M.COLUMNS and len(back) == len(flat)
           and [tuple(b.values()) for b in back] == [cells(r) for r in flat])
-    colls = [b["collection"] for b in back]
+    colls = [b["dataset"] for b in back]
     check("SAR rows come last, together",
           colls[-3:] == ["sentinel-1-rtc", "sentinel-1-rtc", "NISAR_L2_GCOV_PROVISIONAL_V1"],
           colls)

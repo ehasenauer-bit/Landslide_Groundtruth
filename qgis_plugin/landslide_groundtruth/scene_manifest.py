@@ -4,7 +4,7 @@ The exported 3D viewer carries these tables behind its "Export metadata CSV"
 button. They are written for a reader who has the figure but not this project
 (an analyst, or an agent at another organisation) and wants to fetch the same
 acquisitions again. So a row says only that: which event the scene was pulled
-for, before or after, when it was acquired, its id, and the archive + collection
+for, before or after, when it was acquired, its id, and the archive + dataset
 that serve it. How each source was searched (centre, radius, dates, cloud limit)
 is said once per source, in the figure ZIPs' imagery_details.txt, not on every
 row. Nothing that only means something on this machine: no dock tab names, file
@@ -19,7 +19,7 @@ the project downloaded (radar is never draped, but it is half the evidence).
 With no figure given (viewer=None) every downloaded scene is listed.
 
 One CSV, rows grouped by mission (Sentinel-2, Landsat, PlanetScope, Maxar /
-WorldView, SAR Sentinel-1, SAR NISAR); the collection column says which. (It was
+WorldView, SAR Sentinel-1, SAR NISAR); the dataset column says which. (It was
 one CSV per mission in a ZIP until the columns became the same for all of them,
 2026-11-18.) A value the project never recorded reads "n/a".
 
@@ -56,7 +56,7 @@ __all__ = ["SECTIONS", "COLUMNS", "NA", "collect", "to_csv", "search_lines", "pa
 
 NA = "n/a"          # the project never recorded it
 
-COLUMNS = ("event_id", "side", "acquired_utc", "scene_id", "archive", "collection")
+COLUMNS = ("event_id", "side", "acquired_utc", "scene_id", "archive", "dataset")
 
 # (key, title), in the order the tables are written.
 SECTIONS = (
@@ -335,7 +335,7 @@ def _optical_rows(results_dir, event_id):
                            event_id=ev, side=_side(side),
                            acquired_utc=_acquired(date) if date else NA, scene_id=sid,
                            archive=ARCHIVE_MPC,
-                           collection="landsat-c2-l2" if landsat else "sentinel-2-l2a")
+                           dataset="landsat-c2-l2" if landsat else "sentinel-2-l2a")
                 row["_files"] = files
                 rows.append(row)
     return rows
@@ -379,7 +379,7 @@ def _planet_rows(results_dir, event_id):
                 date = f"{d[:4]}-{d[4:6]}-{d[6:]}T{t[:2]}:{t[2:4]}:{t[4:]}"
             row = _row("planetscope", line, event_id=event_id or ev, side=_side(side),
                        acquired_utc=_acquired(date) if date else NA, scene_id=sid,
-                       archive=ARCHIVE_PLANET, collection="PSScene")
+                       archive=ARCHIVE_PLANET, dataset="PSScene")
             row["_files"] = [path]
             by_scene[key] = row
     return list(by_scene.values())
@@ -431,10 +431,10 @@ def _sar_rows(results_dir, event_id):
                       acquired_utc=_acquired(when) if when else NA, scene_id=c.get("id"))
         if tag == "NISAR":
             row = _row("sar_nisar", line, archive=ARCHIVE_ASF,
-                       collection=c.get("collection") or "NISAR_L2_GCOV", **common)
+                       dataset=c.get("collection") or "NISAR_L2_GCOV", **common)
         else:
             row = _row("sar_sentinel1", line, archive=ARCHIVE_MPC,
-                       collection="sentinel-1-rtc", **common)
+                       dataset="sentinel-1-rtc", **common)
         row["_files"] = [path]
         rows.append(row)
     return rows
@@ -480,13 +480,13 @@ def _maxar_rows(results_dir, event_id, streams):
                        side=_side(s.get("side")),
                        acquired_utc=_acquired(p.get("acquisitionDate")),
                        scene_id=p.get("legacyIdentifier") or lp.get("catalog_id") or fid,
-                       archive=ARCHIVE_GEGD, collection="Maxar:FinishedFeature")
+                       archive=ARCHIVE_GEGD, dataset="Maxar:FinishedFeature")
         else:                           # the search is gone: what the layer remembers
             row = _row("maxar", NA, event_id=event_id or lp.get("event_id"),
                        side=_side(s.get("side")),
                        acquired_utc=_acquired(lp.get("acq_utc")) if lp.get("acq_utc") else NA,
                        scene_id=lp.get("catalog_id") or fid,
-                       archive=ARCHIVE_GEGD, collection="Maxar:FinishedFeature")
+                       archive=ARCHIVE_GEGD, dataset="Maxar:FinishedFeature")
         row["_in_figure"] = bool(s.get("in_figure"))
         rows.append(row)
     return rows

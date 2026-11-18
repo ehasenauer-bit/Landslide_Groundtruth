@@ -619,7 +619,7 @@ check(f"the Maxar table holds the figure's strips only ({len(mx)})", len(mx) == 
 check(f"a row is the strip's catalog ID, time and archive ({r31.get('scene_id')})",
       r31.get("acquired_utc", "").startswith("2026-08-31")
       and r31.get("archive") == SM.ARCHIVE_GEGD
-      and r31.get("collection") == "Maxar:FinishedFeature"
+      and r31.get("dataset") == "Maxar:FinishedFeature"
       and r31.get("event_id") == "AK2099-0001")
 check("… and how the strip was searched", r31.get("_search", "").startswith("within "))
 csv_cfg = v3d._scene_csv([b2], [a2])
