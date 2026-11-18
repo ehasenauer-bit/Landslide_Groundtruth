@@ -188,7 +188,7 @@ def set_rights(lyr, strip):
         bits.append(f"processing {strip.processing_level}")
     md.setAbstract(
         "; ".join(bits) + ". 8-bit DRA-stretched display imagery: for looking and "
-        "tracing, never for radiometry (no NIR/SWIR; Fusion refuses it).")
+        "tracing, never for radiometry (no NIR/SWIR).")
     lyr.setMetadata(md)
     set_props(lyr, credit=credit, copyright=strip.copyright or "",
               license_type=strip.license_type or "", vendor=strip.vendor or "")

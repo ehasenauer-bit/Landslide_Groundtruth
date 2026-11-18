@@ -196,7 +196,7 @@ check("masked: a TERRAIN recovery (conf 1), kept on the map — not a frame edge
       "since asc had perfectly finite data there",
       float(cmask[0, 5]) == 1.0 and bool(np.isfinite(asc_before[0, 5])),
       f"conf {cmask[0, 5]}")
-check("and the merged value — what Fusion reads — did not move",
+check("and the merged value did not move",
       float(plain[0, 5]) == float(masked[0, 5]) == -5.0)
 # the loud-shadow mechanism case: a sign conflict becomes a recovery the same way
 check(f"loud shadow vs real scar: sign conflict (conf {cplain[0, 2]:.0f}) -> "

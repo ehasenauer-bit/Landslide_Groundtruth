@@ -162,7 +162,7 @@ check(f"all {len(_boxes)} collapsible boxes sit in a step frame (untinted: {_bar
       len(_boxes) >= 30 and not _bare)
 check("every step colour is in use",
       {_step_of(b) for b in _boxes} == set(_TH.STEPS))
-for _attr in ("planet_tab", "gegd_tab", "sar_tab", "fusion_tab", "viewer3d_tab", "volume_tab"):
+for _attr in ("planet_tab", "gegd_tab", "sar_tab", "viewer3d_tab", "volume_tab"):
     _tab = getattr(dock, _attr)
     check(f"{_attr}: has a ? Help button",
           any(b.text() == "? Help" for b in _tab.findChildren(QToolButton)))

@@ -16,8 +16,7 @@ followed, and both were silent:
     _cd_settings_tag, and NEITHER carried the radius. With `res` no longer
     distinguishing runs above the cap, 20 km / 28 km / 45 km runs of one scene
     pair all wrote S1_change_log-ratio_..._20m_lee5_rn_a8.tif — three different
-    rasters, one path, no warning, last one wins. The Fusion tab reads geometry
-    from the file, so it would pair on the NEW extent while the layer tree still
+    rasters, one path, no warning, last one wins, while the layer tree still
     described the old run.
 
   * every pixel-denominated setting quietly changed meaning with it. "8 px" is
@@ -126,7 +125,7 @@ print("=== 9. a SAR layer-tree folder says which orbit direction it holds ===")
 # "SAR 8-23/9-4 change 17km" was the name of both and the tree told them apart
 # only by the "(2)" new_group appends — on whichever was rendered second. The
 # direction is the one thing you most need to read off a SAR folder: it decides
-# which slopes sit in layover, and Fusion refuses to pool across it.
+# which slopes sit in layover.
 from landslide_groundtruth import layer_group as lg
 
 for states, want in ((("ASCENDING",), "asc"),

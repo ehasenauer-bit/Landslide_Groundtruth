@@ -17,18 +17,14 @@ pixel the primary could see, is not rescued — the stronger-wins merge keeps it
 That is why stronger-wins stays the default until fill-only is benchmarked on
 the truthed events.
 """
-import ast, os, sys, tempfile
+import ast, os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "qgis_plugin"))
 
 import numpy as np
-from osgeo import gdal, osr
-gdal.UseExceptions()
 
 from landslide_groundtruth import sar_change
-from landslide_groundtruth.sar_tab import SarTab
-from landslide_groundtruth.fusion_tab import FusionTab, SAR_HINTS, SAR_EXCLUDE
 
 fails = []
 
@@ -155,87 +151,7 @@ idx, meta = sar_change.choose_primary([quiet, noisy], "logratio", masks=[mask_mo
 check(f"a pass mostly in shadow/layover sees only {meta['coverage'][0]:.0%} and "
       f"does not lead", idx == 1)
 
-print("\n=== 5. filled rasters reach the Fusion tab apart from merged ones ===")
-NAME = {"logratio": "log-ratio", "intcorr": "int-corr",
-        "tsint": "brightness z", "mtcorr": "MT int-corr"}
-PRE, POST, TR, POL, K = "2026-08-31", "2026-09-12", "36+131", "VV", 7
-META = dict(radius=10.0, eff_res=20.0, res=20, speckle=("lee", 5),
-            radionorm=True, min_area=8)
-
-
-def filled_label(mkey, pdir="asce", odir="desc"):
-    """What _emit_filled names the filled raster."""
-    return (f"S1 change {NAME[mkey]} FILLED {pdir} from {odir} {PRE}→{POST} "
-            f"(t{TR} {POL} fill-{pdir}, {K}×{K})")
-
-
-def merged_label(mkey):
-    return f"S1 change {NAME[mkey]} MERGED asce+desc {PRE}→{POST} (t{TR} {POL}, {K}×{K})"
-
-
-def source_label(pdir="asce", odir="desc"):
-    return f"S1 FILLED source {pdir} from {odir} {PRE}→{POST} (t{TR} {POL} fill-{pdir}, {K}×{K})"
-
-
-fname = lambda lbl: f"{SarTab._safe_name(lbl)}_{SarTab._cd_settings_tag(META)}.tif"
-
-
-def detect(label):
-    text = (label + " " + fname(label)).lower()
-    for frag, key in FusionTab.MEASURE_HINTS["sar"]:
-        if frag in text:
-            return key
-
-
-for mkey in NAME:
-    check(f"{mkey:8s} {fname(filled_label(mkey))[:64]}… detects as its own measure",
-          detect(filled_label(mkey)) == mkey, detect(filled_label(mkey)))
-for mkey in ("logratio", "tsint"):
-    lbl = filled_label(mkey).lower()
-    check(f"{mkey:8s} filled raster is offered as a SAR input",
-          any(h in lbl for h in SAR_HINTS) and not any(x in lbl for x in SAR_EXCLUDE))
-src_fn = fname(source_label())
-check(f"source map {src_fn[:40]}… is not a change raster (never pooled)",
-      not src_fn.startswith("S1_change_"))
-check("source map is never preselected",
-      not any(h in source_label().lower() for h in SAR_HINTS))
-fsrc = open(os.path.join(ROOT, "qgis_plugin", "landslide_groundtruth", "fusion_tab.py")).read()
-check("and the Fusion tab refuses it by hand, too", '"filled_source" in ' in fsrc)
-
-
-def tiny_tif(path):
-    ds = gdal.GetDriverByName("GTiff").Create(path, 8, 8, 1, gdal.GDT_Float32)
-    ds.SetGeoTransform((-153.2, 0.001, 0, 60.1, 0, -0.001))
-    srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
-    ds.SetProjection(srs.ExportToWkt())
-    b = ds.GetRasterBand(1)
-    b.SetNoDataValue(-9999.0)
-    b.WriteArray(np.ones((8, 8), np.float32))
-    ds = None
-
-
-shim = type("Shim", (), {"SAR_FILE_KIND": FusionTab.SAR_FILE_KIND})()
-with tempfile.TemporaryDirectory() as d:
-    made = {}
-    for mkey in NAME:
-        for tag, lbl in (("fa", filled_label(mkey)),
-                         ("fd", filled_label(mkey, "desc", "asce")),
-                         ("mg", merged_label(mkey))):
-            made[(tag, mkey)] = os.path.join(d, fname(lbl))
-            tiny_tif(made[(tag, mkey)])
-    tiny_tif(os.path.join(d, src_fn))
-    got = FusionTab._sar_siblings(shim, made[("fa", "logratio")])
-    names = [os.path.basename(p) for p, _k in got]
-    check("a filled log-ratio pools with the other 3 filled detectors",
-          sorted(k for _p, k in got) == ["intcorr", "mtcorr", "tsint"], names)
-    check("all led by the SAME pass", all("fill-asce" in n for n in names), names)
-    check("never with a strongest-wins MERGED raster",
-          not any("_MERGED_" in n for n in names), names)
-    got_m = FusionTab._sar_siblings(shim, made[("mg", "logratio")])
-    check("and a MERGED raster never pools a FILLED one",
-          not any("FILLED" in os.path.basename(p) for p, _k in got_m))
-
-print("\n=== 6. the tab: one primary per Merge, decided before the detectors ===")
+print("\n=== 5. the tab: one primary per Merge, decided before the detectors ===")
 tsrc = open(os.path.join(ROOT, "qgis_plugin", "landslide_groundtruth", "sar_tab.py")).read()
 tree = ast.parse(tsrc)
 fn_ = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
@@ -253,7 +169,7 @@ prim_calls = [c for c in ast.walk(action) if isinstance(c, ast.Call)
               and getattr(c.func, "attr", "") == "_fill_primary"]
 check("the primary is chosen once, OUTSIDE the per-detector loop",
       prim_calls and all(id(c) not in in_loop for c in prim_calls),
-      "per-detector primaries would put the cross-pass max back at Fusion's pooling")
+      "per-detector primaries would lead the four detectors with different passes")
 emit = [c for c in ast.walk(loop) if isinstance(c, ast.Call)
         and getattr(c.func, "attr", "") == "_emit_filled"] if loop else []
 check("each detector is filled with that one primary", bool(emit))

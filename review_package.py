@@ -237,7 +237,7 @@ def _add_overviews(path):
     """Append internal pyramid levels, halving until the top level is small.
 
     Overviews are DISPLAY ONLY -- every read that does not ask for a decimated
-    view (Identify, the fusion/volume tabs, gdal.Warp) still gets full
+    view (Identify, the volume tab, gdal.Warp) still gets full
     resolution. They exist so a zoomed-out repaint reads a 292 px thumbnail
     instead of decimating 9344 px of source. Internal (inside the .tif), not a
     .ovr sidecar, so the pyramid cannot get separated from the raster when a

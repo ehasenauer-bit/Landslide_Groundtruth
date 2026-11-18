@@ -1,5 +1,11 @@
 # Merge-rule benchmark: ascending + descending SAR
 
+> **Needs the Fusion tab's code, which left the plugin on 2026-11-18.** `score.py`
+> imports `fusion_core`, `fusion_grid` and `fusion_cloud`, so it no longer runs
+> against this checkout. Run it from the last commit that had them:
+> `git worktree add ../lg-fusion 90ce0e3` and use `benchmarks/merge_rules/run.sh`
+> there.
+
 Scores the SAR tab's ways of combining an ascending and a descending change map
 by what they do to the **Fusion** result, against the hand-digitised scars of six
 truthed Alaska events (Azumi, Hubbard, Iliamna, Knik–Barry, Mt. Logan, Valdez).

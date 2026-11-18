@@ -5,7 +5,6 @@ detected. Enter the detection (origin time and epicentre) once, then:
 
 - search and compare **pre- and post-event imagery**: Sentinel-2, Landsat,
   PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1 / NISAR radar;
-- **fuse** optical and radar change into one landslide score;
 - read the scar against the terrain in a **3D viewer** (ArcticDEM or your DEM);
 - turn the outline you digitize into a **volume** (Larsen et al. 2010 area–volume
   scaling).
@@ -23,7 +22,7 @@ detected. Enter the detection (origin time and epicentre) once, then:
      (including PyTorch for the snow-robust cloud mask).
    - All of it goes into your user data folder; nothing is installed into QGIS.
    - **Remove** deletes it all again.
-   - Volume, Fusion and Maxar VHR work without it.
+   - Volume and Maxar VHR work without it.
 3. Click **Try an example** in the Detection box, then open the
    **Sentinel-2 / Landsat** tab and press **Search**.
 
@@ -32,7 +31,7 @@ detected. Enter the detection (origin time and epicentre) once, then:
 | Source | Account needed |
 |---|---|
 | Sentinel-2, Landsat, Sentinel-1, ArcticDEM | none |
-| NISAR radar, RGI glacier outlines | free [NASA Earthdata login](https://urs.earthdata.nasa.gov/), entered in the Sentinel-2 / Landsat tab |
+| NISAR radar | free [NASA Earthdata login](https://urs.earthdata.nasa.gov/), entered in the Sentinel-2 / Landsat tab |
 | PlanetScope | a Planet account (paid), entered in the PlanetScope tab |
 | Maxar VHR | a GEGD Pro API key (US government users), entered in the Maxar VHR tab |
 

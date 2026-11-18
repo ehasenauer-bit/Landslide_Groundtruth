@@ -54,17 +54,17 @@ SOURCES = [
 # What a run downloads unless the user says otherwise: one picture and one
 # change raster (chosen 2026-10-21). HDR is the picture — it keeps detail in
 # deep shadow AND sunlit snow, where HONC's cube root flattens most of a glacier
-# frame — and dBright is the change evidence, the optical measure Fusion
-# recommends and preselects. Before this it was HONC + dNDVI + dNDSI + dBright,
-# and before that HONC alone, which could not answer the question the plugin
-# exists to answer. dNDSI and dNDVI stay one tick away: dNDSI for snow and ice
-# that dBright misses, dNDVI for the vegetated coastal events.
+# frame — and dBright is the change evidence. Before this it was HONC + dNDVI +
+# dNDSI + dBright, and before that HONC alone, which could not answer the
+# question the plugin exists to answer. dNDSI and dNDVI stay one tick away:
+# dNDSI for snow and ice that dBright misses, dNDVI for the vegetated coastal
+# events.
 #
 # swir_falsecolor is deliberately NOT here despite being excellent to look at.
-# It is a single-date 3-band composite, not a change detector: Fusion never
-# reads it, it cannot be differenced, and PlanetScope — the primary source —
-# has no SWIR bands at all, so defaulting it on does nothing on a Planet run.
-# It stays one tick away for interpreting a scene by eye.
+# It is a single-date 3-band composite, not a change detector: it cannot be
+# differenced, and PlanetScope — the primary source — has no SWIR bands at all,
+# so defaulting it on does nothing on a Planet run. It stays one tick away for
+# interpreting a scene by eye.
 DEFAULT_SCENE = "highlight_natural"      # kept: project_state and older code read it
 DEFAULT_SCENES = ("highlight_hdr", "dbright")
 SCENES = [
@@ -331,7 +331,6 @@ class LandslideDock(QgsDockWidget):
         (the Planetary Computer STAC pipeline) and a PlanetScope tab (Planet's own
         Data/Orders/Tiles system). Setup is shared because every imagery tab
         launches the SAME pipeline subprocess (pipeline_launch)."""
-        from .fusion_tab import FusionTab
         from .gegd_tab import GegdTab
         from .planet_tab import PlanetTab
         from .sar_tab import SarTab
@@ -354,11 +353,6 @@ class LandslideDock(QgsDockWidget):
         tabs.addTab(self.gegd_tab, "Maxar VHR (GEGD)")
         self.sar_tab = SarTab(self)
         tabs.addTab(self.sar_tab, "SAR")
-        # Consumes the two tabs above rather than searching for imagery itself:
-        # one optical change raster AND one SAR change raster into a single
-        # landslide score. Sits after them because that is the workflow order.
-        self.fusion_tab = FusionTab(self)
-        tabs.addTab(self.fusion_tab, "Fusion")
         self.viewer3d_tab = Viewer3DTab(self)
         tabs.addTab(self.viewer3d_tab, "3D viewer")
         # The one tab that consumes the review step's output rather than
@@ -392,7 +386,7 @@ class LandslideDock(QgsDockWidget):
             "run in a separate Python that the plugin installs once: about "
             f"{environment.DOWNLOAD_MB} MB to download, "
             f"{environment.DISK_GB:.1f} GB on disk, usually under 10 minutes. "
-            "Volume, Fusion, Maxar VHR (with a GEGD key) and the 3D viewer on a DEM "
+            "Volume, Maxar VHR (with a GEGD key) and the 3D viewer on a DEM "
             "you load work without it.")
         intro.setWordWrap(True)
         v.addWidget(intro)
@@ -461,10 +455,9 @@ class LandslideDock(QgsDockWidget):
             (of, "Results (unsaved projects)", self.out_edit, self._pick_out,
              "leave blank for Documents/Landslide Ground-Truthing",
              "A SAVED project keeps every tab's results — PlanetScope, Sentinel-2/"
-             "Landsat, SAR, Fusion, volume, 3D — in its own folder, beside its "
+             "Landsat, SAR, volume, 3D — in its own folder, beside its "
              ".qgz, so switching projects switches the files with it. This folder "
-             "is used only until the project is saved, and for data every project "
-             "shares (the RGI glacier outlines)."),
+             "is used only until the project is saved."),
         )
         for form, label, edit, picker, placeholder, tip in rows:
             edit.setPlaceholderText(placeholder)
@@ -659,7 +652,7 @@ class LandslideDock(QgsDockWidget):
         Each project then keeps its files beside its .qgz, and opening another
         project moves new results with it. A project that hasn't been saved has no
         folder yet, so it falls back to shared_dir(). Tabs add their own subfolder
-        (planet/, sar/, fusion/, viewer3d/ …) exactly as they did under
+        (planet/, sar/, viewer3d/ …) exactly as they did under
         out/interactive."""
         project = QgsProject.instance()
         path = project.absolutePath()
@@ -669,8 +662,7 @@ class LandslideDock(QgsDockWidget):
 
     def shared_dir(self):
         """The Setup box's 'Results (unsaved projects)' folder: results of a project
-        not saved yet, and data every project reuses (the RGI glacier archive, which
-        needs an Earthdata login to fetch again).
+        not saved yet.
 
         Blank falls back to <tools folder>/out/interactive when an own tools folder
         is set (a development checkout, as before), else to
@@ -3349,11 +3341,11 @@ class LandslideDock(QgsDockWidget):
         self._load_layers(result.get("layers", []), result)
 
     # Ramp per change product. All three are signed so that a landslide makes
-    # them NEGATIVE (fusion_core.EVIDENCE_SIGN: dbright -1, dndsi -1; dNDVI is
-    # post-minus-pre, and a scar removes vegetation), so all three show only the
-    # negative side and fade to transparent at 0. The `lo` values are scaled off
-    # fusion_core.DEFAULT_FLOORS — dbright 0.05, dndsi 0.10 — and dNDVI is given
-    # the wider NDVI range a real defoliation covers.
+    # them NEGATIVE (dBright and dNDSI drop over debris; dNDVI is post-minus-pre,
+    # and a scar removes vegetation), so all three show only the negative side
+    # and fade to transparent at 0. The `lo` values are scaled off the change
+    # floors the removed Fusion tab used — dbright 0.05, dndsi 0.10 — and dNDVI
+    # is given the wider NDVI range a real defoliation covers.
     #
     # Distinct hues, not one ramp reused: the three layers are meant to be
     # stacked and compared, and they must stay tellable apart in the legend.
@@ -3578,7 +3570,5 @@ class LandslideDock(QgsDockWidget):
             self.gegd_tab.teardown()
         if getattr(self, "sar_tab", None) is not None:
             self.sar_tab.teardown()
-        if getattr(self, "fusion_tab", None) is not None:
-            self.fusion_tab.teardown()
         if getattr(self, "viewer3d_tab", None) is not None:
             self.viewer3d_tab.teardown()

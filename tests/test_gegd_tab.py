@@ -9,7 +9,7 @@ slip shows, against a local mini-WFS that answers from the SYNTHETIC fixtures in
 tests/fixtures/gegd/ with a DUMMY key. The real GEGD key is never read.
 
 What it pins:
-  * the dock has seven tabs, Maxar VHR (GEGD) right after PlanetScope;
+  * the dock has six tabs, Maxar VHR (GEGD) right after PlanetScope;
   * building the tab (and its deferred restore) never calls authManager();
   * the persisted widget set, and its defaults;
   * 'Use it in every tab' fills the tab, and the origin is the detection's (with
@@ -246,8 +246,8 @@ tab = dock.gegd_tab
 check("the tab is a GegdTab", isinstance(tab, GegdTab))
 tabs = dock.findChild(QTabWidget)
 names = [tabs.tabText(i) for i in range(tabs.count())]
-check(f"7 tabs, Maxar VHR (GEGD) right after PlanetScope ({names})",
-      len(names) == 7 and names.index("Maxar VHR (GEGD)") == names.index("PlanetScope") + 1)
+check(f"6 tabs, Maxar VHR (GEGD) right after PlanetScope ({names})",
+      len(names) == 6 and names.index("Maxar VHR (GEGD)") == names.index("PlanetScope") + 1)
 
 # now the password store may open: isolated, helper off BEFORE the master password
 am = QgsApplication.authManager()

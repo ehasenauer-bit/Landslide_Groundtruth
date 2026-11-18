@@ -262,7 +262,7 @@ def step_tint(step):
 # --------------------------------------------------------------------------
 # Break values are EXPLICIT rather than derived, so the dBright ramp stays
 # exactly the validated one (-0.30 / -0.15 / -0.05). All three products are
-# signed so a landslide makes them NEGATIVE (fusion_core.EVIDENCE_SIGN), hence
+# signed so a landslide makes them NEGATIVE, hence
 # only the negative side is painted and 0 is fully transparent.
 #
 # Three distinct hue families, because these layers exist to be stacked and

@@ -227,9 +227,8 @@ def _sensor(c):
 
 
 def _tag(c):
-    """Layer-name prefix: 'S1' / 'NISAR'. Every downstream name match keys on it
-    — the Fusion tab pools 'S1_change_*' files only — so NISAR rasters can
-    never be pooled with, or mistaken for, the benchmarked C-band ones."""
+    """Layer-name prefix: 'S1' / 'NISAR', so NISAR rasters can never be
+    mistaken for the benchmarked C-band ones."""
     return "NISAR" if _sensor(c) == NISAR else "S1"
 
 
@@ -407,7 +406,7 @@ class SarTab(QWidget):
             "it can catch a deposit Sentinel-1 misses — measured once, on "
             "Iliamna 2026-08-08, where HH log-ratio peaked 0.1 km from the "
             "seismic point. One event is not a validation: NISAR layers are "
-            "named 'NISAR …' and the Fusion tab never picks them for you.\n\n"
+            "named 'NISAR …' so they are never mistaken for Sentinel-1 ones.\n\n"
             "Searching is free; previews and change maps read the pixels from "
             "NASA Earthdata (log in once in the 'NASA Earthdata Login' box "
             "at the top of the Sentinel-2 / Landsat tab). Expect 10–25 s per NISAR scene, in the "
@@ -876,8 +875,8 @@ class SarTab(QWidget):
             "both passes can see — among passes that see at least half the AOI "
             "(a pass that mostly misses the AOI is quiet only because it is "
             "missing). One primary is chosen for all four detectors, from the "
-            "log-ratio maps, so the Fusion tab never pools rasters led by "
-            "different passes. The choice and its numbers go to the Log.")
+            "log-ratio maps, so every detector is led by the same pass. The "
+            "choice and its numbers go to the Log.")
         self.cd_merge_rule_combo.currentIndexChanged.connect(self._merge_rule_changed)
         form.addRow("Merge rule", self.cd_merge_rule_combo)
         form.addRow("Primary pass", self.cd_merge_primary_combo)
@@ -917,10 +916,9 @@ class SarTab(QWidget):
             "there, or they claim opposite signs) are left out, because "
             "'strongest anomaly wins' otherwise paints them exactly like a real "
             "detection and over ice that is most of the AOI. Beneath it sits the "
-            "full merged raster, unticked — that is the one the Fusion tab "
-            "scores, and it deliberately keeps the disagreements: over six "
-            "truthed events they are enriched inside the scar, and dropping them "
-            "from the fused score made detection worse.")
+            "full merged raster, unticked, which deliberately keeps the "
+            "disagreements: over six truthed events they were enriched inside "
+            "the scar.")
         self.cd_merge_btn.clicked.connect(self._merge_clicked)
         form.addRow(self.cd_merge_btn)
         return box
@@ -1830,10 +1828,7 @@ class SarTab(QWidget):
         # or, more often, the ascending and the descending render of one event,
         # which share their dates AND their radius — otherwise produce two
         # top-level folders with the SAME name, told apart only by the "(2)"
-        # new_group appends, which lands on whichever was rendered second. The
-        # Fusion tab pairs on ground and will not pool across geometries, so
-        # picking the wrong one of those is a mismatch you cannot see from the
-        # tree.
+        # new_group appends, which lands on whichever was rendered second.
         minx, miny, maxx, maxy, radius = bbox
         only_nisar = all(_sensor(c) == NISAR for _label, c in picks)
         self._amp_group = lg.name("NISAR" if only_nisar else "SAR",
@@ -2873,8 +2868,8 @@ class SarTab(QWidget):
         pre_d = (roles[pre_roles[0]].get("date") or "")[:10]
         post_d = (roles["post"].get("date") or "")[:10]
         tail = f"(t{track} {pol}, {k}×{k})"
-        # 'S1' / 'NISAR' leads every name: the Fusion tab pools S1_change_* only,
-        # so a NISAR map can be fused by hand but never pooled with C-band ones
+        # 'S1' / 'NISAR' leads every name, so a NISAR map is never mistaken for
+        # a C-band one
         radar = _sensor(roles["post"])
         tg = _tag(roles["post"])
         # short product tag per change metric, for the layer-tree subfolder name
@@ -2933,8 +2928,7 @@ class SarTab(QWidget):
                 # Durable float32 export FIRST, before any display baking. The
                 # layover fade writes RGBA and destroys the signed values, and a
                 # tempfile does not survive the session — so the ANALYSIS product
-                # is written unconditionally, under the layer's own name, for the
-                # Fusion tab to consume.
+                # is written unconditionally, under the layer's own name.
                 data_path = self._cd_export_float(label, out, gt, proj, meta)
                 try:
                     fd, opath = tempfile.mkstemp(suffix=".tif",
@@ -3188,8 +3182,8 @@ class SarTab(QWidget):
 
         The layer label carries only dates, track, polarization and window k, but
         the grid and the values depend on much more, and anything left out of this
-        tag is a file silently overwritten in place — with the Fusion tab then
-        reading pixels that no longer match the layer it was told to fuse.
+        tag is a file silently overwritten in place — with any layer already
+        loaded from it then showing pixels that no longer match its name.
 
         RADIUS leads, because it is the only complete key for the grid. It was
         missing, and `res` did not cover for it: past the 2048-pixel render cap
@@ -3222,7 +3216,7 @@ class SarTab(QWidget):
         Always written, even when the layover fade is on: the fade bakes a colour
         ramp into RGBA, so true values would otherwise survive only in
         self._cd_results -- in memory, capped at 12 and cleared on the next
-        Search. The fusion tab consumes these files, so a tempfile would not do.
+        Search. These files are the durable product, so a tempfile would not do.
         Returns the path, or None if the write failed (never fatal: the layer
         still loads from the temp copy)."""
         try:
@@ -3442,9 +3436,8 @@ class SarTab(QWidget):
         detector's first geometry.
 
         Decided once, from the log-ratio maps when there are any (the benchmarked
-        detector), because the Fusion tab MAX-pools the four detectors: rasters
-        led by different passes would bring the cross-pass max — the very
-        inflation fill-only exists to avoid — back in at the pooling step."""
+        detector), so all four detectors are led by the same pass and stay
+        comparable with each other."""
         want = self.cd_merge_primary_combo.currentData() or "auto"
         mkey = "logratio" if "logratio" in by_prod else next(iter(by_prod))
         sel = by_prod[mkey]
@@ -3479,13 +3472,12 @@ class SarTab(QWidget):
 
     def _emit_filled(self, mkey, results, masks, primary_key, NAME, group):
         """Write and load one detector's fill-only merge: the filled change raster
-        (the heat map, and what the Fusion tab reads) and its source map.
+        (the heat map) and its source map.
         Returns (group, added?).
 
         Named "S1 change <det> FILLED <primary> from <other> ... fill-<primary>"
-        so the fill token sits in the tail _sar_siblings keys on: filled rasters
-        pool with each other (same primary, same settings) and never with the
-        strongest-wins MERGED rasters, whose pixels were chosen differently."""
+        so a filled raster is never confused with a strongest-wins MERGED one,
+        whose pixels were chosen differently."""
         keys = [r["direction"] or f"t{r['track']}" for r in results]
         p = keys.index(primary_key) if primary_key in keys else 0
         label_name = NAME.get(mkey, mkey)
@@ -3606,27 +3598,24 @@ class SarTab(QWidget):
             self.iface.messageBar().pushInfo(
                 "SAR", f"Filled {added} product(s): one pass leads, the other only "
                 "fills where it was blind. The 'source' layer shows which pixels "
-                "came from where; the filled raster is the one the Fusion tab "
-                "reads.")
+                "came from where.")
         elif added:
             self.iface.messageBar().pushInfo(
                 "SAR", f"Merged {added} product(s) across geometries — read the "
                 "confidence layer: 2 = both orbits agree (strong), 1 = recovered "
                 "from one orbit (other blind), 3 = orbits disagree and are left "
                 "out of the heat map on top (the full raster is loaded unticked "
-                "beneath it, and is the one the Fusion tab reads).")
+                "beneath it).")
 
     def _merge_geometries_action(self, cd_results, radar, rule):
         """One radar's merge (see _merge_clicked): every product's newest asc and
         desc maps, strongest-wins or fill-only per `rule`. Returns how many
         products were merged (or filled)."""
         tg = "NISAR" if radar == NISAR else "S1"
-        # EXACTLY the spellings _cd_compute uses for the single-geometry layers.
-        # They used to read "brightness-z" / "MT-corr" here, which no other part
-        # of the plugin says: the Fusion tab's measure auto-detect knows
-        # "brightness z" and "MT int-corr", found neither, and silently scored a
-        # merged raster as a log-ratio against a 3.0 floor — which admits nothing
-        # at all from MT int-corr, whose values live in 0–1.
+        # EXACTLY the spellings _cd_compute uses for the single-geometry layers,
+        # so a merged layer is named like the layers it was merged from. They
+        # used to read "brightness-z" / "MT-corr" here, which no other part of
+        # the plugin says.
         NAME = {"logratio": "log-ratio", "intcorr": "int-corr",
                 "tsint": "brightness z", "mtcorr": "MT int-corr"}
         # group by product, newest first; keep the latest result per orbit direction
@@ -3706,10 +3695,8 @@ class SarTab(QWidget):
                     f"every geometry (NoData — Sentinel-1 cannot see them)")
             # The tail mirrors a single-geometry layer's — "(t36 VV, 7×7)" — but
             # names EVERY track that went in, so the file becomes
-            # S1_change_log-ratio_MERGED_..._to_<post>_t36+131_VV_7x7_….tif.
-            # That is what lets the Fusion tab pool the merged detectors with each
-            # other (_sar_siblings keys on the post date plus this tail) while
-            # never pooling a merged raster with a single-geometry one.
+            # S1_change_log-ratio_MERGED_..._to_<post>_t36+131_VV_7x7_….tif, and
+            # a merged file is never confused with a single-geometry one.
             tracks = "+".join(str(t) for t in sorted(
                 {r["track"] for r in results if r.get("track") is not None}))
             tail = f"(t{tracks or '?'} {r0['pol'].upper()}, {r0['k']}×{r0['k']})"
@@ -3717,7 +3704,6 @@ class SarTab(QWidget):
                      f"{pre_d}→{post_d} {tail}")
             # Durable float32 export FIRST, exactly as a single-geometry compute
             # does it. A merged raster used to exist only as a tempfile, so the
-            # Fusion tab could not glob its siblings (pooling silently off), the
             # layer went stale when the temp dir was swept, and there was no
             # metadata beside it to date the event from.
             tag_meta = dict(radius=r0.get("radius"), eff_res=r0.get("eff_res"),
@@ -3731,16 +3717,11 @@ class SarTab(QWidget):
             # The heat map you READ is the agreeing-only copy: "strongest anomaly
             # wins" paints a conf-3 contradiction exactly like a real detection,
             # and over ice that is most of the AOI. The full max-pooled raster is
-            # still written, still loaded and still what the Fusion tab scores —
-            # see sar_change.agreeing_only for why dropping the disagreements
-            # from the SCORE was measured and rejected.
+            # still written and still loaded — see sar_change.agreeing_only for
+            # why dropping the disagreements from it was measured and rejected.
             shown, n_hidden = sar_change.agreeing_only(merged, conf)
-            # NOT "S1 change ..." like every analysis product: FusionTab's
-            # _sar_siblings globs "S1_change_*_to_<post>_t<tracks>_<POL>_*" to pool
-            # the detectors of one pair, and this copy shares that whole tail. Named
-            # as a change raster it would be pooled with the very raster it is a
-            # filtered view of — the merged log-ratio MAX-pooled with itself minus
-            # its disagreements — which is both meaningless and invisible.
+            # NOT "S1 change ..." like every analysis product, so this filtered
+            # view is never mistaken for the full raster it was cut from.
             dlabel = (f"{tg} MERGED agreeing only {NAME.get(mkey, mkey)} "
                       f"{dirs} {pre_d}→{post_d} {tail}")
             dpath = self._cd_export_float(dlabel, shown, gt, proj, tag_meta)
@@ -3781,10 +3762,9 @@ class SarTab(QWidget):
                             lg.orbit_tag(*(r["direction"] for r in results))))
             sub = lg.subgroup(merge_group, NAME.get(mkey, mkey))
             lg.add_to(clyr, sub)          # confidence underneath
-            # The full raster is LOADED but unticked. It has to be in the project
-            # or the Fusion tab cannot offer it at all — that tab builds its combos
-            # from the project's raster layers, not from the folder — but two
-            # near-identical heat maps drawn on top of each other is not a map.
+            # The full raster is LOADED but unticked: it is the unfiltered result,
+            # but two near-identical heat maps drawn on top of each other is not
+            # a map.
             node = lg.add_to(mlyr, sub)
             try:
                 node.setItemVisibilityChecked(False)
@@ -3794,8 +3774,7 @@ class SarTab(QWidget):
             self._cd_last_layers += [clyr, mlyr, dlyr]
             self._append_log(
                 f"  heat map shown: agreeing only ({n_hidden} disagreeing px "
-                f"hidden); the full raster is loaded unticked and is what the "
-                f"Fusion tab reads")
+                f"hidden); the full raster is loaded unticked beneath it")
             added += 1
         return added
 

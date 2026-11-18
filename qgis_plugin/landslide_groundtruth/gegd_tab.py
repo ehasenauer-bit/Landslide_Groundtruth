@@ -6,8 +6,8 @@ catalog of every WorldView / GeoEye strip over Alaska, searchable in one request
 at any map scale; each strip streamed straight onto the canvas at 0.3–0.6 m; and
 fresh collects online about 2.3 h after the satellite passes. What it does NOT
 give is radiometry: every strip arrives as 8-bit, DRA-stretched RGB (or pan for
-WorldView-1), with no NIR or SWIR. It is for looking and tracing; Fusion refuses
-it, and no layer here is named like a change index.
+WorldView-1), with no NIR or SWIR. It is for looking and tracing, and no layer
+here is named like a change index.
 
 Workflow (M1): **Use it in every tab** fills the Event box from the seismic
 detection → **Search** lists the strips that actually see the search circle,
@@ -308,7 +308,7 @@ class GegdTab(QWidget):
             "Maxar/Vantor strips at 0.3–0.6 m from NGA's GEGD Pro, streamed straight "
             "onto the map for a before/after look at the event. Needs your own GEGD Pro "
             "API key. Display imagery (8-bit, no NIR/SWIR): for looking and tracing, "
-            "never for Fusion's change indices.")
+            "never for change indices.")
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: palette(mid); }")
         # Work order, each box tinted for its step (theme.STEP_TINTS): connection

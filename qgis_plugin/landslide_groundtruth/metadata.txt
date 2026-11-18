@@ -2,14 +2,14 @@
 name=Landslide Ground-Truthing
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
-description=Ground-truth a seismically detected landslide: pre/post Sentinel-2, Landsat, PlanetScope, Maxar and SAR imagery, optical+SAR change fusion, a 3D terrain viewer and scar-to-volume estimates.
-about=Enter a landslide detection (origin time and epicentre) once, then search and compare pre- and post-event imagery from Sentinel-2, Landsat, PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1/NISAR radar; fuse optical and radar change into one landslide score; read the scar against the terrain in 3D (ArcticDEM or your own DEM); and turn the outline you digitize into a volume (Larsen et al. 2010 area-volume scaling). "Try an example" in the Detection box loads a real event to start from.
+description=Ground-truth a seismically detected landslide: pre/post Sentinel-2, Landsat, PlanetScope, Maxar and SAR imagery, a 3D terrain viewer and scar-to-volume estimates.
+about=Enter a landslide detection (origin time and epicentre) once, then search and compare pre- and post-event imagery from Sentinel-2, Landsat, PlanetScope, Maxar VHR (GEGD Pro) and Sentinel-1/NISAR radar; read the scar against the terrain in 3D (ArcticDEM or your own DEM); and turn the outline you digitize into a volume (Larsen et al. 2010 area-volume scaling). "Try an example" in the Detection box loads a real event to start from.
 
-    SETUP: the imagery searches run in a separate Python that the plugin installs itself the first time - click "Install imagery tools" at the top of the panel (about 300 MB to download, 1 GB on disk; nothing is installed into QGIS). It downloads uv (Astral, MIT/Apache-2.0) from PyPI, a standalone Python 3.12 and a pinned, hash-checked package set including PyTorch (for the snow-robust cloud mask) into your user data folder; "Remove" deletes all of it. Volume, Fusion and Maxar VHR work without it.
+    SETUP: the imagery searches run in a separate Python that the plugin installs itself the first time - click "Install imagery tools" at the top of the panel (about 300 MB to download, 1 GB on disk; nothing is installed into QGIS). It downloads uv (Astral, MIT/Apache-2.0) from PyPI, a standalone Python 3.12 and a pinned, hash-checked package set including PyTorch (for the snow-robust cloud mask) into your user data folder; "Remove" deletes all of it. Volume and Maxar VHR work without it.
 
-    ACCOUNTS: Sentinel-2, Landsat, Sentinel-1 and ArcticDEM need none. PlanetScope needs a Planet account (paid). Maxar VHR needs a GEGD Pro API key (US government users). NISAR and the RGI glacier outlines need a free NASA Earthdata login.
+    ACCOUNTS: Sentinel-2, Landsat, Sentinel-1 and ArcticDEM need none. PlanetScope needs a Planet account (paid). Maxar VHR needs a GEGD Pro API key (US government users). NISAR needs a free NASA Earthdata login.
 
-    COVERAGE: built for Alaska (glacier outlines and DEM fetch); the optical and radar searches work worldwide.
+    COVERAGE: built for Alaska (DEM fetch); the optical and radar searches work worldwide.
 
     PLATFORMS: tested on macOS with QGIS 3.44 and 4.2. Windows and Linux are expected to work but are untested - please report problems on the issue tracker.
 
@@ -20,7 +20,7 @@ email=ehasenauer@alaska.edu
 homepage=https://github.com/ehasenauer-bit/Landslide_Groundtruth#readme
 repository=https://github.com/ehasenauer-bit/Landslide_Groundtruth
 tracker=https://github.com/ehasenauer-bit/Landslide_Groundtruth/issues
-changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change map from full-detail scenes; Maxar streams only when asked and only inside the search box; Mark a spot.
+changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change map from full-detail scenes; Maxar streams only when asked and only inside the search box; Mark a spot; the Fusion tab is gone.
     * Every tab: boxes are tinted by workflow step (setup, inputs, options, results, advanced) and sit in the order you work. One ? Help switch shows or hides the explanations on every tab. Galleries and scene previews are collapsible and start closed.
     * The search radius sits in each imagery tab's event box, with the location and time.
     * Mark a spot (Sentinel-2 tab): type coordinates or use Pick on map to drop a red X (don't look here) or a blue circle (come back here) into map_marks.gpkg in the project folder. Show notes opens their table.
@@ -44,6 +44,7 @@ changelog=1.0.2 - Every tab laid out in work order with one ? Help; SAR change m
     * "Seismic offset" is now called "Location error" in the figure details and the exported figures. In the Volume tab's CSV the column offset_from_det_km is now location_error_km (same number: Detection lat/lon to the source scar's centre).
     * 3D viewer: Export metadata CSV is written for someone outside the project: the figure's before/after scenes plus every downloaded SAR scene, in one file, <event_id>_imagery.csv, grouped by mission (Sentinel-2, Landsat, PlanetScope, Maxar / WorldView, SAR Sentinel-1, SAR NISAR). Each row has six columns: event_id (the Detection's), before / after, acquisition time, scene ID (the catalog ID for Maxar) and the archive and dataset to find it in. Tab, In 3D viewer and File are gone.
     * 3D viewer: both figure ZIPs include imagery_details.txt: the figure's Details (imagery, terrain, area, centerline, volume, location error, dates) as text, and how each source in the metadata CSV was searched.
+    * The Fusion tab is gone, with its RGI glacier-outline download. The SAR tab still writes the same change rasters, and a merged asc + desc map still loads its full raster unticked beneath the agreeing-only heat map. Settings a project saved for the Fusion tab are ignored.
     1.0.1 - Faster scene search; seismic offset in the 3D viewer.
     * The Sentinel-2 / Landsat scene search is several times faster (about 20 s where it took 1 to 8 minutes on a slow link): the cloud check now reads each scene through Planetary Computer's data API instead of downloading image tiles.
     * Fixed: the cloud % of a scene that only clips the edge of the search box could read far too low.

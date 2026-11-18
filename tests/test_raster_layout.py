@@ -89,7 +89,7 @@ check(np.array_equal(np.nan_to_num(back, nan=-12345.0).view(np.uint32),
 check(np.array_equal(np.isnan(back), np.isnan(f64)), "NaN/nodata pattern changed")
 
 # ... and the narrowing must stay far inside the thresholds anything downstream uses
-# (dock.CHANGE_RAMPS breaks, fusion_core.DEFAULT_FLOORS). See the measurement in
+# (dock.CHANGE_RAMPS breaks: the weakest is -0.05). See the measurement in
 # review_package: worst real-scar disagreement was one 10 m pixel.
 err = np.nanmax(np.abs(f64 - want.astype("float64")))
 check(err < 1e-5, f"float32 error {err:.2e} is too large for a -0.05 threshold")

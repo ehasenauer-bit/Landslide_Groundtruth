@@ -6,11 +6,10 @@ Run with tests/run_all.sh, or directly with QGIS's bundled python:
 Results used to go to one global folder (<tools>/out/interactive, 12 GB by
 2026-09-25), so a project's files were mixed in with every other project's and
 did not travel with its .qgz. Now dock.results_dir() is the saved project's own
-folder, and each tab keeps its subfolder under it (planet/, sar/, fusion/,
-viewer3d/, and the Sentinel run at the top). Switching projects switches the
-folder. Two things deliberately stay shared (dock.shared_dir): an unsaved
-project's results, which have no folder yet, and the RGI glacier archive (the
-same 67 MB for every project, and it needs an Earthdata login to fetch).
+folder, and each tab keeps its subfolder under it (planet/, sar/, viewer3d/,
+and the Sentinel run at the top). Switching projects switches the folder. An
+unsaved project's results, which have no folder yet, go to the shared fallback
+(dock.shared_dir).
 Checks the real --out each Run would pass to run_single.
 """
 import os, re, sys, tempfile
@@ -105,7 +104,6 @@ def outs():
             ("SAR search", dock.sar_tab._collect()[3]),
             ("SAR amplitude", dock.sar_tab._amp_out_dir()),
             ("SAR change", dock.sar_tab._cd_out_dir()),
-            ("Fusion", dock.fusion_tab._out_dir()),
             ("Maxar VHR (GEGD)", dock.gegd_tab._out_dir()),
             ("3D flip cache", dock.viewer3d_tab._flip_cache_dir())]
     web = getattr(dock.viewer3d_tab, "_web_out_dir", None)   # newer 3D tab only
@@ -136,16 +134,13 @@ project.write(os.path.join(A, "event A.qgz"))
 rows, bad = all_under(A)
 check(f"results_dir() is the project's folder", dock.results_dir() == A)
 check(f"all {len(rows)} tabs write under it (off: {bad})", not bad)
-check("with the same subfolders as before: planet/, sar/, fusion/, viewer3d/",
+check("with the same subfolders as before: planet/, sar/, viewer3d/",
       dict(rows)["PlanetScope search"] == os.path.join(A, "planet")
       and dict(rows)["SAR change"] == os.path.join(A, "sar", "change")
-      and dict(rows)["Fusion"] == os.path.join(A, "fusion")
       and dict(rows).get("3D web export", os.path.join(A, "viewer3d", "web"))
       == os.path.join(A, "viewer3d", "web"))
 check("the Environment box names this project's folder",
       A in dock.results_label.text() and "this project's folder" in dock.results_label.text())
-check("the RGI glacier archive stays shared, not per project",
-      dock.fusion_tab._glacier_cache_dir() == os.path.join(SHARED, "glacier_outlines"))
 
 print("\n=== switching projects switches the folder ===")
 B = tempfile.mkdtemp(prefix="proj B ")

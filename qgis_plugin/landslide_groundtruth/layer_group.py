@@ -77,8 +77,7 @@ def orbit_tag(*states):
     the only thing telling two of them apart in the tree is the '(2)' new_group
     appends — and which run that lands on depends on the order they happened to
     be rendered in. Geometry is the thing you most need to read off a SAR folder:
-    it decides which slopes are in layover, and the Fusion tab will not pool a
-    raster from one geometry with a raster from the other.
+    it decides which slopes are in layover.
     """
     seen = []
     for st in states:

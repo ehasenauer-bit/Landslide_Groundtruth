@@ -718,13 +718,14 @@ def agreeing_only(merged, conf):
     shouting orbit with nothing to say the other one disagreed. On ice that is
     most of the AOI, so the merged heat map renders as change nearly everywhere.
 
-    It is NOT applied to the raster the Fusion tab scores, and must not be.
-    Measured over six truthed events, conf-3 pixels are ENRICHED in the scar
+    It is NOT applied to the full merged raster written to disk, and must not
+    be. Measured over six truthed events, conf-3 pixels are ENRICHED in the scar
     (mean lift 2.0; Logan 5.6, Iliamna 4.1) — over a real scar the two look
-    directions genuinely do disagree. Dropping them from the fused score moved
-    scar area detected 90.0% -> 80.5% and the worst candidate rank 3 -> 7, with
-    Valdez worst hit (76.9% -> 48.1% area). So the SAR tab writes this copy for
-    the map and keeps the full max-pooled values on disk for Fusion.
+    directions genuinely do disagree. Dropping them from the optical+SAR score
+    (the Fusion tab, since removed) moved scar area detected 90.0% -> 80.5% and
+    the worst candidate rank 3 -> 7, with Valdez worst hit (76.9% -> 48.1%
+    area). So the SAR tab writes this copy for the map and keeps the full
+    max-pooled values on disk.
 
     NaN rather than a substituted value: the point is to show nothing where the
     orbits contradict each other, and a NoData pixel is the only thing that
