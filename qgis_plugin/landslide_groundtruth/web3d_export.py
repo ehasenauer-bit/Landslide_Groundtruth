@@ -417,27 +417,23 @@ _VIEWER_JS = r'''
 
   // ---------- metadata CSV: the figure's scenes, plus every SAR scene ----------
   // CFG.scene_csv is built by the plugin at export time (scene_manifest.py): one
-  // CSV per mission table plus a README, saved together as one ZIP. Wired before
-  // WebGL starts, so the tables still save where the 3D view cannot run.
+  // CSV, <event_id>_imagery.csv, six columns, rows grouped by mission. Wired
+  // before WebGL starts, so the table still saves where the 3D view cannot run.
   (function () {
     var b = document.getElementById("csvBtn"), S = CFG.scene_csv;
-    if (!S || !S.n || !S.files) {
+    if (!S || !S.n || !S.csv) {
       b.disabled = true;
       b.title = S ? "None of the figure's layers was a downloaded scene, and the project had no SAR, when this viewer was exported."
                   : "This viewer was exported without a scene list.";
       return;
     }
-    b.title = S.n + " scene" + (S.n === 1 ? "" : "s") + ", one CSV per table — " +
-              S.tables.join(", ") +
-              ": event, before / after, acquisition time, scene ID, archive, collection";
+    b.title = S.n + " scene" + (S.n === 1 ? "" : "s") + " (" + S.tables.join(", ") +
+              "): event, before / after, acquisition time, scene ID, archive, collection";
     b.onclick = function () {
-      // The BOM is for Excel, which otherwise reads this UTF-8 (° —) as Latin-1.
-      var enc = new TextEncoder();
-      var blob = new Blob([zipStore(S.files.map(function (f) {
-        return {name: f.name, data: enc.encode((/\.csv$/i.test(f.name) ? "\ufeff" : "") + f.csv)};
-      }))], {type: "application/zip"});
+      // The BOM is for Excel, which otherwise reads this UTF-8 as Latin-1.
+      var blob = new Blob(["\ufeff" + S.csv], {type: "text/csv;charset=utf-8"});
       var a = document.createElement("a");
-      a.href = URL.createObjectURL(blob); a.download = S.name || "scenes.zip";
+      a.href = URL.createObjectURL(blob); a.download = S.name || "imagery.csv";
       document.body.appendChild(a); a.click();
       setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
     };
@@ -2138,8 +2134,9 @@ _VIEWER_JS = r'''
       .concat((CFG.extra_details||[]).filter(function (kv) { return !!kv[1]; }));
   }
   // The 3D slide's Details block as plain text, for imagery_details.txt in both figure
-  // ZIPs: the full set of rows (the map slide prints fewer, or a locator instead)
-  // and the overlay names its legend shows.
+  // ZIPs: the full set of rows (the map slide prints fewer, or a locator instead),
+  // the overlay names its legend shows, and how each source in the metadata CSV
+  // was searched.
   function detailsText() {
     var L = ["Landslide figure details", ""];
     if (CFG.event_id) L.push("event_id: " + CFG.event_id);
@@ -2147,6 +2144,11 @@ _VIEWER_JS = r'''
     if (layerMeta.length) {
       L.push("", "Overlays:");
       layerMeta.forEach(function (mm) { L.push("  " + mm.name); });
+    }
+    var srch = (CFG.scene_csv && CFG.scene_csv.searches) || [];
+    if (srch.length) {                       // the CSV's rows, and how they were found
+      L.push("", "How each source was searched:");
+      srch.forEach(function (s) { L.push("  " + s); });
     }
     return L.join("\r\n") + "\r\n";
   }

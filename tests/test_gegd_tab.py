@@ -623,12 +623,11 @@ check(f"a row is the strip's catalog ID, time and archive ({r31.get('scene_id')}
       and r31.get("event_id") == "AK2099-0001")
 check("… and how the strip was searched", r31.get("_search", "").startswith("within "))
 csv_cfg = v3d._scene_csv([b2], [a2])
-files = {f["name"]: f["csv"] for f in (csv_cfg or {}).get("files", [])}
-check("the viewer's CSV payload has the Maxar table, and the README its search",
+check("the viewer's CSV payload has the Maxar rows, and its search line",
       csv_cfg is not None and "Maxar / WorldView" in csv_cfg["tables"]
-      and any(n.endswith("_maxar.csv") for n in files)
-      and any(n.endswith("_README.txt") and "Maxar / WorldView: within" in t
-              for n, t in files.items()))
+      and "Maxar:FinishedFeature" in csv_cfg["csv"]
+      and csv_cfg["name"].endswith("_imagery.csv")
+      and any(l.startswith("Maxar / WorldView: within") for l in csv_cfg["searches"]))
 
 print("\n=== table and footprints select each other ===")
 tab._table.selectRow(row31)

@@ -2341,10 +2341,10 @@ class Viewer3DTab(QWidget):
 
     def _scene_csv(self, before, after):
         """The page's scene tables (see scene_manifest.payload): the figure's
-        scenes plus every downloaded SAR scene, one CSV per mission, written for
-        a reader outside this project; the button saves them as one ZIP. None on
-        any failure -- the viewer still exports, just with its CSV button
-        greyed out."""
+        scenes plus every downloaded SAR scene, in one CSV for a reader outside
+        this project, named <event_id>_imagery.csv, and how each source was
+        searched (for imagery_details.txt). None on any failure -- the viewer
+        still exports, just with its CSV button greyed out."""
         from . import scene_manifest as sm
         try:
             det = getattr(self.dock, "detection", None)
@@ -2356,8 +2356,11 @@ class Viewer3DTab(QWidget):
             sections = sm.collect(self.dock.results_dir(), event_id,
                                   viewer={"Before": paths(before), "After": paths(after)},
                                   maxar=self._maxar_streams(before, after))
-            stem = self._viewer_stem()
-            stem = stem[:-3] if stem.endswith("_3d") else stem
+            if event_id:
+                stem = event_id
+            else:                       # no Detection loaded: the page's own name
+                stem = self._viewer_stem()
+                stem = stem[:-3] if stem.endswith("_3d") else stem
             cfg = sm.payload(sections, stem)
         except Exception as e:
             self._log(f"Metadata CSV skipped ({type(e).__name__}: {e}).")

@@ -2,9 +2,10 @@
 """The 3D viewer's metadata CSV: the figure's scenes plus every SAR scene, as
 small per-mission tables someone outside the project can fetch the scenes from.
 
-Six columns in every table (event_id, side, acquired_utc, scene_id, archive,
-collection); how each source was searched is said once, in the README. Ethan
-cut the tables to this on 2026-11-18 from 26-28 columns.
+One CSV, <event_id>_imagery.csv, with six columns (event_id, side,
+acquired_utc, scene_id, archive, collection), rows grouped by mission; how each
+source was searched goes once per source into imagery_details.txt. Ethan cut it
+to this on 2026-11-18 from per-mission tables of 26-28 columns.
 
 scene_manifest reads what each imagery tab leaves in the project folder, not
 the tables on screen (empty again after a reopen). These checks pin the ways a
@@ -313,35 +314,36 @@ with tempfile.TemporaryDirectory() as proj:
     check("...unless no run matches the event at all",
           any("T05VPH" in s for s in ids(M.collect(proj, "AK2099-0000"), "sentinel2")))
 
-    # ---- one CSV per table, plus a README
+    # ---- one CSV, grouped by mission
     titles = [t for k, t in M.SECTIONS if k in secs]
-    files = M.to_csv_files(secs, "AK")
-    want = {f"AK_{k}.csv" for k in secs} | {"AK_README.txt"}
-    check("one CSV per table plus a README", set(files) == want, sorted(files))
-    for k in secs:
-        back = list(csv.DictReader(io.StringIO(files[f"AK_{k}.csv"])))
-        check(f"AK_{k}.csv: the six columns, one line per scene, the rows' values",
-              tuple(back[0]) == M.COLUMNS and len(back) == len(secs[k])
-              and [tuple(b.values()) for b in back] == [cells(r) for r in secs[k]])
-    allcsv = "".join(v for k, v in files.items() if k.endswith(".csv"))
-    check("no blank cell and no search line in any CSV",
-          ",," not in allcsv and not re.search(r",\r\n", allcsv) and "within" not in allcsv)
-    readme = files["AK_README.txt"]
-    check("README names every file and table, and carries the column notes",
-          all(t in readme for t in titles) and all(f"AK_{k}.csv" in readme for k in secs)
-          and all(a in readme for a in M.ABOUT))
-    check("README says once how each source was searched",
-          f"  Sentinel-2: {line}" in readme and readme.count("Sentinel-2: within") == 1
-          and "  SAR - NISAR: within" in readme and "  Maxar / WorldView: within" in readme)
-    check("README says the Maxar scene_id is the catalog ID",
-          "scene_id is the Maxar catalog ID" in readme)
+    text = M.to_csv(secs)
+    back = list(csv.DictReader(io.StringIO(text)))
+    flat = [r for k, _t in M.SECTIONS for r in secs.get(k, [])]
+    check("one CSV: the six columns, every row of every mission, grouped in SECTIONS order",
+          tuple(back[0]) == M.COLUMNS and len(back) == len(flat)
+          and [tuple(b.values()) for b in back] == [cells(r) for r in flat])
+    colls = [b["collection"] for b in back]
+    check("SAR rows come last, together",
+          colls[-3:] == ["sentinel-1-rtc", "sentinel-1-rtc", "NISAR_L2_GCOV_PROVISIONAL_V1"],
+          colls)
+    check("no blank cell and no search line in the CSV",
+          ",," not in text and not re.search(r",\r\n", text) and "within" not in text)
+    lines = M.search_lines(secs)
+    check("search lines: once per source, titled",
+          lines[0] == f"Sentinel-2: {line}" and sum(l.startswith("Sentinel-2:") for l in lines) == 1
+          and any(l.startswith("SAR - NISAR: within") for l in lines), lines)
+    check("the Maxar search line says scene_id is the catalog ID",
+          any(l.startswith("Maxar / WorldView: within") and "Maxar catalog ID" in l
+              for l in lines), lines)
 
     # ---- what the viewer embeds
-    pl = M.payload(secs, "AK")
-    check("payload: the .zip name, the scene count, the table titles, every file",
-          pl["name"] == "AK_scenes.zip" and pl["n"] == sum(len(v) for v in secs.values())
-          and pl["tables"] == titles
-          and {f["name"]: f["csv"] for f in pl["files"]} == files)
+    pl = M.payload(secs, "AK2099-0101")
+    check("payload: <event_id>_imagery.csv, the CSV, the count, the missions, the searches",
+          pl["name"] == "AK2099-0101_imagery.csv" and pl["csv"] == text
+          and pl["n"] == len(flat) and pl["tables"] == titles and pl["searches"] == lines)
+    check("an event id unfit for a file name is made safe",
+          M.payload(secs, "AK 2099/0101")["name"] == "AK_2099_0101_imagery.csv"
+          and M.payload(secs, "")["name"] == "event_imagery.csv")
 
     # ---- one tab's odd file never costs the others
     write(os.path.join(sdir, "search.json"), "{not json")
@@ -356,7 +358,7 @@ check("an empty / missing folder is no tables, not an error",
 # ---------------------------------------------------------------- the page
 evil = M._row("sentinel2", NA, scene_id="</script><b>x")
 evil.pop("_section")
-scene_cfg = M.payload({"sentinel2": [evil]}, "AK")
+scene_cfg = M.payload({"sentinel2": [evil]}, "AK2099-0101")
 base = {"title": "t", "ncols": 2, "nrows": 2, "width_m": 1, "height_m": 1,
         "zmin": 0, "zmax": 1, "exaggeration": 1, "elev_b64": "",
         "before_uri": "", "after_uri": "", "event_id": "AK2099-0101",
@@ -366,13 +368,15 @@ check("the page has the CSV button", 'id="csvBtn"' in html)
 m = re.search(r'<script id="cfg" type="application/json">(.*?)</script>', html, re.S)
 cfg = json.loads(m.group(1)) if m else {}
 check("a '</script>' inside a scene id cannot end the payload early, and round-trips",
-      (cfg.get("scene_csv") or {}).get("files") == scene_cfg["files"])
+      (cfg.get("scene_csv") or {}).get("csv") == scene_cfg["csv"])
 check("the event id rides along for imagery_details.txt", cfg.get("event_id") == "AK2099-0101")
-check("the CSV button saves the per-table files as one ZIP",
-      "zipStore(S.files" in html and "S.csv" not in html)
+check("the CSV button saves the one CSV, not a ZIP",
+      '"\\ufeff" + S.csv' in html and "zipStore(S.files" not in html)
 check("both figure ZIPs get imagery_details.txt from the Details rows",
       'name:"imagery_details.txt"' in html and "function detailsText()" in html
       and "figureDetailRows({})" in html)
+check("imagery_details.txt ends with how each source was searched",
+      "How each source was searched:" in html and "CFG.scene_csv.searches" in html)
 
 node = shutil.which("node")
 if node:

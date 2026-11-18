@@ -6,8 +6,9 @@ button. They are written for a reader who has the figure but not this project
 acquisitions again. So a row says only that: which event the scene was pulled
 for, before or after, when it was acquired, its id, and the archive + collection
 that serve it. How each source was searched (centre, radius, dates, cloud limit)
-is said once, in the README, not on every row. Nothing that only means something
-on this machine: no dock tab names, file names or viewer state.
+is said once per source, in the figure ZIPs' imagery_details.txt, not on every
+row. Nothing that only means something on this machine: no dock tab names, file
+names or viewer state.
 
 Ethan cut the tables to these six columns on 2026-11-18. Before that each table
 had 26-28: footprint bounds, the search repeated on every row, and fields the
@@ -17,9 +18,10 @@ Which scenes: the before/after scenes draped in the figure, plus every SAR scene
 the project downloaded (radar is never draped, but it is half the evidence).
 With no figure given (viewer=None) every downloaded scene is listed.
 
-One CSV per mission (Sentinel-2, Landsat, PlanetScope, Maxar / WorldView, SAR
-Sentinel-1, SAR NISAR) plus the README; the viewer saves them as one ZIP. A
-value the project never recorded reads "n/a".
+One CSV, rows grouped by mission (Sentinel-2, Landsat, PlanetScope, Maxar /
+WorldView, SAR Sentinel-1, SAR NISAR); the collection column says which. (It was
+one CSV per mission in a ZIP until the columns became the same for all of them,
+2026-11-18.) A value the project never recorded reads "n/a".
 
 "Downloaded" is read from what each tab leaves in the project folder, not from
 the tables on screen (empty again after a reopen):
@@ -49,7 +51,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-__all__ = ["SECTIONS", "COLUMNS", "NA", "collect", "to_csv_files", "payload",
+__all__ = ["SECTIONS", "COLUMNS", "NA", "collect", "to_csv", "search_lines", "payload",
            "aoi_box", "coverage_pct"]
 
 NA = "n/a"          # the project never recorded it
@@ -66,17 +68,6 @@ SECTIONS = (
     ("sar_nisar", "SAR - NISAR"),
 )
 _TITLES = dict(SECTIONS)
-
-# The README's column notes.
-ABOUT = (
-    "Columns (the same in every file):",
-    "  event_id      the seismic detection the scenes were pulled for",
-    "  side          before / after the event",
-    "  acquired_utc  when the scene was acquired (UTC)",
-    "  scene_id      the archive's own id for the scene",
-    "  archive, collection  where to search for scene_id",
-    "  n/a           not recorded by the project",
-)
 
 ARCHIVE_MPC = "Microsoft Planetary Computer"
 ARCHIVE_PLANET = "Planet Labs"
@@ -507,7 +498,7 @@ def collect(results_dir, event_id="", viewer=None, maxar=()):
     """{section key: [rows]} in SECTIONS order; tables with no rows are left out.
 
     Each row is COLUMNS plus "_search", the line saying how its source was
-    searched (the README's; to_csv_files leaves it out of the CSV).
+    searched (for search_lines; to_csv leaves it out of the CSV).
     viewer: {"Before": [paths], "After": [paths]} -- the files draped in the
     figure. Given, the optical / PlanetScope / Maxar tables keep only the
     figure's scenes; SAR keeps every downloaded scene. None lists everything.
@@ -557,42 +548,35 @@ def count(sections):
     return sum(len(v) for v in sections.values())
 
 
-def to_csv_files(sections, stem):
-    """{file name: text}: one plain CSV per table (COLUMNS only) and a README
-    naming the files, the columns and how each source was searched.
-    No BOM: the viewer adds it to each CSV when it saves the ZIP, for Excel."""
-    out = {}
+def to_csv(sections):
+    """One CSV text: COLUMNS, then every row, grouped by mission in SECTIONS
+    order (before -> after inside each). No BOM: the viewer adds it when it
+    saves the file, for Excel."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(COLUMNS)
     for key, _t in SECTIONS:
-        if key not in sections:
-            continue
-        buf = io.StringIO()
-        w = csv.writer(buf, lineterminator="\r\n")
-        w.writerow(COLUMNS)
-        for r in sections[key]:
+        for r in sections.get(key, []):
             w.writerow([r.get(c, NA) for c in COLUMNS])
-        out[f"{stem}_{key}.csv"] = buf.getvalue()
-    if not out:
-        return out
-    lines = ["Scene metadata, one CSV per mission:"]
+    return buf.getvalue()
+
+
+def search_lines(sections):
+    """['Sentinel-2: within 15 km of ..., 2026-07-28 to 2026-12-25 (UTC), ...'],
+    one per source searched, for imagery_details.txt."""
+    out = []
     for key, title in SECTIONS:
-        if key in sections:
-            n = len(sections[key])
-            note = "; scene_id is the Maxar catalog ID" if key == "maxar" else ""
-            lines.append(f"  {stem}_{key}.csv  {title} ({n} scene{'' if n == 1 else 's'}{note})")
-    lines += [""] + list(ABOUT) + ["", "How each source was searched:"]
-    for key, title in SECTIONS:
-        if key not in sections:
-            continue
-        for s in dict.fromkeys(r.get("_search") or NA for r in sections[key]):
-            lines.append(f"  {title}: {s}")
-    out[f"{stem}_README.txt"] = "\r\n".join(lines) + "\r\n"
+        for line in dict.fromkeys(r.get("_search") or NA for r in sections.get(key, [])):
+            note = "; scene_id in the CSV is the Maxar catalog ID" if key == "maxar" else ""
+            out.append(f"{title}: {line}{note}")
     return out
 
 
-def payload(sections, stem):
-    """The viewer's scene_csv config: {"name" (the .zip the button saves),
-    "files": [{"name", "csv"}], "n" (scenes), "tables" (their titles)}."""
-    files = to_csv_files(sections, stem)
-    return {"name": stem + "_scenes.zip", "n": count(sections),
+def payload(sections, event_id):
+    """The viewer's scene_csv config: {"name" (<event_id>_imagery.csv, the file
+    the button saves), "csv", "n" (scenes), "tables" (the missions in it),
+    "searches" (for imagery_details.txt)}."""
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(event_id or "")).strip("._") or "event"
+    return {"name": stem + "_imagery.csv", "csv": to_csv(sections), "n": count(sections),
             "tables": [t for k, t in SECTIONS if k in sections],
-            "files": [{"name": k, "csv": v} for k, v in files.items()]}
+            "searches": search_lines(sections)}
