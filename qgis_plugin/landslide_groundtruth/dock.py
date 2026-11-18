@@ -353,7 +353,7 @@ class LandslideDock(QgsDockWidget):
         self.gegd_tab = GegdTab(self)
         tabs.addTab(self.gegd_tab, "Maxar VHR (GEGD)")
         self.sar_tab = SarTab(self)
-        tabs.addTab(self.sar_tab, "SAR (Sentinel-1)")
+        tabs.addTab(self.sar_tab, "SAR")
         # Consumes the two tabs above rather than searching for imagery itself:
         # one optical change raster AND one SAR change raster into a single
         # landslide score. Sits after them because that is the workflow order.

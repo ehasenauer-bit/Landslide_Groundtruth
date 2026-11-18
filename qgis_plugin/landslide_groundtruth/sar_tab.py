@@ -1,4 +1,4 @@
-"""The SAR (Sentinel-1) tab: cloud-free amplitude previews for pre/post visual
+"""The SAR tab (Sentinel-1 and NISAR): cloud-free amplitude previews for pre/post visual
 change inspection, from Planetary Computer's `sentinel-1-rtc` collection.
 
 Why SAR: radar sees through cloud and darkness, so where the optical tabs wait
