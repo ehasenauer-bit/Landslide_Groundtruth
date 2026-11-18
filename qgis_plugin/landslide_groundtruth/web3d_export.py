@@ -669,11 +669,25 @@ _VIEWER_JS = r'''
       }
     });
   });
+  // A line is draped at ~half the mesh spacing, not just at its own vertices:
+  // a centerline's few, long straight segments cut under convex terrain between
+  // vertices and the depth test hid whole stretches of the runout. Collinear
+  // points only, so landslideMetrics (which reads CFG.lines) is unchanged.
+  function densifyPath(pa, step) {
+    var out = [pa[0]];
+    for (var i = 1; i < pa.length; i++) {
+      var a = pa[i-1], b = pa[i];
+      var n = Math.max(1, Math.ceil(Math.hypot(b[0]-a[0], b[1]-a[1]) / step));
+      for (var k = 1; k <= n; k++) out.push([a[0] + (b[0]-a[0])*k/n, a[1] + (b[1]-a[1])*k/n]);
+    }
+    return out;
+  }
   (CFG.lines || []).forEach(function (L) {
     var c = L.color || [90, 190, 255]; regLayer(L.name, c);
     (L.paths || []).forEach(function (path) {
       if (path.length >= 2) {
-        op(drape(path, 1.4), path.length, gl.LINE_STRIP, c, 1.0, false, L.name);
+        var dp = densifyPath(path, 0.5*Math.min(dx, dy));
+        op(drape(dp, 1.4), dp.length, gl.LINE_STRIP, c, 1.0, false, L.name);
         overlays[overlays.length-1].casing = true;   // white halo -> readable on any terrain
         overlays[overlays.length-1].weight = LINE_W.line;
       }
@@ -1519,15 +1533,84 @@ _VIEWER_JS = r'''
   // burn the panel caption (e.g. "BEFORE · 2026-08-01") into a standalone slide so each
   // individual PNG in the bundle is labelled with the imagery date, not just the montage.
   function labelledPanel(s){
-    var iw=s.img.width, ih=s.img.height, bar=Math.max(30, Math.round(ih*0.06));
+    var pw=s.img.width, ih=s.img.height, bar=Math.max(30, Math.round(ih*0.06));
+    var key=s.ov ? panelKey(s.img) : null;
+    var iw=pw + (key ? key.extraW : 0);
     var c=document.createElement("canvas"); c.width=iw; c.height=ih+bar;
     var g=c.getContext("2d");
     g.fillStyle="#0b0e13"; g.fillRect(0,0,c.width,c.height);
     g.drawImage(s.img,0,0);
+    if (key) drawKey(g, key);
     g.fillStyle="#e6ecf6"; g.textAlign="center"; g.textBaseline="middle";
     g.font="600 "+Math.round(bar*0.5)+"px sans-serif";
-    g.fillText(s.cap||"", iw/2, ih+bar*0.5);
+    g.fillText(s.cap||"", pw/2, ih+bar*0.5);
     return c;
+  }
+  // The standalone "AFTER + overlays" PNG in the ZIP carries its own key (the
+  // slide has the Details block's legend instead): it travels alone, and colour
+  // is the only thing saying which outline is which. Short names, only here.
+  function keyName(name) {
+    if (/cent(er|re) ?lines?/i.test(name)) return "Centerline";
+    return String(name).replace(/\s*\(best\)\s*$/i, "");
+  }
+  function keyGeom() {
+    var rows = layerMeta.filter(function (mm) { return vis[mm.name] !== false; });
+    if (!rows.length) return null;
+    var fs = Math.max(12, Math.round(figPanelSize().pxW/85));   // = the callout's
+    var tfs = Math.round(fs*1.1), sw = Math.round(fs*0.95), gap = Math.round(fs*0.55);
+    var g = document.createElement("canvas").getContext("2d");
+    g.font = "600 "+tfs+"px sans-serif";
+    var tw = g.measureText("Key").width;
+    g.font = fs+"px sans-serif";
+    rows.forEach(function (mm) { tw = Math.max(tw, sw + gap + g.measureText(keyName(mm.name)).width); });
+    var padX = fs*0.7, padY = fs*0.6, lineH = fs*1.5, titleH = tfs*1.6;
+    return { rows: rows, fs: fs, tfs: tfs, sw: sw, gap: gap, padX: padX, padY: padY,
+             lineH: lineH, titleH: titleH,
+             bw: Math.ceil(tw + 2*padX), bh: Math.ceil(titleH + rows.length*lineH + 2*padY) };
+  }
+  // Where the key goes on panel image img: the first corner (top-right, top-left,
+  // bottom-right, bottom-left) with no ink under it or within a small gap; when
+  // every corner is taken (a map panel is imagery edge to edge), a column added
+  // on the right. Returns the key geometry plus x, y and extraW, or null.
+  function panelKey(img) {
+    var K = keyGeom(); if (!K) return null;
+    var W = img.width, H = img.height, inset = Math.round(H*0.02), gap = Math.round(H*0.012);
+    var E = inkExtents([img]);
+    var spots = [["right", "top"], ["left", "top"], ["right", "bottom"], ["left", "bottom"]];
+    for (var i = 0; i < spots.length; i++) {
+      var left = spots[i][0] === "left", top = spots[i][1] === "top";
+      var x0 = left ? inset : W - inset - K.bw, y0 = top ? inset : H - inset - K.bh;
+      if (x0 < 0 || y0 < 0) continue;
+      var ya = top ? 0 : Math.max(0, y0 - gap), yb = top ? Math.min(H-1, y0 + K.bh + gap) : H-1;
+      var free = true;
+      for (var y = ya; y <= yb && free; y++)
+        free = left ? (E.lo[y] > x0 + K.bw + gap) : (E.hi[y] < x0 - gap);
+      if (free) { K.x = x0; K.y = y0; K.extraW = 0; return K; }
+    }
+    K.x = W + inset; K.y = inset; K.extraW = K.bw + 2*inset;
+    return K;
+  }
+  function drawKey(g, K) {
+    g.save();
+    g.fillStyle = "rgba(11,14,19,0.86)"; g.strokeStyle = "rgba(150,185,215,0.55)";
+    g.lineWidth = Math.max(1, K.fs/18);
+    g.beginPath(); g.rect(K.x, K.y, K.bw, K.bh); g.fill(); g.stroke();
+    var x = K.x + K.padX, y = K.y + K.padY;
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.fillStyle = "#aeb9cc"; g.font = "600 "+K.tfs+"px sans-serif";
+    g.fillText("Key", x, y + K.titleH*0.45);
+    y += K.titleH;
+    g.font = K.fs+"px sans-serif";
+    K.rows.forEach(function (mm) {
+      var cy = y + K.lineH/2;
+      g.fillStyle = "rgb("+mm.color[0]+","+mm.color[1]+","+mm.color[2]+")";
+      g.fillRect(x, cy - K.sw/2, K.sw, K.sw);
+      g.strokeStyle = "rgba(255,255,255,0.45)"; g.lineWidth = 1;   // a near-black
+      g.strokeRect(x+0.5, cy - K.sw/2 + 0.5, K.sw-1, K.sw-1);      // swatch vanishes
+      g.fillStyle = "#e6ecf6"; g.fillText(keyName(mm.name), x + K.sw + K.gap, cy);
+      y += K.lineH;
+    });
+    g.restore();
   }
   function buildBundle(fig, shots, status, done, opts){
     opts = opts || {};
@@ -2002,7 +2085,7 @@ _VIEWER_JS = r'''
       { cap: "BEFORE" + (CFG.before_date ? " · " + CFG.before_date : ""), side:0, ov:false },
       { cap: "AFTER" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:false },
       { cap: "AFTER + overlays" + (CFG.after_date ? " · " + CFG.after_date : ""), side:1, ov:true }
-    ].map(function (pn) { return { img: mapPanel(pn.side, pn.ov, pxW, pxH), cap: pn.cap }; });
+    ].map(function (pn) { return { img: mapPanel(pn.side, pn.ov, pxW, pxH), cap: pn.cap, ov: pn.ov }; });
     // One crop for the three maps (they share mapLayout, so it only trims margins)...
     var pad = Math.round(pxH*0.02);
     var R = inkBox(inkExtents(shots.map(function (s) { return s.img; })), pad);
