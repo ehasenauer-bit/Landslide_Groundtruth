@@ -503,6 +503,42 @@ finally:
     if home:
         os.environ["HOME"] = home
 
+
+print("a layover-fade DEM fetch leaves nothing behind that blocks NISAR reads")
+# Measured 2026-11-19: fetch_dem_on_grid set CPL_VSIL_CURL_ALLOWED_EXTENSIONS
+# =.tif process-wide, and from then on GDAL refused every /vsicurl .h5 without
+# a request, so every NISAR read in that QGIS session failed as "no answer from
+# ASF at all". No network here: the tile check and the warp are stubbed, and
+# the stub records what the warp saw.
+from landslide_groundtruth import layover_dim as ld  # noqa: E402
+seen = {}
+real_exists, real_warp = ld._url_exists, ld._warp_sources_to_grid
+
+
+def _fake_warp(g, sources, *a):
+    seen["ext"] = g.GetConfigOption("CPL_VSIL_CURL_ALLOWED_EXTENSIONS")
+    seen["readdir"] = g.GetConfigOption("GDAL_DISABLE_READDIR_ON_OPEN")
+    return np.zeros((4, 4), np.float32)
+
+
+before = {k: gdal.GetConfigOption(k) for k in (
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS", "GDAL_DISABLE_READDIR_ON_OPEN",
+    "GDAL_HTTP_MAX_RETRY", "GDAL_HTTP_RETRY_DELAY")}
+ld._url_exists = lambda u, timeout=30: True
+ld._warp_sources_to_grid = _fake_warp
+try:
+    dem = ld.fetch_dem_on_grid(-150.2, 63.0, -150.0, 63.1, 4, 4)
+finally:
+    ld._url_exists, ld._warp_sources_to_grid = real_exists, real_warp
+check("the DEM warp itself still runs .tif-only with no directory listing",
+      seen.get("ext") == ".tif" and seen.get("readdir") == "EMPTY_DIR"
+      and dem is not None)
+after = {k: gdal.GetConfigOption(k) for k in before}
+check(f"  and leaves no process-wide GDAL option behind (was {before}, now {after})",
+      after == before)
+check("  so a later /vsicurl .h5 is not refused locally",
+      ".h5" in (gdal.GetConfigOption("CPL_VSIL_CURL_ALLOWED_EXTENSIONS") or ".h5"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{OK} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

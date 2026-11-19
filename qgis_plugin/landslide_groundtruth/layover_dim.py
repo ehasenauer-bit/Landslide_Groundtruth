@@ -647,15 +647,22 @@ def fetch_dem_on_grid(minx, miny, maxx, maxy, width, height):
     if not urls:
         return None
 
-    for k, v in (("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR"),
-                 ("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif"),
-                 ("GDAL_HTTP_MAX_RETRY", "3"), ("GDAL_HTTP_RETRY_DELAY", "1")):
-        gdal.SetConfigOption(k, v)
+    # Scoped to this thread and this read, never process-wide. Set globally,
+    # CPL_VSIL_CURL_ALLOWED_EXTENSIONS=.tif outlived the DEM read and made GDAL
+    # refuse every later /vsicurl .h5 without sending a request, so after the
+    # first change map with the layover fade every NISAR read in that QGIS
+    # session failed as "no answer from ASF at all" (measured 2026-11-19, GDAL
+    # 3.12 and 3.13; a path-specific override for the ASF host does not beat
+    # it). The warp reads its sources on this thread, so thread-local is enough.
+    opts = {"GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+            "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+            "GDAL_HTTP_MAX_RETRY": "3", "GDAL_HTTP_RETRY_DELAY": "1"}
 
     # 1. fast path
     try:
-        arr = _warp_sources_to_grid(gdal, ["/vsicurl/" + u for u in urls],
-                                    minx, miny, maxx, maxy, width, height)
+        with gdal.config_options(opts, thread_local=True):
+            arr = _warp_sources_to_grid(gdal, ["/vsicurl/" + u for u in urls],
+                                        minx, miny, maxx, maxy, width, height)
         if arr is not None:
             return arr
     except Exception:
