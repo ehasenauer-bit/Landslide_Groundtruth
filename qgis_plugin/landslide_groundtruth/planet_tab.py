@@ -64,6 +64,9 @@ from . import planet_keystore
 TILE_HASH_URL = "https://tiles.planet.com/data/v1/layers"
 TILE_XYZ_URL = "https://tiles{shard}.planet.com/data/v1/layers/{hash}/{{z}}/{{x}}/{{y}}"
 ITEM_TYPE = "PSScene"
+# The search box a tile preview is clipped to, stored on the layer (layer CRS,
+# "xmin,ymin,xmax,ymax"): QGIS does not save a layer's extent (see _clip_preview).
+CLIP_PROP = "landslide/planet_clip"
 
 # Planet account login (mirrors the `planet` SDK's PlanetLegacyAuthClient.login):
 # POST {email, password} as JSON and get back a JSON body {"token": "<jwt>"}, whose
@@ -139,6 +142,14 @@ class PlanetTab(QWidget):
         self._resume_timer.setSingleShot(True)
         self._resume_timer.timeout.connect(self._auto_resume_fire)
         self._build_ui()
+        # Tile previews lose their AOI clip on a project reopen and on QGIS 4's
+        # reload(); put it back (see _clip_preview). Undone in teardown.
+        self._clip_signals = [(QgsProject.instance().readProject, self._reclip_previews)]
+        render_starting = getattr(self.canvas, "renderStarting", None)   # tests: a stub
+        if render_starting is not None:
+            self._clip_signals.append((render_starting, self._reclip_previews))
+        for signal, slot in self._clip_signals:
+            signal.connect(slot)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -512,6 +523,7 @@ class PlanetTab(QWidget):
             "Planet's tile service — no order, no download. Tick the scenes you "
             "want in the table, or double-click a row to preview just that scene. "
             "With nothing ticked, the nearest before & after scenes are used. "
+            "Each preview is clipped to the search area. "
             "Toggle the layers to compare.")
         self.map_preview_btn.setEnabled(False)
         self.map_preview_btn.clicked.connect(self._preview_on_map)
@@ -560,9 +572,8 @@ class PlanetTab(QWidget):
         self.resume_btn.clicked.connect(self._resume_detail)
         self.zoom_btn = QPushButton("Zoom to scene")
         self.zoom_btn.setToolTip(
-            "Frame the previewed scene(s) on the canvas. Use this instead of QGIS's "
-            "own 'Zoom to Layer', which zooms out to the whole world for XYZ tile "
-            "layers like these previews.")
+            "Frame the previewed scene(s) on the canvas: the part of each scene "
+            "inside the search area, which is all a preview draws.")
         self.zoom_btn.setEnabled(False)
         self.zoom_btn.clicked.connect(self._zoom_to_preview)
         self.cancel_btn = QPushButton("Cancel")
@@ -1694,10 +1705,10 @@ class PlanetTab(QWidget):
         if self._tile_pending <= 0:
             self.map_preview_btn.setEnabled(True)
             if self._preview_layers:
-                # Frame the actual scene footprint, not the AOI: a PlanetScope scene
-                # (~32 x 20 km, framed along-track on no tiling grid) can overlap the
-                # AOI at one corner and sit well off the epicentre, so zooming to the
-                # AOI can leave the imagery off-screen (blank canvas).
+                # Frame the imagery actually drawn: the scene footprint cut to the
+                # search box the tiles are clipped to. A PlanetScope scene (~32 x 20
+                # km, framed along-track on no tiling grid) can overlap the AOI at one
+                # corner only, and this frames just that corner.
                 self.zoom_btn.setEnabled(True)
                 if self._preview_extent is not None:
                     self._zoom_to_rect(self._preview_extent)
@@ -2354,11 +2365,8 @@ class PlanetTab(QWidget):
         # (raw url -> tiles draw, encoded url -> blank). A random tiles{0-3} shard
         # spreads the tile requests the way Planet Explorer does.
         #
-        # NB: we deliberately do NOT setExtent() this layer to the scene footprint.
-        # An XYZ layer's provider reports a whole-world tile pyramid, so clamping only
-        # layer.extent() desyncs it from that grid and the tiles stop rendering. That
-        # is why QGIS's own 'Zoom to Layer' zooms to the whole Earth for these layers
-        # — use the tab's "Zoom to scene" button to frame the scene instead.
+        # Clipped to the search box (_clip_preview), the way the Maxar tab clips its
+        # streams: QGIS then fetches and draws tiles only inside the AOI.
         #
         # And NO api_key in the url. QGIS saves every layer source into the project,
         # so a key here sat in plain text in 22 of the 61 projects on the shared drive.
@@ -2373,12 +2381,89 @@ class PlanetTab(QWidget):
         if not lyr.isValid():
             self._append_log(f"    could not build the tile layer for {name}")
             return
+        self._clip_preview(lyr)
         lg.add_to_group(lyr, self._preview_group)
         self._preview_layers.append(lyr)
         self._append_log(f"    added: {name}")
 
+    # ---------- tile previews clipped to the search box ----------
+    # An XYZ layer's extent is the whole world, so a preview streamed every Planet
+    # tile in view: the whole ~32 x 20 km scene, and more whenever the view went past
+    # it. Setting the layer's extent to the search box makes QGIS request and draw
+    # tiles only inside it (measured for the Maxar streams, and for this uri in
+    # tests/test_planet_preview_clip.py). The box must be in the layer's own CRS
+    # (EPSG:3857), not lon/lat. QGIS keeps the extent in memory only: a reopened
+    # project starts at the whole world again, and so does QGIS 4's reload() (F5,
+    # View > Refresh), with no signal. So the box is stored on the layer and put back
+    # on project read and at the start of every canvas render (_reclip_previews).
+    def _clip_preview(self, lyr):
+        """Clip a tile preview to this tab's search box and store the box on it.
+        No search AOI -> left unclipped (the whole world, as before)."""
+        bbox = self._aoi_bbox()
+        if bbox is None:
+            return None
+        try:
+            rect = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"), lyr.crs(),
+                QgsProject.instance()).transformBoundingBox(QgsRectangle(*bbox))
+        except Exception:
+            return None
+        if rect.isEmpty():
+            return None
+        lyr.setCustomProperty(CLIP_PROP, ",".join(repr(v) for v in (
+            rect.xMinimum(), rect.yMinimum(), rect.xMaximum(), rect.yMaximum())))
+        lyr.setExtent(rect)
+        return rect
+
+    @staticmethod
+    def _stored_clip(lyr):
+        """The box _clip_preview stored on ``lyr`` (layer CRS), or None."""
+        try:
+            x0, y0, x1, y1 = (float(v) for v in
+                              str(lyr.customProperty(CLIP_PROP, "")).split(","))
+        except (ValueError, RuntimeError):
+            return None
+        rect = QgsRectangle(x0, y0, x1, y1)
+        return None if rect.isEmpty() else rect
+
+    @classmethod
+    def _reapply_clip(cls, lyr):
+        """Put the stored box back on a preview that lost it. True when it had to."""
+        rect = cls._stored_clip(lyr)
+        if rect is None:
+            return False
+        try:
+            cur = lyr.extent()
+            if all(abs(a - b) < 0.01 for a, b in (
+                    (cur.xMinimum(), rect.xMinimum()), (cur.yMinimum(), rect.yMinimum()),
+                    (cur.xMaximum(), rect.xMaximum()), (cur.yMaximum(), rect.yMaximum()))):
+                return False
+            lyr.setExtent(rect)
+        except (RuntimeError, AttributeError):          # a deleted layer
+            return False
+        return True
+
+    def _reclip_previews(self, *_):
+        """Re-clip every clipped tile preview in the project, this session's or a
+        reopened project's, and redraw the ones that had lost their box. On
+        renderStarting the render that just started is replaced, so its whole-world
+        tile requests are cancelled."""
+        try:
+            layers = list(QgsProject.instance().mapLayers().values())
+        except RuntimeError:
+            return
+        for lyr in layers:
+            try:
+                if lyr.customProperty(CLIP_PROP, None) is None:
+                    continue
+                if self._reapply_clip(lyr):
+                    lyr.triggerRepaint()
+            except RuntimeError:
+                continue
+
     def _grow_preview_extent(self, bounds):
-        """Union a scene's [w, s, e, n] footprint into the preview zoom extent."""
+        """Union a scene's [w, s, e, n] footprint, cut to the search box the tiles
+        are clipped to, into the preview zoom extent."""
         if not bounds or len(bounds) != 4:
             return
         try:
@@ -2386,6 +2471,11 @@ class PlanetTab(QWidget):
                                 float(bounds[2]), float(bounds[3]))
         except (TypeError, ValueError):
             return
+        bbox = self._aoi_bbox()
+        if bbox is not None:
+            cut = rect.intersect(QgsRectangle(*bbox))
+            if not cut.isEmpty():
+                rect = cut
         if self._preview_extent is None:
             self._preview_extent = rect
         else:
@@ -2594,6 +2684,12 @@ class PlanetTab(QWidget):
     def teardown(self):
         if getattr(self, "_resume_timer", None) is not None:
             self._resume_timer.stop()
+        for signal, slot in getattr(self, "_clip_signals", []):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._clip_signals = []
         for attr in ("_preview_reply", "_login_reply"):
             reply = getattr(self, attr, None)
             if reply is not None:
