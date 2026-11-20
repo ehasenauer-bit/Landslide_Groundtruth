@@ -60,7 +60,7 @@ def _search_window(lat, lon, radius_km, start, end, coll, max_cloud):
         cat,
         collections=[coll],
         bbox=imagery._bbox(lat, lon, radius_km),
-        datetime=f"{start.date()}/{end.date()}",
+        datetime=imagery.stac_range(start, end),
         query={"eo:cloud_cover": {"lt": max_cloud}},
     )
     return [i for i in items if i.datetime is not None]

@@ -1188,9 +1188,12 @@ class PlanetTab(QWidget):
                 + (f" Recall still works offline: {cached} paid order(s) here."
                    if cached else ""))
             return
+        locked = len(self._locked_ids())
         self.iface.messageBar().pushInfo(
             "PlanetScope", f"Found {npre} pre / {npost} post candidate scene(s) "
                            f"(no orders placed)."
+            + (f" {locked} of them preview only: your account can't download them yet."
+               if locked else "")
             + (f" {cached} order(s) here are already paid for — use Recall."
                if cached else ""))
 
@@ -1313,7 +1316,11 @@ class PlanetTab(QWidget):
             cover_frac = self._aoi_coverage(c)
             cover = f"{cover_frac*100:.0f}"
             marker = "★ " if is_top else "  "
-            cells = [marker + side, date, gap, cloud, cover, cid or ""]
+            # Listed but not orderable on this account (yet): say so on the row, since
+            # Render detail will skip it (see _detail_picks_by_side).
+            locked = c.get("downloadable") is False
+            cells = [marker + side + (" · preview only" if locked else ""),
+                     date, gap, cloud, cover, cid or ""]
             bg = (PRE_BG if side == "pre" else POST_BG)
             if is_top:
                 bg = bg.darker(112)
@@ -1377,8 +1384,33 @@ class PlanetTab(QWidget):
                 head.setToolTip(
                     "★ Nearest clear scene on this side — ticked by default for "
                     "the before/after preview. Tick more rows to preview several.")
+            if locked:
+                tip = self._locked_tip(c)
+                for col in (0, 1, 2, 5):
+                    cell = self.table.item(r, col)
+                    cell.setToolTip(((cell.toolTip() + "\n\n") if cell.toolTip() else "")
+                                    + tip)
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
+
+    @staticmethod
+    def _locked_tip(c):
+        """Tooltip for a listed scene this Planet account can't download yet."""
+        return ("Your Planet account can't download this scene yet, so Render detail "
+                "skips it. Its browse image and Preview on map are free and don't need "
+                "download rights. On this account scenes have become downloadable about "
+                "30 days after acquisition"
+                + (f" (this one ≈ {c['orderable_after']})" if c.get("orderable_after")
+                   else "") + ".")
+
+    def _locked_ids(self):
+        """Ids of listed scenes this account can't download yet (downloadable False in
+        search.json). They are listed for the browse image and the tile preview, never
+        put in an order. None (Planet didn't say, or a search.json from before the flag)
+        counts as orderable."""
+        result = self._search_result or {}
+        return {c.get("id") for side in ("pre", "post") for c in result.get(side, [])
+                if c.get("downloadable") is False}
 
     # ---------- quicklook gallery ----------
     def _clear_gallery(self):
@@ -1425,15 +1457,17 @@ class PlanetTab(QWidget):
             cloud = "?"
         gap = "" if c.get("gap_days") is None else f"gap {c['gap_days']}d"
         cid = c.get("id")
+        locked = c.get("downloadable") is False
         tile = QToolButton()
         tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         tile.setIconSize(QSize(128, 128))
         tile.setFixedWidth(150)
         tile.setAutoRaise(True)
-        tile.setText(f"{date}\ncloud {cloud} · {gap}")
+        tile.setText(f"{date}\ncloud {cloud} · {gap}" + ("\npreview only" if locked else ""))
         cloud_tip = (f"cloud over AOI {cloud}" if aoi_cloud is not None
                      else f"whole-scene cloud {cloud}")
-        tile.setToolTip(f"{cid}\n{date}  {cloud_tip}  {gap}")
+        tile.setToolTip(f"{cid}\n{date}  {cloud_tip}  {gap}"
+                        + (f"\n\n{self._locked_tip(c)}" if locked else ""))
         tile.clicked.connect(lambda _=False, x=cid: self._select_row_by_id(x))
         url = self._auth_thumb(c.get("thumb_url"))
         if url:
@@ -1556,14 +1590,20 @@ class PlanetTab(QWidget):
                 ranked = self._rank(result.get(side, []))
                 if ranked and ranked[0].get("id"):
                     picks.append((side, ranked[0]["id"]))
-        groups = {}                         # (side, date) -> [ids], in table order
+        # Scenes the account can't download yet get a layer of their own: if Planet
+        # ever refuses to stream one, it can't take an orderable neighbour down with it.
+        locked = self._locked_ids()
+        groups = {}                         # (side, date, locked) -> [ids], in table order
         for side, cid in picks:
-            groups.setdefault((side, self._date_for(side, cid)), []).append(cid)
+            groups.setdefault((side, self._date_for(side, cid), cid in locked),
+                              []).append(cid)
         out = []
-        for (side, _date), ids in groups.items():
+        for (side, _date, is_locked), ids in groups.items():
             label = self._label_for(side, ids[0])
             if len(ids) > 1:
                 label += f" ({len(ids)} scenes stitched)"
+            if is_locked:
+                label += " · preview only"
             out.append((label, ids))
         return out
 
@@ -1661,9 +1701,10 @@ class PlanetTab(QWidget):
         req.setRawHeader(b"Authorization", ("Basic " + token).encode())
         reply = QgsNetworkAccessManager.instance().post(req, body)
         self._tile_replies.append(reply)
-        reply.finished.connect(lambda r=reply, n=name: self._tile_hash_ready(r, n))
+        reply.finished.connect(
+            lambda r=reply, n=name, i=tuple(ids): self._tile_hash_ready(r, n, i))
 
-    def _tile_hash_ready(self, reply, name):
+    def _tile_hash_ready(self, reply, name, ids=()):
         if reply in self._tile_replies:
             self._tile_replies.remove(reply)
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
@@ -1692,7 +1733,11 @@ class PlanetTab(QWidget):
                 except (ValueError, AttributeError):
                     detail = data[:200].decode("utf-8", "replace").strip()
             hint = ""
-            if status in (401, 403):
+            if status in (401, 403) and ids and set(ids) <= self._locked_ids():
+                hint = (" — Planet won't stream this scene to your account yet: it's one "
+                        "of the scenes your plan can't download yet. Its browse image "
+                        "(select the row) still shows it")
+            elif status in (401, 403):
                 hint = (" — the key was rejected: either it's invalid or your Planet "
                         "account isn't licensed to stream these PlanetScope scenes "
                         "(being able to search a scene doesn't grant tile access)")
@@ -1722,9 +1767,16 @@ class PlanetTab(QWidget):
         Grouped by side because the SR render composites per side (one before layer,
         one after layer), unlike the tile preview which streams each scene alone.
         With nothing ticked, fall back to the ★ nearest scene each side — same
-        default as the free tile preview."""
+        default as the free tile preview — or, when the ★ is preview-only, to the
+        nearest scene that can be ordered.
+
+        Scenes the account can't download yet are left out (Planet would refuse the
+        whole order over one of them) and returned as the second value, so the
+        caller can say so. Returns (picks, skipped)."""
         result = self._search_result or {}
+        locked = self._locked_ids()
         picks = {"pre": [], "post": []}
+        skipped = []
         for r in range(self.table.rowCount()):
             head = self.table.item(r, 0)
             if head is None or head.checkState() != Qt.CheckState.Checked:
@@ -1732,13 +1784,17 @@ class PlanetTab(QWidget):
             side = head.data(Qt.ItemDataRole.UserRole + 2)
             cid = head.data(Qt.ItemDataRole.UserRole + 1)
             if cid and side in picks:
-                picks[side].append(cid)
-        if not picks["pre"] and not picks["post"]:
+                if cid in locked:
+                    skipped.append(cid)
+                else:
+                    picks[side].append(cid)
+        if not picks["pre"] and not picks["post"] and not skipped:
             for side in ("pre", "post"):
-                ranked = self._rank(result.get(side, []))
-                if ranked and ranked[0].get("id"):
+                ranked = [c for c in self._rank(result.get(side, []))
+                          if c.get("id") and c.get("id") not in locked]
+                if ranked:
                     picks[side].append(ranked[0]["id"])
-        return picks
+        return picks, skipped
 
     def _render_detail(self):
         """Order the ticked (or ★) scene(s), clip to the AOI, and load the Highlight
@@ -1748,9 +1804,22 @@ class PlanetTab(QWidget):
         out to run_single.py --planet-render, which places a Planet order (uses quota)
         and renders the cube-root tone curve from the raw SR bands so bright terrain
         keeps its texture instead of clipping to white."""
-        picks = self._detail_picks_by_side()
+        picks, skipped = self._detail_picks_by_side()
+        if skipped:
+            self._append_log(
+                f"Render detail: skipping {len(skipped)} preview-only scene(s) your "
+                f"Planet account can't download yet: {', '.join(skipped)}")
         if not picks["pre"] and not picks["post"]:
-            self._warn("Run Search first, then tick the scene(s) to render.")
+            if skipped:
+                self._warn("None of the ticked scenes can be ordered yet: your Planet "
+                           "account can't download them (marked 'preview only'). "
+                           "Preview on map still shows them.")
+            elif self._locked_ids():
+                self._warn("No listed scene can be ordered yet: your Planet account "
+                           "can't download any of them (marked 'preview only'). "
+                           "Preview on map still shows them.")
+            else:
+                self._warn("Run Search first, then tick the scene(s) to render.")
             return
         aoi = self._aoi()
         if aoi is None:
@@ -2025,13 +2094,16 @@ class PlanetTab(QWidget):
         order shows up straight away. `entries` comes from render.json's 'available'
         block when a run just produced one; otherwise the ledger is read directly.
 
-        Only orders whose delivered footprint COVERS the epicentre are listed (the
+        Orders whose delivered footprint COVERS the epicentre are listed first (the
         strict pc.entries(require_point=True) filter), so the picker answers "which
         paid-for orders actually image THIS event?" instead of the whole cumulative
-        ledger. When no AOI is known yet (no lat/lon in the form, no prior search) there
-        is nothing to filter on, so the entire ledger is shown. Trade-off, chosen
-        deliberately: an order for a different location no longer appears here — set the
-        form to that location to bring its orders back into range."""
+        ledger. After them come orders that only overlap the search box, marked "misses
+        epicentre": a strip that clipped one edge of the AOI is still this event's paid
+        imagery, and Recall's own "newest per side" already loads such an order — hiding
+        it here also disabled the Recall button whenever it was the only one. When no
+        AOI is known yet (no lat/lon in the form, no prior search) there is nothing to
+        filter on, so the entire ledger is shown. An order for a different location
+        doesn't appear — set the form to that location to bring its orders into range."""
         combo = getattr(self, "recall_combo", None)
         if combo is None:
             return
@@ -2056,9 +2128,16 @@ class PlanetTab(QWidget):
                 legacy = ([os.path.join(project, "out"), os.path.join(project, "Output")]
                           if project else [])
                 pc.adopt([base_out] + legacy, log=lambda *_: None)
-                near = (pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
-                                   require_point=True)
-                        if aoi else pc.entries())
+                if aoi:
+                    near = pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2],
+                                      require_point=True)
+                    seen = {e.get("order_id") for e in near}
+                    for e in pc.entries(lat=aoi[0], lon=aoi[1], radius_km=aoi[2]):
+                        if e.get("order_id") not in seen:
+                            near.append(dict(e, label=(e.get("label") or e.get(
+                                "order_id") or "") + " · misses epicentre"))
+                else:
+                    near = pc.entries()
             except Exception as e:
                 self._append_log(f"could not list cached Planet orders: {e}")
                 return

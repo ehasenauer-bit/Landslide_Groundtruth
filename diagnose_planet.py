@@ -2,13 +2,12 @@
 """Why isn't a given PlanetScope scene found? Diagnostic for the search filters.
 
 Lists every PSScene near the event in the pre and post windows together with the
-two attributes the pipeline filters on but Planet Explorer does NOT:
-  - download permission  (planet_imagery uses df.permission_filter())
-  - quality_category     (planet_imagery uses df.std_quality_filter() == "standard")
-so you can see exactly which filter drops a scene you can see in Planet Explorer.
+two attributes that decide what the plugin can do with a scene:
+  - download permission  (listed either way; Render detail can only order it with one)
+  - quality_category     ("Standard quality only" in the tab drops non-standard ones)
+so you can see why a scene Planet Explorer shows can't be ordered, or went missing.
 
-This search drops the permission + quality filters on purpose (geometry + date +
-cloud only) so the dropped scenes still SHOW here, each marked keep/DROP and why.
+This search uses geometry + date + cloud only, so every scene still SHOWS here.
 
 Free: Data API search only — no orders, no downloads, no quota consumed.
 
@@ -58,10 +57,11 @@ def main():
     from planet import data_filter as df
     pl = pi._client()
     aoi = pi._bbox_geojson(a.lat, a.lon, a.radius_km)
-    pre0, pre1, post0, post1 = im.windows(a.when, a.pre_days, a.post_days, False)
+    # the same windows planet_imagery.search_event searches: right up to the event time
+    pre0, pre1, post0, post1 = im.windows(a.when, a.pre_days, a.post_days)
 
     print(f"event {a.when}  ({a.lat},{a.lon})  r={a.radius_km}km")
-    print("columns: kept? = what the plugin's permission + std_quality filters keep")
+    print("columns: download? = can this account order it; std? = passes 'Standard quality only'")
 
     any_dropped = False
     for side, start, end in (("PRE", pre0, pre1), ("POST", post0, post1)):
@@ -78,27 +78,28 @@ def main():
         print(f"\n=== {side}  window {start.date()}..{end.date()}  "
               f"({len(items)} PSScene items overlap the AOI) ===")
         print(f"{'date (UTC)':16} {'gap':>4} {'cloud%':>6} {'quality':10} "
-              f"{'download?':9} {'kept?':5}  scene id")
+              f"{'download?':9} {'std?':5}  scene id")
         for i in items[:a.top]:
             d = pi._acquired(i)
             p = i["properties"]
             cloud = p.get("cloud_cover")
             q = p.get("quality_category", "?")
             dl = _can_download(i)
-            kept = dl and q == "standard"
-            any_dropped |= not kept
+            kept = q == "standard"
+            any_dropped |= not (dl and kept)
             cloud_s = "" if cloud is None else f"{round(cloud * 100)}"
             print(f"{d.isoformat()[:16]:16} {abs((d - a.when).days):>4} "
                   f"{cloud_s:>6} {q:10} {('yes' if dl else 'NO'):9} "
-                  f"{('keep' if kept else 'DROP'):5}  {i['id']}")
+                  f"{('yes' if kept else 'no'):5}  {i['id']}")
 
     print("\nHow to read it:")
-    print("  DROP + download?=NO   -> excluded by permission_filter() (you can't ORDER it;")
-    print("                           relaxing the filter would only let you SEE it, not use it)")
-    print("  DROP + quality!=standard -> excluded by std_quality_filter() (a 'test'/non-standard")
-    print("                           acquisition; this one is safe to relax to recover the scene)")
+    print("  download?=NO -> listed in the tab (browse image + Preview on map) but Render")
+    print("                  detail can't order it; this account has gained download rights")
+    print("                  ~30 days after acquisition")
+    print("  std?=no      -> a 'test'-quality acquisition: listed by the tab's default, hidden")
+    print("                  only under 'Standard quality only'")
     if not any_dropped:
-        print("  (nothing was dropped — every overlapping scene already passes both filters)")
+        print("  (every overlapping scene is standard quality and downloadable)")
 
 
 if __name__ == "__main__":

@@ -141,7 +141,7 @@ def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIM
         cat,
         collections=[COLLECTION],
         bbox=im._bbox(lat, lon, radius_km),
-        datetime=f"{start.date()}/{end.date()}",
+        datetime=im.stac_range(start, end),
         query={"sar:instrument_mode": {"eq": "IW"}},
     )
     items = [i for i in items if i.datetime is not None]

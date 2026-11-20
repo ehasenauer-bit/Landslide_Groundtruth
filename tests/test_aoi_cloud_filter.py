@@ -82,7 +82,7 @@ def fake_fractions(items, lat, lon, radius_km, sensor, method="ocm"):
 def fake_search(lat, lon, r, start, end, coll, event_time, max_cloud=60, limit=6,
                 cloud_weight=0.5):
     check(max_cloud is None, f"STAC search carries no tile-cloud predicate ({max_cloud})")
-    pool = POST if start > EVENT else PRE
+    pool = POST if start >= EVENT else PRE     # the post window starts AT the event
     return pool[:limit]
 
 

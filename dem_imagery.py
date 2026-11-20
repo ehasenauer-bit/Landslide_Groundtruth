@@ -390,7 +390,7 @@ def search_scenes(lat, lon, radius_km, start, end, event_time, limit=DEFAULT_LIM
         cat,
         collections=_collections_for(lat),
         bbox=im._bbox(lat, lon, radius_km),
-        datetime=f"{start.date()}/{end.date()}",
+        datetime=im.stac_range(start, end),
     )
     items = [i for i in items if i.datetime is not None]
     items.sort(key=lambda i: abs(
@@ -407,11 +407,12 @@ def _nearest_outside_note(lat, lon, radius_km, event_time, side):
     or states that the archive holds nothing at all (common on the post side:
     stereo tasking and strip processing lag an event by months to years)."""
     word = "before" if side == "pre" else "after"
+    # same boundary as imagery.windows: the sides meet at the event time
     if side == "pre":
-        rng = f"2007-01-01/{(event_time - dt.timedelta(days=1)).date()}"
+        rng = im.stac_range(dt.datetime(2007, 1, 1),
+                            event_time - dt.timedelta(seconds=1))
     else:
-        rng = (f"{(event_time + dt.timedelta(days=1)).date()}/"
-               f"{(event_time + dt.timedelta(days=10 * 365)).date()}")
+        rng = im.stac_range(event_time, event_time + dt.timedelta(days=10 * 365))
     items = im._search_items(
         _client(),
         collections=_collections_for(lat),

@@ -6,8 +6,9 @@ optical source the plugin offers. It is NOT part of the automatic Run pipeline
 run_single.py, one step at a time, so you choose scenes by eye before paying:
 
   1. search_event — Data API search of PSScene by AOI + date (+ whole-scene
-     cloud_cover, permission, quality), ranked by a blend of distance to the event
-     date and cloud cover. Free.
+     cloud_cover and quality, when set), ranked by a blend of distance to the event
+     date and cloud cover. Scenes the account can't download yet are listed too, marked
+     downloadable=False. Free.
   2. render_preview — Orders API: order the ticked scenes as the `analytic_sr_udm2`
      bundle (or `analytic_udm2` for TOA), server-side clipped to the AOI, download,
      reproject to the event UTM zone and median-composite. recall_preview /
@@ -126,7 +127,10 @@ DOWNLOAD_TRIES = 4                   # passes at an order's files before giving 
 
 DEFAULT_MAX_CLOUD_PCT = 80.0         # whole-scene cloud cap when not overridden
 AUTO_WINDOW_MAX_CLOUD_PCT = 20.0     # stricter cap under --auto-window (nearest CLEAR scene)
-SEARCH_LIMIT = 60                    # scenes per side the free preview lists (see search_event)
+SEARCH_LIMIT = 35                    # scenes per side the free preview lists (see search_event)
+# The account in use has gained download rights to a PSScene ~30 days after its
+# acquisition, to within 2 h on 11 sites (measured 2026-09-25). Only a tooltip hint.
+DOWNLOAD_DELAY_DAYS = 30
 
 
 def _resolve_cloud_frac(max_cloud_pct, auto_window):
@@ -267,14 +271,24 @@ def search_scenes(pl, aoi, start, end, event_time, max_cloud=0.6, limit=6,
     actually overlap the location being ground-truthed (and, when none do, the
     caller falls back to Sentinel-2/Landsat rather than mapping an off-centre
     strip).
+
+    No download-permission filter. It used to keep only scenes the account can
+    download, and this account can download a PSScene only ~30 days after it was
+    acquired (see diagnose_planet.py), so every scene of the month after an event was
+    dropped before the tab ever saw it — no browse image, no tile preview, although
+    Planet Explorer lists them. They are listed now and carry `downloadable` (see
+    _candidate); the tab keeps them out of an order.
+
+    max_cloud >= 1 (100%) drops the cloud predicate entirely, as the Sentinel-2
+    search does: a range query also discards an item that carries no cloud_cover.
     """
     from planet import data_filter as df
     filters = [
         df.geometry_filter(cover if cover is not None else aoi),
         df.date_range_filter("acquired", gte=start, lte=end),
-        df.range_filter("cloud_cover", lte=max_cloud),
-        df.permission_filter(),     # only items we have download rights to
     ]
+    if max_cloud is not None and max_cloud < 1.0:
+        filters.append(df.range_filter("cloud_cover", lte=max_cloud))
     if not allow_test_quality:
         # std_quality_filter keeps only quality_category == "standard". Recent
         # PlanetScope acquisitions (and some sensors) are published as "test"
@@ -307,7 +321,19 @@ def search_scenes(pl, aoi, start, end, event_time, max_cloud=0.6, limit=6,
         items.sort(key=lambda i: (round(gap_days(i)), cloud_pct(i)))
     else:
         items.sort(key=lambda i: gap_days(i) + cloud_weight * cloud_pct(i))
-    return items[:limit]
+    return items[:limit]              # limit None = every match
+
+
+def _can_download(item):
+    """True when the account may download at least one of the item's assets — exactly
+    what the Data API's permission filter used to keep. Items carry a `_permissions`
+    list such as ['assets.ortho_analytic_4b_sr:download', ...]; a scene the plan
+    can't download (yet) has an empty one. None when the item carries no list at all:
+    unknown, so nothing downstream refuses to order it."""
+    perms = item.get("_permissions")
+    if perms is None:
+        return None
+    return any(str(p).endswith(":download") for p in perms)
 
 
 def _geom_bbox(geom):
@@ -353,12 +379,23 @@ def _candidate(item, event_time, aoi_cloud_pct=None):
     cloud = item["properties"].get("cloud_cover")
     thumb = (item.get("_links") or {}).get("thumbnail")
     geom = item.get("geometry")
+    downloadable = _can_download(item)
+    # When a locked scene should open up, if that is still ahead: the account's delay
+    # is measured, not documented, so this is a hint for the tooltip, not a promise.
+    opens = d + dt.timedelta(days=DOWNLOAD_DELAY_DAYS)
+    orderable_after = (opens.date().isoformat()
+                       if downloadable is False
+                       and opens > dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+                       else None)
     return dict(id=item["id"], date=d.isoformat(),
                 cloud_pct=round(cloud * 100, 1) if cloud is not None else None,
                 aoi_cloud_pct=round(aoi_cloud_pct, 1) if aoi_cloud_pct is not None else None,
                 gap_days=round(abs((d - event_time).total_seconds()) / 86400.0),
                 source="PlanetScope", thumb_url=thumb,
-                geometry=geom, bbox=_geom_bbox(geom))
+                geometry=geom, bbox=_geom_bbox(geom),
+                # False = listed for its browse image and tile preview, but the account
+                # can't order it (yet); None = Planet didn't say (see _can_download)
+                downloadable=downloadable, orderable_after=orderable_after)
 
 
 def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
@@ -399,26 +436,47 @@ def search_event(lat, lon, radius_km, event_time: dt.datetime, pre_days=60,
     pl = _client()
     aoi = _bbox_geojson(lat, lon, radius_km)
     point = _point_geojson(lat, lon)
+    # Both sides run right up to the event time (see imagery.windows): the scenes
+    # within 24 h of the slide used to be searched by neither.
     pre0, pre1, post0, post1 = im.windows(event_time, pre_days, post_days)
     weight = None if auto_window else cloud_weight   # None = nearest-only (auto_window)
-    # The preview LISTS scenes for you to judge by eye, so it shows far more than
-    # search_scenes' default 6. Six hid 306 scenes ≤20% cloud across the 6
-    # benchmark events, including 19 ≤50%-cloud scenes within 3 d of the event: the
-    # gap + cloud_weight*cloud cost ranks a clear scene 10 d out ahead of a
-    # partly-cloudy one 2 d out, and the whole-scene cloud can't say which is clear
-    # over the AOI. SEARCH_LIMIT keeps every scene within 3 d on those events.
+    # The preview LISTS scenes for you to judge by eye: the SEARCH_LIMIT best-ranked per
+    # side (Ethan's pick, 2026-11-19), and a note whenever the cap leaves scenes out, so
+    # a shorter list never reads as an emptier sky. History: 6 per side hid 306 scenes
+    # ≤20% cloud across the 6 benchmark events, 19 of them ≤50%-cloud within 3 d of the
+    # event (the gap + cloud_weight*cloud cost ranks a clear scene 10 d out ahead of a
+    # partly-cloudy one 2 d out); 60, then no cap, followed.
     lim = 1 if auto_window else SEARCH_LIMIT
     cloud = _resolve_cloud_frac(max_cloud_pct, auto_window)
     cover = point if require_point else None         # default: AOI overlap (Planet Explorer-like)
+    # Fetch and rank every match, then cut here, so the note can say what was left out.
     pre_items = search_scenes(pl, aoi, pre0, pre1, event_time, max_cloud=cloud,
-                              limit=lim, cloud_weight=weight, cover=cover,
+                              limit=None, cloud_weight=weight, cover=cover,
                               allow_test_quality=allow_test_quality)
     post_items = search_scenes(pl, aoi, post0, post1, event_time, max_cloud=cloud,
-                               limit=lim, cloud_weight=weight, cover=cover,
+                               limit=None, cloud_weight=weight, cover=cover,
                                allow_test_quality=allow_test_quality)
-    return dict(source="PlanetScope",
-                pre=[_candidate(i, event_time) for i in pre_items],
-                post=[_candidate(i, event_time) for i in post_items])
+    notes = []
+    if not auto_window and lim is not None:
+        cut = [(side, len(items)) for side, items in (("before", pre_items),
+                                                     ("after", post_items))
+               if len(items) > lim]
+        if cut:
+            notes.append(
+                "PlanetScope: listing the " + str(lim) + " best-ranked scenes per side "
+                "(nearest the event, then clearest) of "
+                + " and ".join(f"{n} {side}" for side, n in cut)
+                + " — shorten the search window or lower Max cloud to see the rest.")
+    pre = [_candidate(i, event_time) for i in pre_items[:lim]]
+    post = [_candidate(i, event_time) for i in post_items[:lim]]
+    locked = sum(1 for c in pre + post if c["downloadable"] is False)
+    if locked:
+        notes.append(
+            f"PlanetScope: {locked} listed scene(s) can't be downloaded on this Planet "
+            f"account yet — browse image and Preview on map only; Render detail skips "
+            f"them. (This account has gained download rights ~30 days after "
+            f"acquisition.)")
+    return dict(source="PlanetScope", pre=pre, post=post, notes=notes)
 
 
 def _create_order(pl, item_ids, aoi):
@@ -594,11 +652,19 @@ def _wait_download(pl, order_id, meta=None, log=print, delay=10, max_attempts=18
 
     final = pl.orders.wait(order_id, delay=delay, max_attempts=max_attempts,
                            callback=_on_state)
-    if final != "success":
-        # failed/partial: the item(s) didn't deliver, so there's nothing to download
+    if final not in ("success", "partial"):
+        # failed/cancelled: nothing was delivered, so there's nothing to download
         raise RuntimeError(f"order finished in state {final!r} (not 'success')")
+    # 'partial' = some of the order's scenes failed and the rest DID deliver. It used to
+    # raise like 'failed', which threw away every delivered (paid-for) scene of the side
+    # and left a pending id whose resume raised the same way. Download what arrived.
     _download_order(pl, order_id, dest, log=log)
     pairs = _pair_downloads(dest)
+    if final == "partial":
+        if not pairs:
+            raise RuntimeError("order finished 'partial' and delivered no usable clips")
+        log(f"    [planet] order {order_id[:12]} finished 'partial': Planet delivered "
+            f"{len(pairs)} scene(s) and failed the rest — loading what arrived")
     # The delivered clip footprint beats the AOI we asked for: it's what actually
     # arrived, so it's the honest answer to "does this order cover that box?" — and it
     # keeps a re-download of someone else's order id from being filed at our AOI.

@@ -206,14 +206,39 @@ def _bbox(lat, lon, radius_km):
 def windows(event_time: dt.datetime, pre_days=60, post_days=60):
     """Pre/post search windows (pre0, pre1, post0, post1) for an event.
 
-    Shared by the optical and PlanetScope paths so the dry-run preview, the
-    Sentinel-2/Landsat run, and the PlanetScope run all bound the same dates.
+    Shared by every source (Sentinel-2/Landsat preview and Run, PlanetScope,
+    Sentinel-1, DEM strips) so the day sliders mean the same thing in every tab.
     The pre window is always the pre_days before the event: the old --seasonal
     shift to a year-earlier window was removed (it handed Mt. Logan 2026-10-06
-    only 2025 pre scenes, gap 336-394 d)."""
-    pre0, pre1 = event_time - dt.timedelta(days=pre_days), event_time - dt.timedelta(days=1)
-    post0, post1 = event_time + dt.timedelta(days=1), event_time + dt.timedelta(days=post_days)
+    only 2025 pre scenes, gap 336-394 d).
+
+    The two sides meet AT the event time: pre ends one second before it, post starts
+    on it. They used to stop a day short each way (pre at event-1 d, post at
+    event+1 d), and the searches sent whole dates, so every scene from the day before
+    the event through the day after it was searched by neither side — the scenes
+    nearest the slide (St. Elias 2026-08-18 had a PlanetScope scene 11 h after it).
+    The event time is the seismic detection's, to the minute, so it splits before
+    from after by itself. Send these to a STAC search with stac_range, never as
+    whole dates: those would put an event-day scene on both sides.
+
+    The outer ends stay whole days (00:00 of the first pre day, 23:59:59 of the last
+    post day), exactly what the date-only searches covered, so nothing that used to
+    be listed at the far end of a window drops off."""
+    first = (event_time - dt.timedelta(days=pre_days)).date()
+    last = (event_time + dt.timedelta(days=post_days)).date()
+    pre0 = dt.datetime.combine(first, dt.time.min)
+    pre1 = event_time - dt.timedelta(seconds=1)
+    post0 = event_time
+    post1 = dt.datetime.combine(last, dt.time(23, 59, 59))
     return pre0, pre1, post0, post1
+
+
+def stac_range(start, end):
+    """A STAC datetime interval to the second, in UTC (the event time and every
+    window bound here are naive UTC). Use this, not f"{start.date()}/{end.date()}":
+    whole dates widen both ends to full days, so the pre and post windows from
+    `windows` would overlap on the event day and list its scenes on both sides."""
+    return f"{start:%Y-%m-%dT%H:%M:%SZ}/{end:%Y-%m-%dT%H:%M:%SZ}"
 
 
 def search_scenes(lat, lon, radius_km, start, end, collection, event_time,
@@ -240,7 +265,7 @@ def search_scenes(lat, lon, radius_km, start, end, collection, event_time,
         cat,
         collections=[collection],
         bbox=_bbox(lat, lon, radius_km),
-        datetime=f"{start.date()}/{end.date()}",
+        datetime=stac_range(start, end),
         query=query,
     )
     items = [i for i in items if i.datetime is not None]
