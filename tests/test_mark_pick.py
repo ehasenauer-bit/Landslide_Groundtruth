@@ -14,6 +14,7 @@ from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem,
 QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX", "/Applications/QGIS-LTR.app/Contents/MacOS"), True)
 app = QgsApplication([], False); app.initQgis()
 from qgis.PyQt.QtWidgets import QLabel, QLineEdit, QPlainTextEdit, QPushButton
+from qgis.PyQt.QtCore import Qt
 from qgis.gui import QgsMapCanvas, QgsMapToolPan
 from landslide_groundtruth import dock as D, map_marks as M
 
@@ -63,7 +64,7 @@ s._mark_pick_btn.setChecked(True)
 assert s.canvas.mapTool() is s._mark_pick_tool
 pt = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), utm,
                             QgsProject.instance()).transform(QgsPointXY(-153.09, 60.03))
-s._mark_pick_tool.canvasClicked.emit(pt, 1)
+s._mark_pick_tool.canvasClicked.emit(pt, Qt.MouseButton.LeftButton)   # Qt 6 rejects a bare 1
 print("   fields:", s._mark_lat_edit.text(), s._mark_lon_edit.text())
 assert (s._mark_lat_edit.text(), s._mark_lon_edit.text()) == ("60.030000", "-153.090000")
 assert not s._mark_pick_btn.isChecked() and s.canvas.mapTool() is pan
@@ -106,3 +107,8 @@ s2._show_mark_notes()
 assert not s2.iface.tables and "No marks yet" in s2._mark_status.text()
 print("   ok")
 print("\nMARK PICK + NOTES VERIFIED")
+# Leave without Python tearing QGIS down: on QGIS 4 that teardown segfaults (exit
+# 139) after every check has passed, and the runner reads it as a failure. Same
+# exit as test_map_marks.py.
+sys.stdout.flush()
+os._exit(0)
